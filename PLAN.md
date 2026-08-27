@@ -1,0 +1,1261 @@
+# hostshift — plan
+
+Serve a CMS site from a hostname other than the one baked into its database,
+without rewriting the database.
+
+**Status: design, audited twice, decided. Not yet ready to build — §4.5 lists
+checks to run first, and §8 M0 is deliberately no-code.**
+
+An earlier version of this document (`wp-host-proxy/PLAN.md`) was audited on
+2026-08-27. Four of its central claims were false. This revision corrects them
+and, as a result, recommends a different approach. The history is kept in full
+because most decisions here are reactions to specific failures.
+
+---
+
+## 1. The problem
+
+CMSes store absolute URLs in the database. For WordPress:
+
+- `wp_options.home` / `wp_options.siteurl`
+- Absolute URLs inside `post_content`
+- Serialized data — ACF, menus, Polylang, widgets
+- Multisite: `wp_blogs.domain` / `wp_site.domain`, exact-match, **no port column**
+
+So a database only renders correctly on the hostname it was made for. Browsing
+it from a second hostname means `wp search-replace` over the whole DB, or
+something at runtime.
+
+This bites in two places. **Every `db:pull`** runs a multisite `--precise`
+search-replace across a 548 MB dump. And **git worktrees with agents** — parallel
+agents on parallel branches, each needing a browser-visible environment, each
+currently needing its own DB copy plus another search-replace.
+
+The design in §4 removes both: the database is never rewritten, and is instead a
+pristine artifact shared by canonical, every worktree, and CI.
+
+Measured on `herrfors`, 2026-08-27:
+
+| Per worktree | Size |
+|---|---|
+| `node_modules` | 2.2 GB (the live `herrfors-wt-pilot` worktree is 1.1 GB) |
+| `vendor` | 232 MB |
+| `web/wp` | 77 MB |
+| database | ~665 MB |
+
+The existing `herrfors-wt-pilot` worktree totals **1.6 GB**. Five parallel
+worktrees is roughly 8 GB, not the 16 GB claimed in the previous revision.
+
+---
+
+## 2. History
+
+### 2.1 The Cursor session, 2026-08-21
+
+85 turns, *"Leaner WordPress Dev"*, 10:27–14:32, cwd `~/Projects/Genero`. Opened
+with *"what would a leaner alternative to ddev be"*, narrowed immediately to the
+real blocker:
+
+> hmm problem is mostly that wordpress hardcodes urls in database so they need
+> to be rewritten with db:pull (that we do now or other means)
+
+**Rejected as DDEV replacements:** thin shared `docker-compose.yml` (abandoned
+after *"sounds we are awfully close to ddev in this plan already :D"*), native
+PHP + Homebrew MariaDB, Lando, wp-env, Trellis/Vagrant, OrbStack,
+`@e0ipso/ddev-worktree`, a custom Rust proxy (*"should we build our own in
+rust?"* — waved off toward Caddy), nginx `sub_filter` (*"sounds brittle"*),
+OpenResty.
+
+**Five ideas for the URL problem:**
+
+1. Shared DB, port per worktree, fixed `Host` header — **chosen**, became v0.1
+2. `/etc/hosts` with production domains — *"hard to beat"* for single-checkout
+   human dev, dies on parallel worktrees. **Never adopted, never revisited**
+3. Runtime URL-rewriting mu-plugin — tried, failed (§2.3)
+4. Golden DB artifact + copy-on-write clone — raised once, **never pursued**
+5. Stop isolating DBs, isolate code only — partly folded into 1
+
+### 2.2 What was built: generoi/ddev-worktree
+
+**v0.1** — canonical DDEV authoritative; each worktree gets a thin sidecar web
+container on the shared MariaDB, a Caddy proxy on `:808x`, and a `wt-guard`
+hook that **blocks `ddev start`** in worktrees.
+
+**v0.2** (`c093297`) reversed the premise: full DDEV per worktree, unique project
+name, DB cloned from canonical, Caddy `:808x` proxy. `Co-authored-by: Cursor`.
+
+After that reversal the **only** remaining differentiator versus plain DDEV is
+the Caddy proxy that avoids search-replace.
+
+### 2.3 What failed
+
+**The mu-plugin.** Killed by the user: *"this mu-plugin is kind of proving this
+isnt working :D"*. Correct — multisite builds blog URLs from `wp_blogs.domain`,
+which has no port column, so `WP_HOME` can never fix it.
+
+**Implementation failures:** `ERR_SSL_PROTOCOL_ERROR` on 8081; missing
+`web/wp/wp-blog-header.php` after symlink removal; `sunrise.php` running too
+early for `add_action('init')`; `.ddev/nginx/` rewrites not applying so uploads
+404'd; and:
+
+    https://herrfors.ddev.site:8081:8081/wp/wp-includes/blocks/gallery/style.css
+
+**The double-port bug.** Diagnosed as Caddy's bare-host rule re-matching URLs
+that already carried the port. User: `how did you not catch that?`, after
+already having said `please test things thoroughly`.
+
+**Correction from the audit:** v0.2 was *not* uniformly naive about this.
+`lib.sh:225-228` emits `header_down Location` **regex** rewrites with `(?::\d+)?`
+— already port-idempotent. Only the body `replace` block (`lib.sh:230-234`, four
+rules per host, not two) was byte-level. A `(?::\d+)?` guard on the body rules
+would have fixed the bug cheaply. This weakens the case for a ground-up rewrite
+and must not be misrepresented.
+
+**Rejected on taste:** `ddev wt-e2e` wrappers (*"not a fan of these.... things
+should just work"*); unfocused churn (*"stop just changing everything, actually
+think about what makes sense...."*); direct pushes to `generoi/github-actions`
+(*"in future always open PRs"*).
+
+**The security issue.** This was in `config/application.php`, running in
+production:
+
+```php
+$_SERVER['HTTP_HOST'] = preg_replace('/:\d+$/', '', $_SERVER['HTTP_HOST']);
+if (! empty($_SERVER['HTTP_X_FORWARDED_PORT'])) {
+    $_SERVER['SERVER_PORT'] = $_SERVER['HTTP_X_FORWARDED_PORT'];
+}
+```
+
+> not happy with this in application.php tbh and that it's used for production.
+> is it safe/secure?
+
+**Correction from the audit:** the previous revision claimed this was gated
+behind `GENEROI_WT` in `config/environments/wt.php`. **That file does not exist
+and never did**; `GENEROI_WT` appears nowhere. The user asked for options, was
+given three, and chose *"3. fix at caddy"*. Both lines were simply reverted.
+
+The lesson is narrow and must not be over-generalised: **do not make production
+trust `X-Forwarded-Port`.** It is *not* a prohibition on forwarded headers —
+`application.php:196` already sets `$_SERVER['HTTPS']` from
+`HTTP_X_FORWARDED_PROTO`, and the app depends on it.
+
+### 2.4 What the previous attempt got wrong
+
+1. Opened by recommending DDEV be replaced; abandoned 45 minutes later
+2. Conflated npm's cache with pnpm's store — *"I was parallelizing them loosely;
+   the mechanics differ"*
+3. Disk goal never met — *"Disk is basically the same … We save container
+   overhead, not disk"*
+4. Its own comparison concluded DDEV native + `omit-project-name-by-default`
+   would be *"less custom code for the same outcome"*
+5. **pnpm was done but never merged.** Branch
+   `origin/feat/generoi-worktree-pnpm` exists with `pnpm-lock.yaml` and
+   `pnpm-workspace.yaml`. `master` still has `package-lock.json` and 2.2 GB of
+   `node_modules`. (The previous revision said it "never landed", implying it
+   was never attempted. It was attempted and left unmerged.)
+6. All code went into transport; the DB and disk problems went untouched
+
+---
+
+## 3. Evidence
+
+Measured 2026-08-27.
+
+**Fleet:** 63 repos with `.ddev/config.yaml`. PHP 8.3×34, 8.4×21, 8.2×7, 8.0×1.
+Webserver `nginx-fpm`×53, `apache-fpm`×10.
+
+**Agent behaviour** (5,808 Claude Code transcripts, 2026-06-20 → 08-26):
+
+- 1,413 subagent spawns; **1,373 (97%) run with no isolation**, same directory
+- 40 worktree-isolated spawns, **all in `kokoomus`** — which shows **0.0%**
+  parallel-session time
+- 352 `git worktree` invocations (Genero 129, kaskipuu 74, suomentyokalu 26)
+
+Two distinct modes: when a human hands out tickets, agents share one directory
+and it works (disjoint tasks, plus `Bash(git add -A*)` in the global deny list).
+When an agent drives itself unattended, it starts isolating.
+
+Worktrees are created **reactively**, on collision with an in-flight WIP branch:
+
+> okay open a PR, note that another agent is working so use a worktree
+
+**Per-repo installation drifts.** 42 repos carry `.claude/agency` (41 with a
+`skills/` dir, 1 uninitialised). The newest skill `facetwp` is in **0 of 42**;
+**9** repos sit at 6 of 18 skills; ~14 distinct submodule SHAs are pinned across
+42 repos. `install.sh` documents this exact failure mode for *rules* and fixed it
+with a single directory symlink; skills and agents were never migrated.
+
+**Design constraint:** anything shipped here must have near-zero per-repo
+footprint.
+
+---
+
+## 4. THE DECISION
+
+Revision 1 framed this as an unresolved go/no-go between a proxy and one-time DB
+normalisation. **Decided 2026-08-27: build the proxy, with canonical = the
+production hostnames.** The reasoning below records why, including what changed.
+
+### 4.1 What the first audit established
+
+On Bedrock, `config/application.php:49-60`:
+
+```php
+$host = match (true) {
+    ! empty($_SERVER['HTTP_HOST']) => $_SERVER['HTTP_HOST'],
+    ! empty(env('DDEV_PRIMARY_URL')) => parse_url(env('DDEV_PRIMARY_URL'), PHP_URL_HOST),
+    ...
+};
+Config::define('WP_HOME', env('WP_HOME') ?: ('https://'.$host));
+Config::define('WP_SITEURL', env('WP_SITEURL') ?: Config::get('WP_HOME').'/wp');
+```
+
+**`WP_HOME` already follows the request host.** Two consequences:
+
+1. **Zero-config discovery is impossible.** Probing `GET /wp-json/` with
+   `Host: X` returns `home = https://X` (`class-wp-rest-server.php:1365-1366`;
+   `functions.php:4727` `_config_wp_home`). The proxy would conclude canonical
+   == variant and rewrite nothing — a **silent no-op**. The map must be declared
+   (§5.3), never discovered.
+2. **`home` / `siteurl` need no help.** They were never the problem.
+
+The residue is: absolute URLs in `post_content` and serialized options, and
+multisite blog resolution via `wp_blogs.domain` / `wp_site.domain`.
+
+### 4.2 Multisite is N→N with unrelated domains — and Genero already has the data
+
+`herrfors` production `wp_blogs`:
+
+    (1, 'www.herrfors.fi',    '/')
+    (2, 'www.herrforsnat.fi', '/')
+
+`SUBDOMAIN_INSTALL` is true, but the blogs sit on **unrelated registrable
+domains**. That is the norm, not the exception:
+
+| repo | blogs | production domains |
+|---|---|---|
+| pellervo | 5 | `kodinpellervo.fi`, `maatilanpellervo.fi`, `omapiha.info`, … |
+| snellmanecom | 5 | `snellmanpetfood.com`, `shop.snellman.fi`, … |
+| steripolarnew | 4 | `steripolar.dk`, `*.steripolarnew.kinsta.cloud` |
+| fluo | 3 | `flpipe.fi`, `kesrec.fi`, `fluosites.kinsta.cloud` |
+| spfpension | 4 | |
+| beamex, mutti, panini, suomentyokalu, herrfors | 2 each | |
+
+12 multisite repos, N from 2 to 5. Any suffix-derived mapping is dead — and not
+only on the production side. `snellmanecom`'s *local* hosts are
+`snellmanecom.ddev.site`, `shop.snellman.ddev.site` and
+`tilaus.figen.ddev.site`: three different bases.
+
+**However, Genero repos already declare the full index-aligned bijection**
+in `robo.yml`, which is what `robo db:pull` uses to search-replace today:
+
+```yaml
+multisite: true
+env:
+  '@ddev':
+    url: ['https://herrfors.ddev.site', 'https://nat.herrfors.ddev.site']
+  '@staging':
+    url: ['https://herrfors.genero-dev.com', 'https://herrforsnat.genero-dev.com']
+  '@production':
+    url: ['https://www.herrfors.fi', 'https://www.herrforsnat.fi']
+```
+
+Position *i* is blog *i* in every environment. This matters as *evidence*, not as an interface: the mapping problem is solvable
+because the data exists, is per-repo, and stays maintained because `db:pull`
+depends on it. It resolves what the previous revision could not:
+
+- **Discovery (§4.1)** — the application self-reports and cannot be interrogated.
+  The map must be declared, and something already declares it.
+- **N→N mapping** — already written down, for all 12 multisite repos.
+
+**hostshift must not read `robo.yml`.** That is Genero deployment-tool config,
+and a standalone tool that parses it is coupled to one agency's stack. hostshift
+defines its own config format (§5.3); Genero writes a small adapter that emits it
+from `robo.yml`. The Genero-specific knowledge stays on the Genero side of the
+boundary — in the DDEV add-on or a robo task — where it can change without
+touching the tool.
+
+It also enables something search-replace does not achieve: because *all*
+environments are listed, the map for blog *i* can be
+`{production_i, staging_i, ddev_i} → variant_i`, so residual production or
+staging URLs left in content by an imperfect `db:pull` are also corrected.
+
+This was the user's own instinct during the 2026-08-21 session — *"hmm could we
+make it 'speak' .ddev.config.yml? and anything else our projects have"* → *"or
+robo.yml"* — and it was not pursued.
+
+**Edge cases found in the fleet:** `spfpension` (`@staging` has 1 URL against 4
+elsewhere), `suomentyokalu` (`@staging` empty) and `snellmanecom` (`@kinsta` has 2
+against 5) carry unequal environment lists; `steripolarnew` carries extra
+`@legacy-*` environments with equal lists; `fsi` is `multisite: true` with no
+`url` lists at all. All must fail loudly rather than mis-align by index.
+
+### 4.3 Why the proxy, and why canonical = production
+
+The alternative — normalise the database once at `db:pull` time, rewriting
+content URLs to root-relative — was seriously considered and rejected.
+
+The decisive reframing: **if canonical is the production hostname, the database
+is never rewritten at all.**
+
+| | `db:pull` rewrites to ddev hosts (status quo) | Normalise to relative once | **Proxy, canonical = production** |
+|---|---|---|---|
+| Full-DB search-replace on every pull | yes | yes, once per pull | **never** |
+| Per-worktree search-replace | yes | no | **no** |
+| Serialized ACF/Polylang/GF rewritten | yes | yes — unverified risk | **never touched** |
+| DB is a reusable artifact | no, environment baked in | partly | **yes — byte-identical to production, shared by canonical, every worktree, and CI** |
+| Content matches production | approximately | approximately | **exactly** |
+| Runtime component | none | none | proxy |
+| Application changes | none | shared `db:pull` task + multisite handling | **none committed** — one generated, already-gitignored file |
+
+`robo db:pull` today runs a multisite `--precise` search-replace across a 548 MB
+dump. Under this design that step disappears — not merely for worktrees, but for
+every pull, for everyone. That is a materially larger prize than revision 1
+claimed, and it removes the one risk that made normalisation uncertain: nothing
+ever rewrites serialized data, so nothing can corrupt it.
+
+The map is unchanged in structure — the same index-aligned bijection (§4.2) —
+only paired `@production ↔ variant` instead of `@ddev ↔ variant`.
+
+**The "no application changes" claim is not free, and the exception is WP-CLI.**
+Under `ddev wp` there is no `HTTP_HOST`, so `application.php:48-53` falls through
+to the ddev host and `DOMAIN_CURRENT_SITE` (line 100) is set to it — while the
+pristine dump's `wp_blogs.domain` is `www.herrfors.fi`, matched exactly by
+`get_site_by_path()`. **Every WP-CLI invocation on all 12 multisite repos would
+fail to resolve a site.** Today this works only because `db:pull` rewrote the
+hosts — the step this design deletes.
+
+**The fix is `wp-cli.local.yml`, and the fleet is already set up for it.**
+
+WP-CLI's `--url` sets `$_SERVER['HTTP_HOST']` before WordPress bootstraps, so it
+satisfies the *first* branch of the `match` above — no environment variables, no
+code change. It only needs the right default.
+
+`wp-cli.yml` already carries a per-alias `url:` for every environment and every
+blog:
+
+```yaml
+'@ddev':              url: herrfors.ddev.site
+'@herrforsnat.ddev':  url: nat.herrfors.ddev.site
+'@production':        url: www.herrfors.fi
+'@nat':               url: www.herrforsnat.fi
+```
+
+What is missing is a **root-level** `url:`, which is what plain `ddev wp` (no
+alias) falls back on — no repo in the fleet has one, which is why it currently
+relies on `DDEV_PRIMARY_URL`.
+
+So: **the add-on generates `wp-cli.local.yml`** with a root-level `url:` set to
+blog 1's canonical origin.
+
+```yaml
+# generated by hostshift — do not commit
+url: https://www.herrfors.fi
+```
+
+`wp-cli.local.yml` is **already gitignored in 53 of 60 repos** that carry a
+`wp-cli.yml`, so it is an established fleet-standard local override. This means:
+
+- **no committed change in any repo**, so nothing to drift (§3)
+- it disappears the moment hostshift is not in use
+- WP-CLI merges it over `wp-cli.yml` with local taking precedence
+- sibling blogs keep working through the existing aliases — `wp @nat …` already
+  carries `www.herrforsnat.fi`
+
+Note the simplification this produces: under production-canonical the `@ddev` and
+`@production` aliases converge on the same `url:`, differing only in transport.
+The per-environment alias duplication in `wp-cli.yml` becomes redundant over time.
+
+The seven repos with a `wp-cli.yml` but no `wp-cli.local.yml` gitignore entry —
+`ekorosk`, `fsi`, `kokoomus`, `niva`, `panini`, `snellman-group`, `vendoprint` —
+need that line added; `hostshift check` should warn when it is missing rather
+than silently generating a file that would be committed.
+
+### 4.4 Two hazards this introduces
+
+**A missed rewrite reaches live production.** This is the serious one and it is
+new. Under the status quo an unrewritten URL points at a host that does not
+resolve locally and fails visibly. Here, an unrewritten
+`https://www.herrfors.fi/…` **works** — the browser leaves for the real site, and
+an agent could issue writes against production.
+
+**The fix is a post-condition inside the proxy, not setup on the machine.**
+Editing `/etc/hosts` was considered and **rejected**: it is a manual, machine-wide
+mutation required on every developer box and CI runner, and it is precisely the
+per-environment footprint §3 forbids. The tool must just work.
+
+(Correcting the record: it would *not* have broken `db:pull` — every
+`@production.host` in the fleet is a bare IP, `79.76.40.134` for herrfors, so
+pulls go over SSH to addresses. The real objections are sudo on every box and CI
+runner, hundreds of accumulating client domains, losing the ability to browse
+real production, and — fatally — landing the browser on DDEV's router holding a
+mkcert cert for the wrong SAN, i.e. a TLS interstitial rather than "back on the
+proxy".)
+
+Instead, exploit an asymmetry already in the design. The Aho–Corasick automaton
+finds occurrences the structured parser does not understand. But it must be built
+correctly, and the obvious construction is wrong:
+
+**A bare-hostname automaton reintroduces the double-port bug.** The first draft of
+this section argued blunt replacement was safe because "canonical hosts are never
+equal to the variant". Substring replacement requires *never contained in*, which
+is false by construction: §5.3 puts ddev hosts in the canonical set as aliases,
+and §5.4 derives variants by prefixing, so `herrfors.ddev.site` is canonical and
+`wt-a--herrfors.ddev.site` contains it. A second pass yields
+`wt-a--wt-a--herrfors.ddev.site` — precisely the failure documented in §2.3.
+
+**Build the automaton from left-anchored origin tokens, not hosts.** For each
+canonical origin emit `https://H`, `http://H`, `//H`, plus the encoded forms
+`https:\/\/H` (JSON) and `https%3A%2F%2FH` / `%2F%2FH` (percent-encoded). Accept
+a match only when the byte following `H` is one of `/ : ? # " ' < > \ &`,
+whitespace, or end of input. `//herrfors.ddev.site/` then matches and
+`//wt-a--herrfors.ddev.site/` does not, because the left anchor fails.
+
+With that construction:
+
+1. **Re-scan the rewritten output.** Any surviving canonical origin is a missed
+   rewrite.
+2. **Replace it**, safely — the anchoring makes the operation idempotent, and it
+   cannot touch a bare hostname appearing as prose.
+3. **Report every straggler** — offset, context, inferred surface. Each is a gap
+   in the structured pass and a bug to fix.
+
+**It runs in-stream, not on a buffer.** The sweep retains a sliding window of
+`max_pattern_len - 1` bytes across chunk boundaries; a match is replaced before
+that window is emitted, so no already-written bytes need re-alignment and the
+body is never buffered whole. The replacement **changes length** —
+`https://www.herrfors.fi` is 23 bytes, `https://wt-a--herrfors.ddev.site` is 32 —
+so downstream framing is chunked per §5.2. `--explain` offsets are cumulative
+**input**-stream offsets, so they stay stable across a length-changing rewrite.
+
+Accepted limitation: a page that *intentionally* links to production, as a URL,
+is rewritten too. On a development clone that is almost always what you want.
+Bare hostnames in prose are **not** rewritten and must not be — see test 28.
+
+**Server-side loopback is a separate problem, and the least certain part of this
+design.** WordPress makes internal HTTP requests to `home_url()` — cron, Site
+Health, some block-editor and REST paths. `WP_HOME` derives from `HTTP_HOST`,
+which the proxy sets to the production host, so those calls would leave the
+container for the real site. Browser-side rewriting cannot touch this.
+
+The resolution is **container-scoped, not machine-scoped**, which is what keeps it
+inside "just works": the container resolves the production hostnames to something
+local, and the request never leaves the box. Note the pleasant property — loopback
+then stays entirely in canonical space and needs *no* rewriting, because
+WordPress is talking to itself using exactly the host its database expects. The
+proxy is only ever in the browser's path.
+
+**Delivery mechanism: a `docker-compose.hostshift.yaml` override in `.ddev/`**,
+setting `extra_hosts` on the web service. DDEV merges `docker-compose.*.yaml`
+overrides by design and this is the standard way add-ons contribute services, so
+it is guaranteed to work. Do **not** build on a `web_extra_hosts` config key —
+its existence in DDEV v1.25.2 was not confirmed, and the override needs no such
+key. Do **not** use `additional_fqdns`: DDEV manages host-level hosts entries for
+those, which would point the developer's own machine at the router for the real
+production domain — worse than the `/etc/hosts` approach already rejected.
+
+**The concrete leak, confirmed — and measured.** `wp-includes/cron.php:985` calls
+`wp_remote_post( site_url('wp-cron.php') … )`, which under production-canonical is
+`https://www.herrfors.fi/wp/wp-cron.php`, fired from inside the container on
+front-end hits. herrfors has `DISABLE_WP_CRON` defaulting to **false**
+(`application.php:126`), and `cron.php:991` passes `'sslverify' => false`, so TLS
+is not even a speed bump.
+
+**Control, measured 2026-08-27** — from an unmodified DDEV container
+(`ddev-kokoomus-web`, no override):
+
+```
+getent hosts www.herrfors.fi
+  151.101.193.91  n.sni.global.fastly.net  www.herrfors.fi
+```
+
+That is live production, via Fastly. Without the override, a dev box POSTs to
+production's cron queue.
+
+**The fix is verified working, end to end.** With
+`.ddev/docker-compose.hostshift.yaml` adding `extra_hosts` to the web service:
+
+```yaml
+services:
+  web:
+    extra_hosts:
+      - "www.herrfors.fi:127.0.0.1"
+      - "www.herrforsnat.fi:127.0.0.1"
+```
+
+measured on herrfors:
+
+| check | result |
+|---|---|
+| `/etc/hosts` inside web container | both hosts → `127.0.0.1` |
+| web container listeners | `0.0.0.0:80` **and** `0.0.0.0:443` — it terminates TLS itself, the router is not required |
+| `curl http://www.herrfors.fi/` from inside | `code=302 ip=127.0.0.1:80` |
+| `curl https://www.herrfors.fi/` from inside | `code=302 ip=127.0.0.1:443` |
+
+Both schemes stay on the box. **The mechanism works and needs no host-level
+change.** Stock DDEV emits no `extra_hosts` on `web` at all (checked on kokoomus,
+snellmanecom, suomentyokalu, steripolarnew), so the override has nothing to
+clobber. (Note the web container listening on 443 was not assumed — it was
+checked, and it is what makes the HTTPS loopback resolvable at all.)
+
+**TLS verification fails, exactly as predicted, and that is acceptable.** The
+presented certificate is mkcert with
+`SAN: herrfors.ddev.site, nat.herrfors.ddev.site, localhost, web, ddev-herrfors-web…`
+— no production names — so unverified `curl` succeeds and verified `curl` returns
+`000`. Consequences:
+
+- **cron** (`sslverify => false`) — works
+- **Site Health** loopback probes (same) — work
+- **`wp_safe_remote_get` paths** — the block editor's link-preview endpoint
+  (`class-wp-rest-url-details-controller.php:254`) and internal oEmbed
+  (`class-wp-oembed.php:454`) — **fail cert validation**
+
+Accept that. The alternative is issuing a locally-trusted certificate bearing a
+real production domain; even scoped to one container's trust store that is a bad
+trade for two non-critical features.
+
+**One more caveat:** `wp_http_validate_url` exempts `$same_host`, so blog 1's own
+loopback survives the private-IP check. A *sibling* blog's host is not
+`$same_host` and, resolving to `127.0.0.1`, is rejected as unsafe — cross-blog
+`wp_safe_remote_*` will fail. Document it.
+
+Exposure is smaller than it first appears: `DISABLE_WP_CRON` (already referenced
+in `herrfors/config/application.php`) removes the most frequent loopback, leaving
+Site Health and occasional REST paths. If TLS proves intractable, disabling cron
+loopback and accepting a failing Site Health check is a legitimate fallback for a
+development environment.
+
+**Writes must be rewritten too.** Response-only rewriting is insufficient:
+Gutenberg receives variant URLs and will save variant URLs back into the DB,
+polluting the clone and breaking edit round trips. The transformation is
+**bidirectional on bodies** — variant → canonical on POST/PUT form data and REST
+JSON writes. See §5.1.
+
+### 4.5 Still to confirm before M1
+
+Neither of these blocks the decision, but both are cheap and should be run first:
+
+- **Usage survey.** 1,373 of 1,413 subagent spawns need no environment at all,
+  and the 40 that isolate are all in a project showing 0.0% parallel-session
+  time. Confirm the population this serves is non-trivial.
+- **Uploads.** With production URLs in content, `https://www.herrfors.fi/app/uploads/…`
+  rewrites to the variant host and must resolve against locally synced uploads.
+  Verify the sync covers what content references.
+
+§5 is the design. §4.5 lists two cheap checks to run before M1; neither blocks
+the decision.
+
+---
+
+## 5. Proxy design (corrected)
+
+### 5.1 Request direction — NEW WORK, not inherited
+
+The previous revision said this was "already solved in v0.2". **False.**
+`lib.sh:252` is `header_up Host {http.request.host}` — it forwards the *request*
+host. That worked only because v0.2's variant differed from canonical by **port
+only**, so the hostname was already canonical. Changing the hostname makes
+variant→canonical request mapping new, unimplemented, and the hard part.
+
+- **Canonical is the production hostname** (§4.2). The browser's variant host is
+  mapped to the production host of the *same blog* before the request is
+  forwarded. WordPress sees exactly the host its database was written for.
+- **Request bodies are rewritten variant → canonical** on POST/PUT/PATCH, for
+  `application/x-www-form-urlencoded`, `multipart/form-data` non-file parts, and
+  `application/json`. Without this, content saved through wp-admin stores dev
+  hostnames. Mirror of §5.2, sharing its machinery.
+- **The request line and query string are rewritten too**, including
+  percent-encoded and JSON-escaped origin forms. This is not optional:
+  `wp-login.php?redirect_to=…` is validated by `wp_validate_redirect()`
+  (`pluggable.php:1665`) against `home_url()`'s host, so a variant origin is
+  silently discarded and login returns to the wrong place. The same applies to
+  `/wp-json/wp-block-editor/v1/url-details?url=` and the oEmbed proxy. §5.5
+  previously left this open; it is decided here. Rewriting query origins is only
+  wrong when done response-side alone — done symmetrically it is correct.
+- **Multipart:** rewrite only parts whose `Content-Disposition` carries no
+  `filename=` and whose type is `text/*`; file parts pass through byte-identical.
+  Apply only when the whole body is under the size cap (§5.8); above it, stream
+  through untouched and log the skip.
+- **Multisite:** apply the **inverse** of the host bijection per request.
+  `nat.wt-a.local` must arrive as `Host: nat.herrfors.ddev.site` — the sibling
+  blog's host, not the network's main host. `ms-settings.php:62-68` lowercases
+  and strips `:80`/`:443`, then `get_site_by_path()` (`ms-load.php:163,313`)
+  matches `wp_blogs.domain` **exactly**.
+- **`Referer` must be rewritten variant→canonical.** `functions.php:1986` runs
+  it through `wp_validate_redirect($ref, false)`, which rejects any host ≠
+  `home_url()` host, so without this `wp_get_referer()` is `false` throughout
+  wp-admin and bulk actions and back-links degrade.
+- **Send `X-Forwarded-Proto: https`.** `load.php:1659-1673` makes `is_ssl()`
+  true only via `$_SERVER['HTTPS']` or `SERVER_PORT === '443'`;
+  `application.php:196` already reads `HTTP_X_FORWARDED_PROTO`. Omit it and
+  `wp-login.php:14-22` (`force_ssl_admin() && ! is_ssl()`) redirects forever.
+- **Never send `X-Forwarded-Port`** (§2.3).
+
+### 5.2 Response direction — locate spans, splice, never re-serialise
+
+**The core property: output is byte-identical to input everywhere a rewrite did
+not occur — universally, not merely outside modified tags.**
+
+`golang.org/x/net/html`'s `Tokenizer` provides the framing, and its `Raw()`
+carries a documented contract:
+
+> "The token stream's raw bytes partition the byte stream (up until an
+> ErrorToken). There are no overlaps or gaps between two consecutive token's raw
+> bytes. One implication is that the byte offset of the current token is the sum
+> of the lengths of all previous tokens' raw bytes."
+
+So untouched tokens are emitted verbatim and byte offsets come for free — which
+is also what `--explain` (§5.8) needs. Verified over **15 real pages (5,940,172 bytes)** and 36 adversarial fixtures,
+including with a one-byte-at-a-time reader.
+
+Use the **`Tokenizer`, never `html.Parse` + `html.Render`.** The lossy-round-trip
+reputation belongs entirely to the parser/renderer, which alphabetises
+attributes, lowercases names, decodes entities and inserts `<tbody>`. `goquery`
+and `cascadia` build on that tree and are therefore also unsuitable — and
+unnecessary, since §5.2 scans every attribute rather than selecting by CSS.
+
+The tokenizer does not report attribute-value offsets, so a **~60-line intra-tag
+span scanner** supplies them: HTML5 tag-open / attribute-name / before-value /
+quoted-and-unquoted-value states. Validated against the tokenizer's own output — though note the committed
+validator compares only attribute **counts and names**, never `ValueStart`/
+`ValueEnd`. Land the value-span assertion before M1 (it passes: 37,280 values,
+zero real mismatches; two apparent ones are comparison artifacts —
+`html.UnescapeString` being more aggressive than the tokenizer's attribute mode
+on legacy entities like `&not`, and CRLF normalisation). Counts:
+**19,953 start tags, 37,280 attributes, 9 divergences across 6 files** — all
+duplicate attribute names (`rel`, `media`, `defer`, `class`,
+`data-wp-on-window--resize`), where it reports every physical position; dropping
+duplicates would lose a splice site.
+Copy `Raw()` before calling `TagName()`/`TagAttr()`. The docs make **no** lifetime
+promise about `Raw()` — the partition guarantee is all they state; safety today
+rests on `TagAttr` happening to allocate via `bytes.ReplaceAll` before its
+in-place unescape, which is an implementation detail. Separately, the slices from
+`Text()`/`TagName()`/`TagAttr()` *are* documented to change on the next `Next()` —
+never retain them. (`spike/go/full/main.go:100–105` aliases `raw` across a
+`TagName()` call and must be fixed before M1.)
+
+There is **no text-fragmentation problem**: a 700 KB inline `<script>` arrives as
+a single text token, and token counts are identical at chunk sizes 1, 7, 4096 and
+whole-file.
+
+The single exception to splicing is an HTML fragment nested inside a JSON string
+(`content.rendered`): that value is decoded, rewritten, re-encoded and spliced
+back. Recursion stops at depth 2.
+
+**Known gap.** Without a tree builder the tokenizer does not track foreign
+content, so `<svg><title>` is treated as raw text and a URL in an `<a href>`
+inside it is missed. Byte preservation is unaffected. §4.4's straggler sweep is
+exactly the mechanism that catches and reports this.
+
+#### Length, validators, and framing
+
+Every rewrite changes body length. Therefore:
+
+- **Responses:** drop `Content-Length` and emit chunked whenever any handler
+  fired; never forward a stale length. Drop or weaken `ETag` and `Last-Modified`
+  on any modified response — otherwise a conditional request returns 304 and the
+  browser serves a **cached canonical-bearing body**, defeating test 28 silently.
+- **Requests:** body rewriting changes request length; recompute `Content-Length`
+  or send chunked upstream.
+- `Vary` and `Accept-Ranges` need the same care.
+
+#### The surface, ranked by measured value
+
+**Tier 1 — required.**
+
+| Surface | Notes |
+|---|---|
+| Response headers | `Location`, `Content-Location`, `Refresh`, `Link`, `Content-Security-Policy`(`-Report-Only`), `Access-Control-Allow-Origin`, `Set-Cookie` `Domain=` |
+| HTML | **Every attribute value on every element** — see below |
+| Inline `<style>` and `<script>` | Each arrives as a **single** `TextToken` (measured: a 700 KB inline script is one token), so scan it directly — no accumulation. **This is where the CSS and JS URLs actually are.** `type="application/ld+json"` and `type="application/json"` route to the JSON rewriter |
+| JSON | URL-valued strings, **plus the HTML rewriter over string values containing HTML** — `content.rendered` is a full HTML blob a URL-only rule skips |
+
+**Do not use an attribute allowlist.** An allowlist guarantees a long tail of
+leaks; the fleet already supplies three — `style="…url(https://…)"` on cover and
+hero blocks, `data-src`/`data-srcset`/`data-large_image` from lazyload and the
+WooCommerce gallery, and Yoast's JSON-LD graph on every page. Instead, following
+pywb (§10), **run the origin automaton over every attribute value** and rewrite
+any value whose origin is in the canonical set. Keep a named list only where
+*structured* parsing is required:
+
+- `srcset` / `imagesrcset` — comma-separated with descriptors
+- `<meta http-equiv=refresh>` — `N;url=…`
+- `<iframe srcdoc>` — nested HTML
+- `ping` — space-separated
+- `<base href>` — highest-severity single omission: one tag re-points every
+  relative URL at canonical and the browser leaves the proxy entirely
+
+This is cheaper than an allowlist, strictly more complete, and removes most of
+the work the §4.4 sweep exists to catch.
+
+`Set-Cookie` `Domain=` is **Tier 1 and load-bearing** — the previous revision
+wrongly called it optional on the strength of herrfors alone.
+`ms_cookie_constants()` defines `COOKIE_DOMAIN` from the network domain on any
+subdomain multisite that does not set it explicitly, so such a site would emit
+`Domain=.www.herrfors.fi` while the browser is on a variant host — the cookie is
+discarded and **login fails outright**. Prefer *dropping* the attribute
+(host-scoped is always safe) over substituting it.
+
+**Tier 2 — measured to be near-worthless; do not build initially.**
+
+Standalone `.css` and `.js` files served from disk. Surveyed herrfors:
+**88 CSS and 185 JS files in `web/app/themes/`, zero containing an absolute site
+URL** — the only matches are `bud.config.js`, a build config that is never
+served. Built CSS elsewhere in the fleet contains no `url(https://…)` at all.
+Themes avoid absolute URLs precisely because they would break across
+environments. The absolute URLs live in PHP patterns, i.e. in rendered HTML,
+which Tier 1 already covers.
+
+**Tier 3 — drop for now.** XML sitemaps and RSS. Real in production SEO terms,
+irrelevant to an agent rendering pages in a worktree. Revisit only on evidence.
+
+(herrfors happens to set `COOKIE_DOMAIN` to `''` at `application.php:106`, so it
+emits no `Domain=` at all — which is why an earlier revision wrongly generalised
+this surface as optional. Other subdomain multisites do not set it.)
+
+Everything else is byte-identical passthrough.
+
+#### Fast path
+
+**The gate is `Content-Type`, not a body scan.** An earlier revision proposed
+running Aho–Corasick over every raw body and skipping parse on no match. That is
+backwards: learning that a 4 MB JPEG contains no canonical host means reading 4 MB
+through the automaton — buffering exactly the bodies most worth streaming — when
+the header answered it for free.
+
+Anything outside the rewritable set — `text/html`, `application/json`,
+`application/*+json` — streams through untouched, never entering a rewriter.
+`text/css` and `application/javascript`/`text/javascript` are **deliberately
+excluded** per Tier 2, and added only if the corpus diff shows a leak (if ever
+added, include `text/javascript`: it is the IANA-preferred type and what nginx
+serves). That is where "most responses are never
+parsed" comes from, at zero buffering cost.
+
+Within the rewritable set the automaton is used only on already-bounded values:
+per attribute value and per header value; over accumulated `<script>`/`<style>`
+text (which must be accumulated anyway); and over the JSON buffer. **HTML is never
+whole-body prefiltered** — the tokenizer already is the fast path: with no rewrite
+firing, concatenating `Raw()` reproduces the input exactly, measured at ~300 MB/s.
+
+#### Compression
+
+Send `Accept-Encoding: identity` **upstream**. The fleet has no compression
+config of its own, so DDEV's stock nginx applies — gzip for text types, no
+brotli module, no zstd — and asking for identity means the common path needs no
+decoder at all. Keep a gzip decoder as fallback for upstreams that compress
+regardless.
+
+Serve **identity downstream by default**: over loopback and the Docker bridge
+compression buys nothing, and v0.2's mistake was forcing `identity` on the
+*browser* side, silently changing behaviour under test. Provide `--compress` to
+re-encode per the client's `Accept-Encoding` for performance work, where transfer
+size and `Content-Encoding` must resemble production.
+
+**Never rewrite what cannot be decoded.** An unsupported encoding is passed
+through byte-identical and logged as skipped. `deflate` is not worth
+implementing; `bzip2` is not an HTTP content encoding.
+
+### 5.3 Configuration
+
+Discovery by probing is unusable (§4.1). The map is **declared**, in three
+layers, each overriding the last.
+
+**1. DDEV defaults (optional, used when present).** `.ddev/config.yaml` gives
+`name` plus `additional_hostnames`, which yields the ordered list of local hosts
+for free — `herrfors` + `[nat.herrfors]` → `herrfors.ddev.site`,
+`nat.herrfors.ddev.site`. For a single-environment site with no extra aliases
+this is sufficient on its own and **no hostshift config file is needed at all**.
+DDEV is a widely used tool and this is real value; it is the only third-party
+format hostshift reads.
+
+**2. `hostshift.yaml`.** The tool's own format. Adds alias hosts (other
+environments' domains that may still appear in content), the variant naming
+pattern, and the upstream.
+
+```yaml
+version: 1
+upstream: http://web:80
+
+variant:
+  pattern: "{slug}--{leftmost-label}"   # applied to the leftmost label of `base`
+
+sites:
+  - name: main
+    canonical: https://www.herrfors.fi
+    base:      https://herrfors.ddev.site          # variant derived from this
+    aliases:   [https://herrfors.genero-dev.com]
+  - name: nat
+    canonical: https://www.herrforsnat.fi
+    base:      https://nat.herrfors.ddev.site
+    aliases:   [https://herrforsnat.genero-dev.com]
+```
+
+Variants are **derived**, not written out: `--slug wt-a` yields
+`https://wt-a--herrfors.ddev.site` and `https://nat.wt-a--herrfors.ddev.site`.
+An explicit `variant:` on a site overrides derivation for the rare case that
+needs it.
+
+**The map is origin→origin (scheme + host + port), never host→host.**
+`application.php:59` hardcodes `https://`, so every canonical URL in output is
+`https://…`. A host-valued map plus a plain-HTTP listener would rewrite
+`https://www.herrfors.fi/x` to `https://wt-a--herrfors.ddev.site/x` — wrong
+scheme, wrong port, unreachable, and `force_ssl_admin()` then redirect-loops.
+`:80`/`:443` are normalised away per §5.5.
+
+`canonical` plus `base` plus `aliases` form blog *i*'s canonical set;
+`variant.pattern` applied to `base` derives its variant, with an explicit
+`variant:` per site as an override. **With canonical = production (§4.2), the production hostname is the
+primary entry**; ddev and staging hosts remain listed so that a database which
+*has* been through `db:pull` also works. Listing non-local environments is what lets residual production or
+staging URLs — left behind by an imperfect `db:pull` — be corrected too.
+
+**3. CLI flags.** `--upstream`, `--map`, `--slug`, `--canonical` override
+everything, so the tool is usable with no config files at all.
+
+**Genero's adapter is out of scope for this repo.** A robo task or the DDEV
+add-on generates `hostshift.yaml` from `robo.yml`. The fleet edge cases found in
+§4.2 — `steripolarnew`'s unequal environment lists, `fsi`'s empty `@ddev` list —
+are that adapter's problem to resolve or refuse, not hostshift's.
+
+**hostshift validates its own config and fails loudly when:**
+
+- a canonical host appears in more than one site entry
+- the map is not injective in both directions
+- a generated variant collides with any canonical
+- `sites` is empty and no DDEV config or `--map` is available
+
+### 5.4 Variant hosts and idempotency
+
+Variants are **generated**, one per blog, from a worktree slug — N new hostnames
+per worktree, not one.
+
+Generation must be deterministic and **exact-host disjoint** from every
+canonical in the map. Prefixing the leftmost label is sufficient
+(`kodinpellervo.ddev.site` → `wt-a--kodinpellervo.ddev.site`) *provided matching
+is on exact host equality, never string-suffix*. The previous revision's
+common-suffix map produced `nat.herrfors.ddev.site` →
+`nat.wt-a.herrfors.ddev.site` → `nat.wt-a.wt-a.herrfors.ddev.site`: the
+double-port bug in a new costume.
+
+**Startup validation, refuse to run on failure:**
+
+- **matching is on exact origin equality**, never string-suffix and never
+  substring. Containment between a canonical host and a variant host is
+  *permitted* — §4.4's left-anchored origin tokens with a delimiter check make it
+  safe, which is precisely what allows the leftmost-label prefix scheme to be
+  used at all
+- **assert the anchoring property directly:** for every (canonical, variant)
+  pair, running the §4.4 automaton over the variant origin must yield **zero
+  matches**. That is the invariant, not a substring ban
+- the map is injective in both directions
+
+Collisions with *other projects* on the machine are not hostshift's problem —
+see §5.6.
+
+Idempotency is then a property of exact-set membership, and must still be
+asserted by test 7 rather than assumed.
+
+### 5.5 Parsing hazards to handle explicitly
+
+- **Protocol-relative `//host/path`** — Go's `net/url.Parse` accepts these and
+  fills `Host` with an empty `Scheme`; do not treat an empty scheme as failure,
+  or every one is silently missed
+- **Explicit `:443` / `:80`** — must compare equal to the bare host and serialise
+  without the default port
+- **Never re-serialise through `net/url`.** `url.Parse` is for *comparison
+  only* — lowercase the scheme, normalise the port, punycode the host, decide.
+  The splice then replaces only the origin byte range in the original value;
+  path, query and fragment are copied verbatim. `URL.String()` lowercases the
+  scheme and percent-encodes (measured: `https://host/a b` → `.../a%20b`), which
+  would silently break test 24
+- **Case** — compare ASCII-case-insensitively (`ms-settings.php:62` lowercases)
+- **IDN / punycode** — real for `.fi` client domains; compare on normalised
+  punycode, preserve the original form on output
+- **Percent-encoded hosts in query values** — `redirect_to=https%3A%2F%2F…`.
+  **Decided in §5.1: rewrite them, symmetrically.** Variant→canonical on the
+  request line and query, canonical→variant on `Location`. `pluggable.php:1715`
+  then sees a `redirect_to` whose host equals `home_url()`'s and accepts it.
+  Rewriting query origins is only wrong when done response-side alone. Test 19
+  is the round trip
+- **`data:` / base64 URIs** containing URLs — passthrough, stated as an accepted
+  limitation
+- **`Range` requests** — rewriting a partial body is incoherent; bypass
+- **`Vary`** — ensure nothing downstream caches a variant-specific body
+
+### 5.6 Upstream selection — resolved
+
+"One instance serves every worktree" is **dropped**. It was never designable
+without a machine-wide registry, which §3 forbids.
+
+**One hostshift process per DDEV project**, run as a compose service on that
+project's network with a single static `--upstream http://web:80`. No host-based
+upstream selection, no registry, no cross-project failure coupling, one upstream
+and one connection pool.
+
+Machine-wide hostname routing is DDEV's router's job, and it already does it —
+including the registration that a three-label variant host requires anyway, since
+`wt-a--nat.herrfors.ddev.site` is not covered by the `*.ddev.site` wildcard and
+needs an explicit SAN regardless of hostshift.
+
+Registering variant hostnames in a *worktree's* `.ddev/config.yaml` is
+per-worktree runtime config generated by the worktree tooling, not per-repo
+installed footprint, so §3's constraint is not violated.
+
+**Routing to the service is not automatic and is M6 packaging work.** DDEV's
+router reaches the `web` service via `VIRTUAL_HOST` / `HTTP_EXPOSE` /
+`HTTPS_EXPOSE` environment variables and `com.ddev.*` labels (see
+`herrfors/.ddev/.ddev-docker-compose-full.yaml`). Pointing variant hostnames at a
+*different* compose service requires the same variables and labels on the
+hostshift service, plus the variant hosts in the worktree's
+`additional_hostnames` so the mkcert SAN covers them. M2's tests 10 and 10a–10e
+will hit this first.
+
+Cost: N processes at a few MB RSS. Irrelevant.
+
+### 5.7 Transport and packaging
+
+Plain HTTP by default, TLS optional and off — behind DDEV's router, DDEV
+terminates TLS. Compression is specified in §5.2: identity upstream, identity downstream by
+default, `--compress` to opt in. Do not leak uncompressed responses to the
+browser the way v0.2 does (`lib.sh:246-251`).
+
+**Language: Go.** Decided 2026-08-27 after an empirical evaluation that
+**reversed an earlier decision for Rust**. The reasoning is recorded because the
+earlier argument was wrong in a way worth not repeating.
+
+The Rust case was: *"Go has no lossless streaming HTML rewriter; `x/net/html`
+round-trips lossily, so a Go implementation must hand-write one — a large job
+whose defects are silent."* Every clause is false. The tokenizer **is** a
+lossless streaming rewriter with a documented partition guarantee (§5.2); the
+hand-written part is ~100 lines; and its defects are the loudest available,
+because the identity-map test is five lines and runs in 35 ms over 5.9 MB.
+
+What settled it was measuring lol-html rather than trusting its reputation. Its
+passthrough of untouched input is real — 306 identity runs, byte-identical — but
+it is **documented nowhere** a user would look, and it does not hold for a tag
+that was modified. `Attributes::into_bytes` re-emits every attribute with
+single-space separators and forces double quotes, so changing one attribute on
+the real herrfors homepage **deleted 400 lines and 2,852 bytes of whitespace**
+(5157 → 4757 lines; the Go splice yields 5157 → 5157). Cloudflare issue #214,
+closed without fix. That is precisely the silent divergence Rust was chosen to
+avoid.
+
+Rust with `html5gum` instead of lol-html was evaluated as the strongest remaining
+alternative and still loses: its per-attribute spans save ~60 lines, but its
+`BTreeMap` drops duplicate attribute names — losing splice sites — it gives up
+lol-html's namespace tracking, and it leaves both the proxy shell and JSON spans
+hand-written.
+
+Go also wins the two largest chunks of work outright:
+
+- **The proxy shell is free.** `httputil.ReverseProxy` is ~987 lines of hardened
+  stdlib: hop-by-hop stripping per RFC 9110 §7.6.1, `X-Forwarded-*`, protocol
+  upgrades, flush intervals, cancellation. Mishandled `Content-Length` on a
+  body-rewriting proxy is a request-smuggling class of bug — not plumbing worth
+  hand-rolling for a dev tool.
+- **JSON spans are solved.** `encoding/json/jsontext`: `ReadValue` returns "the
+  exact bytes of the input" and `InputOffset` "the location of the next byte
+  immediately after the most recently returned token or value", so
+  `start = end - len(v)` holds by construction, with RFC 6901 paths and
+  key/value discrimination. It ships in Go 1.25/1.26 **behind
+  `GOEXPERIMENT=jsonv2`** — verified: a plain import fails with "build
+  constraints exclude all Go files" — and is expected on by default in a later
+  release. Until then use `github.com/go-json-experiment/json/jsontext`, which is
+  the same code. The earlier revision listed this as "the one genuine gap …
+  Go has the same problem" — it does not.
+
+Dependency shape: stdlib `net/http` + `httputil`, `golang.org/x/net/html`,
+`jsontext`, `golang.org/x/net/idna` for punycode (§5.5; same module as
+`x/net/html`), stdlib `compress/gzip`, and a CLI library of choice.
+
+For the origin automaton (§4.4) use `github.com/petar-dambovaliev/aho-corasick`
+or `github.com/BobuSumisu/aho-corasick` — both return match **positions**, which
+`--explain` and the sliding-window sweep require. **Do not use
+`github.com/cloudflare/ahocorasick`:** its `Match` returns dictionary indices
+only, takes a whole `[]byte`, and cannot stream.
+
+Working proof is in `spike/`: `go/full/main.go` (130 non-blank lines — framing,
+the 64-line span scanner, per-value splicing) and `go/e2e/main.go` (98 non-blank
+lines — the proxy), with acceptance tests 1, 15, 24, 27 and 28 green, plus the
+corpus and adversarial fixtures.
+
+**That is the M1 starting point for the framing and splicing — do not rebuild
+those. Its *matching* is a placeholder unanchored `bytes.ReplaceAll` and must be
+replaced by §4.4's anchored origin automaton before anything else;
+`rewriteValue` is the seam.** Note also that the spike only *counts* structured
+surfaces (`srcset` et al.) rather than parsing them, and its `// idempotency
+(test 7)` block discards its result — test 7 is **not** green in the spike.
+
+**Required regardless of the above:** rewriting with an **identity map must
+produce byte-identical output**. Run it over `spike/corpus` and `spike/adv` from
+M1 onward. It is the invariant that catches every splice and offset defect, it is
+five lines, and it runs in 35 ms over 5.9 MB.
+
+#### `httputil.ReverseProxy` mechanics that must be got right
+
+All verified against Go 1.26.5. Each is a silent failure if missed.
+
+- Use **`Rewrite`, not `Director`** — setting both is an error ("must have
+  exactly one of Director or Rewrite set").
+- `ProxyRequest.SetURL` ends with `r.Out.Host = ""`. **Assign the canonical
+  `Out.Host` after `SetURL`**, or the upstream sees the container's host and
+  multisite resolution fails silently.
+- `SetXForwarded` sets `X-Forwarded-Proto: http` whenever `r.In.TLS == nil`,
+  which is always, since hostshift listens plain. **`Set` the `https` value
+  after `SetXForwarded()`**, never before, or `wp-login.php` redirect-loops.
+- **`Del("X-Forwarded-Port")` explicitly.** It is not hop-by-hop, so it is
+  forwarded verbatim; §2.3 is the reason this matters.
+- **`resp.ContentLength = -1` alongside `resp.Header.Del("Content-Length")`.**
+  `flushInterval` keys off the struct field, not the header; leaving it stale
+  disables periodic flushing.
+- **Request bodies:** `http.Request.ContentLength` drives the transport, not the
+  header. After rewriting a request body set `Out.ContentLength` to the new
+  length (or `-1`), clear `Out.TransferEncoding`, and set `Out.GetBody` if
+  retries matter — otherwise the transport errors or truncates.
+- **`ModifyResponse` errors are recoverable; mid-body errors are not.** An error
+  returned from `ModifyResponse` becomes a clean 502 via `ErrorHandler`, but a
+  rewriter error surfacing during `copyResponse` can only
+  `panic(http.ErrAbortHandler)` — headers are already sent. Test 14 covers the
+  first class only.
+
+Bind `0.0.0.0` **inside the container** with no published host port — `127.0.0.1`
+is unreachable from the DDEV router. When run as a bare binary, bind `127.0.0.1`.
+Never publish the port.
+
+Distribution: static binary, distroless image, and a DDEV add-on that is *only*
+a compose service — no `lib.sh`, no generated files, no hooks, no guard.
+
+---
+
+### 5.8 Command-line design
+
+The rewriter must be usable **without running a server**. That is what makes it
+testable, pipeable, and CI-friendly.
+
+```
+hostshift rewrite   --from https://a --to https://b   < in.html > out.html
+hostshift proxy     --upstream http://web:80 --listen 127.0.0.1:8080
+hostshift map       # print the resolved host map (table, or --json)
+hostshift check     # validate config; exit 2 if invalid
+```
+
+`rewrite` is the whole engine as a Unix filter, content type from `--type` or
+sniffed. It collapses the corpus diff (§7) to one line:
+
+```bash
+curl -s https://canonical/page | hostshift rewrite --from … --to … \
+  | diff - <(curl -s https://variant/page)
+```
+
+Conventions:
+
+- **stdout is data, stderr is diagnostics.** Always, in every subcommand
+- **Exit codes:** 0 success, 1 runtime error, 2 invalid configuration
+- `--json` emits machine-readable counters and traces
+- **No daemonising.** Run in the foreground; DDEV or a supervisor owns the
+  lifecycle. `SIGHUP` reloads config, `SIGTERM` drains
+- Config precedence: CLI flags → `hostshift.yaml` → DDEV defaults (§5.3)
+
+**`--explain` is the answer to "why was this URL not rewritten?"** For every
+candidate the Aho–Corasick prefilter matched that did *not* result in a rewrite,
+emit the surface (`html-attr`, `json-string`, `header`, `inline-script`, `none`)
+and the reason: `not-a-url`, `host-not-in-map`, `unparseable`,
+`encoding-not-decodable`, `size-cap-exceeded`, `depth-limit`. Given how many
+silent-failure modes this design has, that trace is the difference between a
+five-minute diagnosis and an afternoon.
+
+`--dry-run` on `proxy` serves responses unmodified while logging every rewrite it
+would have made — safe to point at a live canonical checkout.
+
+**Limits:** JSON is buffered, not streamed; cap at a configurable size (8 MB
+default) and pass through untouched beyond it, logging the skip. The same cap
+applies to **request** bodies, including multipart. HTML streams end to end.
+
+## 6. Non-goals
+
+Cron and phpunit (do not travel over HTTP). **WP-CLI is not in this list** — it is
+regressed by production-canonical and needs the environment change in §4.3. Rewriting the database (that
+is the alternative, §4). Replacing DDEV (attempted and abandoned, §2.1).
+Worktree lifecycle management. Production use. `Range` responses. URLs inside
+`data:` URIs. URLs built by JS string concatenation at runtime.
+
+---
+
+## 7. Acceptance tests
+
+*(Numbering has a gap at 6: the XML/RSS test was removed with §5.2 Tier 3.
+Numbers are stable identifiers — do not renumber.)*
+
+1. `Location` on a login redirect
+2. `Set-Cookie` `Domain=` — on a site that sets `COOKIE_DOMAIN`; not herrfors
+3. `srcset` with width descriptors and commas
+4. JSON-escaped `https:\/\/C\/` in a REST response
+5. `wpApiSettings` in an inline `<script>` (JS statement, unescaped slashes)
+7. **Idempotency fixed point** — proxy output re-fed through the proxy is unchanged
+8. Third-party host untouched
+9. gzip upstream decoded correctly; unsupported encodings passed through
+10. Multisite sibling blog: **request** `nat.V` lands on the `nat.C` blog, and
+    its response URLs come back as `nat.V`
+10a. A 5-blog site (pellervo) maps all five, with unrelated registrable domains
+10b. Cross-blog link in content: blog 1 linking to blog 2's canonical is
+     rewritten to blog 2's *variant*, not blog 1's
+10c. Residual `@production` URL in a `@ddev` database is rewritten to the variant
+10d. A config whose canonical sets overlap between sites is rejected at startup
+10e. Bare DDEV defaults (name + additional_hostnames, no hostshift.yaml) produce
+     a working map for a 2-blog site
+11. `Link` REST discovery header
+12. Binary passthrough byte-identical
+13. Large streamed HTML buffers **at most one token** — assert peak RSS is
+    bounded by O(largest token), not by response size, over a 5 MB page.
+    `Tokenizer.SetMaxBuf(n)` caps it; note that exceeding the cap yields
+    `ErrBufferExceeded` mid-body, which per §5.7 cannot become an error response
+    once headers are sent
+14. Upstream 5xx / connection failure surfaced, not swallowed
+15. A rewritten response carries no stale `Content-Length` and no upstream `ETag`
+16. A request `Host` absent from the map is rejected with **421**, never proxied
+17. **Suffix-overlapping host sets rejected at startup**
+18. `<base href>` rewritten or stripped
+19. Full wp-admin login round trip, including `redirect_to` and `wp_get_referer()`
+20. `FORCE_SSL_ADMIN` site does not redirect-loop
+21. Protocol-relative `//C/path` rewritten
+22. `content.rendered` HTML-in-JSON rewritten
+23. CSP header rewritten
+24. Identity-map byte-identity: with canonical == variant, output equals input
+    byte for byte. Where URLs did change, output is byte-identical **everywhere
+    else** — splicing never re-serialises, so this holds universally, including
+    inside modified start tags (attribute order, quoting and whitespace all
+    survive). Run over `spike/corpus` and `spike/adv`
+25. A response whose `Content-Type` is outside the rewritable set never enters a
+    rewriter — proven by a per-surface counter of zero
+26. Undecodable content-encoding is passed through byte-identical and logged
+27. `hostshift rewrite` as a filter produces the same bytes as the proxy path
+28. **No dereferenceable production origin reaches the browser.** Extract every
+    URL-valued position — HTML attribute values, CSS `url()`, JSON strings,
+    JSON-LD, header values — and assert none has an origin in the canonical set.
+    Bare hostnames in prose are explicitly out of scope and must **not** be
+    rewritten. Safety-critical
+29. Straggler sweep: a URL in a deliberately unhandled position is caught,
+    rewritten, and reported — and running the sweep twice is a fixed point
+29c. Substring-overlapping canonical/variant sets are rejected at startup
+29d. `ddev wp option get home` and `ddev wp site list` resolve correctly on a
+     multisite repo with an unrewritten production database
+29a. Server-side loopback (Site Health, an internal REST request) resolves
+     locally, never reaching production — asserted by observing that no request
+     for a mapped production host leaves the machine during a full crawl
+29b. Loopback TLS verification **fails** against the mapped production hostname
+     from inside the web container (§4.4 measures this and accepts it), and the
+     failure is confined to the two documented surfaces: `wp_safe_remote_get`
+     link-preview and internal oEmbed. `sslverify => false` callers — cron, Site
+     Health — succeed. Assert both halves
+30. Edit round trip: save a post containing an internal link through wp-admin,
+    and assert the **database** holds the canonical (production) URL, not the
+    variant
+31. A REST write (`POST /wp-json/wp/v2/posts`) with a variant URL in the body is
+    stored canonical
+
+**Corpus diff — the only test that validates against reality.** Crawl N URLs on
+canonical and the same N through the proxy, normalise host, assert DOM
+equality. Fixtures would not have caught the double-port bug; this would.
+
+---
+
+## 8. Milestones
+
+**M0 — pre-flight (§4.5).** Usage survey and uploads-sync check. The `extra_hosts`
+loopback mechanism is already verified (§4.4); re-create the override file, which
+was deleted after the experiment. *No code.*
+
+**M1 — proxy shell, observability, and the identity invariant.** `httputil.ReverseProxy`
+skeleton; `hostshift rewrite` filter mode;
+`--dry-run` and `--explain` (§5.8); per-surface counters. The identity-map guard rail for
+everything after (§5.2). Start from `spike/`, which already has this green.
+Tests 24, 27. Given how
+many silent-failure modes exist above, this precedes correctness work.
+
+**M2 — host map, request direction, and request bodies.** Config layering (DDEV defaults +
+`hostshift.yaml` + flags), variant generation,
+startup validation (§5.3–§5.4), then §5.1 in full: multisite inverse mapping,
+`Referer`, `X-Forwarded-Proto`, `Location`/`Link`/CSP. Tests 1, 8, 10, 10a–10e,
+2, 8, 10, 10a–10e, 11, 15, 16, 17, 20, 23, 29a, 29b, 29c, 29d.
+
+**M3 — HTML.** Every-attribute scan, structured attributes, inline script/style
+accumulation, `<base href>`, the §4.4 straggler sweep. Tests 3, 5, 7, 12, 18, 19, 21, 25, 28, 29.
+
+**M4 — structured bodies.** JSON incl. HTML-in-JSON and JSON-LD; the JSON
+span-scanner (§5.7). Tests 4, 22, 30, 31. XML and standalone CSS/JS are **not**
+built — §5.2 Tiers 2 and 3.
+
+**M5 — transport.** Compression, streaming bounds, error surfacing, `Vary`,
+`Range`. Tests 9, 13, 14, 26.
+
+**M6 — packaging + pilot.** Binary, image, thin add-on, corpus diff against
+herrfors, and test 28 over the full crawl.
+
+This is not a small project. The previous revision's *"the tool is
+straightforward once these are green"* is the sentence most likely to mislead an
+implementing agent. Delete that expectation.
+
+**Relationship to `generoi/ddev-worktree`:** if this ships, that add-on reduces
+to a compose service. Note that `wt-up`, `wt-guard` and `wt-wp` were already
+removed in v0.2 per its README (though `install.yaml` still ships `wt-up` and
+`wt-wp`), and no `sunrise.php` generation exists anywhere in the repo — do not
+plan to remove things that are already gone. Do not delete it until M6 is proven.
+
+---
+
+## 8a. Day-one setup
+
+`hostshift/` is not yet a git repository — no `.git`, no root `go.mod`, no
+LICENSE, only `PLAN.md` and `spike/`. M1 begins with `git init` and a module
+decision this plan does not make: module path, and a **minimum Go version**
+(`spike/go/go.mod` pins `go 1.26.5`, a patch-level directive that refuses to
+build on 1.26.4 — use `go 1.26`). `spike/.gitignore` already excludes build
+output. `spike/README.md` needs the same statistics corrections as §5.2 and does
+not yet document `go/main.go`, `go/rewriter/main.go` or `go/svg/main.go`.
+
+## 9. Risks
+
+- **Fleet-wide coupling — the largest unstated risk.** Deleting `search-replace`
+  from `db:pull` makes hostshift a hard runtime dependency for every developer on
+  all 63 repos, on day one, for an unproven hand-written proxy. Without it
+  running, a freshly pulled site loads live production assets into the dev
+  browser (they *resolve*), and an admin action can write to production.
+  **Stage it:** keep `db:pull`'s search-replace as the default through M6; make
+  production-canonical opt-in per repo via the presence of `hostshift.yaml`; flip
+  the fleet default only after the corpus diff is green on herrfors *and* on a
+  five-blog site (pellervo). The prize is the payoff, not the entry ticket
+- A documented **fallback to search-replace per site** must remain supported
+- Performance: immaterial for dev, and the Aho–Corasick prefilter means most
+  responses are never parsed at all
+- The tokenizer does not track foreign content (SVG/MathML), so URLs inside
+  `<svg>` subtrees are missed and caught only by the §4.4 sweep. Quantify on the
+  corpus during M3
+- HTTP/2 and websockets: passthrough behaviour undefined
+- Every silent-failure mode above (C1-class especially) argues for M1 first
+
+---
+
+## 10. Prior art
+
+The closest correct implementations are in **web archiving**, not dev tooling.
+pywb and the Wayback Machine do content-type-aware URL rewriting of HTML, CSS,
+JS and JSON at scale — replaying an archived site is the same problem. Read their
+rewriters first.
+
+Nothing packages that as a small development proxy, which is why every WordPress
+shop reaches for `search-replace`. The problem is not WordPress-specific — any
+CMS with absolute URLs in the DB has it — so the engine should be CMS-agnostic
+with WordPress as one discovery adapter and the acceptance bar.
+
+---
+
+## 11. Sources
+
+- `generoi/ddev-worktree` — git log, `generoi-worktree/lib.sh`, README, `install.yaml`
+- Cursor session *"Leaner WordPress Dev"*, 2026-08-21, 286 turns,
+  `~/.cursor/chats/1ddf8c12…/25fa7c51-…/store.db`
+- Claude Code transcripts, `~/.claude/projects`, 2026-06-20 → 08-26
+- WordPress core in `~/Projects/Genero/herrfors/web/wp`
+- `herrfors/config/application.php`, `herrfors/database.@production.2026-06-09-162529.sql`
+- Direct measurement of `~/Projects/Genero`, 2026-08-27
+- Adversarial audit of revision 1, 2026-08-27

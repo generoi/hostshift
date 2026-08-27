@@ -1,0 +1,6 @@
+# build output
+/hostshift
+/dist/
+
+# local agent scaffolding, not part of the design record — PLAN.md is authoritative
+/GOAL.md
