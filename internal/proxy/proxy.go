@@ -39,6 +39,10 @@ type Proxy struct {
 	// MaxBody caps request-body buffering. Zero means DefaultMaxBody.
 	MaxBody int64
 
+	// NoSweep disables §4.4's straggler backstop. It exists to measure the
+	// structured pass, not to run without a net.
+	NoSweep bool
+
 	Log *slog.Logger
 }
 
@@ -278,9 +282,11 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	if !rewritableHTML(resp.Header.Get("Content-Type")) {
 		return nil
 	}
-	resp.Body = rewrite.NewHTML(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
-		DryRun: p.DryRun,
-		Stats:  p.Stats,
+	resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
+		DryRun:  p.DryRun,
+		NoSweep: p.NoSweep,
+		Stats:   p.Stats,
+		Log:     p.log(),
 	})
 	changed = true
 

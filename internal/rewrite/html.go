@@ -3,6 +3,7 @@ package rewrite
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -39,7 +40,25 @@ type Options struct {
 	// DryRun computes and counts every rewrite but emits the input unchanged
 	// (PLAN §5.8) — safe to point at a live canonical checkout.
 	DryRun bool
-	Stats  *Stats
+	// NoSweep disables PLAN §4.4's straggler backstop. It exists to *measure*
+	// the structured pass, not to run without a net.
+	NoSweep bool
+	Stats   *Stats
+	Log     *slog.Logger
+}
+
+// NewResponseBody is the full response-side pipeline: the tokenizer-based
+// rewriter, then §4.4's straggler sweep as a backstop.
+//
+// Both the proxy and `hostshift rewrite` compose it through this one function,
+// which is what keeps test 27 — the filter and the proxy produce the same bytes
+// — an assertion about a shared code path rather than a coincidence.
+func NewResponseBody(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) io.ReadCloser {
+	h := NewHTML(r, m, src, opt)
+	if opt.NoSweep {
+		return h
+	}
+	return NewSweep(h, m, h, opt)
 }
 
 // NewHTML wraps r. If src is non-nil, Close closes it — the proxy passes the
@@ -158,13 +177,27 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// A raw-text element's content arrives as a single token — a 700 KB
 			// inline script is one token — so it is scanned directly, with no
 			// accumulation. This is where the CSS and JS URLs actually are.
+			//
+			// Every raw-text element is scanned, not just script and style. The
+			// tokenizer hands back the *markup* inside <noscript>, <textarea>,
+			// <iframe> and <svg><title> as opaque text, so a URL in an <a href>
+			// there is invisible to the attribute scan. Scanning only script and
+			// style left those to §4.4's sweep, which is meant to be a backstop
+			// rather than a load-bearing part; the corpus turned up a real
+			// <noscript> case.
+			//
+			// Anchored matching is what makes this safe on prose-bearing
+			// elements like <title>: it can only match a real origin, never a
+			// bare hostname (test 28).
 			switch w.rawText {
+			case "":
+				w.pend.Write(raw)
 			case "script":
 				w.pend.Write(w.rewriteValue(SurfaceInlineScript, "", off, raw))
 			case "style":
 				w.pend.Write(w.rewriteValue(SurfaceInlineStyle, "", off, raw))
 			default:
-				w.pend.Write(raw)
+				w.pend.Write(w.rewriteValue(SurfaceRawText, "", off, raw))
 			}
 		default:
 			w.pend.Write(raw)
