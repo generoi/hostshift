@@ -2,9 +2,11 @@ package rewrite
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/generoi/hostshift/internal/origin"
@@ -198,4 +200,59 @@ func pairMatcher(t *testing.T, from, to string) *origin.Matcher {
 		t.Fatal(err)
 	}
 	return m
+}
+
+// TestTruncatedBodyKeepsEveryByte is the regression test for silent data loss.
+//
+// At ErrorToken the rewriter wrote only Buffered(); when the tokenizer hits EOF
+// inside a tag the partial tag is in Raw() and Buffered() is empty, so those
+// bytes vanished — exit status 0, no diagnostic. It also broke test 24 for any
+// truncated input, which is how a real upstream that closes early arrives.
+func TestTruncatedBodyKeepsEveryByte(t *testing.T) {
+	m := identityMatcher(t)
+	full, err := os.ReadFile("../../spike/corpus/page3.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sample prefixes across the file, so the cut lands in many tokenizer states.
+	step := len(full)/150 + 1
+	for n := 0; n <= len(full); n += step {
+		in := full[:n]
+		out := runHTML(t, in, m, Options{})
+		if !bytes.Equal(in, out) {
+			t.Fatalf("prefix of %d bytes: identity map returned %d bytes", n, len(out))
+		}
+	}
+}
+
+// TestMidBodyErrorIsNotSwallowed: converting a read failure into io.EOF turns a
+// detectable truncation into an undetectable one, because the rewritten
+// response is chunked and has no Content-Length for the client to check.
+func TestMidBodyErrorIsNotSwallowed(t *testing.T) {
+	want := errors.New("upstream went away")
+	r := io.MultiReader(strings.NewReader("<html><body><p>x</p>"), errReader{want})
+	_, err := io.ReadAll(NewHTML(r, identityMatcher(t), nil, Options{}))
+	if !errors.Is(err, want) {
+		t.Errorf("read error was %v, want it to surface %v", err, want)
+	}
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// TestSelfClosingRawTextIsScanned: x/net/html sets its own raw-text state for
+// `<script/>` and returns SelfClosingTagToken, so gating on StartTagToken alone
+// left that spelling's contents unscanned — a leak in the surface §5.2 calls
+// "where the CSS and JS URLs actually are".
+func TestSelfClosingRawTextIsScanned(t *testing.T) {
+	m := pairMatcher(t, "https://c.example", "https://v.example")
+	for _, in := range []string{
+		`<script/>var u="https://c.example/x";</script>`,
+		`<style/>.a{background:url(https://c.example/b.png)}</style>`,
+	} {
+		if got := runHTML(t, []byte(in), m, Options{}); bytes.Contains(got, []byte("c.example")) {
+			t.Errorf("unscanned: %s", got)
+		}
+	}
 }
