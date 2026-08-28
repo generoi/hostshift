@@ -345,10 +345,27 @@ is never rewritten at all.**
 | Application changes | none | shared `db:pull` task + multisite handling | **none committed** — one generated, already-gitignored file |
 
 `robo db:pull` today runs a multisite `--precise` search-replace across a 548 MB
-dump. Under this design that step disappears — not merely for worktrees, but for
-every pull, for everyone. That is a materially larger prize than revision 1
-claimed, and it removes the one risk that made normalisation uncertain: nothing
-ever rewrites serialized data, so nothing can corrupt it.
+dump. Production-canonical would let that step disappear — not merely for
+worktrees, but for every pull, for everyone — and it removes the one risk that
+made normalisation uncertain: nothing ever rewrites serialized data, so nothing
+can corrupt it.
+
+**That is the ceiling, not the plan.** Decided 2026-08-28: `db:pull` keeps its
+search-replace, the main DDEV site keeps a database written for
+`<project>.ddev.site`, and hostshift's job is **worktrees** — serving that same
+database at a second hostname so an agent or a branch can be previewed without a
+database of its own. Canonical is then the ddev host, not the production one,
+and the map is `<project>.ddev.site → wt-a--<project>.ddev.site`.
+
+Everything below still holds, because the engine does not care which hostname is
+canonical: it maps origin to origin. What changes is which risks are live.
+Production-canonical is what makes §4.4's loopback containment load-bearing —
+under ddev-canonical `home_url()` is already a local hostname, so WordPress
+talking to itself never leaves the box — and it is what makes a leak reach the
+client's live site rather than a neighbouring dev host. Those hazards do not
+disappear; they become opt-in, per repo, via a `hostshift.yaml` that declares
+production hostnames. herrfors and pellervo are piloted that way and stay that
+way.
 
 The map is unchanged in structure — the same index-aligned bijection (§4.2) —
 only paired `@production ↔ variant` instead of `@ddev ↔ variant`.
@@ -400,18 +417,25 @@ url: https://www.herrfors.fi
 **`wp-cli.local.yml` does not merge — it replaces.** Measured with WP-CLI 2.12.0:
 a local file containing only `url:` loses `path:`, `require:` and *every* alias,
 leaving WP-CLI unable to find the installation at all ("This does not seem to be
-a WordPress installation"). So `hostshift wp-cli` emits the existing `wp-cli.yml`
-back with a root `url:` added, rather than a bare two-line file written over it.
+a WordPress installation"). So `ddev hostshift wp-cli` emits the existing
+`wp-cli.yml` back with a root `url:` added, rather than a bare two-line file
+written over it — an existing root `url:` replaced rather than duplicated, and a
+newline forced between the two, since yaml.v3 rejects a duplicate key and a file
+with no trailing newline glues `url:` onto its last line.
+
+It lives in the add-on and not the binary: `hostshift` does not know what a CMS
+is, and a proxy with a `wp-cli` subcommand is not a Unix tool.
 
 **"Sibling blogs keep working through the existing aliases" was wrong twice.**
 In herrfors' `wp-cli.yml`, `@nat` is an **SSH alias into production** — following
 that advice would have run the command against the live site. The *local* sibling
 alias is `@herrforsnat.ddev`, and its `url:` is the ddev host, which
 production-canonical breaks. The honest instruction is `wp --url=https://www.herrforsnat.fi`,
-and `hostshift wp-cli` warns for every alias whose `url:` the database no longer
-holds rather than silently rewriting it — silently changing what `wp @ddev` means
-is worse than saying so, especially when some of these aliases are SSH into
-production.
+and `ddev hostshift wp-cli` leaves every alias exactly as written rather than
+silently rewriting it — silently changing what `wp @ddev` means is worse than
+leaving it alone, especially when some of these aliases are SSH into production.
+The M6 pilot's alias warning went with the Go implementation and has not been
+rebuilt in shell; `wp-cli.yml` is read-only to this command now.
 
 With the full generated override, test 29d passes on an unrewritten production
 database: `ddev wp option get home` returns `https://www.herrfors.fi` and
@@ -1001,6 +1025,16 @@ added, include `text/javascript`: it is the IANA-preferred type and what nginx
 serves). That is where "most responses are never
 parsed" comes from, at zero buffering cost.
 
+**`text/event-stream` is a known gap, and it is the one exclusion that can leak.**
+An SSE body carrying `data: https://www.herrfors.fi/x` reaches the browser
+verbatim — a dereferenceable production origin, which is what test 28 exists to
+prevent. It has been true since the content-type gate was written, so it is not a
+regression, and it stays open here rather than being fixed in passing: SSE cannot
+be buffered the way JSON is, and `NewSweep` holds a carry-over window that would
+delay an event until the next one arrived. The fix is a streaming text rewriter
+that flushes on a record boundary, with its own tests. Until then, a site that
+serves SSE with absolute production URLs in it is outside what hostshift covers.
+
 Within the rewritable set the automaton is used only on already-bounded values:
 per attribute value and per header value; over accumulated `<script>`/`<style>`
 text (which must be accumulated anyway); and over the JSON buffer. **HTML is never
@@ -1318,8 +1352,16 @@ Bind `0.0.0.0` **inside the container** with no published host port — `127.0.0
 is unreachable from the DDEV router. When run as a bare binary, bind `127.0.0.1`.
 Never publish the port.
 
-Distribution: static binary, distroless image, and a DDEV add-on that is *only*
-a compose service — no `lib.sh`, no generated files, no hooks, no guard.
+Distribution: static binary, distroless image, and a DDEV add-on that is a
+compose service, the loopback override, and **one host command**. No `lib.sh`,
+no hooks, no guard — nothing runs during a request.
+
+The command exists because the binary refuses to. Deriving a slug from a git
+branch, deciding which hostnames `web` should keep, writing `.ddev/.env` and the
+generated `additional_hostnames`: all of that is opinionated setup, and a binary
+carrying it is a tool for one shop. `hostshift` maps origins and *reads* a DDEV
+project's declared hostnames as one source for that map; `ddev hostshift` does
+the rest, and can one day be its own repo without the binary noticing.
 
 ---
 
@@ -1688,11 +1730,27 @@ This is not a small project. The previous revision's *"the tool is
 straightforward once these are green"* is the sentence most likely to mislead an
 implementing agent. Delete that expectation.
 
-**Relationship to `generoi/ddev-worktree`:** if this ships, that add-on reduces
-to a compose service. Note that `wt-up`, `wt-guard` and `wt-wp` were already
-removed in v0.2 per its README (though `install.yaml` still ships `wt-up` and
-`wt-wp`), and no `sunrise.php` generation exists anywhere in the repo — do not
-plan to remove things that are already gone. Do not delete it until M6 is proven.
+**Relationship to `generoi/ddev-worktree` — decided 2026-08-28: hostshift.**
+
+The two are different answers to one question. `generoi-worktree` gives each
+worktree its own database and reaches it on a port, `:808x` behind Caddy;
+hostshift shares one database and gives each worktree a hostname. M6 proved the
+second, and the choice is made: hostshift.
+
+The difference that decided it is the database. A forked database per worktree
+is a `db:pull` apiece — 548 MB on herrfors — and it diverges from the moment it
+is taken, so a worktree is testing against data the site no longer has. Sharing
+one means a worktree is testing the real thing, and the price is the hostname
+mapping this document is about. Ports also make the *browser* the thing that
+knows which worktree it is on, which absolute URLs in a database defeat: WordPress
+redirects to the hostname it was told, and the port is not part of it.
+
+Note that `wt-up`, `wt-guard` and `wt-wp` were already removed in v0.2 per its
+README (though `install.yaml` still ships `wt-up` and `wt-wp`), and no
+`sunrise.php` generation exists anywhere in the repo — do not plan to remove
+things that are already gone. The add-on itself is one repo, installed in one
+project, and worth archiving rather than deleting: it is the record of what was
+tried.
 
 ---
 
@@ -1725,10 +1783,15 @@ document `go/main.go`, `go/rewriter/main.go` or `go/svg/main.go`.
   browser (they *resolve* — M0 measured 95.2% of the *distinct* upload URLs
   referenced by herrfors' content as absent locally, §4.5), and an admin action
   can write to production.
-  **Stage it:** keep `db:pull`'s search-replace as the default through M6; make
-  production-canonical opt-in per repo via the presence of `hostshift.yaml`; flip
-  the fleet default only after the corpus diff is green on herrfors *and* on a
-  five-blog site (pellervo). The prize is the payoff, not the entry ticket
+  **Resolved 2026-08-28: the flip is not happening, at least not now.**
+  `db:pull` keeps its search-replace and the main site keeps a `.ddev.site`
+  database. hostshift is deployed for **worktrees**, where the whole point is
+  that there is no second database to rewrite — so nothing about a normal pull
+  changes and nobody acquires a runtime dependency they did not ask for.
+  Production-canonical remains supported and piloted (herrfors, pellervo,
+  both green), opt-in per repo via `hostshift.yaml`. This retires the risk
+  rather than staging it: the fleet-wide coupling only ever existed because of
+  the flip
 - A documented **fallback to search-replace per site** must remain supported
 - Performance: immaterial for dev, and the Aho–Corasick prefilter means most
   responses are never parsed at all

@@ -7,6 +7,18 @@ A reverse proxy that maps origins in both directions: the browser talks to a
 variant hostname, the application sees the hostname its database was written
 for. Nothing in the database is ever rewritten.
 
+**What it is for: worktrees.** One project, one database, and a second hostname
+so a branch or an agent can be previewed without a database of its own —
+`herrfors.ddev.site` served also at `wt-a--herrfors.ddev.site`. `robo db:pull`
+keeps its search-replace and the main site is unaffected; nothing about a normal
+pull changes.
+
+**Production-canonical is the same engine pointed further.** Declare production
+hostnames in `hostshift.yaml` and a pristine, unrewritten dump can be browsed
+directly. It is supported and piloted, opt-in per repo, and it is where the
+hazards live — see PLAN §4.4, particularly loopback containment, which only
+matters once `home_url()` is a hostname that resolves off the box.
+
 [`PLAN.md`](PLAN.md) is the authoritative design and is not re-decided here.
 [`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
 for completed milestones live in [`docs/`](docs/).
@@ -17,8 +29,10 @@ and against `pellervo`'s five blogs. Both corpus diffs green: 0 leaks, 0
 stragglers, every line count identical. `docs/m6-pilot.md` has the numbers and
 the four `PLAN.md` claims the pilot corrected.
 
-Not yet done: installing the DDEV add-on into a project and starting it — the
-pilot drove `hostshift proxy` directly.
+Not yet done at pilot time: installing the DDEV add-on into a project and
+starting it — the pilot drove `hostshift proxy` directly. Both adoption PRs
+(generoi/herrfors, generoi/btbtransformers) now document that path, and CI's e2e
+job installs through the add-on.
 
 ## Using it
 
@@ -26,9 +40,17 @@ pilot drove `hostshift proxy` directly.
 hostshift rewrite < in.html > out.html   the whole engine as a Unix filter
 hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --slug wt-a
 hostshift map     print the resolved host map
-hostshift check   validate the config; exit 2 if invalid
-hostshift wp-cli  print wp-cli.local.yml for this project
+hostshift hosts   print the hostnames a project declares, one per line
+hostshift check   validate the map; exit 2 if it is not usable
+hostshift diff    crawl a site two ways and compare
 ```
+
+**It scaffolds nothing.** No config files written, no slug guessed from a
+branch, no knowledge of any CMS. It *reads* a DDEV project's declared hostnames
+as one source for the map, because that costs no opinion — anyone running DDEV
+gets a map for free and anyone else loses nothing — but setting a project up is
+opinionated work and lives in the add-on, as `ddev hostshift`. One day that is
+its own repo.
 
 ### The map
 
@@ -37,7 +59,8 @@ is impossible and would be a silent no-op, so the map is always declared.
 
 1. **DDEV defaults.** `.ddev/config.yaml`'s `name` and `additional_hostnames`
    give the ordered list of local hosts for free. For a single-environment site
-   with no extra aliases this is enough on its own and no config file is needed.
+   with no extra aliases this is enough on its own and no config file is needed
+   — with a `--slug`, which is what says *which* variant to derive.
 2. **`hostshift.yaml`.** Adds the production hostnames, alias hosts from other
    environments, the variant pattern and the upstream.
 3. **Flags.** `--slug`, `--upstream`, `--from`/`--to`, `--map C=V`.
@@ -81,11 +104,16 @@ or `@staging` URL left behind by an imperfect `db:pull` be corrected too.
 and `application/*+json` are buffered and get an RFC 6901 path in `--explain`:
 
 ```
-$ hostshift rewrite --type application/json --explain --map https://c.example=https://v.example < rest.json
+$ hostshift rewrite --type application/json --explain \
+    --map https://c.example=https://v.example < rest.json > out.json
+rewrites by surface:
+  json-string              3
+candidates by surface:
+  json-string              3
 explain (3 events):
-      16  rewrote  -   json-string /link                   https:\/\/c.example
-      95  rewrote  -   json-string /content/rendered       https:\/\/c.example
-     164  rewrote  -   json-string /_links/self/0/href     https:\/\/c.example
+     9  rewrote  -  json-string /link                  https://c.example
+    63  rewrote  -  json-string /content/rendered      https://c.example
+   120  rewrote  -  json-string /_links/self/0/href    https://c.example
 ```
 
 Everything else passes through byte-identical and never enters a rewriter.
@@ -108,10 +136,15 @@ production origin reaches the browser"; `--strict-origins` returns 404 instead.
 
 ## The DDEV add-on
 
-The whole add-on is two compose files and an `install.yaml`. No `lib.sh`, no
+Two compose files, an `install.yaml`, and one host command. No `lib.sh`, no
 hooks, no guard — §3 measured what happens when per-repo footprint is not held
 to, and the answer was 42 repos carrying 14 different pinned SHAs of the same
 submodule.
+
+The command is the opinionated half, and it is opinionated on purpose: it works
+the slug out from the git branch, decides which hostnames `web` keeps, and
+writes the two gitignored files a worktree needs. Its tests are
+`test/addon-command.sh`.
 
 ```
 ddev add-on get generoi/hostshift
@@ -121,13 +154,15 @@ Then, per project:
 
 1. **Declare the map** — `.ddev/config.yaml` alone is enough for a
    single-environment site; `hostshift.yaml` for production-canonical.
-2. **Set the variant hostnames** in `.ddev/.env` (`HOSTSHIFT_SLUG`,
-   `HOSTSHIFT_VARIANTS`) *and* in `additional_hostnames`, or mkcert issues no SAN
-   for them and the browser gets a TLS interstitial instead of a site. A
-   three-label variant host is not covered by the `*.ddev.site` wildcard, so it
-   needs registering regardless. `hostshift map --slug wt-a` prints the list.
-3. **`hostshift wp-cli > wp-cli.local.yml`** if the database holds production
-   hostnames — without it every `ddev wp` on a multisite fails to resolve a site.
+2. **`ddev hostshift init`** writes the variant hostnames into `.ddev/.env`
+   (`HOSTSHIFT_SLUG`, `HOSTSHIFT_VARIANTS`, `HOSTSHIFT_WEB_HOSTS`) and into
+   `additional_hostnames`, without which mkcert issues no SAN for them and the
+   browser gets a TLS interstitial instead of a site — a three-label variant
+   host is not covered by the `*.ddev.site` wildcard, so it needs registering
+   regardless of hostshift.
+3. **`ddev hostshift wp-cli > wp-cli.local.yml`** if the database holds
+   production hostnames — without it every `ddev wp` on a multisite fails to
+   resolve a site.
 4. **List this site's production hostnames** in
    `.ddev/docker-compose.hostshift-loopback.yaml`, or WordPress's internal
    requests (wp-cron, Site Health) leave the machine for live production.

@@ -33,7 +33,7 @@ Error: Site 'herrfors.ddev.site/' not found. Verify DOMAIN_CURRENT_SITE
 matches an existing site or use `--url=<url>` to override.
 ```
 
-After `hostshift wp-cli > wp-cli.local.yml`:
+After `ddev hostshift wp-cli > wp-cli.local.yml`:
 
 ```
 $ ddev wp option get home
@@ -157,7 +157,7 @@ Applied to `PLAN.md`.
 | §4.4: "**Site Health** loopback probes (same) — work" | **They loop.** DDEV's nginx derives `$fcgi_https` from `$http_x_forwarded_proto` alone, never `$scheme`, so a request on the container's own 443 listener is reported to PHP as plain HTTP and WordPress redirects to the https URL it is already on |
 | §4.4: a sibling blog "resolving to `127.0.0.1`, is rejected as unsafe" by `wp_http_validate_url` | It gets as far as TLS and fails with the same `cURL error 60`. Same outcome, different mechanism |
 
-`hostshift wp-cli` now emits the existing `wp-cli.yml` back with a root `url:`
+`ddev hostshift wp-cli` now emits the existing `wp-cli.yml` back with a root `url:`
 added, and warns for every alias whose `url:` the database no longer holds rather
 than rewriting it — silently changing what `wp @ddev` means is worse than saying
 so, when some of those aliases are SSH into production.

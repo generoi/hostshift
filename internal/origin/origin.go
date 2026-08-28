@@ -30,8 +30,11 @@ type Origin struct {
 	Port   string // "" when it is the scheme's default port
 }
 
-// Parse normalises a declared origin. Input may carry a path, which is ignored:
-// callers declare origins, not URLs.
+// Parse normalises a declared origin. A trailing "/" is accepted and ignored —
+// people write origins that way — but any longer path is an error rather than
+// something quietly discarded. hostshift maps origins, not URL prefixes, so
+// `--map https://a.example/blog=https://b.example` cannot do what its author
+// meant, and silently dropping the path let them believe it had.
 //
 // A protocol-relative "//host" is rejected here — a *declared* origin must name
 // its scheme (PLAN §5.3, the plain-HTTP-listener case). The matcher handles
@@ -52,6 +55,13 @@ func Parse(s string) (Origin, error) {
 	}
 	if u.Hostname() == "" {
 		return Origin{}, fmt.Errorf("parse origin %q: no host", s)
+	}
+	if p := strings.TrimSuffix(u.EscapedPath(), "/"); p != "" {
+		return Origin{}, fmt.Errorf(
+			"parse origin %q: an origin is a scheme and a host, with no path — drop %q", s, p)
+	}
+	if u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return Origin{}, fmt.Errorf("parse origin %q: an origin is a scheme and a host, nothing else", s)
 	}
 	host, err := normaliseHost(u.Hostname())
 	if err != nil {

@@ -3,8 +3,11 @@ name: hostshift
 # Serve a site from a hostname other than the one in its database, without
 # rewriting the database.
 #
-# The add-on is deliberately only a compose service plus the loopback override.
-# PLAN §5.7: "no lib.sh, no generated files, no hooks, no guard."
+# The add-on is a compose service, the loopback override, and one host command.
+# The command is where the DDEV- and stack-shaped opinions live — deriving a slug
+# from a branch, deciding which hostnames web keeps, writing .ddev/ files — so
+# that the binary can stay a general origin mapper that scaffolds nothing.
+# PLAN §5.7. There are still no hooks and no guard.
 
 pre_install_actions:
   - |
@@ -12,51 +15,46 @@ pre_install_actions:
     if ! command -v hostshift >/dev/null 2>&1; then
       echo "note: the hostshift CLI is not on PATH." >&2
       echo "The proxy itself runs from the container image, so the add-on works" >&2
-      echo "without it, but 'hostshift map', 'check', 'wp-cli' and 'diff' need it." >&2
+      echo "without it, but 'ddev hostshift' and 'hostshift map|check|diff' need it." >&2
     fi
 
 project_files:
   - docker-compose.hostshift.yaml
   - docker-compose.hostshift-loopback.yaml
+  - commands/host/hostshift
 
 post_install_actions:
   - |
     #ddev-nodisplay
-    # Two things have to be true before this add-on serves anything, and both
-    # are per-project rather than per-add-on, so they are reported rather than
-    # guessed at.
+    # One command, because both files it writes are derived from the same map
+    # and neither is a decision anyone needs to make. It is not run for you: it
+    # writes into .ddev/, and an add-on that edits a project's configuration
+    # without being asked is how a surprise gets installed.
     echo
-    echo "hostshift installed. Two steps remain, both per-project:"
+    echo "hostshift installed. One step remains:"
     echo
-    echo "1. Declare the map. For a single-environment site, .ddev/config.yaml's"
-    echo "   name and additional_hostnames are enough on their own. For"
-    echo "   production-canonical, write hostshift.yaml — see the README."
+    echo "    ddev hostshift init"
     echo
-    echo "2. Set the variant hostnames, in .ddev/.env — all three, since"
-    echo "   HOSTSHIFT_WEB_HOSTS has no default and an unset one blanks web's"
-    echo "   VIRTUAL_HOST, which stops mailpit and 'ddev launch' routing:"
-    echo "       HOSTSHIFT_SLUG=wt-a"
-    echo "       HOSTSHIFT_VARIANTS=wt-a--<project>.ddev.site,..."
-    echo "       HOSTSHIFT_WEB_HOSTS=<project>.ddev.site,..."
-    echo "   'hostshift map --slug wt-a --env' prints all three, ready to paste."
-    echo "   Add the variant names to additional_hostnames in .ddev/config.yaml,"
-    echo "   or the mkcert certificate carries no SAN for them and the browser"
-    echo "   gets a TLS interstitial instead of a site."
+    echo "It works out the slug from the git branch, writes the variant"
+    echo "hostnames into .ddev/config.hostshift.local.yaml so mkcert covers them,"
+    echo "and merges HOSTSHIFT_SLUG/VARIANTS/WEB_HOSTS into .ddev/.env. Then"
+    echo "'ddev restart'. Pass --dry-run first to see what it would write, or"
+    echo "--slug to choose the name yourself."
     echo
-    echo "   'hostshift map --slug wt-a' prints exactly the list to use."
+    echo "Two things it cannot do for you:"
     echo
-    echo "3. If the database holds production hostnames, generate the WP-CLI"
-    echo "   override — without it every 'ddev wp' on a multisite fails to"
-    echo "   resolve a site:"
-    echo "       hostshift wp-cli > wp-cli.local.yml"
-    echo "   It is already gitignored in 53 of the fleet's 60 repos; 'hostshift"
-    echo "   check' warns when it is not."
+    echo "  * If the database holds production hostnames, generate the WP-CLI"
+    echo "    override — without it every 'ddev wp' on a multisite fails to"
+    echo "    resolve a site:  ddev hostshift wp-cli > wp-cli.local.yml"
     echo
-    echo "4. Edit .ddev/docker-compose.hostshift-loopback.yaml to list this"
-    echo "   site's production hostnames, or WordPress's internal requests"
-    echo "   (wp-cron, Site Health) leave the machine for live production."
-    echo "   That file carries no #ddev-generated marker, so your edit survives"
-    echo "   the next 'ddev add-on get'."
+    echo "  * And list that site's production hostnames in"
+    echo "    .ddev/docker-compose.hostshift-loopback.yaml, or WordPress's"
+    echo "    internal requests (wp-cron, Site Health) leave the machine for"
+    echo "    live production. That file has no generated-file marker, so your"
+    echo "    edit survives the next 'ddev add-on get'."
+    echo
+    echo "'ddev hostshift init --dry-run' shows what it would write; 'hostshift"
+    echo "check' validates the map it resolved."
     echo
 
 removal_actions:

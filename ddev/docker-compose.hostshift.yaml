@@ -29,9 +29,15 @@ services:
   #
   # So web's list is narrowed back to the canonical hostnames. Everything not
   # named here keeps going to web; only the variants reach hostshift.
+  #
+  # The default is every hostname the project has, which is what DDEV would have
+  # done on its own. Without it, installing the add-on and not yet configuring it
+  # left web with an *empty* VIRTUAL_HOST — the canonical site, mailpit and
+  # `ddev launch` all stopped routing, on a project where nothing had been asked
+  # of hostshift yet. An add-on has to be inert until it is configured.
   web:
     environment:
-      VIRTUAL_HOST: ${HOSTSHIFT_WEB_HOSTS}
+      VIRTUAL_HOST: ${HOSTSHIFT_WEB_HOSTS:-$DDEV_HOSTNAME}
 
   hostshift:
     container_name: ddev-${DDEV_SITENAME}-hostshift
