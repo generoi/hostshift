@@ -154,6 +154,34 @@ cannot be innocent: **a canonical origin reaching the browser**, and **a page
 whose line count changed** — splicing never rebuilds whitespace, so a line-count
 change means something re-serialised.
 
+## Tests
+
+```
+go test ./...                       hermetic; no Docker, no network
+test/bootstrap-ddev.sh up           build a WordPress multisite from nothing and run the live suite
+test/bootstrap-ddev.sh down         delete it
+```
+
+`internal/e2e` drives hostshift against a real DDEV project and is skipped unless
+`HOSTSHIFT_E2E_VARIANT` is set, so `go test ./...` stays hermetic. It covers what
+no `httptest` can: the site served at a hostname its database has never heard of,
+per-blog multisite routing, live authenticated REST JSON, WP-CLI resolution,
+loopback containment, and the **database** half of tests 30 and 31 — a REST write
+carrying variant URLs is asserted *in `wp_posts`*, via WP-CLI, to have been
+stored canonical.
+
+`test/bootstrap-ddev.sh` creates the project it runs against: a stock DDEV
+WordPress multisite whose database is then moved to production hostnames, with
+the add-on installed. It takes about two minutes and needs nothing but `ddev`.
+
+One thing it has to do is worth knowing, because it is a precondition hostshift
+cannot supply: **the application must derive its host from the request.** §4.1
+records this as a fact about Bedrock (`config/application.php:49-60`), and it is
+what lets one database be served at more than one hostname. A *stock* DDEV
+WordPress does not — `wp-config-ddev.php:26` pins `WP_HOME` to
+`DDEV_PRIMARY_URL` — so the bootstrap writes the Bedrock equivalent. Any site
+that pins its own home URL cannot be proxied by hostshift or anything else.
+
 ## Building
 
 ```
