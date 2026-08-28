@@ -43,6 +43,12 @@ type Proxy struct {
 	// structured pass, not to run without a net.
 	NoSweep bool
 
+	// Compress re-encodes rewritten bodies per the client's Accept-Encoding.
+	// Off by default: over loopback and the Docker bridge compression buys
+	// nothing, and it exists for performance work where transfer size and
+	// Content-Encoding must resemble production (PLAN §5.2).
+	Compress bool
+
 	Log *slog.Logger
 }
 
@@ -77,8 +83,11 @@ type state struct {
 	site *origin.Site
 	// url is the absolute URL the browser asked for, in variant space. The
 	// self-redirect guard compares against it.
-	url  string
-	body []byte
+	url string
+	// accept is the browser's Accept-Encoding, kept because --compress
+	// re-encodes per the *client's* preference rather than the upstream's.
+	accept string
+	body   []byte
 }
 
 func (p *Proxy) log() *slog.Logger {
@@ -119,7 +128,11 @@ func (p *Proxy) Handler() http.Handler {
 			return
 		}
 
-		st := &state{site: site, url: "https://" + r.Host + r.URL.RequestURI()}
+		st := &state{
+			site:   site,
+			url:    "https://" + r.Host + r.URL.RequestURI(),
+			accept: r.Header.Get("Accept-Encoding"),
+		}
 		p.rewriteRequestBody(r, st)
 		rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), stateKey, st)))
 	})
@@ -279,6 +292,14 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 }
 
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
+	if isPartial(resp) {
+		p.log().Info("range response passed through unrewritten", "status", resp.StatusCode)
+		return nil
+	}
+	if !p.decodeBody(resp) {
+		return nil // an encoding hostshift cannot decode: byte-identical passthrough
+	}
+
 	ct := resp.Header.Get("Content-Type")
 	switch {
 	case rewritableHTML(ct):
@@ -334,6 +355,14 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		resp.Header.Del("ETag")
 		resp.Header.Del("Last-Modified")
 		resp.Header.Del("Accept-Ranges")
+	}
+
+	// The body varies with the request Host, so a shared cache downstream must
+	// not serve one variant's body to another (PLAN §5.5).
+	addVary(resp.Header, "Host")
+
+	if p.Compress && st != nil && !p.DryRun {
+		p.compressBody(resp, st.accept)
 	}
 	return nil
 }

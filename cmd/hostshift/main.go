@@ -212,6 +212,7 @@ func cmdProxy(args []string) (int, error) {
 	explain := fs.Bool("explain", false, "trace every candidate that did not result in a rewrite")
 	strict := fs.Bool("strict-origins", false, "return 404 instead of passing a self-redirect through (PLAN §4.4)")
 	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
+	compress := fs.Bool("compress", false, "re-encode responses per the client's Accept-Encoding, for performance work")
 	maxBody := fs.Int64("max-body", proxy.DefaultMaxBody, "request-body buffering cap in bytes")
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
@@ -236,6 +237,7 @@ func cmdProxy(args []string) (int, error) {
 		DryRun:        *dryRun,
 		StrictOrigins: *strict,
 		NoSweep:       *noSweep,
+		Compress:      *compress,
 		MaxBody:       *maxBody,
 		Log:           log,
 	}
