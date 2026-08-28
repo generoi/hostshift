@@ -1025,6 +1025,16 @@ added, include `text/javascript`: it is the IANA-preferred type and what nginx
 serves). That is where "most responses are never
 parsed" comes from, at zero buffering cost.
 
+**`text/event-stream` is a known gap, and it is the one exclusion that can leak.**
+An SSE body carrying `data: https://www.herrfors.fi/x` reaches the browser
+verbatim — a dereferenceable production origin, which is what test 28 exists to
+prevent. It has been true since the content-type gate was written, so it is not a
+regression, and it stays open here rather than being fixed in passing: SSE cannot
+be buffered the way JSON is, and `NewSweep` holds a carry-over window that would
+delay an event until the next one arrived. The fix is a streaming text rewriter
+that flushes on a record boundary, with its own tests. Until then, a site that
+serves SSE with absolute production URLs in it is outside what hostshift covers.
+
 Within the rewritable set the automaton is used only on already-bounded values:
 per attribute value and per header value; over accumulated `<script>`/`<style>`
 text (which must be accumulated anyway); and over the JSON buffer. **HTML is never

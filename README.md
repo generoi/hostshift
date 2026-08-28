@@ -104,11 +104,16 @@ or `@staging` URL left behind by an imperfect `db:pull` be corrected too.
 and `application/*+json` are buffered and get an RFC 6901 path in `--explain`:
 
 ```
-$ hostshift rewrite --type application/json --explain --map https://c.example=https://v.example < rest.json
+$ hostshift rewrite --type application/json --explain \
+    --map https://c.example=https://v.example < rest.json > out.json
+rewrites by surface:
+  json-string              3
+candidates by surface:
+  json-string              3
 explain (3 events):
-      16  rewrote  -   json-string /link                   https:\/\/c.example
-      95  rewrote  -   json-string /content/rendered       https:\/\/c.example
-     164  rewrote  -   json-string /_links/self/0/href     https:\/\/c.example
+     9  rewrote  -  json-string /link                  https://c.example
+    63  rewrote  -  json-string /content/rendered      https://c.example
+   120  rewrote  -  json-string /_links/self/0/href    https://c.example
 ```
 
 Everything else passes through byte-identical and never enters a rewriter.
