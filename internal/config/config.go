@@ -449,7 +449,20 @@ func loadDDEV(dir string) (*ddevConfig, string, error) {
 	}
 
 	if d.Name == "" {
-		return nil, "", fmt.Errorf("%s: no `name`", path)
+		// DDEV defaults the project name to the directory name, and hostshift
+		// has to agree with it or the map is built for a project that does not
+		// exist. Verified against `ddev debug configyaml`.
+		//
+		// It is also the thing that makes a worktree work with no configuration
+		// at all: two DDEV projects cannot share a name, and .ddev/config.yaml
+		// is tracked — so a repo that *omits* `name` gives every worktree its
+		// own project for free, named after its own directory. Requiring the
+		// field turned that into an error instead.
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return nil, "", err
+		}
+		d.Name = filepath.Base(abs)
 	}
 	return &d, path, nil
 }

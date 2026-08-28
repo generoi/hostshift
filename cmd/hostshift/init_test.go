@@ -180,3 +180,73 @@ func TestHostLabel(t *testing.T) {
 		}
 	}
 }
+
+// TestInitZeroConfigWorktree is the whole point, for the simplest kind of site.
+//
+// A project that omits `name:` from .ddev/config.yaml gets DDEV's default, which
+// is the directory name — so a git worktree is automatically its own DDEV
+// project, and two projects cannot share a name is no longer a problem anyone
+// has to solve by hand. Nothing is committed, nothing is passed, and `init`
+// works out both ends: canonical from the checkout the worktree was created
+// from, variant from its own branch.
+func TestInitZeroConfigWorktree(t *testing.T) {
+	root := t.TempDir()
+	main := filepath.Join(root, "transformerco")
+	// No `name:` — this is the one-line change a project makes.
+	writeFile(t, main, ".ddev/config.yaml", "type: wordpress\ndocroot: web\n")
+	git(t, main, "init", "-q", "-b", "master")
+	git(t, main, "add", "-A")
+	git(t, main, "commit", "-qm", "init")
+
+	wt := filepath.Join(root, "transformerco-wt-a")
+	git(t, main, "worktree", "add", "-q", wt, "-b", "feature/ABC-123")
+
+	code, _, errOut := run(t, "", cmdInit, "-C", wt)
+	if code != exitOK {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+
+	// Canonical is the parent checkout's project, which is its directory name.
+	got := readAll(t, filepath.Join(wt, "hostshift.yaml"))
+	if !strings.Contains(got, "canonical: https://transformerco.ddev.site") {
+		t.Errorf("canonical not derived from the parent checkout:\n%s", got)
+	}
+
+	env := readAll(t, filepath.Join(wt, ".ddev", ".env"))
+	if !strings.Contains(env, "HOSTSHIFT_VARIANTS=feature-abc-123--transformerco.ddev.site") {
+		t.Errorf("variant:\n%s", env)
+	}
+	// web keeps the worktree's own hostname, so mailpit and `ddev launch` still
+	// route. That is what naming the project after the directory buys.
+	if !strings.Contains(env, "HOSTSHIFT_WEB_HOSTS=transformerco-wt-a.ddev.site") {
+		t.Errorf("web hosts:\n%s", env)
+	}
+
+	// And the compose service, so nothing had to be committed and no add-on
+	// install was needed.
+	compose := readAll(t, filepath.Join(wt, ".ddev", "docker-compose.hostshift.yaml"))
+	if !strings.Contains(compose, "ghcr.io/generoi/hostshift") {
+		t.Errorf("the compose service was not written:\n%s", compose)
+	}
+
+	// The proxy resolves the same map the init run reported.
+	_, out, _ := run(t, "", cmdMap, "-C", wt, "--slug", "feature-abc-123")
+	if !strings.Contains(out, "https://transformerco.ddev.site  ->  https://feature-abc-123--transformerco.ddev.site") {
+		t.Errorf("map:\n%s", out)
+	}
+}
+
+// TestInitDoesNotClobberAnInstalledAddon: a project that has run
+// `ddev add-on get`, or pinned the service deliberately, keeps what it has.
+func TestInitDoesNotClobberAnInstalledAddon(t *testing.T) {
+	wt := worktree(t, "acme", "acme-wt-a", "wt-a")
+	const pinned = "services:\n  hostshift:\n    image: ghcr.io/generoi/hostshift:v0.1.0\n"
+	writeFile(t, wt, ".ddev/docker-compose.hostshift.yaml", pinned)
+
+	if code, _, errOut := run(t, "", cmdInit, "-C", wt, "--slug", "wt-a"); code != exitOK {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+	if got := readAll(t, filepath.Join(wt, ".ddev", "docker-compose.hostshift.yaml")); got != pinned {
+		t.Errorf("an existing compose service was overwritten:\n%s", got)
+	}
+}
