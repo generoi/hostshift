@@ -105,6 +105,14 @@ out="$(cd "$same" && "$cmd" env --slug wt-b 2>/dev/null || true)"
 contains "a same-project worktree keeps its hostnames on web" \
   "HOSTSHIFT_WEB_HOSTS=pinned.ddev.site,nat.pinned.ddev.site" "$out"
 
+# Falling back silently is the failure this path exists to prevent: the map gets
+# built against the hostname the worktree is served at, and nothing is rewritten.
+mv "$main/.ddev/config.yaml" "$main/.ddev/hidden.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "an unreadable parent is a warning, not a silent wrong map" \
+  "no DDEV" "$out"
+mv "$main/.ddev/hidden.yaml" "$main/.ddev/config.yaml"
+
 # hostshift.yaml is a deliberate statement about which hostnames the database
 # holds; --from would override it.
 printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n' > "$wt/hostshift.yaml"
