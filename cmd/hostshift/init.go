@@ -60,14 +60,26 @@ func cmdInit(args []string) (int, error) {
 	if err != nil {
 		return exitConfig, err
 	}
-	own, tld, err := config.DDEVHostnames(c.dir)
+	_, own, tld, err := config.DDEVProject(c.dir)
 	if err != nil {
 		return exitConfig, err
 	}
 	if len(own) == 0 {
 		return exitConfig, fmt.Errorf("no .ddev/config.yaml in %s: init configures a DDEV project", c.dir)
 	}
-	res.DDEVHosts, res.ProjectTLD = own, tld
+	// The project's own hostnames, minus the variants — which are in that list
+	// only because a previous run put them there. Without this the second run
+	// reads its own output back as more of the project's identity: the variants
+	// become hostnames web must keep, the generated list grows, and init stops
+	// being idempotent. sitesFromDDEV skips them for the same reason.
+	kept := own[:0]
+	for _, h := range own {
+		if !strings.HasPrefix(h, c.slug+"--") {
+			kept = append(kept, h)
+		}
+	}
+	res.DDEVHosts, res.ProjectTLD = kept, tld
+	own = kept
 	variants, webHosts := res.DDEVEnv()
 
 	// Every hostname the project should register: its own, plus the variants.
@@ -191,25 +203,6 @@ func mainWorktree(dir string) string {
 	return filepath.Dir(common)
 }
 
-// ddevProjectName reads name: from a project's .ddev/config.yaml. It is a
-// deliberately shallow read: the full parse lives in internal/config, and this
-// runs before a map exists.
-func ddevProjectName(dir string) string {
-	if dir == "" {
-		return ""
-	}
-	b, err := os.ReadFile(filepath.Join(dir, ".ddev", "config.yaml"))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "name:"); ok {
-			return strings.Trim(strings.TrimSpace(v), `"'`)
-		}
-	}
-	return ""
-}
-
 // writeMapFromParent declares the parent worktree's DDEV hostnames as this
 // worktree's canonical set, when nothing else has.
 //
@@ -227,7 +220,7 @@ func writeMapFromParent(dir, slug string) (string, error) {
 	if _, err := os.Stat(path); err == nil {
 		return "", nil
 	}
-	hosts, _, err := config.DDEVHostnames(main)
+	_, hosts, _, err := config.DDEVProject(main)
 	if err != nil {
 		return "", err
 	}
@@ -253,6 +246,18 @@ func writeMapFromParent(dir, slug string) (string, error) {
 		body += fmt.Sprintf("  - {name: %s, canonical: https://%s, base: https://%s}\n", name, h, h)
 	}
 	return path, os.WriteFile(path, []byte(body), 0o644)
+}
+
+// ddevProjectName is what DDEV would call the project in dir.
+func ddevProjectName(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	name, _, _, err := config.DDEVProject(dir)
+	if err != nil {
+		return ""
+	}
+	return name
 }
 
 func gitOutput(dir string, args ...string) string {
