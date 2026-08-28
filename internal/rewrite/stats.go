@@ -19,7 +19,14 @@ const (
 	// SurfaceRawText is the markup inside every other raw-text element —
 	// noscript, textarea, title, iframe, and <title> inside foreign content —
 	// which the tokenizer hands back as opaque text rather than parsing.
-	SurfaceRawText     = "raw-text"
+	SurfaceRawText = "raw-text"
+	// SurfaceText is ordinary body prose and SurfaceComment an HTML comment.
+	// Both carry real URLs on real pages — the M6 pilot found a privacy-policy
+	// paragraph quoting its own URL, and sage-cachetags emitting one per cached
+	// page — and anchoring is what keeps a bare hostname in prose untouched
+	// (test 28).
+	SurfaceText        = "text"
+	SurfaceComment     = "comment"
 	SurfaceHeader      = "header"
 	SurfaceJSONString  = "json-string"
 	SurfaceRequestLine = "request-line"

@@ -249,7 +249,19 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// bare hostname (test 28).
 			switch w.rawText {
 			case "":
-				w.pend.Write(raw)
+				// Ordinary body text. The M6 pilot found real pages carrying
+				// "https://host/path" in visible prose — a privacy-policy
+				// paragraph quoting its own URL — which the sweep was then
+				// catching. Under production-canonical that is precisely the
+				// hazard §4.4 opens with: a developer copy-pastes it and lands
+				// on live production.
+				//
+				// §4.4 already accepts the consequence: "a page that
+				// intentionally links to production, as a URL, is rewritten too.
+				// On a development clone that is almost always what you want."
+				// Anchoring is what keeps test 28's exclusion intact — a bare
+				// hostname in prose has no scheme and cannot match.
+				w.pend.Write(w.rewriteValue(SurfaceText, "", off, raw))
 			case "script":
 				w.pend.Write(w.rewriteValue(SurfaceInlineScript, "", off, raw))
 			case "style":
@@ -257,6 +269,14 @@ func (w *HTML) Read(p []byte) (int, error) {
 			default:
 				w.pend.Write(w.rewriteValue(SurfaceRawText, "", off, raw))
 			}
+		case html.CommentToken:
+			// Not dereferenceable by the browser, but the fleet puts real URLs
+			// here: sage-cachetags emits "<!-- sage-cachetags Url: https://… -->"
+			// on every cached page, and the M6 pilot found 20-odd per crawl
+			// going to the sweep. §4.4 wants every straggler to be a bug in the
+			// structured pass, so this belongs here rather than in the backstop.
+			w.pend.Write(w.rewriteValue(SurfaceComment, "", off, raw))
+
 		default:
 			w.pend.Write(raw)
 		}
