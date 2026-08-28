@@ -34,6 +34,7 @@ import (
 
 const usage = `hostshift — serve a site from a hostname other than the one in its database
 
+  hostshift init    configure this DDEV project; the usual first command
   hostshift rewrite --from https://a --to https://b < in.html > out.html
   hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --slug wt-a
   hostshift map     print the resolved host map
@@ -46,7 +47,8 @@ DDEV defaults in .ddev/config.yaml, then hostshift.yaml, then these flags.
 
   -C dir        project directory (default ".")
   --slug        worktree slug; variants are derived by prefixing the leftmost
-                label of each site's base host
+                label of each site's base host. init guesses it from the git
+                branch when it is not given
   --from/--to   explicit index-aligned map; replaces the config files entirely
   --map C=V     the same thing written as one argument
   --upstream    upstream base URL, e.g. http://web:80
@@ -73,6 +75,8 @@ func main() {
 	var err error
 	code := exitOK
 	switch os.Args[1] {
+	case "init":
+		code, err = cmdInit(os.Args[2:])
 	case "rewrite":
 		code, err = cmdRewrite(os.Args[2:])
 	case "proxy":

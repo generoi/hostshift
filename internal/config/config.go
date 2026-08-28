@@ -454,3 +454,17 @@ func sitesFromDDEV(d *ddevConfig, pattern, slug string) ([]origin.Site, error) {
 	}
 	return sites, nil
 }
+
+// DDEVHostnames returns every hostname a DDEV project registers, and its TLD.
+//
+// It is the shallow question — what does this project answer to — as distinct
+// from Load's, which is what maps to what. `init` needs both, and for a worktree
+// they come from different directories: the map from the checkout whose database
+// is shared, the hostnames from the project being configured.
+func DDEVHostnames(dir string) ([]string, string, error) {
+	d, _, err := loadDDEV(dir)
+	if err != nil {
+		return nil, "", err
+	}
+	return ddevHostnames(d), projectTLD(d), nil
+}
