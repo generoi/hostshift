@@ -40,6 +40,7 @@ type HTML struct {
 	markCur int
 	maxPend int // high-water mark of the token buffer, for test 13
 	tail    io.Reader
+	attrs   []Attr // scratch for scanAttrsInto, reused across tags
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -168,15 +169,32 @@ func NewHTML(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) *HTML {
 // asserts it is bounded by the largest token rather than by the response size.
 func (w *HTML) MaxBuffered() int { return w.maxPend }
 
-// rawTextElement reports elements whose content the tokenizer returns as a
-// single text token rather than parsing.
-func rawTextElement(n string) bool {
-	switch n {
-	case "script", "style", "textarea", "title", "iframe",
-		"noembed", "noframes", "noscript", "plaintext", "xmp":
-		return true
+// rawTextNames are the elements whose content the tokenizer returns as a single
+// text token rather than parsing. The string form is what w.rawText holds; the
+// byte form is what a tag name is compared against, without allocating.
+var rawTextNames = []string{
+	"script", "style", "textarea", "title", "iframe",
+	"noembed", "noframes", "noscript", "plaintext", "xmp",
+}
+
+var rawTextNameBytes = func() [][]byte {
+	out := make([][]byte, len(rawTextNames))
+	for i, s := range rawTextNames {
+		out[i] = []byte(s)
 	}
-	return false
+	return out
+}()
+
+// rawTextElement returns the canonical name when name is a raw-text element,
+// and "" otherwise. Case-folding here rather than lowercasing into a string is
+// what keeps a start tag from allocating at all.
+func rawTextElement(name []byte) string {
+	for i, s := range rawTextNameBytes {
+		if len(name) == len(s) && bytes.EqualFold(name, s) {
+			return rawTextNames[i]
+		}
+	}
+	return ""
 }
 
 // structuredAttrNames are the values §5.2 listed as needing their grammar
@@ -260,7 +278,8 @@ func (w *HTML) decodeEntityLeak(base int, v []byte) []byte {
 // between them verbatim. Attribute order, quoting, whitespace and case all
 // survive, because nothing is rebuilt — only value byte ranges are replaced.
 func (w *HTML) rewriteTag(raw []byte, tagOff int) []byte {
-	attrs := scanAttrs(raw)
+	w.attrs = scanAttrsInto(w.attrs[:0], raw)
+	attrs := w.attrs
 	var out bytes.Buffer
 	prev := 0
 	for _, a := range attrs {
@@ -372,32 +391,30 @@ func (w *HTML) Read(p []byte) (int, error) {
 		off := w.inOff
 		w.inOff += len(raw)
 
-		// Copy Raw() before touching TagName()/TagAttr(), and *only* then.
+		// Raw() is used directly, and no copy is made.
 		//
-		// spike/go/full/main.go:100-105 aliased it across a TagName() call. The
-		// docs make no lifetime promise about Raw() — the partition guarantee is
-		// all they state — and safety today rests on TagAttr happening to
-		// allocate before its in-place unescape, which is an implementation
-		// detail. The slices from Text()/TagName()/TagAttr() *are* documented to
-		// change on the next Next(), so none of them are retained either.
+		// The copy existed because TagName()/TagAttr() may invalidate Raw() —
+		// the docs promise only the partition guarantee, and safety rested on
+		// TagAttr happening to allocate before its in-place unescape, which is
+		// an implementation detail. spike/go/full/main.go:100-105 aliased across
+		// exactly that and was the reason for the hedge.
 		//
-		// Every other token type is written straight to the pending buffer,
-		// which copies, and TagName/TagAttr are never called for them — so the
-		// defensive copy is pure garbage there. Restricting it to start tags
-		// removes roughly a third of the allocations on a page with no rewrites.
-		if tt == html.StartTagToken || tt == html.SelfClosingTagToken {
-			raw = append([]byte(nil), raw...)
-		}
+		// Neither is called any more. The tag name comes from the raw bytes
+		// (tagNameOf), which is where readTagName would have found it, and the
+		// attribute spans always came from scanAttrs. So the hazard is gone
+		// rather than guarded against — and with it two allocations per start
+		// tag, since TagName() is bytes.ReplaceAll and Go's bytes.Replace copies
+		// even when it replaces nothing. Text()/Raw() are still never retained
+		// past the next Next().
 
 		switch tt {
 		case html.StartTagToken, html.SelfClosingTagToken:
-			name, _ := w.z.TagName()
 			// Self-closing too: x/net/html sets its own raw-text state for
 			// `<script/>` and returns SelfClosingTagToken, so gating on
 			// StartTagToken alone left that spelling's contents unscanned —
 			// and inline script is where the JS URLs actually are (§5.2).
-			if rawTextElement(string(name)) {
-				w.rawText = string(name)
+			if name := rawTextElement(tagNameOf(raw)); name != "" {
+				w.rawText = name
 			}
 			w.write(off, len(raw), w.rewriteTag(raw, off))
 		case html.EndTagToken:
