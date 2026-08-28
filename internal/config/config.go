@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -204,11 +205,17 @@ func ddevHostnames(d *ddevConfig) []string {
 		return nil
 	}
 	tld := projectTLD(d)
-	hosts := []string{d.Name + "." + tld}
+	all := []string{d.Name + "." + tld}
 	for _, h := range d.AdditionalHostnames {
-		hosts = append(hosts, h+"."+tld)
+		all = append(all, h+"."+tld)
 	}
-	return append(hosts, d.AdditionalFQDNs...)
+	all = append(all, d.AdditionalFQDNs...)
+	// Deduped as a whole, not pairwise: a generated config.*.local.yaml lists
+	// the project's own hostname alongside the variants, so after the merge
+	// `name` and an entry in additional_hostnames are the same host. Answering
+	// to it twice is meaningless, and it reached HOSTSHIFT_WEB_HOSTS as a
+	// repeated value.
+	return appendUnique(nil, all)
 }
 
 func mapFromFlags(f Flags) (*origin.Map, error) {
@@ -405,10 +412,74 @@ func loadDDEV(dir string) (*ddevConfig, string, error) {
 	if err := yaml.Unmarshal(b, &d); err != nil {
 		return nil, "", fmt.Errorf("%s: %w", path, err)
 	}
+
+	// DDEV merges every .ddev/config.*.yaml over config.yaml, and reading only
+	// the base file made hostshift's view of the project differ from DDEV's.
+	//
+	// That is not academic: config.*.local.yaml is gitignored by DDEV's own
+	// .ddev/.gitignore, which makes it the natural place for a worktree to give
+	// itself a project name of its own — two DDEV projects cannot share one
+	// name, and .ddev/config.yaml is tracked, so overriding it there is the only
+	// way that does not dirty the worktree. hostshift would have gone on
+	// resolving the map against the parent's name while DDEV served the
+	// worktree's, and every request would have 421'd.
+	//
+	// Scalars overwrite, lists append and dedupe, which is what DDEV does and
+	// what the pilot's own override demonstrates: it repeats a hostname already
+	// in config.yaml and the project ends up with one of it, not two.
+	globs, _ := filepath.Glob(filepath.Join(dir, ".ddev", "config.*.yaml"))
+	sort.Strings(globs)
+	for _, g := range globs {
+		ob, err := os.ReadFile(g)
+		if err != nil {
+			continue
+		}
+		var o ddevConfig
+		if err := yaml.Unmarshal(ob, &o); err != nil {
+			return nil, "", fmt.Errorf("%s: %w", g, err)
+		}
+		if o.Name != "" {
+			d.Name = o.Name
+		}
+		if o.ProjectTLD != "" {
+			d.ProjectTLD = o.ProjectTLD
+		}
+		d.AdditionalHostnames = appendUnique(d.AdditionalHostnames, o.AdditionalHostnames)
+		d.AdditionalFQDNs = appendUnique(d.AdditionalFQDNs, o.AdditionalFQDNs)
+	}
+
 	if d.Name == "" {
 		return nil, "", fmt.Errorf("%s: no `name`", path)
 	}
 	return &d, path, nil
+}
+
+func appendUnique(dst, src []string) []string {
+	seen := make(map[string]bool, len(dst))
+	for _, s := range dst {
+		seen[s] = true
+	}
+	for _, s := range src {
+		if !seen[s] {
+			seen[s] = true
+			dst = append(dst, s)
+		}
+	}
+	return dst
+}
+
+// DDEVProject reports what DDEV would call this project and what it answers to.
+//
+// It is the shallow question — the project's own identity — as distinct from
+// Load's, which is what maps to what. `init` needs both, and for a worktree they
+// come from different directories: the map from the checkout whose database is
+// shared, the identity from the project being configured.
+func DDEVProject(dir string) (name string, hosts []string, tld string, err error) {
+	d, _, err := loadDDEV(dir)
+	if err != nil || d == nil {
+		return "", nil, "", err
+	}
+	return d.Name, ddevHostnames(d), projectTLD(d), nil
 }
 
 // sitesFromDDEV builds the ordered list of local hosts for free: `name` plus
@@ -453,18 +524,4 @@ func sitesFromDDEV(d *ddevConfig, pattern, slug string) ([]origin.Site, error) {
 		sites = append(sites, origin.Site{Name: name, Canonical: c, Variant: v})
 	}
 	return sites, nil
-}
-
-// DDEVHostnames returns every hostname a DDEV project registers, and its TLD.
-//
-// It is the shallow question — what does this project answer to — as distinct
-// from Load's, which is what maps to what. `init` needs both, and for a worktree
-// they come from different directories: the map from the checkout whose database
-// is shared, the hostnames from the project being configured.
-func DDEVHostnames(dir string) ([]string, string, error) {
-	d, _, err := loadDDEV(dir)
-	if err != nil {
-		return nil, "", err
-	}
-	return ddevHostnames(d), projectTLD(d), nil
 }
