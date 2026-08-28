@@ -1313,12 +1313,21 @@ re-created from `templates/` and verified merged onto the `web` service via
 `ddev debug compose-config`. Found the `redirect-uploads.conf` redirect loop
 (§4.4, test 32) and corrected five §4.2 claims. *No code.*
 
-**M1 — proxy shell, observability, and the identity invariant.** `httputil.ReverseProxy`
-skeleton; `hostshift rewrite` filter mode;
-`--dry-run` and `--explain` (§5.8); per-surface counters. The identity-map guard rail for
-everything after (§5.2). Start from `spike/`, which already has this green.
-Tests 24, 27. Given how
-many silent-failure modes exist above, this precedes correctness work.
+**M1 — proxy shell, observability, and the identity invariant. Done 2026-08-27.**
+`httputil.ReverseProxy` skeleton with every §5.7 mechanic asserted; `hostshift
+rewrite` filter mode; `--dry-run` and `--explain` (§5.8); per-surface counters.
+The `bytes.ReplaceAll` placeholder is replaced by §4.4's anchored origin
+automaton, the `Raw()` aliasing is fixed, and the span scanner's
+`ValueStart`/`ValueEnd` assertion is landed over all 37,280 attribute values.
+Tests 24 and 27 green, and 7, 8, 12, 14, 15, 25 came free. `spike/` is superseded
+and kept only as evidence.
+
+One library gotcha worth not rediscovering: `petar-dambovaliev/aho-corasick`'s
+`findIter` advances with `pos = end - len + 1` — one byte past the match
+*start*, not its end — so it yields overlapping matches even under
+`LeftMostLongestMatch`. Non-overlapping semantics have to be recovered by the
+caller; without that, `https://h` is matched and then `//h` again six bytes
+inside it.
 
 **M2 — host map, request direction, and request bodies.** Config layering (DDEV defaults +
 `hostshift.yaml` + flags), variant generation,
