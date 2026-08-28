@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -338,5 +339,100 @@ func TestInitRefreshesTheComposeService(t *testing.T) {
 	}
 	if readAll(t, p) != owned {
 		t.Error("a file the project owns was overwritten")
+	}
+}
+
+// TestInitSharesTheParentDatabase is the half that makes the rest worth having.
+// A worktree only needs a hostname of its own *because* it is serving someone
+// else's database; a proxy in front of an empty database solves nothing.
+func TestInitSharesTheParentDatabase(t *testing.T) {
+	root := t.TempDir()
+	main := filepath.Join(root, "acme")
+	writeFile(t, main, ".ddev/config.yaml", "type: wordpress\ndocroot: web\n")
+	writeFile(t, main, "web/app/uploads/2025/05/x.png", "not really a png")
+	git(t, main, "init", "-q", "-b", "master")
+	git(t, main, "add", "-A")
+	git(t, main, "commit", "-qm", "init")
+
+	wt := filepath.Join(root, "acme-wt-a")
+	git(t, main, "worktree", "add", "-q", wt, "-b", "wt-a")
+
+	code, _, errOut := run(t, "", cmdInit, "-C", wt)
+	if code != exitOK {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+
+	cfg := readAll(t, filepath.Join(wt, ".ddev", "config.hostshift.local.yaml"))
+	// No database of its own...
+	if !strings.Contains(cfg, "omit_containers: [db]") {
+		t.Errorf("the worktree still runs its own database:\n%s", cfg)
+	}
+	// ...and the application pointed at the parent's. DDEV already puts every
+	// container on ddev_default, so the name resolves with no network override.
+	if !strings.Contains(cfg, "DATABASE_URL=mysql://db:db@ddev-acme-db:3306/db") {
+		t.Errorf("DATABASE_URL does not name the parent's database:\n%s", cfg)
+	}
+
+	// Uploads are content, and the rows saying which post owns which file are
+	// in the shared database — so they have to be the same files, read-only.
+	up := readAll(t, filepath.Join(wt, ".ddev", "docker-compose.hostshift-uploads.yaml"))
+	want := main + "/web/app/uploads:/var/www/html/web/app/uploads:ro"
+	if !strings.Contains(up, want) {
+		t.Errorf("uploads not mounted from the parent:\n%s", up)
+	}
+
+	if !strings.Contains(errOut, "shares acme's database") {
+		t.Errorf("the consequence was not stated:\n%s", errOut)
+	}
+
+	// Idempotent, like the rest.
+	before := cfg + up
+	if code, _, _ := run(t, "", cmdInit, "-C", wt); code != exitOK {
+		t.Fatal("second run failed")
+	}
+	after := readAll(t, filepath.Join(wt, ".ddev", "config.hostshift.local.yaml")) +
+		readAll(t, filepath.Join(wt, ".ddev", "docker-compose.hostshift-uploads.yaml"))
+	if before != after {
+		t.Error("not idempotent")
+	}
+}
+
+// TestInitWarnsWhenUploadsCannotBeFound. Only 2 of the fleet's 66 projects set
+// DDEV's upload_dirs, so the conventional layouts are tried — but only a
+// directory that is really there is mounted, because mounting an empty one over
+// a populated one is worse than not mounting. When none is found the media is
+// missing, and that is worth saying rather than discovering.
+func TestInitWarnsWhenUploadsCannotBeFound(t *testing.T) {
+	root := t.TempDir()
+	main := filepath.Join(root, "acme")
+	writeFile(t, main, ".ddev/config.yaml", "type: php\n") // no uploads anywhere
+	git(t, main, "init", "-q", "-b", "master")
+	git(t, main, "add", "-A")
+	git(t, main, "commit", "-qm", "init")
+	wt := filepath.Join(root, "acme-wt-a")
+	git(t, main, "worktree", "add", "-q", wt, "-b", "wt-a")
+
+	_, _, errOut := run(t, "", cmdInit, "-C", wt)
+	if !strings.Contains(errOut, "no upload directory found") {
+		t.Errorf("missing media was not reported:\n%s", errOut)
+	}
+	if _, err := os.Stat(filepath.Join(wt, ".ddev", "docker-compose.hostshift-uploads.yaml")); err == nil {
+		t.Error("an empty uploads mount was written anyway")
+	}
+}
+
+// TestInitDoesNotShareInTheMainCheckout: the database wiring is for worktrees.
+// A project that is its own parent has nothing to point at.
+func TestInitDoesNotShareInTheMainCheckout(t *testing.T) {
+	wt := worktree(t, "acme", "", "wt-a") // same DDEV project as its parent
+	code, _, errOut := run(t, "", cmdInit, "-C", wt)
+	if code != exitOK {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+	if cfg := readAll(t, filepath.Join(wt, ".ddev", "config.hostshift.local.yaml")); strings.Contains(cfg, "omit_containers") {
+		t.Errorf("dropped the database of a project that owns it:\n%s", cfg)
+	}
+	if strings.Contains(errOut, "shares") {
+		t.Errorf("claimed to share a database with itself:\n%s", errOut)
 	}
 }

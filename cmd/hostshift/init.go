@@ -168,10 +168,36 @@ func cmdInit(args []string) (int, error) {
 		}
 	}
 
+	// Sharing the database is the other half of the feature, and without it
+	// hostshift solves a problem nobody has: a worktree only needs a hostname
+	// of its own *because* it is serving someone else's database.
+	//
+	// Three things do it, and DDEV supplies two. omit_containers drops this
+	// project's own database, DATABASE_URL points the application at the one
+	// belonging to the checkout this worktree came from, and DDEV already puts
+	// every container on the ddev_default network so the container is reachable
+	// by name with no override. §4.1 names DATABASE_URL as Bedrock's escape
+	// hatch; it goes in web_environment rather than the project's own .env so
+	// nothing outside .ddev/ is touched.
+	parent := mainWorktree(c.dir)
+	sharing := parent != "" && ddevProjectName(parent) != "" && ddevProjectName(parent) != ddevProjectName(c.dir)
+	if sharing {
+		cfg += "\n# The database belongs to " + filepath.Base(parent) + ". This project runs none\n" +
+			"# of its own and points the application at that one.\n" +
+			"omit_containers: [db]\n\n" +
+			"web_environment:\n" +
+			"  - DATABASE_URL=mysql://db:db@ddev-" + ddevProjectName(parent) + "-db:3306/db\n"
+	}
+
 	env := map[string]string{
 		"HOSTSHIFT_SLUG":      c.slug,
 		"HOSTSHIFT_VARIANTS":  strings.Join(variants, ","),
 		"HOSTSHIFT_WEB_HOSTS": strings.Join(webHosts, ","),
+	}
+	var uploads string
+	if sharing {
+		env["HOSTSHIFT_CANONICAL_APPROOT"] = parent
+		uploads = uploadsOverride(parent, uploadDirsFor(c.dir, parent))
 	}
 	envPath := filepath.Join(c.dir, ".ddev", ".env")
 	merged, err := mergeEnv(envPath, env)
@@ -223,10 +249,28 @@ func cmdInit(args []string) (int, error) {
 		}
 		fmt.Fprintf(os.Stderr, "hostshift: wrote .ddev/docker-compose.hostshift.yaml\n")
 	}
+	if uploads != "" {
+		if err := os.WriteFile(filepath.Join(c.dir, ".ddev", "docker-compose.hostshift-uploads.yaml"), []byte(uploads), 0o644); err != nil {
+			return exitRuntime, err
+		}
+		fmt.Fprintf(os.Stderr, "hostshift: wrote .ddev/docker-compose.hostshift-uploads.yaml\n")
+	}
 
 	fmt.Fprintf(os.Stderr, "hostshift: wrote .ddev/config.hostshift.local.yaml and .ddev/.env\n")
 	for _, s := range res.Map.Sites {
 		fmt.Fprintf(os.Stderr, "  %-6s %s  ->  %s\n", s.Name, s.Canonical, s.Variant)
+	}
+	if sharing {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: this worktree shares %s's database. Writes through wp-admin land\n"+
+				"  in the real thing — previewing a branch is safe, activating a plugin or\n"+
+				"  running a migration is not.\n", filepath.Base(parent))
+		if uploads == "" {
+			fmt.Fprintf(os.Stderr,
+				"hostshift: warning: no upload directory found, so media will be missing —\n"+
+					"  every image 404s and a plugin reading one server-side is fatal. Set\n"+
+					"  upload_dirs in .ddev/config.yaml, which DDEV wants anyway, and rerun.\n")
+		}
 	}
 	fmt.Fprintf(os.Stderr, "hostshift: now run `ddev restart`\n")
 	return exitOK, nil
@@ -264,6 +308,55 @@ func ours(path string) bool {
 func hasMarker(path, marker string) bool {
 	b, err := os.ReadFile(path)
 	return err == nil && strings.HasPrefix(string(b), marker)
+}
+
+// uploadDirsFor finds the directories holding uploaded content.
+//
+// DDEV's own upload_dirs is the right answer and almost nobody sets it — 2 of
+// the fleet's 66 projects. So the conventional layouts are tried too, and only
+// a directory that actually exists in the parent checkout is used: guessing a
+// path that is not there would mount an empty directory over a populated one,
+// which is worse than not mounting at all.
+func uploadDirsFor(dir, parent string) []string {
+	if d := config.DDEVUploadDirs(dir); len(d) > 0 {
+		return d
+	}
+	for _, guess := range []string{"web/app/uploads", "web/wp-content/uploads", "wp-content/uploads"} {
+		if st, err := os.Stat(filepath.Join(parent, guess)); err == nil && st.IsDir() {
+			return []string{guess}
+		}
+	}
+	return nil
+}
+
+// uploadsOverride mounts the canonical checkout's upload directories read-only.
+//
+// Uploads are content, not code: a branch changes PHP and templates, not which
+// image belongs to which post, and the rows saying so are in the shared
+// database. Copying them per worktree duplicates hundreds of megabytes that
+// drift from the database referencing them; leaving them empty makes every
+// media request 302 away and any plugin that reads a file server-side fatal —
+// the tier-2 prototype 500'd on file_get_contents of an uploaded SVG before
+// this mount existed.
+//
+// Read-only, deliberately. A worktree previewing a branch has no business
+// writing to the canonical media library, and a media upload is one of the
+// writes a shared-database preview is not safe for.
+func uploadsOverride(parent string, dirs []string) string {
+	if len(dirs) == 0 {
+		return ""
+	}
+	out := generatedBy + " — delete it to undo, rerun to update.\n" +
+		"#\n" +
+		"# The upload directories of the checkout this worktree came from, mounted\n" +
+		"# read-only. They are content, and the database saying which post owns which\n" +
+		"# file is shared, so they have to be the same files.\n\n" +
+		"services:\n  web:\n    volumes:\n"
+	for _, d := range dirs {
+		d = strings.Trim(d, "/")
+		out += "      - \"" + parent + "/" + d + ":/var/www/html/" + d + ":ro\"\n"
+	}
+	return out
 }
 
 // deriveSlug works out which worktree this is, without being told.
