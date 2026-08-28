@@ -186,6 +186,15 @@ fi
 # the browser gets a TLS interstitial rather than a site. config.*.local.yaml is
 # in DDEV's own .ddev/.gitignore.
 #
+# *Only* the variants. This file used to list every hostname the project has,
+# and the rest of them were already there: `name` gives the project's own
+# hostname on its own, and anything in the tracked config.yaml is inherited
+# because DDEV appends override lists rather than replacing them. Verified with
+# `ddev debug configyaml` — dropping them changes nothing about what DDEV
+# serves. Re-listing the project's own hostname was worse than merely
+# redundant: after the merge `name` and an additional_hostnames entry were the
+# same host, and it reached HOSTSHIFT_WEB_HOSTS as a repeated value.
+#
 # additional_hostnames are relative to the project TLD and additional_fqdns are
 # not, and writing an FQDN under the wrong key makes DDEV register
 # acme.test.example.com.ddev.site — no SAN for the real host, which is the
@@ -198,7 +207,7 @@ tld="$(printf '%s\n' "$hosts" | head -1 | cut -d. -f2-)"
 tld="${tld:-ddev.site}"
 short=""
 fqdns=""
-for h in $(printf '%s\n%s' "$hosts" "$(printf '%s' "$variants" | tr ',' '\n')" | sed '/^$/d' | sort -u); do
+for h in $(printf '%s' "$variants" | tr ',' '\n' | sed '/^$/d' | sort -u); do
   case "$h" in
     *".$tld") short="$short  - ${h%".$tld"}
 " ;;
