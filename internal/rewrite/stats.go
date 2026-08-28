@@ -16,10 +16,14 @@ const (
 	SurfaceHTMLAttr     = "html-attr"
 	SurfaceInlineScript = "inline-script"
 	SurfaceInlineStyle  = "inline-style"
-	SurfaceHeader       = "header"
-	SurfaceJSONString   = "json-string"
-	SurfaceRequestLine  = "request-line"
-	SurfaceRequestBody  = "request-body"
+	// SurfaceRawText is the markup inside every other raw-text element —
+	// noscript, textarea, title, iframe, and <title> inside foreign content —
+	// which the tokenizer hands back as opaque text rather than parsing.
+	SurfaceRawText     = "raw-text"
+	SurfaceHeader      = "header"
+	SurfaceJSONString  = "json-string"
+	SurfaceRequestLine = "request-line"
+	SurfaceRequestBody = "request-body"
 )
 
 // Stats accumulates per-surface counters and, under --explain, the trace of
@@ -74,9 +78,14 @@ func (s *Stats) Record(surface string, base int, events []origin.Event) {
 	}
 }
 
-// Structured counts a value that needs structured parsing (srcset, refresh,
-// ping, srcdoc) rather than a plain origin substitution. M1 substitutes plainly;
-// this counter is the M3 baseline.
+// Structured counts the attributes §5.2 listed as needing their grammar parsed
+// — srcset, imagesrcset, ping, srcdoc, content.
+//
+// M3 established that none of them does: anchoring finds origins wherever they
+// sit, so commas, descriptors, "N;url=" and entity-encoded HTML never have to be
+// understood. The counter is kept for visibility into how often those values
+// carry origins at all, since a regression there is the first place a leak would
+// show.
 func (s *Stats) Structured(name string) {
 	if s == nil {
 		return

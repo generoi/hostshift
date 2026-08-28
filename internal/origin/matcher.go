@@ -85,11 +85,18 @@ type pattern struct {
 // fixed point. The unanchored bytes.ReplaceAll in spike/ is the double-port bug
 // in a new costume; this replaces it.
 type Matcher struct {
-	pairs []Pair
-	pats  []pattern
-	ac    aho.AhoCorasick
-	ident bool // every pair maps to itself
+	pairs  []Pair
+	pats   []pattern
+	ac     aho.AhoCorasick
+	ident  bool // every pair maps to itself
+	maxPat int
 }
+
+// MaxMatchLen is the longest run of bytes a single match can span: the longest
+// pattern, plus room for a trailing root dot, ":port" and the delimiter that
+// terminates it. The streaming straggler sweep uses it to size its carry-over
+// window, so that no match can straddle a chunk boundary.
+func (m *Matcher) MaxMatchLen() int { return m.maxPat + 16 }
 
 // NewMatcher builds the automaton for a set of canonical→variant pairs.
 func NewMatcher(pairs []Pair) (*Matcher, error) {
@@ -125,6 +132,7 @@ func NewMatcher(pairs []Pair) (*Matcher, error) {
 		byKey[text] = len(m.pats)
 		m.pats = append(m.pats, p)
 		texts = append(texts, text)
+		m.maxPat = max(m.maxPat, len(text))
 	}
 	for _, h := range hostNames {
 		idx := hosts[h]
@@ -181,7 +189,7 @@ func (m *Matcher) Validate() error {
 	for _, p := range m.pairs {
 		for _, enc := range []encoding{encRaw, encJSON, encPercent} {
 			probe := p.Variant.Scheme + enc.schemeSep() + enc.hostPort(p.Variant)
-			out, ev := m.rewrite([]byte(probe), "validate", false)
+			out, _, ev := m.rewrite([]byte(probe), len(probe), "validate", false)
 			if string(out) != probe {
 				return fmt.Errorf("origin: variant %s is matched by a canonical origin — rewriting it yields %q; "+
 					"the map is not a fixed point and would double-rewrite (PLAN §5.4)", p.Variant, out)
@@ -258,18 +266,38 @@ func okBeforeRelative(c byte) bool {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-// Rewrite replaces every canonical origin in b with its variant.
+// Rewrite replaces every canonical origin in b with its variant, treating b as
+// a complete value.
 //
 // It returns b itself when nothing changed, so an unmodified value is not merely
-// equal to the input but the same bytes. base is added to every event offset so
-// callers can report cumulative input-stream positions.
+// equal to the input but the same bytes.
 func (m *Matcher) Rewrite(b []byte, surface string, explain bool) (out []byte, events []Event) {
-	return m.rewrite(b, surface, explain)
+	out, _, events = m.rewrite(b, len(b), surface, explain)
+	return out, events
 }
 
-func (m *Matcher) rewrite(b []byte, surface string, explain bool) ([]byte, []Event) {
+// RewritePrefix is Rewrite for a stream, where more bytes are still to come.
+//
+// Only matches beginning before limit are considered, so that a match cannot
+// straddle the end of the buffer and be decided on bytes that have not arrived.
+// Callers pass limit = len(b) - MaxMatchLen() while more input is expected, and
+// limit = len(b) at EOF.
+//
+// It returns the rewritten prefix and how many bytes of b it consumed, which is
+// at least limit and never less; the caller retains b[consumed:] for the next
+// round. This is what lets §4.4's straggler sweep run in-stream: a match is
+// replaced before its bytes are emitted, so nothing already written needs
+// re-aligning and the body is never buffered whole.
+func (m *Matcher) RewritePrefix(b []byte, limit int, surface string, explain bool) (out []byte, consumed int, events []Event) {
+	return m.rewrite(b, limit, surface, explain)
+}
+
+func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]byte, int, []Event) {
+	if limit < 0 {
+		limit = 0
+	}
 	if len(b) == 0 {
-		return b, nil
+		return b, 0, nil
 	}
 	var (
 		events []Event
@@ -293,10 +321,20 @@ func (m *Matcher) rewrite(b []byte, surface string, explain bool) ([]byte, []Eve
 	// bookkeeping runs backwards, a panic.
 	scanned := 0
 
+	// consumed is how far into b the caller may advance. It starts at limit and
+	// grows to cover any match that began before limit but extends past it, so
+	// no match is ever split across two rounds of a streaming scan.
+	consumed := limit
+
 	iter := m.ac.IterByte(b)
 	for match := iter.Next(); match != nil; match = iter.Next() {
 		p := m.pats[match.Pattern()]
 		start, hostEnd := match.Start(), match.End()
+		if start >= limit {
+			// Beyond the safe point: the bytes that decide this match may not
+			// have arrived yet. Leave it for the next round.
+			break
+		}
 		if start < scanned {
 			continue // shadowed by a longer match that began earlier
 		}
@@ -307,8 +345,20 @@ func (m *Matcher) rewrite(b []byte, surface string, explain bool) ([]byte, []Eve
 			continue
 		}
 
-		// Optional :port. A ':' not followed by digits is itself a delimiter.
 		end, port := hostEnd, ""
+
+		// A trailing root dot is part of the host: "www.example.fi." is the
+		// same host as "www.example.fi" and a browser dereferences it
+		// identically, so leaving it unrewritten is a test 28 leak. M0 found
+		// five of them in herrfors' production database.
+		//
+		// The dot is only consumed when what follows terminates the host;
+		// "c.example.evil/" still falls through to the not-a-url rejection.
+		if end < len(b) && b[end] == '.' && (end+1 >= len(b) || isDelim(b[end+1])) {
+			end++
+		}
+
+		// Optional :port. A ':' not followed by digits is itself a delimiter.
 		if end < len(b) && b[end] == ':' {
 			j := end + 1
 			for j < len(b) && isDigit(b[j]) {
@@ -319,6 +369,7 @@ func (m *Matcher) rewrite(b []byte, surface string, explain bool) ([]byte, []Eve
 			}
 		}
 		scanned = end
+		consumed = max(consumed, end)
 		if end < len(b) && !isDelim(b[end]) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, string(b[start:end]), ActionSkipped, ReasonNotAURL)
@@ -370,10 +421,13 @@ func (m *Matcher) rewrite(b []byte, surface string, explain bool) ([]byte, []Eve
 	}
 
 	if buf == nil {
-		return b, events // untouched: the same bytes, not a copy
+		if consumed == len(b) {
+			return b, consumed, events // untouched: the same bytes, not a copy
+		}
+		return b[:consumed], consumed, events
 	}
-	buf = append(buf, b[last:]...)
-	return buf, events
+	buf = append(buf, b[last:consumed]...)
+	return buf, consumed, events
 }
 
 // String renders the map for `hostshift map`.

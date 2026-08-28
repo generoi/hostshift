@@ -741,10 +741,22 @@ The single exception to splicing is an HTML fragment nested inside a JSON string
 (`content.rendered`): that value is decoded, rewritten, re-encoded and spliced
 back. Recursion stops at depth 2.
 
-**Known gap.** Without a tree builder the tokenizer does not track foreign
-content, so `<svg><title>` is treated as raw text and a URL in an `<a href>`
-inside it is missed. Byte preservation is unaffected. §4.4's straggler sweep is
-exactly the mechanism that catches and reports this.
+**Known gap — closed in M3, and it was wider than described.** Without a tree
+builder the tokenizer does not track foreign content, so `<svg><title>` is
+treated as raw text and a URL in an `<a href>` inside it is missed. The same is
+true of `<noscript>`, `<textarea>`, `<iframe>` and `<title>`: the tokenizer hands
+back the *markup* inside every raw-text element as one opaque text token, so an
+attribute in there never reaches the attribute scan. The corpus turned up a real
+`<noscript>` case, not an SVG one.
+
+Scanning the text of **every** raw-text element — not just `<script>` and
+`<style>` — closes all of them in the structured pass, which is where §4.4 says
+such gaps belong. Anchoring is what makes it safe on prose-bearing elements like
+`<title>`: it can only match a real origin, never a bare hostname.
+
+Measured after the change: the structured pass makes 1,112 rewrites across the
+corpus and the straggler sweep catches **zero**. It is a backstop again rather
+than a load-bearing part. Byte preservation is unaffected either way.
 
 #### Length, validators, and framing
 
@@ -786,6 +798,18 @@ any value whose origin is in the canonical set. Keep a named list only where
 
 This is cheaper than an allowlist, strictly more complete, and removes most of
 the work the §4.4 sweep exists to catch.
+
+**M3 found that none of those five needs structured parsing after all.**
+Anchoring locates origins wherever they sit, so the *grammar* of the value never
+has to be understood: `srcset`'s commas and descriptors, `refresh`'s `N;url=`,
+`ping`'s spaces, and `srcdoc`'s entity-encoded HTML all fall out of running the
+automaton over the whole value, because the origins appear literally in every
+one. `<base href>` was never a parsing problem at all — it is one more attribute
+value, and the every-attribute scan already covers it.
+
+The named list is kept in the tests as the cases most likely to regress, not in
+the code as five parsers. If a future surface genuinely needs its grammar
+parsed, the evidence for it should be a failing test, not this list.
 
 `Set-Cookie` `Domain=` is **Tier 1 and load-bearing** — the previous revision
 wrongly called it optional on the strength of herrfors alone.
@@ -1323,8 +1347,15 @@ need a live DDEV project running against an unrewritten production database —
 which is precisely the "done when" criterion M6 exists to prove. Nothing in M2's
 code blocks them; they cannot be asserted before the pilot stands up.
 
-**M3 — HTML.** Every-attribute scan, structured attributes, inline script/style
-accumulation, `<base href>`, the §4.4 straggler sweep. Tests 3, 5, 7, 12, 18, 19, 21, 25, 28, 29.
+**M3 — HTML. Done 2026-08-27.** Every-attribute scan, every raw-text element,
+`<base href>`, the §4.4 straggler sweep as a streaming backstop, and the
+trailing-root-dot fix M0 found. Tests 3, 5, 7, 12, 18, 19, 21, 25, 28, 29 green.
+
+The structured attributes turned out to need no parsers (§5.2), and the
+foreign-content gap turned out to be wider than described and was closed rather
+than delegated to the sweep. Test 28 runs over the corpus with an extractor that
+does not share code with the matcher: 51 documents, 10,271 URL-valued positions,
+zero canonical origins.
 
 **M4 — structured bodies.** JSON incl. HTML-in-JSON and JSON-LD; the JSON
 span-scanner (§5.7). Tests 4, 22, 30, 31. XML and standalone CSS/JS are **not**
@@ -1385,9 +1416,11 @@ document `go/main.go`, `go/rewriter/main.go` or `go/svg/main.go`.
 - A documented **fallback to search-replace per site** must remain supported
 - Performance: immaterial for dev, and the Aho–Corasick prefilter means most
   responses are never parsed at all
-- The tokenizer does not track foreign content (SVG/MathML), so URLs inside
+- ~~The tokenizer does not track foreign content (SVG/MathML), so URLs inside
   `<svg>` subtrees are missed and caught only by the §4.4 sweep. Quantify on the
-  corpus during M3
+  corpus during M3~~ — **retired in M3.** Quantified and then closed: scanning
+  every raw-text element handles it in the structured pass, and the sweep now
+  catches zero across the corpus (§5.2)
 - HTTP/2 and websockets: passthrough behaviour undefined
 - Every silent-failure mode above (C1-class especially) argues for M1 first
 
