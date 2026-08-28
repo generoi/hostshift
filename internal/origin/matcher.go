@@ -227,9 +227,12 @@ const (
 type Event struct {
 	Offset  int    `json:"offset"`
 	Surface string `json:"surface"`
-	Text    string `json:"text"`
-	Action  string `json:"action"`
-	Reason  string `json:"reason,omitempty"`
+	// Path locates the value within a structured document — an RFC 6901 pointer
+	// for JSON. Empty for surfaces that have no such addressing.
+	Path   string `json:"path,omitempty"`
+	Text   string `json:"text"`
+	Action string `json:"action"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // isDelim implements PLAN §4.4's right-hand anchor: a match is only an origin if

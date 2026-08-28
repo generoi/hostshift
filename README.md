@@ -11,9 +11,9 @@ for. Nothing in the database is ever rewritten.
 [`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
 for completed milestones live in [`docs/`](docs/).
 
-**Status: M2.** The rewrite engine, the anchored origin matcher, the host map and
-both request and response directions are in place. JSON is M4, transport is M5,
-packaging and the pilot are M6; `PLAN.md` §8 has the rest.
+**Status: M4.** The rewrite engine, the anchored origin matcher, the host map,
+both request and response directions, HTML and JSON are in place. Transport is
+M5, packaging and the pilot are M6; `PLAN.md` §8 has the rest.
 
 ## Using it
 
@@ -68,6 +68,19 @@ or `@staging` URL left behind by an imperfect `db:pull` be corrected too.
 - `--strict-origins` turns off the self-redirect carve-out (see below).
 - stdout is data, stderr is diagnostics, in every subcommand. Exit codes are
   0 success, 1 runtime error, 2 invalid configuration.
+
+`--type` selects the surface: `text/html` (the default) streams; `application/json`
+and `application/*+json` are buffered and get an RFC 6901 path in `--explain`:
+
+```
+$ hostshift rewrite --type application/json --explain --map https://c.example=https://v.example < rest.json
+explain (3 events):
+      16  rewrote  -   json-string /link                   https:\/\/c.example
+      95  rewrote  -   json-string /content/rendered       https:\/\/c.example
+     164  rewrote  -   json-string /_links/self/0/href     https:\/\/c.example
+```
+
+Everything else passes through byte-identical and never enters a rewriter.
 
 The corpus diff (§7) collapses to one line:
 

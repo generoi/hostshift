@@ -196,7 +196,11 @@ func (s *Stats) WriteReport(w io.Writer) {
 			if reason == "" {
 				reason = "-"
 			}
-			fmt.Fprintf(w, "  %8d  %-14s %-8s %-22s %s\n", e.Offset, e.Surface, e.Action, reason, e.Text)
+			where := e.Surface
+			if e.Path != "" {
+				where += " " + e.Path
+			}
+			fmt.Fprintf(w, "  %8d  %-8s %-22s %-40s %s\n", e.Offset, e.Action, reason, where, e.Text)
 		}
 	}
 }
