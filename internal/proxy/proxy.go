@@ -150,6 +150,13 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// draws without qualification.
 	r.Out.Header.Del("X-Forwarded-Port")
 
+	// X-Forwarded-Host goes for the same reason, and it is the more likely of
+	// the two to do damage: SetXForwarded fills it with the *variant* host, so
+	// anything in Bedrock or a plugin that prefers it over Host puts the variant
+	// straight back inside WordPress — undoing the request mapping this function
+	// exists to perform.
+	r.Out.Header.Del("X-Forwarded-Host")
+
 	// Identity upstream: the fleet has no compression config of its own, so
 	// DDEV's stock nginx applies, and asking for identity means the common path
 	// needs no decoder. Setting it explicitly also stops Go's transport adding
@@ -215,13 +222,27 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	explain := p.Stats.Explain()
 	changed := false
 
-	// The self-redirect guard (PLAN §4.4, test 32). 53 of the fleet's 63 DDEV
+	// The self-redirect guard (PLAN §4.4, test 32). 55 of the fleet's 63 DDEV
 	// repos ship an nginx snippet that 302s a missing /app/uploads/ request to a
-	// hardcoded production origin. Rewriting that Location sends the browser
-	// back to the request it just made: an infinite redirect loop, on 94% of
-	// media requests. Passing it through unmodified is the one enumerated
-	// carve-out to test 28 — a read-only asset GET, not the write hazard.
-	if st != nil && isRedirect(resp.StatusCode) {
+	// hardcoded remote origin. Rewriting that Location sends the browser back to
+	// the request it just made: an infinite redirect loop. Passing it through
+	// unmodified is the one enumerated carve-out to test 28.
+	//
+	// Two things this deliberately does *not* do, both of which it used to.
+	//
+	// It does not fire on an unsafe method. The carve-out's whole justification
+	// is that it is "a read-only asset GET, not the write hazard §4.4 opens
+	// with" — but there was no method test, so a POST to admin-post.php answered
+	// with a self-redirect sent the browser to live production on a write path,
+	// which is that exact hazard.
+	//
+	// It does not skip the rest of the response. It used to return early, which
+	// jumped over every other Tier 1 header and the Set-Cookie Domain= drop, so
+	// Link and CSP went out naming the canonical host and a Domain=.canonical
+	// cookie survived. Test 28 enumerates the carve-out as *one* header; only
+	// Location is exempt, and only for the duration of this block.
+	skipLocation := false
+	if st != nil && isRedirect(resp.StatusCode) && safeMethod(resp.Request) {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceHeader, false)
 			if sameURL(string(rewritten), st.url) {
@@ -237,12 +258,15 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 					Action: origin.ActionSkipped, Reason: origin.ReasonSelfRedirect,
 				}})
 				p.log().Info("self-redirect passed through", "location", loc)
-				return p.finishBody(resp, st, false)
+				skipLocation = true
 			}
 		}
 	}
 
 	for _, h := range originHeaders {
+		if skipLocation && h == "Location" {
+			continue
+		}
 		vs := resp.Header.Values(h)
 		for i, v := range vs {
 			out, ev := fwd.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
@@ -440,6 +464,15 @@ func bodyKind(ct string) bodyClass {
 	return bodyOther
 }
 
+// safeMethod reports a method with no side effects, which is the only kind the
+// self-redirect carve-out may apply to.
+func safeMethod(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return r.Method == http.MethodGet || r.Method == http.MethodHead
+}
+
 func isRedirect(code int) bool {
 	switch code {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
@@ -449,8 +482,13 @@ func isRedirect(code int) bool {
 	return false
 }
 
-// sameURL compares two absolute URLs for the self-redirect guard, ignoring a
-// default port and a trailing-slash-only difference on the path.
+// sameURL compares two absolute URLs for the self-redirect guard.
+//
+// It normalises the default port and an empty path to "/". It does *not* treat
+// "/a" and "/a/" as equal — an earlier version of this comment claimed it did.
+// If an upstream's hardcoded redirect ever differs from the request by a
+// trailing slash the guard will miss it, the Location will be rewritten back to
+// the variant, and the request will loop.
 func sameURL(a, b string) bool {
 	na, ok := normaliseURL(a)
 	if !ok {
