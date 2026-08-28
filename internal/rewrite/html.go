@@ -27,16 +27,20 @@ type HTML struct {
 	z       *html.Tokenizer
 	m       *origin.Matcher
 	stats   *Stats
+	log     *slog.Logger
 	dryRun  bool
 	src     io.Closer
+	raw     io.Reader // the original source, for the passthrough fallback
 	rawText string
 	pend    bytes.Buffer
 	done    bool
-	err     error // a non-EOF tokenizer error, surfaced once pending bytes are out
+	err     error // a real read failure, surfaced once pending bytes are out
 	inOff   int   // cumulative input-stream offset, for --explain
 	outOff  int   // cumulative output-stream offset, to map the sweep's finds back
 	marks   []mark
 	markCur int
+	maxPend int // high-water mark of the token buffer, for test 13
+	tail    io.Reader
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -82,6 +86,13 @@ func (w *HTML) write(inStart, inLen int, out []byte) {
 	w.pend.Write(out)
 }
 
+// DefaultMaxToken caps the tokenizer's buffer, which bounds memory by the size
+// of the largest single token rather than by the response size (test 13).
+//
+// It has to be generous: a raw-text element arrives as one token, and a 700 KB
+// inline script is normal. Exceeding it is not fatal — see Read.
+const DefaultMaxToken = 4 << 20
+
 // Options configures a rewriter.
 type Options struct {
 	// DryRun computes and counts every rewrite but emits the input unchanged
@@ -92,6 +103,8 @@ type Options struct {
 	NoSweep bool
 	Stats   *Stats
 	Log     *slog.Logger
+	// MaxToken caps the tokenizer's buffer. Zero means DefaultMaxToken.
+	MaxToken int
 }
 
 // NewResponseBody is the full response-side pipeline: the tokenizer-based
@@ -131,14 +144,30 @@ func NewHTML(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) *HTML {
 	if st == nil {
 		st = NewStats(false)
 	}
+	log := opt.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	maxTok := opt.MaxToken
+	if maxTok == 0 {
+		maxTok = DefaultMaxToken
+	}
+	z := html.NewTokenizer(r)
+	z.SetMaxBuf(maxTok)
 	return &HTML{
-		z:      html.NewTokenizer(r),
+		z:      z,
 		m:      m,
 		stats:  st,
+		log:    log,
 		dryRun: opt.DryRun,
 		src:    src,
+		raw:    r,
 	}
 }
+
+// MaxBuffered is the high-water mark of the token buffer, in bytes. Test 13
+// asserts it is bounded by the largest token rather than by the response size.
+func (w *HTML) MaxBuffered() int { return w.maxPend }
 
 // rawTextElement reports elements whose content the tokenizer returns as a
 // single text token rather than parsing.
@@ -242,9 +271,59 @@ func (w *HTML) rewriteTag(raw []byte, tagOff int) []byte {
 }
 
 func (w *HTML) Read(p []byte) (int, error) {
+	if w.tail != nil {
+		return w.tail.Read(p)
+	}
 	for w.pend.Len() == 0 && !w.done {
 		tt := w.z.Next()
 		if tt == html.ErrorToken {
+			err := w.z.Err()
+
+			if err == html.ErrBufferExceeded {
+				// A single token larger than the cap. Headers are already sent
+				// by now, so this cannot become an error response (PLAN §5.7) —
+				// and aborting the connection would be a worse answer than a
+				// page with one unrewritten region.
+				//
+				// Instead the remainder streams through untouched. §4.4's
+				// straggler sweep sits downstream of this reader, so origins in
+				// the passthrough tail are still caught and reported rather than
+				// leaking.
+				w.log.Warn("token exceeds the buffer cap; the remainder of this response is passed through unparsed",
+					"err", err, "offset", w.inOff)
+				w.stats.Record(SurfaceHTMLAttr, w.inOff, []origin.Event{{
+					Surface: SurfaceHTMLAttr, Action: origin.ActionSkipped,
+					Reason: origin.ReasonSizeCap,
+				}})
+				// Raw() and Buffered(), for the same reason the EOF path below
+				// gives — and here it is not an edge case but the main one.
+				//
+				// x/net/html's readByte advances raw.end *before* it tests
+				// maxBuf, so at the error the oversized token sits in Raw() and
+				// Buffered() holds only read-ahead. A text token is returned as
+				// a partial TextToken first, so text, <script> and comments
+				// survived; a *tag* token errors from inside readStartTag with
+				// the bytes still in Raw(), so emitting Buffered() alone deleted
+				// exactly MaxToken bytes. At the shipped 4 MiB cap that is a
+				// 5 MB page arriving 4 MiB short, status 200, no Content-Length
+				// to check it against, the opening <img src="data:image/png;
+				// base64, gone and the rest of its value rendered as visible
+				// text. An inlined LCP image or a multi-MB Elementor
+				// data-settings attribute is all it takes, and it broke test 24.
+				head := append([]byte(nil), w.z.Raw()...)
+				head = append(head, w.z.Buffered()...)
+				w.tail = io.MultiReader(bytes.NewReader(head), w.raw)
+
+				// The tail bypasses write(), so one last mark pins the mapping
+				// for everything after it: from here the two streams run 1:1
+				// again, and without this the sweep reports stragglers in the
+				// passthrough at output offsets — 4 MiB adrift in the case
+				// above.
+				w.marks = append(w.marks, mark{w.outOff, w.inOff})
+				w.done = true
+				return w.tail.Read(p)
+			}
+
 			// Both halves, and in this order. When the tokenizer hits EOF part
 			// way through a tag, the partial tag is in Raw() and Buffered() is
 			// empty — so emitting only Buffered() silently drops those bytes.
@@ -260,16 +339,18 @@ func (w *HTML) Read(p []byte) (int, error) {
 			n := w.pend.Len() - tail
 			w.inOff += n
 			w.outOff += n
-			w.done = true
 
 			// io.EOF is the ordinary end of a body. Anything else is a real
 			// failure — an upstream that closed early, a read error — and
 			// converting it to io.EOF turns a *detectable* truncation into an
 			// undetectable one, because the rewritten response is chunked and
-			// has no Content-Length for the client to check against.
-			if err := w.z.Err(); err != nil && err != io.EOF {
+			// has no Content-Length for the client to check against. The token
+			// cap is the one such error with a better answer than failing, and
+			// it is handled above.
+			if err != nil && err != io.EOF {
 				w.err = err
 			}
+			w.done = true
 			break
 		}
 
@@ -328,6 +409,9 @@ func (w *HTML) Read(p []byte) (int, error) {
 		default:
 			w.write(off, len(raw), raw)
 		}
+	}
+	if n := w.pend.Len(); n > w.maxPend {
+		w.maxPend = n
 	}
 	if w.pend.Len() == 0 && w.done {
 		if w.err != nil {

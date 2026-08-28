@@ -43,6 +43,12 @@ type Proxy struct {
 	// structured pass, not to run without a net.
 	NoSweep bool
 
+	// Compress re-encodes rewritten bodies per the client's Accept-Encoding.
+	// Off by default: over loopback and the Docker bridge compression buys
+	// nothing, and it exists for performance work where transfer size and
+	// Content-Encoding must resemble production (PLAN §5.2).
+	Compress bool
+
 	Log *slog.Logger
 }
 
@@ -77,8 +83,11 @@ type state struct {
 	site *origin.Site
 	// url is the absolute URL the browser asked for, in variant space. The
 	// self-redirect guard compares against it.
-	url  string
-	body []byte
+	url string
+	// accept is the browser's Accept-Encoding, kept because --compress
+	// re-encodes per the *client's* preference rather than the upstream's.
+	accept string
+	body   []byte
 }
 
 func (p *Proxy) log() *slog.Logger {
@@ -119,7 +128,11 @@ func (p *Proxy) Handler() http.Handler {
 			return
 		}
 
-		st := &state{site: site, url: "https://" + r.Host + r.URL.RequestURI()}
+		st := &state{
+			site:   site,
+			url:    "https://" + r.Host + r.URL.RequestURI(),
+			accept: r.Header.Get("Accept-Encoding"),
+		}
 		p.rewriteRequestBody(r, st)
 		rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), stateKey, st)))
 	})
@@ -166,6 +179,11 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// needs no decoder. Setting it explicitly also stops Go's transport adding
 	// its own transparent gzip.
 	r.Out.Header.Set("Accept-Encoding", "identity")
+
+	// No ranges upstream. A 206 skips every rewriter, so forwarding Range let
+	// any client turn the engine off and read the document whole with its
+	// production origins intact (test 28).
+	stripRange(r.Out.Header)
 
 	// The query string, byte for byte. This is not optional:
 	// wp-login.php?redirect_to=… is validated by wp_validate_redirect() against
@@ -303,6 +321,42 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 }
 
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
+	// Vary first, before anything can return early.
+	//
+	// It used to sit after the content-type switch, whose default arm returns
+	// nil — so the responses that most need it never got it. A 302 whose
+	// Location had just been rewritten into variant space went out with no
+	// Vary at all, and a shared cache keyed on path alone (nginx
+	// proxy_cache_key $uri, a Varnish default with no host in the key — the
+	// deployment §5.5 is written for) then hands variant A's redirect to a
+	// browser sitting on variant B, which is bounced out of its own worktree.
+	// Headers are rewritten for every response, so every response varies.
+	if !p.DryRun {
+		addVary(resp.Header, "Host")
+	}
+
+	if isPartial(resp) {
+		p.log().Info("range response passed through unrewritten", "status", resp.StatusCode)
+		return nil
+	}
+	// Decoding is a modification, so --dry-run must not do it. §5.8 defines
+	// that mode as safe to point at a live canonical checkout, and its whole
+	// value is that it cannot perturb what it measures — gunzipping the body
+	// and stripping Content-Encoding is exactly the v0.2 mistake compressBody's
+	// own comment says it exists to avoid.
+	//
+	// A compressed body therefore cannot be measured in that mode. Saying so is
+	// the point: a silent zero reads as "nothing to rewrite here".
+	if p.DryRun {
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(strings.TrimSpace(enc), "identity") {
+			p.log().Info("--dry-run leaves a compressed body untouched, so it is not measured", "encoding", enc)
+			p.skipEncoding(enc)
+			return nil
+		}
+	} else if !p.decodeBody(resp) {
+		return nil // an encoding hostshift cannot decode: byte-identical passthrough
+	}
+
 	ct := resp.Header.Get("Content-Type")
 	switch {
 	case rewritableHTML(ct):
@@ -381,6 +435,10 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		resp.Header.Del("ETag")
 		resp.Header.Del("Last-Modified")
 		resp.Header.Del("Accept-Ranges")
+	}
+
+	if p.Compress && st != nil && !p.DryRun {
+		p.compressBody(resp, st.accept)
 	}
 	return nil
 }
