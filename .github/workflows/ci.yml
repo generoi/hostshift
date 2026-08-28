@@ -35,6 +35,13 @@ jobs:
 
       - run: go test ./... -race
 
+      # The add-on command is shell and holds the opinions the binary refuses
+      # to: the slug, which checkout the map comes from, which hostnames web
+      # keeps. It needs no Docker and no DDEV, so it belongs here rather than in
+      # the e2e job that takes twenty minutes.
+      - name: the add-on command
+        run: make test-addon
+
       - name: build for every target platform
         run: make dist
 

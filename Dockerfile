@@ -13,12 +13,6 @@ RUN go mod download
 
 COPY cmd ./cmd
 COPY internal ./internal
-# assets.go and ddev/ too: the root package embeds the add-on's compose files so
-# `hostshift init` can write them, and go:embed needs the real files at build
-# time. Leaving them out failed the build rather than silently shipping an empty
-# string, which is the right way round.
-COPY assets.go ./
-COPY ddev ./ddev
 
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ## Description: configure hostshift for this DDEV project
-## Usage: hostshift [init|env|wp-cli] [--slug NAME]
+## Usage: hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]
 ## Example: "ddev hostshift init"
 ##
 ## Scaffolding a DDEV project is opinionated work, and this is where it is
@@ -11,19 +11,37 @@
 ## a tool for one shop; this command is the shop.
 ##
 ## Needs the hostshift binary on PATH. Everything generic comes from it — the
-## map, the variants — and everything DDEV-shaped is assembled here.
+## map, the variants, the hostnames a checkout declares — and everything
+## DDEV-shaped is assembled here.
 
 set -euo pipefail
 
+# Every path below is relative to the project root, and `ddev` may be run from
+# anywhere inside the project.
+[ -n "${DDEV_APPROOT:-}" ] && cd "$DDEV_APPROOT"
+
 cmd="${1:-init}"; shift || true
 slug=""
+dry_run=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --slug) slug="${2:-}"; shift 2 ;;
+    --slug) slug="${2:?--slug needs a value}"; shift 2 ;;
     --slug=*) slug="${1#*=}"; shift ;;
-    *) shift ;;
+    --dry-run|-n) dry_run=1; shift ;;
+    # Silently discarding an unknown flag is how `--dry-run` came to write the
+    # files it was passed to prevent.
+    *) echo "unknown argument: $1" >&2
+       echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]" >&2
+       exit 2 ;;
   esac
 done
+
+case "$cmd" in
+  init|env|wp-cli) ;;
+  -h|--help|help)
+    echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]"; exit 0 ;;
+  *) echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]" >&2; exit 2 ;;
+esac
 
 command -v hostshift >/dev/null || {
   echo "hostshift is not on PATH — https://github.com/generoi/hostshift" >&2; exit 1; }
@@ -31,34 +49,71 @@ command -v hostshift >/dev/null || {
 # A worktree exists to hold a branch, so the branch is the slug unless told
 # otherwise. Guessing this is exactly the kind of opinion the binary should not
 # carry and a project-level command should.
+#
+# LC_ALL=C because the pipeline works on bytes: under a UTF-8 locale BSD sed
+# aborts with "RE error: illegal byte sequence" on a branch named
+# feature/käyttöliittymä, and en_US.UTF-8 is the macOS default in a Finnish
+# shop. The trim runs after the truncation as well as before it, or a slug cut
+# at 30 characters can end in a hyphen and derive "…abc---site.ddev.site".
 if [ -z "$slug" ]; then
   branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
   [ -n "$branch" ] || { echo "no git branch here — pass --slug" >&2; exit 2; }
-  slug="$(printf '%s' "$branch" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-30)"
+  slug="$(printf '%s' "$branch" \
+    | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+    | LC_ALL=C sed -e 's/[^a-z0-9]\{1,\}/-/g' \
+    | LC_ALL=C cut -c1-30 \
+    | LC_ALL=C sed -e 's/^-\{1,\}//' -e 's/-\{1,\}$//')"
+  [ -n "$slug" ] || {
+    echo "the branch $branch has no letters or digits to make a hostname label from — pass --slug" >&2
+    exit 2; }
   echo "hostshift: slug \"$slug\", from the git branch $branch" >&2
 fi
 
-# The map is the binary's business; parse only what this needs from it.
-variants="$(hostshift map --slug "$slug" --json | sed -n 's|.*"variant": *"https\{0,1\}://\([^"]*\)".*|\1|p' | paste -sd, -)"
-[ -n "$variants" ] || { echo "hostshift produced no map — run 'hostshift check'" >&2; exit 2; }
-
-# What this project answers to. `hostshift hosts` reads the DDEV config with its
-# config.*.yaml overrides — parsing that here would be the place the careful
-# parts get lost.
+# What this project answers to.  `hostshift hosts` reads the DDEV config with
+# its config.*.yaml override merging — parsing that here would be the place the
+# careful parts get lost.
 hosts="$(hostshift hosts)"
 
-# And what the checkout this worktree came from answers to, if it is a worktree
-# with a project of its own. Those hostnames belong to a DDEV project that is
-# still running and still serving them; a worktree inherits them only because
-# .ddev/config.yaml is tracked, and DDEV appends override lists rather than
-# replacing them, so they cannot be dropped there.
+# And what the checkout this worktree came from answers to.
+#
+# Those hostnames are the ones the *database* holds. `db:pull` search-replaced
+# to the parent's hostname, not to the worktree's, and a worktree that gives
+# itself a DDEV project of its own is by definition served at a hostname the
+# database has never heard of. Asking `hostshift map` for this directory's map
+# would build it against that served-at hostname: nothing to rewrite, every link
+# still pointing at the parent, and `check` reporting the map injective and
+# anchored. So when this is a linked worktree of a *different* DDEV project, its
+# hostnames are the canonical side.
+parent=""
 parent_hosts=""
 common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
 if [ -n "$common" ] && [ "$common" != "$gitdir" ]; then
   parent="$(dirname "$common")"
   parent_hosts="$(hostshift hosts -C "$parent" 2>/dev/null || true)"
+  # A worktree of a repo that pins `name:` in tracked config.yaml is the same
+  # DDEV project as its parent, sharing its containers and its hostnames. There
+  # is nothing to derive from elsewhere and nothing to subtract.
+  if [ "$parent_hosts" = "$hosts" ]; then
+    parent=""
+    parent_hosts=""
+  fi
 fi
+
+# hostshift.yaml, where a project has one, is a deliberate statement about which
+# hostnames the database holds — a multisite's canonical hostnames are not
+# derivable from any DDEV config. Passing --from would override it.
+map_args=()
+if [ ! -f hostshift.yaml ] && [ -n "$parent_hosts" ]; then
+  while IFS= read -r h; do
+    [ -n "$h" ] && map_args+=(--from "https://$h")
+  done <<<"$parent_hosts"
+fi
+
+# The map is the binary's business; parse only what this needs from it.
+variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --json \
+  | sed -n 's|.*"variant": *"https\{0,1\}://\([^"]*\)".*|\1|p' | paste -sd, -)"
+[ -n "$variants" ] || { echo "hostshift produced no map — run 'hostshift check'" >&2; exit 2; }
 
 # web keeps this project's own hostnames, minus the variants and minus the
 # parent's. DDEV puts every additional hostname on web's VIRTUAL_HOST, so
@@ -66,7 +121,8 @@ fi
 # picks web — WordPress then sees a variant host, fails to match
 # wp_blogs.domain, and redirects to wp-signup.php.
 web=""
-for h in $hosts; do
+while IFS= read -r h; do
+  [ -n "$h" ] || continue
   case ",$variants," in *",$h,"*) continue ;; esac
   case "
 $parent_hosts
@@ -74,7 +130,7 @@ $parent_hosts
 $h
 "*) continue ;; esac
   web="${web:+$web,}$h"
-done
+done <<<"$hosts"
 
 env_out="HOSTSHIFT_SLUG=$slug
 HOSTSHIFT_VARIANTS=$variants
@@ -93,39 +149,80 @@ fi
 # Appending a top-level key is all that takes, and it beats a YAML round trip:
 # the original formatting, key order and comments survive untouched. This is
 # WordPress's business, not the proxy's — hostshift does not know what a CMS is.
+#
+# Two details make the difference between valid YAML and a parse error. A
+# wp-cli.yml with no trailing newline (what printf and several editors produce)
+# glues `url:` onto its last line — "require: wp-cli.phpurl: https://…". And a
+# wp-cli.yml that already has a root `url:` gets it twice, which yaml.v3 rejects
+# outright as a duplicate key.
 if [ "$cmd" = "wp-cli" ]; then
-  canonical="$(hostshift map --slug "$slug" --json | sed -n 's|.*"canonical": *"\([^"]*\)".*|\1|p' | head -1)"
+  canonical="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --json \
+    | sed -n 's|.*"canonical": *"\([^"]*\)".*|\1|p' | head -1)"
   [ -n "$canonical" ] || { echo "no canonical origin in the map" >&2; exit 2; }
   echo "# generated by \`ddev hostshift wp-cli\` — do not commit"
-  [ -f wp-cli.yml ] && cat wp-cli.yml
+  if [ -f wp-cli.yml ]; then
+    sed -e '/^url:[[:space:]]/d' wp-cli.yml
+    echo
+  fi
   echo "url: $canonical"
   exit 0
 fi
-
-[ "$cmd" = "init" ] || { echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME]" >&2; exit 2; }
-
-# Merged, not truncated: .ddev/.env is a project file that may hold something
-# else already.
-touch .ddev/.env
-tmp="$(mktemp)"
-grep -v '^HOSTSHIFT_' .ddev/.env > "$tmp" || true
-printf '%s\n' "$env_out" >> "$tmp"
-mv "$tmp" .ddev/.env
 
 # Registering the variants is what puts them in the mkcert certificate's SAN: a
 # three-label host is not covered by the *.ddev.site wildcard, so without this
 # the browser gets a TLS interstitial rather than a site. config.*.local.yaml is
 # in DDEV's own .ddev/.gitignore.
+#
+# additional_hostnames are relative to the project TLD and additional_fqdns are
+# not, and writing an FQDN under the wrong key makes DDEV register
+# acme.test.example.com.ddev.site — no SAN for the real host, which is the
+# interstitial this file exists to prevent.
+#
+# hostshift:ignore, because this file is a config.*.yaml and hostshift reads
+# those: without the marker its variants come back as canonical hosts on the
+# next run, get variants of their own, and the list grows without bound.
 tld="$(printf '%s\n' "$hosts" | head -1 | cut -d. -f2-)"
 tld="${tld:-ddev.site}"
-{
-  echo "# generated by \`ddev hostshift init\` — delete it to undo, rerun to update."
-  echo "additional_hostnames:"
-  for h in $(printf '%s\n%s' "$hosts" "$(printf '%s' "$variants" | tr ',' '\n')" | sed '/^$/d' | sort -u); do
-    echo "  - ${h%".$tld"}"
-  done
-} > .ddev/config.hostshift.local.yaml
+short=""
+fqdns=""
+for h in $(printf '%s\n%s' "$hosts" "$(printf '%s' "$variants" | tr ',' '\n')" | sed '/^$/d' | sort -u); do
+  case "$h" in
+    *".$tld") short="$short  - ${h%".$tld"}
+" ;;
+    *) fqdns="$fqdns  - $h
+" ;;
+  esac
+done
+
+config_out="# generated by \`ddev hostshift init\` — delete it to undo, rerun to update.
+# hostshift:ignore — hostshift must not read its own output back as input.
+"
+[ -n "$short" ] && config_out="${config_out}additional_hostnames:
+$short"
+[ -n "$fqdns" ] && config_out="${config_out}additional_fqdns:
+$fqdns"
+
+if [ -n "$dry_run" ]; then
+  echo "# .ddev/.env" ; printf '%s\n\n' "$env_out"
+  echo "# .ddev/config.hostshift.local.yaml" ; printf '%s' "$config_out"
+  echo
+  hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
+  echo "hostshift: --dry-run, nothing written" >&2
+  exit 0
+fi
+
+# Merged, not truncated: .ddev/.env is a project file that may hold something
+# else already. Written in place rather than moved over, or the destination
+# inherits mktemp's 0600 and its creator's group.
+touch .ddev/.env
+tmp="$(mktemp)"
+grep -v '^HOSTSHIFT_' .ddev/.env > "$tmp" || true
+printf '%s\n' "$env_out" >> "$tmp"
+cat "$tmp" > .ddev/.env
+rm -f "$tmp"
+
+printf '%s' "$config_out" > .ddev/config.hostshift.local.yaml
 
 echo "hostshift: wrote .ddev/.env and .ddev/config.hostshift.local.yaml" >&2
-hostshift map --slug "$slug" >&2
+hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
 echo "hostshift: now run \`ddev restart\`" >&2

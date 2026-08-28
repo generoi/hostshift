@@ -8,7 +8,11 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +74,42 @@ type Resolved struct {
 
 // Load resolves the map for a project directory.
 func Load(dir string, f Flags) (*Resolved, error) {
+	res, err := resolve(dir, f)
+	if err != nil {
+		return nil, err
+	}
+	// Validated here rather than where it is dialled, so `check` catches a typo
+	// before a restart does. `--upstream web:80` parsed happily and was reported
+	// back as `upstream web:80`, then every request failed at dial time; a URL
+	// with a space came back percent-encoded, which only the author could read.
+	if err := validateUpstream(res.Upstream); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// validateUpstream holds an upstream to the same standard as an origin: a
+// scheme and a host, because that is all a reverse proxy can dial.
+func validateUpstream(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("upstream %q: %w", raw, err)
+	}
+	switch {
+	case u.Scheme != "http" && u.Scheme != "https":
+		return fmt.Errorf("upstream %q: scheme is required (http:// or https://)", raw)
+	case u.Host == "":
+		return fmt.Errorf("upstream %q: no host", raw)
+	case strings.ContainsAny(raw, " \t"):
+		return fmt.Errorf("upstream %q: contains a space", raw)
+	}
+	return nil
+}
+
+func resolve(dir string, f Flags) (*Resolved, error) {
 	// Layer 3 first when it is total: an explicit --from/--to map needs no files.
 	if len(f.From) > 0 || len(f.To) > 0 {
 		m, err := mapFromFlags(f)
@@ -92,9 +132,10 @@ func Load(dir string, f Flags) (*Resolved, error) {
 	// map, so that a yaml omitting some of those hostnames can be reported
 	// rather than silently leaving them unreachable.
 	//
-	// Everything else DDEV-shaped — writing .ddev/ files, the env the compose
-	// service reads — lives in internal/ddev and cmd/hostshift/ddev.go. This is
-	// a binary that runs anywhere, with a DDEV integration beside it.
+	// Reading is the whole of it. Writing .ddev/ files and deciding the env the
+	// compose service reads is opinionated setup and lives in the add-on, as
+	// `ddev hostshift`. This is a binary that runs anywhere, with a DDEV
+	// integration beside it.
 	proj, err := ddev.Load(dir)
 	if err != nil {
 		return nil, err
@@ -163,6 +204,33 @@ func Load(dir string, f Flags) (*Resolved, error) {
 }
 
 func mapFromFlags(f Flags) (*origin.Map, error) {
+	// --from on its own, with --slug, derives each variant the same way every
+	// other layer does. It is how a caller says "here are the canonical origins,
+	// you work out the rest" without writing a file, and it is what a worktree
+	// needs: the hostnames its database holds belong to a *different* directory —
+	// the checkout it was branched from — so they cannot come from layer 1, which
+	// only ever reads the project being configured. Without this the map is built
+	// against the hostname the worktree is served at, which appears nowhere in the
+	// database, and nothing rewrites.
+	if len(f.To) == 0 && len(f.From) > 0 {
+		if f.Slug == "" {
+			return nil, errors.New("--from without --to needs --slug, to derive the variant of each canonical origin")
+		}
+		sites := make([]origin.Site, 0, len(f.From))
+		for i, raw := range f.From {
+			name := fmt.Sprintf("site%d", i+1)
+			c, err := origin.Parse(raw)
+			if err != nil {
+				return nil, err
+			}
+			v, err := deriveVariant("", "", raw, DefaultVariantPattern, f.Slug, name)
+			if err != nil {
+				return nil, err
+			}
+			sites = append(sites, origin.Site{Name: name, Canonical: c, Variant: v})
+		}
+		return origin.NewMap(sites)
+	}
 	if len(f.From) != len(f.To) {
 		return nil, fmt.Errorf("map is not index-aligned: %d --from against %d --to", len(f.From), len(f.To))
 	}
@@ -190,8 +258,16 @@ func loadFile(dir string) (*File, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	// KnownFields, because the failure mode of a silently-ignored key is the
+	// worst one this file has: `upsteam:` left the map valid, `check` reported it
+	// injective and anchored, and `proxy` then refused to start with "no
+	// upstream" pointing at a key the reader can see is right there. A misspelled
+	// `alias:` was quieter still — the staging hostname simply was not in the map
+	// and every request to it 421'd.
 	var f File
-	if err := yaml.Unmarshal(b, &f); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
 		return nil, "", fmt.Errorf("%s: %w", path, err)
 	}
 	if f.Version != 0 && f.Version != 1 {
