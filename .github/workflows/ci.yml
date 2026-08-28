@@ -42,6 +42,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Build only — publishing to GHCR is deliberately not wired up yet
-      # (see issue #8). This asserts the Dockerfile still builds.
+      # Build only. Publishing is release.yml's job, on a tag; this asserts the
+      # Dockerfile still builds on every PR, which is where it would break.
       - run: docker build -t hostshift:ci .
+
+  # The acceptance suite against a WordPress that this job builds from nothing.
+  #
+  # internal/e2e can be pointed at any project, but it skips unless the variant
+  # host is set — so for most of this project's life it ran against exactly one
+  # machine's copy of acmecorp, and never in CI. Both of the add-on bugs the M6
+  # audit found were in the install path, which is the part only a from-scratch
+  # project exercises.
+  #
+  # The canonical hostnames use the reserved .test TLD, so nothing here can
+  # reach a real site even if loopback containment broke.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      # autostart: false — bootstrap-ddev.sh runs `ddev config` itself, in a
+      # directory it creates.
+      - uses: ddev/github-action-setup-ddev@v1
+        with:
+          autostart: false
+
+      - name: build the CLI the bootstrap uses
+        run: make build
+
+      - name: bootstrap a stock DDEV multisite and run the suite
+        env:
+          HOSTSHIFT_TEST_ROOT: ${{ runner.temp }}/hostshift-e2e
+        run: test/bootstrap-ddev.sh up
+
+      - name: ddev logs on failure
+        if: failure()
+        env:
+          HOSTSHIFT_TEST_ROOT: ${{ runner.temp }}/hostshift-e2e
+        run: |
+          cd "$HOSTSHIFT_TEST_ROOT" || exit 0
+          ddev logs -s web  --tail 200 || true
+          ddev logs -s hostshift --tail 200 || true
+          ddev describe || true
