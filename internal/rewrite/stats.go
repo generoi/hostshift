@@ -16,10 +16,20 @@ const (
 	SurfaceHTMLAttr     = "html-attr"
 	SurfaceInlineScript = "inline-script"
 	SurfaceInlineStyle  = "inline-style"
-	SurfaceHeader       = "header"
-	SurfaceJSONString   = "json-string"
-	SurfaceRequestLine  = "request-line"
-	SurfaceRequestBody  = "request-body"
+	// SurfaceRawText is the markup inside every other raw-text element —
+	// noscript, textarea, title, iframe, and <title> inside foreign content —
+	// which the tokenizer hands back as opaque text rather than parsing.
+	SurfaceRawText = "raw-text"
+	// SurfaceHTMLEntity is an attribute value whose origin was only visible
+	// after character references were decoded — the browser decodes before it
+	// resolves, so these are test 28 leaks the raw scan cannot see. A non-zero
+	// count is worth looking at: it means content is storing origins in a form
+	// §5.3's three encodings do not model.
+	SurfaceHTMLEntity  = "html-entity"
+	SurfaceHeader      = "header"
+	SurfaceJSONString  = "json-string"
+	SurfaceRequestLine = "request-line"
+	SurfaceRequestBody = "request-body"
 )
 
 // Stats accumulates per-surface counters and, under --explain, the trace of
@@ -35,6 +45,19 @@ type Stats struct {
 	events     []origin.Event
 	explain    bool
 	maxEvents  int
+	noSweep    bool
+}
+
+// SweepSkipped records that §4.4's straggler backstop did not run, so the
+// report says the census is unavailable instead of printing a zero that reads
+// like proof of coverage.
+func (s *Stats) SweepSkipped() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.noSweep = true
+	s.mu.Unlock()
 }
 
 // NewStats returns a Stats. When explain is false only rewrites are recorded,
@@ -74,9 +97,14 @@ func (s *Stats) Record(surface string, base int, events []origin.Event) {
 	}
 }
 
-// Structured counts a value that needs structured parsing (srcset, refresh,
-// ping, srcdoc) rather than a plain origin substitution. M1 substitutes plainly;
-// this counter is the M3 baseline.
+// Structured counts the attributes §5.2 listed as needing their grammar parsed
+// — srcset, imagesrcset, ping, srcdoc, content.
+//
+// M3 established that none of them does: anchoring finds origins wherever they
+// sit, so commas, descriptors, "N;url=" and entity-encoded HTML never have to be
+// understood. The counter is kept for visibility into how often those values
+// carry origins at all, since a regression there is the first place a leak would
+// show.
 func (s *Stats) Structured(name string) {
 	if s == nil {
 		return
@@ -179,6 +207,10 @@ func (s *Stats) WriteReport(w io.Writer) {
 	section("candidates by surface", s.candidates)
 	section("skipped, by reason", s.skips)
 	section("structured attributes seen", s.structured)
+
+	if s.noSweep {
+		fmt.Fprintln(w, "straggler sweep: not run — census unavailable")
+	}
 
 	if s.explain && len(s.events) > 0 {
 		fmt.Fprintf(w, "explain (%d events):\n", len(s.events))
