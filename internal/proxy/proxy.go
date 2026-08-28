@@ -360,12 +360,12 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	ct := resp.Header.Get("Content-Type")
 	switch {
 	case rewritableHTML(ct):
-		resp.Body = filled{rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
+		resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
 			DryRun:  p.DryRun,
 			NoSweep: p.NoSweep,
 			Stats:   p.Stats,
 			Log:     p.log(),
-		})}
+		})
 
 	case rewritableJSON(ct):
 		// JSON is buffered rather than streamed, and capped (PLAN §5.8). Above
@@ -694,37 +694,44 @@ type readCloser struct {
 // 50 bytes. So a 508 KB page became roughly ten thousand chunked writes, ten
 // thousand flushes and ten thousand syscalls.
 //
-// The streaming bound is unchanged: this fills the *caller's* buffer, which is
-// the 32 KiB io.Copy already allocates, and nothing new is retained. What does
-// change is that a progressively flushed response reaches the browser in 32 KiB
-// steps rather than token by token — acceptable here because PHP-FPM sends a
-// WordPress page as one burst, and because text/event-stream never arrives:
-// rewritableHTML is an exact match on text/html, and httputil flushes SSE
-// immediately on its own Content-Type check regardless.
+// Response bodies are not batched, and the measurement that says they should be
+// is worth keeping because it is a trap.
 //
-// Measured on spike/corpus/page1.html through an httptest proxy: 13.55 ms ->
-// 4.38 ms, 37.5 -> 116 MB/s.
-type filled struct{ rc io.ReadCloser }
-
-func (f filled) Read(p []byte) (int, error) {
-	n := 0
-	for n < len(p) {
-		m, err := f.rc.Read(p[n:])
-		n += m
-		if err != nil {
-			if n > 0 && err == io.EOF {
-				return n, nil // report the EOF on the next call, with no bytes
-			}
-			return n, err
-		}
-		if m == 0 {
-			break // a reader with nothing to add and no error; do not spin
-		}
-	}
-	return n, nil
-}
-
-func (f filled) Close() error { return f.rc.Close() }
+// httputil's flushInterval() returns -1 — flush after every Read — whenever
+// res.ContentLength is -1, and ignores p.FlushInterval in that branch. hostshift
+// sets ContentLength to -1 on every rewritten response because every rewrite
+// changes the length, and HTML.Read returns one token, about 50 bytes. So a
+// 508 KB page is roughly ten thousand chunked writes, ten thousand flushes and
+// ten thousand write syscalls: profiling a whole request puts the tokenizer,
+// matcher and sweep together at 1.4% of CPU and raw syscalls at 78.8%.
+//
+// Filling the caller's buffer instead measures 13.55 ms -> 4.38 ms, 3.1x. It is
+// not taken, for two reasons that only appear when you try it.
+//
+// Synchronous filling means one more Read than there is data, which blocks. That
+// holds a progressively flushed response — wp-admin's update and import screens,
+// which emit a few hundred bytes over a long operation — until 32 KiB has
+// accumulated or the operation ends, on exactly the screens where watching
+// progress is the point. Measured: the first flush never arrived. Two cheaper
+// discriminators failed too. Asking the pipeline "have you more in hand" does
+// not work, because a tokenizer's Buffered() being non-empty does not mean
+// another token can be produced — a trailing text token is incomplete until the
+// next "<" or EOF — and it blocked anyway. Gating on the upstream having sent a
+// Content-Length is correct and useless: a WordPress page far exceeds nginx's
+// FastCGI buffers so it arrives chunked, and the benchmark went straight back to
+// 12.9 ms.
+//
+// Decoupling production from consumption does work, and costs a goroutine and a
+// ring buffer in the response path. A first cut allocated 45 MB per page, an
+// 8 KiB chunk per 50-byte token.
+//
+// Which is where the arithmetic decides it: 13 ms against 4 ms, on a page
+// WordPress spends 200 to 2000 ms generating. Nobody can perceive 9 ms. A
+// progress screen that shows nothing until it finishes is very perceptible. §9
+// calls performance immaterial for dev and it is right; this is the shape of
+// optimisation that buys an invisible win with a visible regression.
+//
+// BenchmarkE2EPage measures it, so the number stays honest if that ever changes.
 
 func itoa(n int) string {
 	if n == 0 {

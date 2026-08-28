@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -240,4 +241,63 @@ func TestCompressIsANoOpUnderAnIdentityMap(t *testing.T) {
 	if ce := res.Header.Get("Content-Encoding"); ce != "" {
 		t.Errorf("identity map + --compress set Content-Encoding %q", ce)
 	}
+}
+
+// TestProgressiveResponseIsNotHeld guards the reason response bodies are not
+// batched.
+//
+// Batching reads is worth 3.1x end to end and is not taken: filling the caller's
+// buffer means one more Read than there is data, which blocks, and that holds a
+// progressively flushed response — wp-admin's update and import screens, which
+// emit a few hundred bytes over a long operation — until 32 KiB has accumulated
+// or the operation ends. See the note above readAhead's grave in proxy.go.
+//
+// The chunk is a kilobyte because §4.4's carry-over window sets a floor that has
+// nothing to do with batching: the sweep holds back MaxMatchLen bytes so no
+// match can straddle a boundary, so anything smaller is buffered whatever the
+// reader above it does.
+func TestProgressiveResponseIsNotHeld(t *testing.T) {
+	step := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(step) }) }
+	defer release() // never leave the upstream handler parked
+
+	first := "<p>" + strings.Repeat("step one ", 120) + "</p>\n"
+	h := newHarness(t, herrforsMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, first)
+		w.(http.Flusher).Flush()
+		<-step // hold the connection open, as a long operation would
+		io.WriteString(w, "<p>step two</p>\n")
+	})
+
+	req, err := http.NewRequest("GET", h.front.URL+"/wp-admin/update-core.php", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = variantHost
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	got := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 32*1024)
+		n, _ := res.Body.Read(buf)
+		got <- string(buf[:n])
+	}()
+
+	select {
+	case s := <-got:
+		if !strings.Contains(s, "step one") {
+			t.Errorf("first chunk was %q, want the first flush", s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the first flush never reached the client: a progressive response is being held")
+	}
+
+	release()
+	io.Copy(io.Discard, res.Body)
 }
