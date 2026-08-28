@@ -106,8 +106,17 @@ func rewritablePart(headers []byte) bool {
 			ctype = v
 		}
 	}
+	// A part with no Content-Disposition at all is not a form field — §5.1
+	// scopes rewriting to parts *whose Content-Disposition carries no
+	// filename=*, which presupposes there is one. Rewriting an unlabelled part
+	// was reading the rule as its converse.
+	if strings.TrimSpace(disposition) == "" {
+		return false
+	}
 	if _, params, err := mime.ParseMediaType(strings.TrimSpace(disposition)); err == nil {
-		if params["filename"] != "" {
+		// Presence, not non-emptiness. filename="" still means a file part;
+		// testing the value let an empty file input through.
+		if _, isFile := params["filename"]; isFile {
 			return false
 		}
 	} else if strings.Contains(strings.ToLower(disposition), "filename=") {

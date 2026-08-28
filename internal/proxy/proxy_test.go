@@ -383,26 +383,16 @@ func TestSelfRedirectGuard(t *testing.T) {
 
 	// The fleet's conf is `rewrite ^ https://host$request_uri redirect`, and
 	// nginx appends the query string *again* unless the replacement ends in "?".
-	// So the Location is one query longer than the request that produced it.
-	// Comparing whole URLs never matched, the guard never fired, and each hop
-	// appended another copy until the browser gave up with 414 URI Too Long —
-	// observed live on acmecorp before this was fixed.
-	t.Run("survives nginx duplicating the query string", func(t *testing.T) {
-		const path = "/app/uploads/2025/05/x.png?cb=20260410"
-		h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, canonical+r.URL.Path+"?"+r.URL.RawQuery+"?"+r.URL.RawQuery,
-				http.StatusFound)
-		})
-		res, _ := h.get(t, variantHost, path)
-		loc := res.Header.Get("Location")
-		if strings.Contains(loc, variantHost) {
-			t.Errorf("Location points back at the variant: %q\n"+
-				"each hop appends another query and the browser ends at 414", loc)
-		}
-		if !strings.HasPrefix(loc, canonical) {
-			t.Errorf("Location is %q, want the canonical origin passed through", loc)
-		}
-	})
+	// The Location is then one query longer than the request that produced it,
+	// the guard never matches, and each hop appends another copy until the
+	// browser gives up with 414 — observed live on acmecorp.
+	//
+	// The guard deliberately does *not* absorb that. Ignoring the query here
+	// would make hostshift carry a workaround for a one-character bug in the
+	// fleet's own nginx snippet, and would silently pass through every redirect
+	// that changes only the query on the same path. The fix is `$request_uri?`
+	// in redirect-uploads.conf, which the rollout PR ships; `hostshift check`
+	// warns when a project still has the loop.
 
 	t.Run("an ordinary redirect is still rewritten", func(t *testing.T) {
 		// Test 1: a login redirect goes somewhere else, so the guard must not
@@ -850,4 +840,58 @@ func TestDryRunServesUnmodified(t *testing.T) {
 // on behaviour rather than on the log.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// TestSelfRedirectCarveOutIsOneHeader: the guard used to `return` early, which
+// jumped over every other Tier 1 header and the Set-Cookie Domain= drop. Test 28
+// enumerates the carve-out as *one* header — Location — not the whole response.
+func TestSelfRedirectCarveOutIsOneHeader(t *testing.T) {
+	const path = "/app/uploads/x.jpg"
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", canonical+r.URL.Path)
+		w.Header().Set("Link", "<"+canonical+"/wp-json/>; rel=\"x\"")
+		w.Header().Set("Content-Security-Policy", "default-src "+canonical)
+		w.Header().Add("Set-Cookie", "s=1; Domain=.www.acmecorp.fi; Path=/")
+		w.WriteHeader(http.StatusFound)
+	})
+	res, _ := h.get(t, variantHost, path)
+
+	if got := res.Header.Get("Location"); got != canonical+path {
+		t.Errorf("Location is %q; the carve-out should pass it through", got)
+	}
+	for _, k := range []string{"Link", "Content-Security-Policy"} {
+		if v := res.Header.Get(k); strings.Contains(v, canonical) {
+			t.Errorf("%s still names the canonical host: %q", k, v)
+		}
+	}
+	if c := res.Header.Get("Set-Cookie"); strings.Contains(c, "Domain=") {
+		t.Errorf("the canonical cookie Domain survived: %q", c)
+	}
+}
+
+// TestSelfRedirectOnlyForSafeMethods: the carve-out's stated justification is
+// that it is "a read-only asset GET, not the write hazard §4.4 opens with" —
+// but there was no method test, so a POST answered with a self-redirect sent the
+// browser to live production on a write path.
+func TestSelfRedirectOnlyForSafeMethods(t *testing.T) {
+	const path = "/wp-admin/admin-post.php"
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", canonical+r.URL.Path)
+		w.WriteHeader(http.StatusFound)
+	})
+	res, _ := h.do(t, "POST", variantHost, path, "application/x-www-form-urlencoded", []byte("a=1"))
+	if got := res.Header.Get("Location"); strings.Contains(got, "acmecorp.fi") {
+		t.Errorf("a POST self-redirect was passed through to production: %q", got)
+	}
+}
+
+// TestXForwardedHostIsNotForwarded: SetXForwarded fills it with the *variant*
+// host, so anything preferring it over Host puts the variant straight back
+// inside WordPress — undoing the request mapping.
+func TestXForwardedHostIsNotForwarded(t *testing.T) {
+	h := newHarness(t, acmecorpMap(t), html("<p>x</p>"))
+	h.get(t, variantHost, "/")
+	if got := h.seen.Header.Get("X-Forwarded-Host"); got != "" {
+		t.Errorf("X-Forwarded-Host reached upstream as %q", got)
+	}
 }
