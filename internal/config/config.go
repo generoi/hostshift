@@ -75,8 +75,10 @@ type Resolved struct {
 	ProjectTLD string
 
 	// Uncovered lists hostnames DDEV registers for this project that the map
-	// does not mention. Requests for them reach hostshift and get a 421, so a
-	// developer wondering why one blog of nine is dead wants this named.
+	// does not mention, so they have no variant and cannot be reached here — a
+	// hostshift.yaml declaring three of nine blogs leaves the other six with
+	// nowhere to be previewed. The project's own primary hostname is exempt:
+	// in a worktree it belongs to web by design.
 	Uncovered []string
 }
 
@@ -156,8 +158,15 @@ func Load(dir string, f Flags) (*Resolved, error) {
 			}
 			covered[st.Variant.Host] = true
 		}
+		// The project's own primary hostname is exempt. In a worktree it is
+		// supposed to be absent from the map — herrfors-wt-a.ddev.site is what
+		// web answers to, and web is where mailpit and `ddev launch` live — so
+		// warning about it fires on every correctly configured worktree, which
+		// is how people learn to skip warnings. In a canonical project it is a
+		// canonical host anyway and never reaches here.
+		own := ddev.Name + "." + projectTLD(ddev)
 		for _, h := range ddevHostnames(ddev) {
-			if !covered[h] {
+			if !covered[h] && h != own {
 				res.Uncovered = append(res.Uncovered, h)
 			}
 		}

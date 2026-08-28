@@ -374,8 +374,8 @@ func cmdCheck(args []string) (int, error) {
 
 	if len(res.Uncovered) > 0 {
 		fmt.Fprintf(os.Stderr,
-			"hostshift: warning: DDEV registers %d hostname(s) this map does not cover; "+
-				"requests for them get a 421:\n", len(res.Uncovered))
+			"hostshift: warning: DDEV registers %d hostname(s) this map does not cover, so they\n"+
+				"  have no variant and cannot be previewed here:\n", len(res.Uncovered))
 		for _, h := range res.Uncovered {
 			fmt.Fprintf(os.Stderr, "  %s\n", h)
 		}
