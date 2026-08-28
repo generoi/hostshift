@@ -9,7 +9,7 @@ import (
 
 func rwJSON(t *testing.T, m *origin.Matcher, in string) string {
 	t.Helper()
-	return string(RewriteJSON([]byte(in), m, NewStats(false), false))
+	return string(RewriteJSON([]byte(in), m, NewStats(false), quiet(), false))
 }
 
 // TestJSONStringValues is acceptance test 4: a JSON-escaped origin in a REST
@@ -112,7 +112,7 @@ func TestJSONIdentityMap(t *testing.T) {
 		`{"a":"https:\/\/c.example\/x","b":[1,{"c":"//c.example/y"}]}`,
 		`{"content":{"rendered":"<a href=\"https:\/\/c.example\/x\">k<\/a>"}}`,
 	} {
-		out := RewriteJSON([]byte(in), m, NewStats(false), false)
+		out := RewriteJSON([]byte(in), m, NewStats(false), quiet(), false)
 		if string(out) != in {
 			t.Errorf("identity map changed the JSON:\n got %s\nwant %s", out, in)
 		}
@@ -158,7 +158,7 @@ func TestMalformedJSONUnchanged(t *testing.T) {
 func TestJSONExplainCarriesAPointer(t *testing.T) {
 	m := pairMatcher(t, "https://c.example", "https://v.example")
 	st := NewStats(true)
-	RewriteJSON([]byte(`{"_links":{"self":[{"href":"https://c.example/x"}]}}`), m, st, true)
+	RewriteJSON([]byte(`{"_links":{"self":[{"href":"https://c.example/x"}]}}`), m, st, quiet(), true)
 
 	ev := st.Events()
 	if len(ev) != 1 {

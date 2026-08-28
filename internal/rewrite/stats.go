@@ -19,9 +19,21 @@ const (
 	// SurfaceRawText is the markup inside every other raw-text element —
 	// noscript, textarea, title, iframe, and <title> inside foreign content —
 	// which the tokenizer hands back as opaque text rather than parsing.
-	SurfaceRawText     = "raw-text"
-	SurfaceHeader      = "header"
-	SurfaceJSONString  = "json-string"
+	SurfaceRawText = "raw-text"
+	// SurfaceHTMLEntity is an attribute value whose origin was only visible
+	// after character references were decoded — the browser decodes before it
+	// resolves, so these are test 28 leaks the raw scan cannot see. A non-zero
+	// count is worth looking at: it means content is storing origins in a form
+	// §5.3's three encodings do not model.
+	SurfaceHTMLEntity = "html-entity"
+	SurfaceHeader     = "header"
+	SurfaceJSONString = "json-string"
+	// SurfaceJSONEscape is a JSON string whose origin was only visible after
+	// the string was unquoted — a \uXXXX-escaped IDN host, an HTML character
+	// reference inside content.rendered, or double-escaped JSON-in-JSON. Like
+	// html-entity, a non-zero count means content is storing origins in a form
+	// §5.3 does not model.
+	SurfaceJSONEscape  = "json-escape"
 	SurfaceRequestLine = "request-line"
 	SurfaceRequestBody = "request-body"
 )
@@ -39,6 +51,19 @@ type Stats struct {
 	events     []origin.Event
 	explain    bool
 	maxEvents  int
+	noSweep    bool
+}
+
+// SweepSkipped records that §4.4's straggler backstop did not run, so the
+// report says the census is unavailable instead of printing a zero that reads
+// like proof of coverage.
+func (s *Stats) SweepSkipped() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.noSweep = true
+	s.mu.Unlock()
 }
 
 // NewStats returns a Stats. When explain is false only rewrites are recorded,
@@ -188,6 +213,10 @@ func (s *Stats) WriteReport(w io.Writer) {
 	section("candidates by surface", s.candidates)
 	section("skipped, by reason", s.skips)
 	section("structured attributes seen", s.structured)
+
+	if s.noSweep {
+		fmt.Fprintln(w, "straggler sweep: not run — census unavailable")
+	}
 
 	if s.explain && len(s.events) > 0 {
 		fmt.Fprintf(w, "explain (%d events):\n", len(s.events))

@@ -288,3 +288,79 @@ func TestThirdPartyHostUntouched(t *testing.T) {
 		t.Errorf("third-party hosts were touched:\n got %q\nwant %q", got, in)
 	}
 }
+
+// TestDelimiterIsNotAnAllowlist covers the audit's finding that an enumerated
+// terminator set has the same long tail an attribute allowlist does. The CSP
+// case was live: a source list names the origin without a trailing slash, so
+// `default-src 'self' https://c.example; script-src …` went out naming only the
+// canonical host and the browser blocked every resource on the variant.
+func TestDelimiterIsNotAnAllowlist(t *testing.T) {
+	m := mk(t, "https://c.example", "https://v.example")
+	for _, c := range []struct{ in, want string }{
+		{"default-src 'self' https://c.example; script-src 'self'", "default-src 'self' https://v.example; script-src 'self'"},
+		{"@import url(https://c.example);", "@import url(https://v.example);"},
+		{"[https://c.example]", "[https://v.example]"},
+		{"a=https://c.example|b", "a=https://v.example|b"},
+		{"{\"u\":https://c.example}", "{\"u\":https://v.example}"},
+		// Still not a URL: the host simply continues.
+		{"https://c.example.evil/x", "https://c.example.evil/x"},
+	} {
+		if got := rw(t, m, c.in); got != c.want {
+			t.Errorf("Rewrite(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestPercentEncodedDotIsPartOfTheHost: '%' is not a host byte, but "%2E" is a
+// dot, so treating '%' as an unconditional terminator rewrote a *different*
+// registrable domain — one the code correctly refuses when the dot is literal.
+func TestPercentEncodedDotIsPartOfTheHost(t *testing.T) {
+	m := mk(t, "https://c.example", "https://v.example")
+	for _, in := range []string{
+		"https://c.example%2Eattacker.test/p", // %2E is '.'
+		"https://c.example%2Dx.test/p",        // %2D is '-'
+	} {
+		if got := rw(t, m, in); got != in {
+			t.Errorf("Rewrite(%q) = %q — that is a different host", in, got)
+		}
+	}
+	// A percent-escape that really does terminate the host still works.
+	if got, want := rw(t, m, "https%3A%2F%2Fc.example%2Fwp-admin"), "https%3A%2F%2Fv.example%2Fwp-admin"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestPercentEncodedPort is the port family of the double-port bug. "%3A" is how
+// a port separator appears inside redirect_to=, and reading only ':' made it a
+// terminator — so an origin on a port nothing listens on was rewritten to the
+// variant, and a canonical origin that *did* carry the mapped port was missed.
+func TestPercentEncodedPort(t *testing.T) {
+	plain := mk(t, "https://c.example", "https://v.example")
+	in := "https%3A%2F%2Fc.example%3A8443%2Fx"
+	if got := rw(t, plain, in); got != in {
+		t.Errorf("a different origin was rewritten: %q -> %q", in, got)
+	}
+
+	ported := mk(t, "https://c.example:8443", "https://v.example")
+	want := "https%3A%2F%2Fv.example%2Fx"
+	if got := rw(t, ported, in); got != want {
+		t.Errorf("the mapped port was missed:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestIDNMatchesTheUnicodeLabel: WordPress does not punycode siteurl, so a site
+// declared with a Unicode host has the U-label in its database and in every
+// rendered page. Building patterns from the A-label alone matched nothing at
+// all, and the whole page leaked.
+func TestIDNMatchesTheUnicodeLabel(t *testing.T) {
+	m := mk(t, "https://hämeen.fi", "https://v.example")
+	for _, c := range []struct{ in, want string }{
+		{"https://hämeen.fi/x", "https://v.example/x"},
+		{"https://HÄMEEN.FI/x", "https://v.example/x"},
+		{"https://xn--hmeen-gra.fi/x", "https://v.example/x"},
+	} {
+		if got := rw(t, m, c.in); got != c.want {
+			t.Errorf("Rewrite(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
