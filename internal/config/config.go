@@ -47,9 +47,8 @@ type SiteFile struct {
 
 // Flags are the CLI overrides. They win over every file (PLAN §5.3).
 type Flags struct {
-	Upstream  string
-	Slug      string
-	Canonical string
+	Upstream string
+	Slug     string
 	// From/To are an explicit index-aligned map that replaces the files entirely.
 	From, To []string
 }
@@ -65,6 +64,11 @@ type Resolved struct {
 	// when hostshift.yaml supplies the map, because `map --env` needs to know
 	// which of the project's hostnames belong to `web` and which to hostshift.
 	DDEVHosts []string
+
+	// Uncovered lists hostnames DDEV registers for this project that the map
+	// does not mention. Requests for them reach hostshift and get a 421, so a
+	// developer wondering why one blog of nine is dead wants this named.
+	Uncovered []string
 }
 
 // Load resolves the map for a project directory.
@@ -85,10 +89,12 @@ func Load(dir string, f Flags) (*Resolved, error) {
 		pattern = DefaultVariantPattern
 	)
 
-	// The DDEV config is read whether or not it supplies the map, because
-	// `map --env` needs the project's full hostname list to work out which
-	// hostnames stay with `web`. In a worktree those are not the canonical
-	// hosts at all — canonical is a different project, still running.
+	// The DDEV config is read whether or not it supplies the map, for two
+	// reasons. `map --env` needs the project's full hostname list to work out
+	// which hostnames stay with `web` — in a worktree those are not the
+	// canonical hosts at all, since canonical is a different project still
+	// running. And a hostshift.yaml that omits some of the project's registered
+	// hostnames can then be reported rather than silently 421ing them.
 	ddev, ddevPath, err := loadDDEV(dir)
 	if err != nil {
 		return nil, err
@@ -120,11 +126,33 @@ func Load(dir string, f Flags) (*Resolved, error) {
 		}
 	}
 
-	m, err := origin.NewMap(sites)
-	if err != nil {
+	m, err2 := origin.NewMap(sites)
+	if err = err2; err != nil {
 		return nil, err
 	}
-	return &Resolved{Map: m, Upstream: up, Source: source, DDEVHosts: ddevHostnames(ddev)}, nil
+	res := &Resolved{Map: m, Upstream: up, Source: source, DDEVHosts: ddevHostnames(ddev)}
+
+	// A hostshift.yaml *replaces* the DDEV layer rather than merging with it:
+	// an explicit map is a statement about which hosts this project serves, and
+	// merging would resurrect ones the author deliberately left out. But a
+	// project whose .ddev/config.yaml registers nine hostnames and whose
+	// hostshift.yaml declares three will 421 the other six with no explanation,
+	// which is a plausible fsi or pellervo shape. Say so.
+	if ddev != nil && len(sites) > 0 {
+		covered := map[string]bool{}
+		for _, st := range sites {
+			for _, o := range st.CanonicalSet() {
+				covered[o.Host] = true
+			}
+			covered[st.Variant.Host] = true
+		}
+		for _, h := range ddevHostnames(ddev) {
+			if !covered[h] {
+				res.Uncovered = append(res.Uncovered, h)
+			}
+		}
+	}
+	return res, nil
 }
 
 // DDEVEnv returns the two lists the DDEV add-on needs in .ddev/.env.
@@ -277,7 +305,52 @@ func deriveVariant(explicit, base, canonical, pattern, slug, name string) (origi
 	if err != nil {
 		return origin.Origin{}, fmt.Errorf("site %q: %w", name, err)
 	}
-	return origin.Origin{Scheme: o.Scheme, Host: host, Port: o.Port}, nil
+
+	// Back through Parse rather than assembling an Origin by hand. The slug is
+	// a worktree slug, which in practice is a branch name — so uppercase and
+	// "/" are the common case, not the exotic one. Assembling the struct
+	// directly skipped normalisation and validation entirely, so
+	// `--slug feature/ABC-123` produced the host
+	// "feature/ABC-123--herrfors.ddev.site": `check` called the map "injective
+	// and anchored" and exited 0, while SiteForHost lowercases the incoming
+	// Host and so could never match it. Every request 421'd.
+	v, err := origin.Parse(o.Scheme + "://" + host + portSuffix(o))
+	if err != nil {
+		return origin.Origin{}, fmt.Errorf(
+			"site %q: --slug %q derives the invalid host %q: %w\n"+
+				"slugs become hostname labels, so use only letters, digits and hyphens",
+			name, slug, host, err)
+	}
+	if v.Host != strings.ToLower(host) || !validHostLabels(v.Host) {
+		return origin.Origin{}, fmt.Errorf(
+			"site %q: --slug %q derives %q, which is not a usable hostname\n"+
+				"slugs become hostname labels, so use only letters, digits and hyphens",
+			name, slug, host)
+	}
+	return v, nil
+}
+
+// validHostLabels checks each dot-separated label is non-empty and starts and
+// ends alphanumeric. A slug ending in "." derives "wt-a.--herrfors.ddev.site",
+// whose second label starts with a hyphen — DNS-invalid, and it resolves or not
+// depending on the resolver rather than failing at startup where it belongs.
+func validHostLabels(h string) bool {
+	alnum := func(c byte) bool {
+		return c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+	}
+	for _, l := range strings.Split(h, ".") {
+		if l == "" || !alnum(l[0]) || !alnum(l[len(l)-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func portSuffix(o origin.Origin) string {
+	if o.Port == "" {
+		return ""
+	}
+	return ":" + o.Port
 }
 
 // applyPattern rewrites the leftmost label of host according to pattern.

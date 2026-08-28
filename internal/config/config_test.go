@@ -409,8 +409,67 @@ func TestDDEVEnvForACanonicalProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, webHosts := res.DDEVEnv()
+	variants, webHosts := res.DDEVEnv()
+	if strings.Join(variants, ",") != "wt-a--herrfors.ddev.site,wt-a--nat.herrfors.ddev.site" {
+		t.Errorf("variants = %v", variants)
+	}
 	if strings.Join(webHosts, ",") != "herrfors.ddev.site,nat.herrfors.ddev.site" {
-		t.Errorf("webHosts = %v, want the two canonical ddev hosts", webHosts)
+		t.Errorf("webHosts = %v, want the canonical project's own two hostnames", webHosts)
+	}
+}
+
+// TestSlugMustBeAHostnameLabel is the regression test for a config that `check`
+// called "injective and anchored" while every request to it returned 421.
+//
+// A slug is a worktree slug, which in practice is a branch name — so uppercase
+// and "/" are the common case. deriveVariant assembled an Origin by hand,
+// skipping normalisation, so "feature/ABC-123" produced a host SiteForHost
+// could never match because it lowercases the incoming Host.
+func TestSlugMustBeAHostnameLabel(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, ".ddev/config.yaml", "name: herrfors\nadditional_hostnames:\n  - nat.herrfors\n")
+
+	for _, bad := range []string{"feature/ABC-123", "wt a", "wt-a.", "wt_a."} {
+		if _, err := Load(dir, Flags{Slug: bad}); err == nil {
+			t.Errorf("--slug %q was accepted; it cannot be a hostname label", bad)
+		}
+	}
+
+	// Uppercase alone is fine — it normalises, and must normalise, because the
+	// map is keyed on the lowercased host.
+	res, err := Load(dir, Flags{Slug: "WT-A"})
+	if err != nil {
+		t.Fatalf("--slug WT-A should normalise, not fail: %v", err)
+	}
+	if got := res.Map.Sites[0].Variant.Host; got != "wt-a--herrfors.ddev.site" {
+		t.Errorf("variant host %q, want it lowercased", got)
+	}
+	if _, ok := res.Map.SiteForHost("wt-a--herrfors.ddev.site"); !ok {
+		t.Error("the derived variant host does not route — this is the 421")
+	}
+}
+
+// TestUncoveredDDEVHostsAreReported: a hostshift.yaml replaces the DDEV layer
+// rather than merging with it, which is right — but a project registering nine
+// hostnames whose yaml declares three will 421 the other six in silence.
+func TestUncoveredDDEVHostsAreReported(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, ".ddev/config.yaml",
+		"name: herrfors\nadditional_hostnames:\n  - nat.herrfors\n  - extra.herrfors\n")
+	write(t, dir, "hostshift.yaml",
+		"version: 1\nsites:\n  - {name: main, canonical: https://www.herrfors.fi, base: https://herrfors.ddev.site}\n")
+
+	res, err := Load(dir, Flags{Slug: "wt-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Uncovered) != 2 {
+		t.Fatalf("Uncovered = %v, want the two undeclared DDEV hostnames", res.Uncovered)
+	}
+	// And the ones the map does cover must not be reported.
+	for _, h := range res.Uncovered {
+		if h == "herrfors.ddev.site" {
+			t.Errorf("%s is the declared base and is covered", h)
+		}
 	}
 }

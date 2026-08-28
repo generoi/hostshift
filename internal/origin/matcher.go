@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	aho "github.com/petar-dambovaliev/aho-corasick"
+	"golang.org/x/net/idna"
 )
 
 // Pair is one canonical→variant mapping. Under an identity map the two are equal
@@ -151,16 +152,35 @@ func NewMatcher(pairs []Pair) (*Matcher, error) {
 	}
 	for _, h := range hostNames {
 		idx := hosts[h]
-		for _, enc := range []encoding{encRaw, encJSON, encPercent} {
-			// Both schemes for every canonical host: the fleet's databases carry
-			// http:// forms of hosts declared as https (M0 measured
-			// nat.herrfors.ddev.site appearing 165 times over http and zero over
-			// https). A host-keyed map would be wrong; matching both schemes and
-			// replacing with the *variant's* declared origin is right.
-			for _, scheme := range []string{"https", "http"} {
-				add(scheme+enc.schemeSep()+h, pattern{enc: enc, scheme: scheme, host: h, pairs: idx})
+		// Both labels. Origin.Parse normalises to the A-label, but WordPress
+		// does not punycode siteurl — a site declared as https://hämeen.fi has
+		// the U-label in its database and in every rendered page, so building
+		// patterns from the A-label alone matched nothing at all and the whole
+		// page leaked. §5.5 calls IDN "real for .fi client domains".
+		forms := []string{h}
+		if u, err := idna.Punycode.ToUnicode(h); err == nil && u != h {
+			// The automaton folds ASCII case only, so a non-ASCII letter has to
+			// be carried in both cases explicitly. That covers "hämeen.fi" and
+			// "HÄMEEN.FI"; the ASCII folding covers every mix of the ASCII
+			// letters around them. A host with only *some* of its non-ASCII
+			// letters capitalised is not matched, which no real siteurl is.
+			forms = append(forms, u)
+			if up := strings.ToUpper(u); up != u {
+				forms = append(forms, up)
 			}
-			add(enc.relSep()+h, pattern{enc: enc, relative: true, host: h, pairs: idx})
+		}
+		for _, hf := range forms {
+			for _, enc := range []encoding{encRaw, encJSON, encPercent} {
+				// Both schemes for every canonical host: the fleet's databases carry
+				// http:// forms of hosts declared as https (M0 measured
+				// nat.herrfors.ddev.site appearing 165 times over http and zero over
+				// https). A host-keyed map would be wrong; matching both schemes and
+				// replacing with the *variant's* declared origin is right.
+				for _, scheme := range []string{"https", "http"} {
+					add(scheme+enc.schemeSep()+hf, pattern{enc: enc, scheme: scheme, host: hf, pairs: idx})
+				}
+				add(enc.relSep()+hf, pattern{enc: enc, relative: true, host: hf, pairs: idx})
+			}
 		}
 	}
 
@@ -204,7 +224,7 @@ func (m *Matcher) Validate() error {
 	for _, p := range m.pairs {
 		for _, enc := range []encoding{encRaw, encJSON, encPercent} {
 			probe := p.Variant.Scheme + enc.schemeSep() + enc.hostPort(p.Variant)
-			out, _, ev := m.rewrite([]byte(probe), len(probe), "validate", false)
+			out, _, ev := m.rewrite([]byte(probe), len(probe), NoPrev, "validate", false)
 			if string(out) != probe {
 				return fmt.Errorf("origin: variant %s is matched by a canonical origin — rewriting it yields %q; "+
 					"the map is not a fixed point and would double-rewrite (PLAN §5.4)", p.Variant, out)
@@ -250,21 +270,74 @@ type Event struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// isDelim implements PLAN §4.4's right-hand anchor: a match is only an origin if
-// what follows the host terminates it.
+// isHostByte reports whether a byte can appear in a hostname. Everything else
+// terminates one.
 //
-// Two additions to the set §4.4 lists, both required rather than defensive:
-//   - '%' — without it the percent-encoded form can never match, since
-//     "https%3A%2F%2Fhost%2Fpath" continues with '%'. That form is exactly the
-//     redirect_to= case §5.5 names.
-//   - ',' — srcset, ping and Link headers separate on it.
-func isDelim(c byte) bool {
-	switch c {
-	case '/', ':', '?', '#', '"', '\'', '<', '>', '\\', '&', '%', ',',
-		' ', '\t', '\n', '\r', '\f', '\v':
+// This replaces the enumerated delimiter list §4.4 sketches. An allowlist of
+// terminators is the same mistake as an allowlist of attributes: it guarantees a
+// long tail of misses, and the tail was real — ';' is how a CSP source list ends
+// a directive, so `default-src 'self' https://canonical; script-src …` was left
+// untouched and the delivered policy named only the canonical host, blocking
+// every resource on the variant. ')' closes `@import url(…)`. ']' and '|' and
+// '=' were missing too. Asking what a hostname *can* contain has no tail.
+func isHostByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '-' || c == '.' || c == '_':
 		return true
 	}
 	return false
+}
+
+// delimAt implements PLAN §4.4's right-hand anchor: a match is only an origin if
+// what follows the host terminates it. End of input terminates.
+//
+// '%' needs care rather than a blanket yes. It is not a host byte, but in the
+// percent encoding it introduces one: "%2E" is a dot and "%2D" a hyphen, so
+//
+//	https://www.example.com%2Eattacker.test/p
+//
+// is a URL whose real host is www.example.com.attacker.test — a different
+// registrable domain, which this code correctly refuses when the dot is
+// written literally. Treating '%' as an unconditional terminator rewrote it.
+// So the escape is decoded and the same question asked of the byte it denotes.
+func delimAt(b []byte, i int) bool {
+	if i >= len(b) {
+		return true
+	}
+	if b[i] == '%' {
+		if c, ok := unhex(b, i+1); ok {
+			return !isHostByte(c)
+		}
+		return true // a stray '%' is not a host byte either
+	}
+	return !isHostByte(b[i])
+}
+
+// unhex decodes the two hex digits at i.
+func unhex(b []byte, i int) (byte, bool) {
+	if i+1 >= len(b) {
+		return 0, false
+	}
+	hi, ok1 := hexVal(b[i])
+	lo, ok2 := hexVal(b[i+1])
+	if !ok1 || !ok2 {
+		return 0, false
+	}
+	return hi<<4 | lo, true
+}
+
+func hexVal(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 // okBeforeRelative guards the left side of a protocol-relative match. "//host"
@@ -292,15 +365,59 @@ var (
 	sepPercent = []byte("%2F")
 )
 
+// hostTerminated reports whether the host ends at end, allowing one root dot
+// to sit between it and the delimiter.
+//
+// Which is the whole reason the dot is not simply consumed. In prose —
+// "Read more at https://www.example.fi. Thanks" — the dot is a full stop, and
+// swallowing it into the span deletes a character from the rendered page,
+// because the variant is written in its root-less form. Rejecting the match
+// instead is worse: the origin then goes out unrewritten, dereferenceable, and
+// M0 counted five of those in herrfors' database. So the dot terminates the
+// host and stays where it is, and only the endsHost case above — where real
+// URL structure follows, so the dot is genuinely the root label — absorbs it.
+func hostTerminated(b []byte, end int) bool {
+	if delimAt(b, end) {
+		return true
+	}
+	return b[end] == '.' && delimAt(b, end+1)
+}
+
+// endsHost reports whether position i is where a URL's host component ends —
+// end of buffer, or one of the characters that can follow an authority. It is
+// deliberately narrower than delimAt, which answers the different question of
+// whether a host has been cut short by any non-host byte.
+func endsHost(b []byte, i int, wholeValue bool) bool {
+	if i >= len(b) {
+		return wholeValue
+	}
+	switch b[i] {
+	case '/', ':', '?', '#':
+		return true
+	case '%':
+		if c, ok := unhex(b, i+1); ok {
+			switch c {
+			case '/', ':', '?', '#':
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Rewrite replaces every canonical origin in b with its variant, treating b as
 // a complete value.
 //
 // It returns b itself when nothing changed, so an unmodified value is not merely
 // equal to the input but the same bytes.
 func (m *Matcher) Rewrite(b []byte, surface string, explain bool) (out []byte, events []Event) {
-	out, _, events = m.rewrite(b, len(b), surface, explain)
+	out, _, events = m.rewrite(b, len(b), NoPrev, surface, explain)
 	return out, events
 }
+
+// NoPrev is the prev argument for a buffer that begins at the start of its
+// value or stream, where there is no preceding byte to anchor against.
+const NoPrev = -1
 
 // RewritePrefix is Rewrite for a stream, where more bytes are still to come.
 //
@@ -314,11 +431,21 @@ func (m *Matcher) Rewrite(b []byte, surface string, explain bool) (out []byte, e
 // round. This is what lets §4.4's straggler sweep run in-stream: a match is
 // replaced before its bytes are emitted, so nothing already written needs
 // re-aligning and the body is never buffered whole.
-func (m *Matcher) RewritePrefix(b []byte, limit int, surface string, explain bool) (out []byte, consumed int, events []Event) {
-	return m.rewrite(b, limit, surface, explain)
+//
+// prev is the byte immediately before b[0] in the stream, or NoPrev at the very
+// start. The carry-over window protects a match from being decided on bytes
+// that have not arrived on the *right*; prev is the same protection on the
+// left, and it is not optional. A protocol-relative "//host" is only an origin
+// after a separator, so the byte before it decides the match — and that byte
+// has usually already been emitted and dropped by the time the rest arrives.
+// Passing NoPrev there says "start of stream", which anchors, so the same
+// document rewrote differently depending on where the 32 KiB read boundary
+// happened to fall.
+func (m *Matcher) RewritePrefix(b []byte, limit int, prev int, surface string, explain bool) (out []byte, consumed int, events []Event) {
+	return m.rewrite(b, limit, prev, surface, explain)
 }
 
-func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]byte, int, []Event) {
+func (m *Matcher) rewrite(b []byte, limit int, prev int, surface string, explain bool) ([]byte, int, []Event) {
 	if limit < 0 {
 		limit = 0
 	}
@@ -330,13 +457,22 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		buf    []byte
 		last   int
 	)
-	// text is taken as a slice and converted only when the event is actually
-	// recorded: with --explain off, every skipped candidate was allocating a
-	// string nobody read.
+	// Every candidate is emitted, not only rewrites and not only under
+	// --explain. Recording skips exclusively when explaining meant the `--json`
+	// counters always showed candidates == rewrites, which reads as "nothing was
+	// skipped" when in fact skips were simply never counted — the one number a
+	// reader would use to decide whether the map is missing a host.
+	//
+	// Text is the one expensive field, and it is only ever read by --explain and
+	// by the straggler WARN, so it is materialised for those and left empty
+	// otherwise: converting a slice nobody reads cost an allocation per skipped
+	// candidate.
 	emit := func(off int, text []byte, action, reason string) {
+		e := Event{Offset: off, Surface: surface, Action: action, Reason: reason}
 		if explain || action == ActionRewrote {
-			events = append(events, Event{Offset: off, Surface: surface, Text: string(text), Action: action, Reason: reason})
+			e.Text = string(text)
 		}
+		events = append(events, e)
 	}
 
 	// Every pattern contains one of these three, because every origin form
@@ -378,9 +514,17 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		}
 		scanned = hostEnd
 
-		if p.relative && start > 0 && !okBeforeRelative(b[start-1]) {
-			emit(start, b[start:hostEnd], ActionSkipped, ReasonUnanchored)
-			continue
+		if p.relative {
+			// The byte before the match, which for start == 0 lives in the
+			// caller's stream rather than in b.
+			c, have := prev, prev >= 0
+			if start > 0 {
+				c, have = int(b[start-1]), true
+			}
+			if have && !okBeforeRelative(byte(c)) {
+				emit(start, b[start:hostEnd], ActionSkipped, ReasonUnanchored)
+				continue
+			}
 		}
 
 		end, port := hostEnd, ""
@@ -390,25 +534,56 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		// identically, so leaving it unrewritten is a test 28 leak. M0 found
 		// five of them in herrfors' production database.
 		//
-		// The dot is only consumed when what follows terminates the host;
-		// "c.example.evil/" still falls through to the not-a-url rejection.
-		if end < len(b) && b[end] == '.' && (end+1 >= len(b) || isDelim(b[end+1])) {
+		// It is consumed into the span and not re-emitted, because the variant
+		// is written in its own root-less form — which is why what follows has
+		// to be URL structure and not merely a delimiter. Accepting any
+		// delimiter ate the full stop in "Read more at https://www.example.fi.
+		// Thanks", deleting a character from rendered prose; that is a corpus
+		// diff, and prose is exactly where a bare origin followed by a period
+		// is common. "c.example.evil/" still falls through to the not-a-url
+		// rejection either way.
+		//
+		// End of buffer counts as structure only when the origin *is* the whole
+		// buffer — href="https://www.example.fi." and nothing else. M6 made
+		// that distinction load-bearing by rewriting body text token by token:
+		// the text node in "<p>see https://www.example.fi.</p>" ends at the
+		// dot, so "end of buffer" alone started eating full stops again, in the
+		// commonest prose shape there is.
+		//
+		// When the dot is *not* consumed the match still stands — see
+		// hostTerminated. Rejecting it instead would leave the whole origin
+		// unrewritten, which is the test 28 leak this rule exists to close.
+		wholeValue := start == 0 && prev < 0
+		if end < len(b) && b[end] == '.' && endsHost(b, end+1, wholeValue) {
 			end++
 		}
 
-		// Optional :port. A ':' not followed by digits is itself a delimiter.
+		// Optional port, in either spelling. The percent form matters: "%3A" is
+		// how a port separator appears inside redirect_to= and friends, and
+		// reading only ':' meant "https%3A%2F%2Fh%3A8443%2Fx" had its port
+		// treated as a *terminator* — so an origin on a different port was
+		// rewritten to the variant host. That is the port family of the
+		// double-port bug this design exists to avoid.
+		sep := 0
 		if end < len(b) && b[end] == ':' {
-			j := end + 1
+			sep = 1
+		} else if end < len(b) && b[end] == '%' {
+			if c, ok := unhex(b, end+1); ok && c == ':' {
+				sep = 3
+			}
+		}
+		if sep > 0 {
+			j := end + sep
 			for j < len(b) && isDigit(b[j]) {
 				j++
 			}
-			if j > end+1 {
-				port, end = string(b[end+1:j]), j
+			if j > end+sep {
+				port, end = string(b[end+sep:j]), j
 			}
 		}
 		scanned = end
 		consumed = max(consumed, end)
-		if end < len(b) && !isDelim(b[end]) {
+		if !hostTerminated(b, end) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, b[start:end], ActionSkipped, ReasonNotAURL)
 			continue

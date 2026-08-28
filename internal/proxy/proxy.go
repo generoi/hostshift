@@ -167,11 +167,23 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// draws without qualification.
 	r.Out.Header.Del("X-Forwarded-Port")
 
+	// X-Forwarded-Host goes for the same reason, and it is the more likely of
+	// the two to do damage: SetXForwarded fills it with the *variant* host, so
+	// anything in Bedrock or a plugin that prefers it over Host puts the variant
+	// straight back inside WordPress — undoing the request mapping this function
+	// exists to perform.
+	r.Out.Header.Del("X-Forwarded-Host")
+
 	// Identity upstream: the fleet has no compression config of its own, so
 	// DDEV's stock nginx applies, and asking for identity means the common path
 	// needs no decoder. Setting it explicitly also stops Go's transport adding
 	// its own transparent gzip.
 	r.Out.Header.Set("Accept-Encoding", "identity")
+
+	// No ranges upstream. A 206 skips every rewriter, so forwarding Range let
+	// any client turn the engine off and read the document whole with its
+	// production origins intact (test 28).
+	stripRange(r.Out.Header)
 
 	// The query string, byte for byte. This is not optional:
 	// wp-login.php?redirect_to=… is validated by wp_validate_redirect() against
@@ -232,16 +244,30 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	explain := p.Stats.Explain()
 	changed := false
 
-	// The self-redirect guard (PLAN §4.4, test 32). 53 of the fleet's 63 DDEV
+	// The self-redirect guard (PLAN §4.4, test 32). 55 of the fleet's 63 DDEV
 	// repos ship an nginx snippet that 302s a missing /app/uploads/ request to a
-	// hardcoded production origin. Rewriting that Location sends the browser
-	// back to the request it just made: an infinite redirect loop, on 94% of
-	// media requests. Passing it through unmodified is the one enumerated
-	// carve-out to test 28 — a read-only asset GET, not the write hazard.
-	if st != nil && isRedirect(resp.StatusCode) {
+	// hardcoded remote origin. Rewriting that Location sends the browser back to
+	// the request it just made: an infinite redirect loop. Passing it through
+	// unmodified is the one enumerated carve-out to test 28.
+	//
+	// Two things this deliberately does *not* do, both of which it used to.
+	//
+	// It does not fire on an unsafe method. The carve-out's whole justification
+	// is that it is "a read-only asset GET, not the write hazard §4.4 opens
+	// with" — but there was no method test, so a POST to admin-post.php answered
+	// with a self-redirect sent the browser to live production on a write path,
+	// which is that exact hazard.
+	//
+	// It does not skip the rest of the response. It used to return early, which
+	// jumped over every other Tier 1 header and the Set-Cookie Domain= drop, so
+	// Link and CSP went out naming the canonical host and a Domain=.canonical
+	// cookie survived. Test 28 enumerates the carve-out as *one* header; only
+	// Location is exempt, and only for the duration of this block.
+	skipLocation := false
+	if st != nil && isRedirect(resp.StatusCode) && safeMethod(resp.Request) {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceHeader, false)
-			if sameTarget(string(rewritten), st.url) {
+			if sameURL(string(rewritten), st.url) {
 				if p.StrictOrigins {
 					p.log().Warn("self-redirect suppressed by --strict-origins", "url", st.url)
 					blank(resp, http.StatusNotFound,
@@ -254,12 +280,15 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 					Action: origin.ActionSkipped, Reason: origin.ReasonSelfRedirect,
 				}})
 				p.log().Info("self-redirect passed through", "location", loc)
-				return p.finishBody(resp, st, false)
+				skipLocation = true
 			}
 		}
 	}
 
 	for _, h := range originHeaders {
+		if skipLocation && h == "Location" {
+			continue
+		}
 		vs := resp.Header.Values(h)
 		for i, v := range vs {
 			out, ev := fwd.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
@@ -292,11 +321,39 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 }
 
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
+	// Vary first, before anything can return early.
+	//
+	// It used to sit after the content-type switch, whose default arm returns
+	// nil — so the responses that most need it never got it. A 302 whose
+	// Location had just been rewritten into variant space went out with no
+	// Vary at all, and a shared cache keyed on path alone (nginx
+	// proxy_cache_key $uri, a Varnish default with no host in the key — the
+	// deployment §5.5 is written for) then hands variant A's redirect to a
+	// browser sitting on variant B, which is bounced out of its own worktree.
+	// Headers are rewritten for every response, so every response varies.
+	if !p.DryRun {
+		addVary(resp.Header, "Host")
+	}
+
 	if isPartial(resp) {
 		p.log().Info("range response passed through unrewritten", "status", resp.StatusCode)
 		return nil
 	}
-	if !p.decodeBody(resp) {
+	// Decoding is a modification, so --dry-run must not do it. §5.8 defines
+	// that mode as safe to point at a live canonical checkout, and its whole
+	// value is that it cannot perturb what it measures — gunzipping the body
+	// and stripping Content-Encoding is exactly the v0.2 mistake compressBody's
+	// own comment says it exists to avoid.
+	//
+	// A compressed body therefore cannot be measured in that mode. Saying so is
+	// the point: a silent zero reads as "nothing to rewrite here".
+	if p.DryRun {
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(strings.TrimSpace(enc), "identity") {
+			p.log().Info("--dry-run leaves a compressed body untouched, so it is not measured", "encoding", enc)
+			p.skipEncoding(enc)
+			return nil
+		}
+	} else if !p.decodeBody(resp) {
 		return nil // an encoding hostshift cannot decode: byte-identical passthrough
 	}
 
@@ -327,28 +384,43 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			resp.Body = readCloser{io.MultiReader(bytes.NewReader(body), over), resp.Body}
 			return nil
 		}
-		out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.Stats.Explain())
+		out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.log(), p.Stats.Explain())
+		if !p.NoSweep {
+			// §4.4's backstop, which the JSON path was missing entirely. It is
+			// what turns a malformed-document pass-through — a duplicate object
+			// member is legal JSON and jsontext rejects it — from a silent leak
+			// into a rewrite plus a WARN.
+			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+		}
 		if p.DryRun {
 			out = body
 		}
-		resp.Body = io.NopCloser(bytes.NewReader(out))
+		// The upstream body is handed on as the Closer. ReverseProxy closes only
+		// what finishBody leaves in resp.Body, so wrapping the bytes in a
+		// NopCloser dropped the upstream stream on the floor — invisible over
+		// HTTP/1, where it is read to EOF anyway, and a leaked stream over
+		// HTTP/2. The over-cap branch above already did this correctly.
+		resp.Body = readCloser{bytes.NewReader(out), resp.Body}
 		if bytes.Equal(out, body) && !changed {
-			// Genuinely untouched, so the upstream's length and validators
-			// still hold.
+			// Nothing moved, so the upstream's length and validators still hold.
 			//
-			// This compares bytes, not lengths. Equal lengths do not mean equal
-			// bodies: a canonical and variant host of the same length —
-			// https://a.example.com to https://b.example.com — rewrites in
-			// place. Keeping the ETag then lets a conditional request return
-			// 304 and the browser serve a cached canonical-bearing body, which
-			// is the silent failure test 15 exists to prevent.
+			// Length is not the test. Two hosts of equal length — the fleet has
+			// them — meant a rewritten body kept the upstream's ETag, so the
+			// next revalidation 304s and the browser serves whatever it cached
+			// under a validator that now names content the upstream never sent.
 			return nil
 		}
 
 	default:
 		return nil
 	}
-	changed = true
+	// An identity map cannot change a byte, so the upstream's length and
+	// validators still describe the body. Dropping them anyway made test 24's
+	// premise — that an identity map is a no-op — true of the body but not of
+	// the response.
+	if !p.Map.Identity() {
+		changed = true
+	}
 
 	if changed && !p.DryRun {
 		// Every rewrite changes body length, so no stale length may be
@@ -364,10 +436,6 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		resp.Header.Del("Last-Modified")
 		resp.Header.Del("Accept-Ranges")
 	}
-
-	// The body varies with the request Host, so a shared cache downstream must
-	// not serve one variant's body to another (PLAN §5.5).
-	addVary(resp.Header, "Host")
 
 	if p.Compress && st != nil && !p.DryRun {
 		p.compressBody(resp, st.accept)
@@ -426,7 +494,7 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// *keys*, give --explain no RFC 6901 path, and half-rewrite malformed
 		// JSON rather than leaving it alone — three ways for a write to differ
 		// from the read that produced it.
-		out = rewrite.RewriteJSON(buf, rev, p.Stats, explain)
+		out = rewrite.RewriteJSON(buf, rev, p.Stats, p.log(), explain)
 	default:
 		var ev []origin.Event
 		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
@@ -492,7 +560,11 @@ func rewritableHTML(ct string) bool {
 // rewriter's raw-text scan that handles it, not this.
 func rewritableJSON(ct string) bool {
 	mt := strings.ToLower(mediaType(ct))
-	return mt == "application/json" || strings.HasSuffix(mt, "+json")
+	// text/json is not registered, but it is what several WordPress plugins
+	// send, and bodyKind already treats text/* as rewritable on the request
+	// side — so leaving it out here had the two directions disagreeing about
+	// the same body.
+	return mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json")
 }
 
 // readCapped reads up to max bytes. When the body is longer it returns the bytes
@@ -539,6 +611,15 @@ func bodyKind(ct string) bodyClass {
 	return bodyOther
 }
 
+// safeMethod reports a method with no side effects, which is the only kind the
+// self-redirect carve-out may apply to.
+func safeMethod(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return r.Method == http.MethodGet || r.Method == http.MethodHead
+}
+
 func isRedirect(code int) bool {
 	switch code {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
@@ -548,33 +629,23 @@ func isRedirect(code int) bool {
 	return false
 }
 
-// sameTarget reports whether a redirect would send the browser back to the
-// resource it just asked for — host and path, deliberately ignoring the query.
+// sameURL compares two absolute URLs for the self-redirect guard.
 //
-// Ignoring the query is not sloppiness, it is the whole point. The fleet's
-// redirect-uploads.conf says
-//
-//	rewrite ^ https://www.herrfors.fi$request_uri redirect;
-//
-// and nginx *appends the query string again* unless the replacement ends in
-// "?". So the Location comes back as "…png?cb=X?cb=X" — one query longer than
-// the request that produced it. Comparing whole URLs therefore never matched,
-// the guard never fired, and each hop appended another copy until the browser
-// gave up with 414 URI Too Long. Measured live on herrfors.
-//
-// The cost is that a redirect which changes only the query on the same path is
-// now treated as a self-redirect and passed through unrewritten. That is a rare
-// shape, and the alternative it replaces is an infinite loop.
-func sameTarget(a, b string) bool {
-	na, ok := hostPath(a)
+// It normalises the default port and an empty path to "/". It does *not* treat
+// "/a" and "/a/" as equal — an earlier version of this comment claimed it did.
+// If an upstream's hardcoded redirect ever differs from the request by a
+// trailing slash the guard will miss it, the Location will be rewritten back to
+// the variant, and the request will loop.
+func sameURL(a, b string) bool {
+	na, ok := normaliseURL(a)
 	if !ok {
 		return false
 	}
-	nb, ok := hostPath(b)
+	nb, ok := normaliseURL(b)
 	return ok && na == nb
 }
 
-func hostPath(s string) (string, bool) {
+func normaliseURL(s string) (string, bool) {
 	u, err := url.Parse(s)
 	if err != nil || u.Host == "" {
 		return "", false
@@ -587,7 +658,11 @@ func hostPath(s string) (string, bool) {
 	if path == "" {
 		path = "/"
 	}
-	return o.HostPort() + path, true
+	q := u.RawQuery
+	if q != "" {
+		q = "?" + q
+	}
+	return o.HostPort() + path + q, true
 }
 
 // blank replaces a response with a plain-text status.

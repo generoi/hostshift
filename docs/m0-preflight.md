@@ -4,9 +4,15 @@ Run 2026-08-27. No code, per PLAN §8. Three deliverables: the two §4.5 checks,
 and re-creating the `.ddev/docker-compose.hostshift.yaml` loopback override that
 was deleted at the end of the §4.4 experiment.
 
-It found one hazard the plan did not anticipate and corrected five claims in
+It found one hazard the plan did not anticipate and corrected four claims in
 §4.2. Those corrections are applied to `PLAN.md` in this same change; this
 document holds the method and the raw numbers behind them.
+
+**A review pass corrected this document in turn.** Three of its own measurements
+were wrong, two of them badly enough to invert a conclusion, and one had
+"corrected" `PLAN.md` into being less accurate than before. Those are marked in
+place rather than quietly rewritten, because how the numbers were got wrong is
+the more transferable lesson.
 
 ---
 
@@ -30,21 +36,32 @@ orders of magnitude and cannot be used for occupancy. The metric used instead is
 which is what "two agents needing a browsable environment at once" looks like
 from outside.
 
-Caveat: a `.jsonl` is a session transcript, and subagent transcripts cannot be
-distinguished from top-level ones without reading content. If anything this
-*inflates* the concurrency numbers below.
+**Two method errors, corrected after review. Both inverted the conclusion.**
 
-**Result.**
+*The denominator counted a different population from the numerator.* A subagent
+transcript is not a session, and the two are distinguishable purely by path
+depth: a session is `<project>/*.jsonl`, a subagent is
+`<project>/<session-uuid>/subagents/*.jsonl`. The numerator counted only
+sessions; the denominator counted every `.jsonl` on disk. Measured:
+**184 top-level sessions and 5,648 subagent transcripts**, of which 4,238 belong
+to one non-DDEV session. So the ratio was wrong by a factor of about 32, and the
+original caveat here — that subagents "cannot be distinguished without reading
+content" and would "inflate" the numbers — was wrong twice over.
+
+*The worktree scan only looked at sibling directories* in `~/Projects/Genero/`,
+so it missed every worktree checked out **inside** a repo.
+
+**Result, corrected.**
 
 | | |
 |---|---|
 | DDEV repos (`.ddev/config.yaml`) | 63 |
 | …with any Claude Code history | **31** |
-| Sessions in DDEV repos | **113** of 5,826 total (**1.9%**) |
+| Top-level sessions in DDEV repos | **113 of 184 — 61%** |
 | Repos ever reaching 2 concurrent starts | **7** |
 | Clustered start-pairs, entire history | **17** |
-| Worktree-shaped session directories | **1** (`suomentyokalu`) |
-| Worktree checkouts on disk | **1** (`herrfors-wt-pilot` — the pilot itself) |
+| Worktree checkouts on disk | **19** — 18 in `kokoomus/.claude/worktrees/`, 1 in `suomentyokalu` |
+| Worktrees registered in `.git/worktrees/` | **57**, across 30 repos |
 
 Per repo, where any clustering occurred:
 
@@ -58,31 +75,50 @@ snellmanecom     sessions=6   peak_in_window=2  clustered_pairs=1
 holmasto         sessions=6   peak_in_window=2  clustered_pairs=1
 ```
 
-**Reading.** The check does not pass on the terms §4.5 set. Parallel agents in
-worktrees is a real pattern but a small one — 17 clustered pairs across the whole
-history, one worktree on disk. It must not be the headline justification, and
-§3's observation that agents overwhelmingly share one directory is confirmed
-rather than overturned.
+**Reading — the check passes, and the first draft of this document said the
+opposite.** Most Claude Code sessions happen in DDEV repos, not a rounding error
+of them. And the 18 `kokoomus/.claude/worktrees/agent-*` checkouts were created
+on 2026-08-20 in bursts: four within 53 seconds (21:45:23 / 21:45:37 / 21:45:59 /
+21:46:16), three more within 54 seconds the same morning. That is parallel agents
+in worktrees, at a concurrency of three to four, in a DDEV repo — the exact
+population §4.5 asked us to confirm.
 
-**The project is justified by the other half of §4.3.** Counting the `db:pull`
-artifacts that survive on this box:
+kokoomus is also the project §3 cites as showing "0.0% parallel-session time".
+Its 18 parallel agents are subagent transcripts, which the clustering metric
+below excludes by construction, so the metric cannot see the very thing it was
+built to measure. The clustering table is left in place because it is accurate
+for *top-level* sessions, but it is a floor, not a count.
+
+The same standard has to apply in both directions: this document is careful to
+say that retained dumps are "a floor, not a count — they get overwritten and
+deleted", and worktrees are deleted far more aggressively than dumps. Worktrees
+under `/private/tmp/.../scratchpad/` are pruned when a session ends and cannot be
+seen on disk at all.
+
+**The `db:pull` prize is real too, and smaller than first stated.**
 
 | | |
 |---|---|
-| Retained `database.@*.sql` / `wp-sync.sql` dumps | **19** |
-| Total pulled-database bytes on disk | **9.6 GB** |
+| Retained `database.@*.sql` / `wp-sync.sql` files | **19** |
+| …of which are production pulls | **13** (5 are `@ddev` exports, 1 is `@staging`) |
+| Total bytes on disk | **8.6 GB** (first stated as 9.6; no arithmetic over the files yields that) |
 | Span | 2025-08-08 → 2026-08-27 |
 | Multisite repos (search-replace is `--precise` across N pairs) | **12**, N from 2 to 9 |
 
-Retained dumps are a floor, not a count — they get overwritten and deleted. Every
-one represents a full-DB multisite `--precise` search-replace that
-production-canonical deletes outright, for every developer, on every pull,
-needing no worktree at all. That population is not trivial and it is the one to
-build for.
+Not every pull is a *multisite* `--precise` run either: 11 of the 19 files belong
+to single-site repos. And these are one developer's dumps on one machine, so
+"every developer on every pull" is an extrapolation, not a measurement — the same
+caveat that applies to the worktree numbers above.
 
-This does not change the design. It changes what the design is sold on, and it
-makes §9's staging plan (`db:pull`'s search-replace stays the default through M6)
-the right shape rather than merely a cautious one.
+The 9.6 GB figure is reachable only by adding `.sql` files that are not `db:pull`
+artifacts at all (`kokoomus/database.sql`, a Liana export, a cleaned staging
+dump), which contradicts the sentence it was supporting. Worth knowing separately:
+DDEV keeps a full copy of the last imported dump under `.ddev/.importdb*/`, so on
+any repo that has imported one, bytes-on-disk is roughly double the number of
+distinct pulls.
+
+So both halves of §4.3 hold. The design does not change; what changes is that
+the worktree case no longer needs to be argued down.
 
 ## 2. Uploads (§4.5)
 
@@ -101,27 +137,42 @@ existence under `web/app/uploads/`.
 |---|---|
 | Occurrences of canonical `/app/uploads/` URLs | 122,179 |
 | Distinct upload URLs referenced | 2,661 |
-| Present locally | **162** |
-| **Missing locally** | **2,499 (94%)** |
+| Present locally as a regular file | **127** |
+| **Missing locally** | **2,534 — 95.2% of distinct URLs** |
 
-The local tree is 137 files, 868 KB: hand-added SVGs, plus an empty directory
-skeleton (`uploads/.github/workflows`, `uploads/config/`, `uploads/web/app/`)
-left by a mis-targeted rsync. `web/app/uploads/*` is fully gitignored and
-`robo files:pull` has evidently never completed on this checkout.
+The first draft said 162 present and 94% missing. The existence test used `-e`,
+which is true for directories: **35 of the 162 were directories**, not files.
+The document contained the evidence of its own bug — 162 "present" against a
+tree it described as 137 files is impossible — and did not notice.
+
+**"95.2% of distinct URLs" is not "95.2% of requests", and the difference
+matters.** Request volume is nowhere near uniform across distinct URLs: the 127
+present files are theme SVGs, icons and fonts, which is exactly what loads on
+*every* page view, while the 2,534 missing are long-tail post attachments.
+Weighted by requests the figure would be far lower, and nothing in this method
+measures requests. Wherever this number is quoted, it is a distinct-URL rate.
+
+The local tree is 159 files, 1.2 MB — 137 SVGs plus 6 `woff2`, 6 `woff`, 4 HTML
+and 4 CSS. The `2016`–`2026` folders are ordinary WordPress structure; only
+`uploads/.github/`, `uploads/config/` and `uploads/web/app/` are the empty
+skeleton left by a mis-targeted rsync. `web/app/uploads/*` is fully gitignored
+and `robo files:pull` has evidently never completed on this checkout.
 
 Missing uploads are **not** a regression hostshift introduces — under the status
-quo the same 2,499 files are absent. The finding matters for two other reasons,
-both recorded in §4.5: it makes the redirect hazard in §3 below load-bearing
-rather than theoretical, and it puts a number on §9 (on a production-canonical
-database with hostshift not running, 94% of herrfors media loads from live
-production).
+quo the same files are absent. The finding matters for two other reasons, both
+recorded in §4.5: it makes the redirect hazard in §3 below load-bearing rather
+than theoretical, and it puts a number on §9.
 
 Syncing uploads is `robo files:pull`'s job and is explicitly not a hostshift
 deliverable.
 
 ### What the dump also settles about the origin automaton
 
-Origin *forms* actually present in a production database, per host:
+Which origin *forms* are present, per host. These are **matching lines**
+(`grep -c`), not occurrences — a single SQL insert line can carry hundreds of
+URLs, which is why `www.herrfors.fi` shows 15,155 here and 125,534 occurrences
+when counted with `grep -o`. The table is for reading which *forms* exist, not
+how many:
 
 ```
 www.herrfors.fi        https=15155  http=2    pct-enc=6   json-esc=0
@@ -138,7 +189,8 @@ argument:
 - **Both schemes are required.** `nat.herrfors.ddev.site` appears **only** over
   `http://` (165, zero `https://`). A host-keyed map would be wrong; §5.3's
   origin→origin map is right.
-- **Percent-encoded origins are real**, 46 occurrences of `https%3A%2F%2F…`.
+- **Percent-encoded origins are real** — 44 matching lines (6 + 38 in the table
+  above; the first draft said 46, a slip).
 - **JSON-escaped origins are zero in the database** — but that is where you
   cannot measure them. `https:\/\/` is produced at render time by the REST API,
   not stored. Do not conclude from this that §5.2's JSON handling is unnecessary.
@@ -164,16 +216,23 @@ Both belong to M3 (§5.5 comparison rules and the sweep), not M0.
 
 ## 3. The hazard M0 found: the fleet's uploads redirect loops
 
-**53 of 63 DDEV repos (84%)** ship a committed nginx snippet that 302-redirects
+**55 of 63 DDEV repos (87%)** ship a committed nginx snippet that 302-redirects
 any missing `/app/uploads/` request to a hardcoded **production** origin —
-`.ddev/nginx/redirect-uploads.conf` in most, `uploads-redirect.conf` in three
+`.ddev/nginx/redirect-uploads.conf` in 49, `uploads-redirect.conf` in three
 (`ekorosk`, `familjen-snellman-sweden`, `generogrowth`), folded into
 `nginx_full/nginx-site.conf` in three more (`niva`, `snellmanecom`,
-`solarplexius`).
+`solarplexius`). The first draft said 53; the three-and-three sub-lists were
+right and the total was not.
+
+About a third target a `*.kinsta.cloud` hosting hostname rather than the site's
+public production domain, so "production origin" is loose for those — but every
+one of them is a host the repo's own `robo.yml` declares, so the loop argument
+is unaffected.
 
 Under hostshift, that 302's `Location` is Tier 1 and gets rewritten back to the
 variant host — which re-requests the same missing file. `ERR_TOO_MANY_REDIRECTS`,
-on 94% of media requests, on 84% of the fleet. Today it works, because no proxy
+for the 95.2% of distinct upload URLs that are absent locally, on 87% of the
+fleet. Today it works, because no proxy
 is in the path and the redirect simply leaves for production.
 
 Full analysis and the decision — a counted self-redirect guard, with
@@ -224,16 +283,26 @@ Applied to `PLAN.md` §4.2 in this change.
 
 | §4.2 said | Measured |
 |---|---|
-| `fsi` is `multisite: true` with no `url` lists at all | **False.** Complete index-aligned **9**-entry lists for `@ddev`, `@staging`, `@production`. The largest multisite in the fleet, across 7 registrable domains |
+| `fsi` is `multisite: true` with no `url` lists at all | **False.** Complete index-aligned **9**-entry lists for `@ddev`, `@staging`, `@production`. The largest multisite in the fleet, across 5 registrable domains |
 | `suomentyokalu` `@staging` empty | **False.** Aligned at 2 |
-| `spfpension` `@staging` has 1 URL against 4 | **0**, not 1 |
+| `spfpension` `@staging` has 1 URL against 4 | **The plan was right.** It is a *scalar* `url: 'https://stg-spfpension-staging.kinsta.cloud'`, one URL. The audit script counted `- ` list items and got 0, and the first draft of this document "corrected" the plan into being wrong |
 | "N from 2 to 5" | N from **2 to 9** |
 | table of multisite repos | omitted `fsi` (9) and `steripolar` (3) |
 
-One further correction, not a claim §4.2 made but an assumption it invites: the
-environment set is **not** `{@ddev, @staging, @production}`. `@vagrant` (beamex,
-suomentyokalu), `@dev` (mutti), `@kinsta` (snellmanecom) and `@legacy-*`
-(steripolarnew) all occur. The adapter must enumerate, not assume.
+Three further corrections, none of them a claim §4.2 made but all assumptions it
+invites:
+
+- **The environment set is not fixed.** Fleet-wide: `@ddev`, `@dev`, `@kinsta`,
+  `@legacy`, `@legacy-production`, `@legacy-staging`, `@netvisor`, `@production`,
+  `@staging`, `@vagrant`, some with the key quoted. An earlier draft of this
+  paragraph listed five of the ten while arguing against assuming a fixed set.
+- **A URL can repeat within one environment's list**, so the derived map is not
+  injective: `spfpension`'s `@ddev` lists `osterbotten.spfpension.ddev.site`
+  twice against two different canonical origins, and `mutti` and `panini` repeat
+  hosts too. That is test 29c firing on real fleet data, and the adapter must
+  resolve it rather than emit a map hostshift refuses at startup.
+- **Values interpolate** — `mutti`'s URLs are `http://${machine_name}.ddev.site`.
+  The adapter must expand placeholders, not read them literally.
 
 Full per-repo audit:
 
@@ -253,8 +322,10 @@ suomentyokalu  @ddev=2 @vagrant=2 @staging=2 @production=2
 ```
 
 `fsi` is the hardest case in the fleet and a better M6 pilot than the plan's
-herrfors (2) + pellervo (5): nine blogs, seven registrable domains, and an
-`@staging` list that is `http://` where every other environment is `https://`.
+herrfors (2) + pellervo (5): nine blogs across five registrable domains, and an
+`@staging` list that is `http://` where fsi's other environments are `https://`.
+(Not a fleet-wide first: `mutti`'s `@ddev` and `@dev`, and `beamex` and
+`suomentyokalu`'s `@vagrant`, are `http://` too.)
 §8's "done when" is left as written; this is a note, not a change.
 
 ## 7. Toolchain
