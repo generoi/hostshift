@@ -1,0 +1,10 @@
+module github.com/generoi/hostshift
+
+go 1.26
+
+require (
+	github.com/petar-dambovaliev/aho-corasick v0.0.0-20250424160509-463d218d4745
+	golang.org/x/net v0.58.0
+)
+
+require golang.org/x/text v0.41.0 // indirect

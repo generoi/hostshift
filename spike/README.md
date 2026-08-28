@@ -20,9 +20,15 @@ the proof behind §5.2 and §5.7 and the intended M1 starting point.
   drafts, kept only for comparison. **Not** the starting point.
 - `corpus/` — 15 real pages (5,940,172 bytes). `adv/` — 36 adversarial fixtures.
 
-**Before building on this:** the matching in `full` and `e2e` is an unanchored
-`bytes.ReplaceAll` placeholder — the exact construction PLAN §4.4 identifies as
-the double-port bug. Replace it with the anchored origin automaton first;
-`rewriteValue` is the seam. Keep the framing and splicing.
+**Superseded by M1 — do not build on this any more.** The framing and splicing
+now live in `internal/rewrite`, the anchored origin automaton that replaced the
+`bytes.ReplaceAll` placeholder in `internal/origin`, and the proxy in
+`internal/proxy`. The identity check is
+`internal/rewrite.TestIdentityMapByteIdentity`, the span scanner's
+`ValueStart`/`ValueEnd` assertion is `TestAttrSpansAgainstTokenizer`, and test 7
+is covered by `TestIdempotencyFixedPoint`.
 
-Run the identity check over `corpus/` and `adv/` before trusting any change.
+This directory is kept as the evidence behind the Go decision (PLAN §5.7) and as
+the source of `corpus/` and `adv/`, which the real tests run over. It is not
+maintained: it is not gofmt-clean, and its matching is the exact construction
+PLAN §4.4 identifies as the double-port bug.
