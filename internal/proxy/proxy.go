@@ -303,15 +303,63 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 }
 
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
-	if !rewritableHTML(resp.Header.Get("Content-Type")) {
+	ct := resp.Header.Get("Content-Type")
+	switch {
+	case rewritableHTML(ct):
+		resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
+			DryRun:  p.DryRun,
+			NoSweep: p.NoSweep,
+			Stats:   p.Stats,
+			Log:     p.log(),
+		})
+
+	case rewritableJSON(ct):
+		// JSON is buffered rather than streamed, and capped (PLAN §5.8). Above
+		// the cap it passes through untouched and the skip is logged.
+		body, over, err := readCapped(resp.Body, p.maxBody())
+		if err != nil {
+			return err
+		}
+		if over != nil {
+			p.log().Warn("JSON body exceeds the size cap, passing through untouched",
+				"cap", p.maxBody(), "content-type", ct)
+			p.Stats.Record(rewrite.SurfaceJSONString, 0, []origin.Event{{
+				Surface: rewrite.SurfaceJSONString, Action: origin.ActionSkipped,
+				Reason: origin.ReasonSizeCap,
+			}})
+			resp.Body = readCloser{io.MultiReader(bytes.NewReader(body), over), resp.Body}
+			return nil
+		}
+		out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.log(), p.Stats.Explain())
+		if !p.NoSweep {
+			// §4.4's backstop, which the JSON path was missing entirely. It is
+			// what turns a malformed-document pass-through — a duplicate object
+			// member is legal JSON and jsontext rejects it — from a silent leak
+			// into a rewrite plus a WARN.
+			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+		}
+		if p.DryRun {
+			out = body
+		}
+		// The upstream body is handed on as the Closer. ReverseProxy closes only
+		// what finishBody leaves in resp.Body, so wrapping the bytes in a
+		// NopCloser dropped the upstream stream on the floor — invisible over
+		// HTTP/1, where it is read to EOF anyway, and a leaked stream over
+		// HTTP/2. The over-cap branch above already did this correctly.
+		resp.Body = readCloser{bytes.NewReader(out), resp.Body}
+		if bytes.Equal(out, body) && !changed {
+			// Nothing moved, so the upstream's length and validators still hold.
+			//
+			// Length is not the test. Two hosts of equal length — the fleet has
+			// them — meant a rewritten body kept the upstream's ETag, so the
+			// next revalidation 304s and the browser serves whatever it cached
+			// under a validator that now names content the upstream never sent.
+			return nil
+		}
+
+	default:
 		return nil
 	}
-	resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
-		DryRun:  p.DryRun,
-		NoSweep: p.NoSweep,
-		Stats:   p.Stats,
-		Log:     p.log(),
-	})
 	// An identity map cannot change a byte, so the upstream's length and
 	// validators still describe the body. Dropping them anyway made test 24's
 	// premise — that an identity map is a no-op — true of the body but not of
@@ -439,6 +487,32 @@ func (p *Proxy) isCanonicalDomain(d string) bool {
 // Tier 2: 88 CSS and 185 JS files in the fleet's themes, zero absolute URLs.
 func rewritableHTML(ct string) bool {
 	return strings.EqualFold(mediaType(ct), "text/html")
+}
+
+// rewritableJSON covers the REST API and everything modelled on it. JSON-LD
+// arrives inside a <script> tag rather than as a response, so it is the HTML
+// rewriter's raw-text scan that handles it, not this.
+func rewritableJSON(ct string) bool {
+	mt := strings.ToLower(mediaType(ct))
+	// text/json is not registered, but it is what several WordPress plugins
+	// send, and bodyKind already treats text/* as rewritable on the request
+	// side — so leaving it out here had the two directions disagreeing about
+	// the same body.
+	return mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json")
+}
+
+// readCapped reads up to max bytes. When the body is longer it returns the bytes
+// read plus a reader for the rest, so the caller can pass the whole thing
+// through untouched without having lost anything.
+func readCapped(r io.Reader, max int64) (body []byte, over io.Reader, err error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if int64(len(b)) > max {
+		return b, r, nil
+	}
+	return b, nil, nil
 }
 
 func mediaType(ct string) string {

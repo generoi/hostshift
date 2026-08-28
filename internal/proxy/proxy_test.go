@@ -557,11 +557,102 @@ func TestRequestDirectionMechanics(t *testing.T) {
 	}
 }
 
+// TestJSONResponseRewritten is the response half of tests 4, 22 and 31. Without
+// it the REST API hands the browser canonical origins and Gutenberg saves them
+// straight back — response-only rewriting is not enough, and neither is
+// request-only.
+func TestJSONResponseRewritten(t *testing.T) {
+	body := `{"link":"https:\/\/www.acmecorp.fi\/x","content":{"rendered":"<a href=\"https:\/\/www.acmecorpnat.fi\/y\">k<\/a>"}}`
+	for _, ct := range []string{"application/json", "application/ld+json", "application/json; charset=UTF-8"} {
+		h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", ct)
+			io.WriteString(w, body)
+		})
+		res, got := h.get(t, variantHost, "/wp-json/wp/v2/posts/1")
+		if bytes.Contains(got, []byte("acmecorp.fi")) {
+			t.Errorf("%s: a canonical origin reached the browser: %s", ct, got)
+		}
+		// Cross-blog: blog 2's canonical must land on blog 2's variant.
+		if !bytes.Contains(got, []byte(`https:\/\/wt-a--nat.acmecorp.ddev.site\/y`)) {
+			t.Errorf("%s: the sibling blog's URL was not mapped per blog: %s", ct, got)
+		}
+		if res.Header.Get("Content-Length") != "" {
+			t.Errorf("%s: a stale Content-Length survived a rewritten JSON body", ct)
+		}
+	}
+}
+
+// TestEditRoundTrip is acceptance tests 30 and 31, as far as the proxy can
+// carry them.
+//
+// The upstream is a one-post "database": a POST stores exactly the bytes it
+// receives and a GET returns exactly what was stored. The assertion is the whole
+// point of the bidirectional design — what is *stored* must be canonical, so the
+// clone stays byte-comparable with production, while what the browser sees is
+// always the variant.
+//
+// The database half of tests 30 and 31 — asserting against real wp_posts rows —
+// needs a live WordPress and lands with the M6 pilot.
+func TestEditRoundTrip(t *testing.T) {
+	var stored string
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "POST" {
+			b, _ := io.ReadAll(r.Body)
+			stored = string(b)
+			w.Write(b)
+			return
+		}
+		io.WriteString(w, stored)
+	})
+
+	// Gutenberg saves a post whose body links to another page on the site. It
+	// only ever saw variant URLs, so that is what it sends.
+	sent := `{"content":"<a href=\"https:\/\/wt-a--acmecorp.ddev.site\/about\/\">About<\/a>"}`
+	h.do(t, "POST", variantHost, "/wp-json/wp/v2/posts/1", "application/json", []byte(sent))
+
+	// What the database holds is canonical — production, exactly as an
+	// unrewritten dump would have it.
+	if !strings.Contains(stored, `https:\/\/www.acmecorp.fi\/about\/`) {
+		t.Errorf("the database stored a variant URL, polluting the clone:\n%s", stored)
+	}
+	if strings.Contains(stored, "ddev.site") {
+		t.Errorf("a dev hostname reached the database:\n%s", stored)
+	}
+
+	// And reading it back gives the browser the variant again, so the edit
+	// round trip closes.
+	_, got := h.get(t, variantHost, "/wp-json/wp/v2/posts/1")
+	if !bytes.Contains(got, []byte(`https:\/\/wt-a--acmecorp.ddev.site\/about\/`)) {
+		t.Errorf("the round trip did not come back as the variant:\n%s", got)
+	}
+	if bytes.Contains(got, []byte("acmecorp.fi")) {
+		t.Errorf("a canonical origin reached the browser:\n%s", got)
+	}
+}
+
+// TestJSONOverCapPassesThrough: above the cap a JSON response streams through
+// untouched (PLAN §5.8).
+func TestJSONOverCapPassesThrough(t *testing.T) {
+	body := `{"pad":"` + strings.Repeat("x", 4096) + `","u":"https://www.acmecorp.fi/x"}`
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}, func(p *Proxy) { p.MaxBody = 1024 })
+
+	_, got := h.get(t, variantHost, "/wp-json/")
+	if string(got) != body {
+		t.Errorf("an over-cap JSON body was modified (%d in, %d out)", len(body), len(got))
+	}
+}
+
 // TestNonRewritableNeverEntersARewriter is acceptance test 25, and test 12 for
-// the binary case.
+// the binary case. JSON is deliberately absent: it is in the rewritable set from
+// M4. text/css and application/javascript stay out per §5.2 Tier 2 — 88 CSS and
+// 185 JS files in the fleet's themes, zero absolute URLs between them.
 func TestNonRewritableNeverEntersARewriter(t *testing.T) {
 	binary := append([]byte("\x89PNG\r\n\x1a\n"), []byte(canonical+"/x")...)
-	for _, ct := range []string{"image/png", "text/css", "application/javascript", "application/json"} {
+	for _, ct := range []string{"image/png", "text/css", "application/javascript", "font/woff2"} {
 		h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", ct)
 			w.Write(binary)
