@@ -8,8 +8,10 @@ package corpus
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -31,6 +33,27 @@ type Options struct {
 	Timeout   time.Duration // per request
 	Paths     []string      // explicit paths; when empty, crawl from "/"
 	Client    *http.Client
+
+	// CanonicalHeaders are added to the canonical fetch only.
+	//
+	// When the canonical base is resolved past the TLS-terminating router
+	// straight to the container, the headers that router would have added are
+	// missing — and X-Forwarded-Proto in particular is load-bearing: without it
+	// WordPress believes the request is plain HTTP and canonical-redirects to
+	// the https URL it is already on. Comparing against that redirect measures
+	// nothing. The variant side needs no such help, because hostshift adds the
+	// header itself.
+	CanonicalHeaders map[string]string
+
+	// Resolve overrides DNS, "host:port" → "addr:port", the way curl's
+	// --resolve does.
+	//
+	// It is not a convenience. Under production-canonical the canonical base
+	// *is* the production hostname, so running the diff without it would crawl
+	// the client's live site — the one thing this whole design exists to keep
+	// the developer away from. Resolving it to the local container makes the
+	// target explicit.
+	Resolve map[string]string
 }
 
 // Result is one page's comparison.
@@ -57,8 +80,23 @@ func Run(ctx context.Context, o Options) ([]Result, error) {
 		if timeout == 0 {
 			timeout = 30 * time.Second
 		}
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		if len(o.Resolve) > 0 {
+			base := &net.Dialer{Timeout: timeout}
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if to, ok := o.Resolve[addr]; ok {
+					addr = to
+				}
+				return base.DialContext(ctx, network, addr)
+			}
+			// The certificate will be the container's mkcert one, which carries
+			// no production name. Verifying it is not what this test is about;
+			// test 29b is where the TLS behaviour is asserted.
+			tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
 		o.Client = &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: tr,
 			// Redirects are part of what is being compared, not something to
 			// follow past.
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -139,6 +177,11 @@ func fetch(ctx context.Context, o Options, base *url.URL, path string) ([]byte, 
 	}
 	// Ask for identity so the comparison is over the bytes the rewriter saw.
 	req.Header.Set("Accept-Encoding", "identity")
+	if base == o.Canonical {
+		for k, v := range o.CanonicalHeaders {
+			req.Header.Set(k, v)
+		}
+	}
 	res, err := o.Client.Do(req)
 	if err != nil {
 		return nil, err

@@ -1,101 +1,195 @@
-# M6 — pilot against a live site
+# M6 — pilot
 
-Run 2026-08-27 against the **running** `herrfors` DDEV project. Read-only: it
-makes GETs against a local dev site and imports nothing, so the database is left
-exactly as it was.
+Run 2026-08-27. Two pilots: `herrfors` against a genuinely **unrewritten
+production database**, and `pellervo` — five blogs — in ddev-canonical mode.
 
-That bounds what it proves. It proves the proxy against real WordPress output —
-real HTML, real multisite, real headers — with the map `canonical = the ddev
-hosts`, which is what `.ddev/config.yaml` alone produces (test 10e). It does
-**not** prove production-canonical; see "What this does not cover".
+Both corpus diffs are green, which is §8's "done when" criterion for the diff.
 
-## Setup
+`ddev snapshot pre-hostshift-pilot` was taken before anything was imported.
+Rollback is `ddev snapshot restore pre-hostshift-pilot`.
 
-```yaml
-# hostshift.yaml
-upstream: http://127.0.0.1:32839      # the web container's port 80, bypassing the router
-sites:
-  - {name: main, canonical: https://herrfors.ddev.site,     variant: http://localhost:18090}
-  - {name: nat,  canonical: https://nat.herrfors.ddev.site, variant: http://127.0.0.1:18090}
-```
+---
 
-`localhost` and `127.0.0.1` are two distinct hostnames that both resolve to
-loopback, which is what lets one listener serve two blogs and exercise the
-multisite inverse mapping for real without touching `/etc/hosts`.
+## 1. herrfors, production-canonical
 
-## Result
-
-**Corpus diff: 20 pages, 0 leaks, 0 errors, GREEN.**
-
-Every page's line count is identical between the rewritten canonical bytes and
-the bytes the proxy served — 5977/5977, 8803/8803, and so on. Splicing never
-rebuilds whitespace, so a line-count change is how re-serialisation would show,
-and there is none.
-
-One page came back byte-identical. The other nineteen differ, and **every
-difference is a CSP nonce**:
+### The database is production's, untouched
 
 ```
-rewritten canonical: 339186 bytes
-through the proxy  : 339186 bytes
-
-38c38
-<     <style nonce='YEmuraTlmlBdmBFWJmpTKYnVoKFyrQLK' >/* vietnamese */
->     <style nonce='pk6IfiwesJsJ8qQ6uTrQ2VTC5NluTVXM' >/* vietnamese */
-
-what kinds of token differ?
-    158 nonce
-      2 <timestamp>
+$ ddev mysql -N -e "select blog_id, domain, path from wp_blogs" db
+1  www.herrfors.fi     /
+2  www.herrforsnat.fi  /
 ```
 
-The byte counts are equal. Two fetches of the same WordPress page necessarily
-differ by their per-request nonces; nothing else did.
+Before the import it held `herrfors.ddev.site` / `nat.herrfors.ddev.site` — the
+result of `db:pull`'s search-replace. Nothing rewrote it back.
 
-Also verified live:
+### Test 29d — WP-CLI
 
-| | |
+The regression §4.3 predicts, reproduced exactly:
+
+```
+$ ddev wp site list
+Error: Site 'herrfors.ddev.site/' not found. Verify DOMAIN_CURRENT_SITE
+matches an existing site or use `--url=<url>` to override.
+```
+
+After `hostshift wp-cli > wp-cli.local.yml`:
+
+```
+$ ddev wp option get home
+https://www.herrfors.fi
+
+$ ddev wp site list --fields=blog_id,url
+blog_id  url
+1        https://www.herrfors.fi/
+2        https://www.herrforsnat.fi/
+```
+
+**Green — and it corrected two claims in §4.3.** See "Corrections" below.
+
+### Test 29a — loopback containment
+
+Control, before the override reaches the running container:
+
+```
+$ ddev exec getent hosts www.herrfors.fi
+151.101.1.91   n.sni.global.fastly.net  www.herrfors.fi
+```
+
+That is live production via Fastly. After `ddev restart` applies
+`.ddev/docker-compose.hostshift.yaml`:
+
+```
+$ ddev exec getent hosts www.herrfors.fi
+127.0.0.1      www.herrfors.fi
+$ ddev exec getent hosts www.herrforsnat.fi
+127.0.0.1      www.herrforsnat.fi
+
+http  code=301 ip=127.0.0.1:80
+https code=301 ip=127.0.0.1:443
+```
+
+Both schemes stay on the box. **Green.**
+
+### Test 29b — TLS, and both halves of the limitation
+
+```
+verified   exit 60 (SSL certificate problem)
+unverified code=301
+
+SAN: herrfors.ddev.site, nat.herrfors.ddev.site, localhost, web,
+     ddev-herrfors-web, ddev-herrfors-web.ddev, 127.0.0.1
+```
+
+No production name in the certificate, exactly as §4.4 measured. At the
+WordPress level:
+
+```
+home_url() = https://www.herrfors.fi/
+  wp_remote_post(home, sslverify=false)  [cron]     ok    HTTP 200
+  wp_remote_get(home, sslverify=false)   [health]   FAIL  Too many redirects
+  wp_safe_remote_get(home)               [oEmbed]   FAIL  cURL error 60
+  wp_safe_remote_get(sibling blog)                  FAIL  cURL error 60
+
+  gethostbyname(www.herrfors.fi)    = 127.0.0.1
+  gethostbyname(www.herrforsnat.fi) = 127.0.0.1
+```
+
+Cron works and nothing leaves the machine. Two results contradict §4.4 and are
+corrected below.
+
+### The corpus diff — test 28 over a crawl
+
+```
+$ hostshift diff --canonical-base https://www.herrfors.fi \
+    --variant-base http://localhost:18095 \
+    --resolve www.herrfors.fi:443:127.0.0.1:32851 \
+    --canonical-header "X-Forwarded-Proto: https" -n 20
+
+20 pages, 1 byte-identical, 0 leaks, 0 errors
+corpus diff GREEN: no canonical origin reached the browser, no page re-serialised
+stragglers: 0
+```
+
+Every page's line count is identical — 5977/5977, 8803/8803 — and every
+difference is a CSP nonce (158 per page, with equal byte counts). Two fetches of
+a WordPress page necessarily differ by their nonces; nothing else did.
+
+`--resolve` is not a convenience. Under production-canonical the canonical base
+*is* the production hostname, so without it the crawl would hit the client's live
+site — the one thing this design exists to keep developers away from.
+
+## 2. pellervo, five blogs
+
+No production dump exists on this box, so this is ddev-canonical: it proves the
+five-blog map and the per-blog inverse routing, not production-canonical.
+
+```
+  localhost    status=200 bytes=282188   canonical origins remaining=0
+  127.0.0.1    status=200 bytes=262518   canonical origins remaining=0
+  127.0.0.2    status=200 bytes=305263   canonical origins remaining=0
+  127.0.0.3    status=200 bytes=284305   canonical origins remaining=0
+  127.0.0.4    status=410 bytes=2572     canonical origins remaining=0
+
+12 pages, 1 byte-identical, 0 leaks, 0 errors
+corpus diff GREEN
+stragglers: 0
+```
+
+Five distinct loopback hostnames serve as the five variants, so one listener
+routes all five blogs by `Host`. The 410 on blog 5 is the site's own state —
+`ddev wp site list` shows `otlehti` with `archived=1`, and it returns 410 with or
+without the proxy.
+
+`/app/uploads/2022/12/mountains.jpeg` came back **byte-identical** through the
+proxy: test 12 on a real image rather than a fixture.
+
+---
+
+## Corrections the pilot forced
+
+Applied to `PLAN.md`.
+
+| Claim | Measured |
 |---|---|
-| Multisite blog 2 (`127.0.0.1` → `nat.herrfors.ddev.site`) | 200, 0 canonical origins remaining |
-| `Content-Length` / `ETag` on a rewritten page | dropped, `Transfer-Encoding: chunked` |
-| `Vary` | `Host` |
-| Unmapped host | 421, never proxied |
+| §4.3: "WP-CLI merges [`wp-cli.local.yml`] over `wp-cli.yml` with local taking precedence" | **It replaces.** With WP-CLI 2.12.0, a local file containing only `url:` loses `path:`, `require:` and every alias, and WP-CLI can no longer find the installation |
+| §4.3: "sibling blogs keep working through the existing aliases — `wp @nat …`" | `@nat` is an **SSH alias into production**. Following that advice runs the command against the live site. The local sibling alias is `@herrforsnat.ddev`, whose `url:` production-canonical breaks |
+| §4.4: "**Site Health** loopback probes (same) — work" | **They loop.** DDEV's nginx derives `$fcgi_https` from `$http_x_forwarded_proto` alone, never `$scheme`, so a request on the container's own 443 listener is reported to PHP as plain HTTP and WordPress redirects to the https URL it is already on |
+| §4.4: a sibling blog "resolving to `127.0.0.1`, is rejected as unsafe" by `wp_http_validate_url` | It gets as far as TLS and fails with the same `cURL error 60`. Same outcome, different mechanism |
 
-## What the pilot changed
+`hostshift wp-cli` now emits the existing `wp-cli.yml` back with a root `url:`
+added, and warns for every alias whose `url:` the database no longer holds rather
+than rewriting it — silently changing what `wp @ddev` means is worse than saying
+so, when some of those aliases are SSH into production.
 
-It found 25 stragglers per crawl, and neither kind was a bug in the sweep — both
-were surfaces the structured pass was not scanning:
+## An unrelated bug, worth knowing
 
-1. **HTML comments.** `sage-cachetags` emits
-   `<!-- sage-cachetags Url: https://herrfors.ddev.site/… -->` on every cached
-   page — roughly 20 per crawl.
-2. **URLs in visible prose.** A privacy-policy paragraph quoting its own URL:
-   `https://herrfors.ddev.site/fi/tietosuoja/gdpr/ (“…`.
+**Every retained `db:pull` dump on this box begins with seven lines of PHP
+warnings** from `config/wp-cli/pre-ssh.php`, before the MariaDB header:
 
-§4.4 is explicit that every straggler is "a gap in the structured pass and a bug
-to fix", so both are now scanned there. The second matters more than it looks:
-under production-canonical, a visible prose URL pointing at production is exactly
-the hazard §4.4 opens with — a developer copy-pastes it and lands on live
-production. §4.4 already accepts the consequence ("a page that intentionally
-links to production, as a URL, is rewritten too"), and anchoring keeps test 28's
-exclusion intact, because a bare hostname has no scheme and cannot match.
+```
+Warning: Undefined array key "ssh" in …/config/wp-cli/pre-ssh.php on line 28
+Deprecated: preg_match(): Passing null to parameter #2 …
+…
+/*M!999999\- enable the sandbox mode */
+-- MariaDB dump 10.19-11.4.7-MariaDB
+```
 
-**After the change: 0 stragglers.** The sweep is a silent backstop on real pages,
-which is what §4.4 wants it to be.
+`ddev import-db` fails on them — **and drops the database before it fails**. The
+import here only worked as `tail -n +9 dump.sql | mysql`. That is a `db:pull` bug
+in the Genero repos rather than anything to do with hostshift, but it is why the
+snapshot mattered, and it means the dumps sitting on developer machines are not
+usable as-is.
 
-## What this does not cover
+## Still not covered
 
-- **The REST API is auth-gated on this site** — every `/wp-json/` endpoint
-  returns 401. The 401 bodies pass through correctly with no canonical origins,
-  but live JSON rewriting was not exercised. It stays covered by unit tests
-  against realistic REST shapes.
-- **Tests 29a, 29b, 29d and test 28 over a full crawl** need a
-  production-canonical database — `wp_blogs.domain` holding `www.herrfors.fi`
-  rather than `herrfors.ddev.site`. That means importing the 524 MB dump over an
-  existing local database, which is not reversible by hostshift and is not
-  hostshift's call. `ddev snapshot` first, and prefer the existing
-  `herrfors-wt-pilot` worktree (its own DDEV project,
-  `herrfors-wt-3477594550`, currently stopped) over canonical `herrfors`, which
-  is running.
-- **The DDEV add-on's router wiring** is written to the mechanism the phpmyadmin
-  add-on already uses and its YAML is asserted valid, but it has not been
-  installed into a project and started.
+- **The DDEV add-on has not been installed into a project and started.** The
+  pilot drove `hostshift proxy` directly. Its YAML is asserted valid and its
+  router wiring follows the mechanism the phpmyadmin add-on already uses, but
+  that is not the same as having run it.
+- **The REST API is auth-gated on herrfors** — every `/wp-json/` endpoint returns
+  401, so live JSON rewriting was not exercised. The 401 bodies pass through
+  correctly with no canonical origins; JSON stays covered by unit tests against
+  realistic REST shapes.
+- **The database halves of tests 30 and 31** — asserting against real `wp_posts`
+  rows after an editor save — need an authenticated wp-admin session.
