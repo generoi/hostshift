@@ -286,7 +286,7 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	// validators still describe the body. Dropping them anyway made test 24's
 	// premise — that an identity map is a no-op — true of the body but not of
 	// the response.
-	if !p.Matcher.Identity() {
+	if !p.Map.Identity() {
 		changed = true
 	}
 
