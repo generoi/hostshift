@@ -282,7 +282,13 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		DryRun: p.DryRun,
 		Stats:  p.Stats,
 	})
-	changed = true
+	// An identity map cannot change a byte, so the upstream's length and
+	// validators still describe the body. Dropping them anyway made test 24's
+	// premise — that an identity map is a no-op — true of the body but not of
+	// the response.
+	if !p.Matcher.Identity() {
+		changed = true
+	}
 
 	if changed && !p.DryRun {
 		// Every rewrite changes body length, so no stale length may be
