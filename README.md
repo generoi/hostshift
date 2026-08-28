@@ -29,8 +29,10 @@ and against `pellervo`'s five blogs. Both corpus diffs green: 0 leaks, 0
 stragglers, every line count identical. `docs/m6-pilot.md` has the numbers and
 the four `PLAN.md` claims the pilot corrected.
 
-Not yet done: installing the DDEV add-on into a project and starting it — the
-pilot drove `hostshift proxy` directly.
+Not yet done at pilot time: installing the DDEV add-on into a project and
+starting it — the pilot drove `hostshift proxy` directly. Both adoption PRs
+(generoi/herrfors, generoi/btbtransformers) now document that path, and CI's e2e
+job installs through the add-on.
 
 ## Using it
 
@@ -57,7 +59,8 @@ is impossible and would be a silent no-op, so the map is always declared.
 
 1. **DDEV defaults.** `.ddev/config.yaml`'s `name` and `additional_hostnames`
    give the ordered list of local hosts for free. For a single-environment site
-   with no extra aliases this is enough on its own and no config file is needed.
+   with no extra aliases this is enough on its own and no config file is needed
+   — with a `--slug`, which is what says *which* variant to derive.
 2. **`hostshift.yaml`.** Adds the production hostnames, alias hosts from other
    environments, the variant pattern and the upstream.
 3. **Flags.** `--slug`, `--upstream`, `--from`/`--to`, `--map C=V`.
@@ -128,10 +131,15 @@ production origin reaches the browser"; `--strict-origins` returns 404 instead.
 
 ## The DDEV add-on
 
-The whole add-on is two compose files and an `install.yaml`. No `lib.sh`, no
+Two compose files, an `install.yaml`, and one host command. No `lib.sh`, no
 hooks, no guard — §3 measured what happens when per-repo footprint is not held
 to, and the answer was 42 repos carrying 14 different pinned SHAs of the same
 submodule.
+
+The command is the opinionated half, and it is opinionated on purpose: it works
+the slug out from the git branch, decides which hostnames `web` keeps, and
+writes the two gitignored files a worktree needs. Its tests are
+`test/addon-command.sh`.
 
 ```
 ddev add-on get generoi/hostshift

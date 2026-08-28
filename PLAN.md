@@ -417,18 +417,25 @@ url: https://www.herrfors.fi
 **`wp-cli.local.yml` does not merge — it replaces.** Measured with WP-CLI 2.12.0:
 a local file containing only `url:` loses `path:`, `require:` and *every* alias,
 leaving WP-CLI unable to find the installation at all ("This does not seem to be
-a WordPress installation"). So `hostshift wp-cli` emits the existing `wp-cli.yml`
-back with a root `url:` added, rather than a bare two-line file written over it.
+a WordPress installation"). So `ddev hostshift wp-cli` emits the existing
+`wp-cli.yml` back with a root `url:` added, rather than a bare two-line file
+written over it — an existing root `url:` replaced rather than duplicated, and a
+newline forced between the two, since yaml.v3 rejects a duplicate key and a file
+with no trailing newline glues `url:` onto its last line.
+
+It lives in the add-on and not the binary: `hostshift` does not know what a CMS
+is, and a proxy with a `wp-cli` subcommand is not a Unix tool.
 
 **"Sibling blogs keep working through the existing aliases" was wrong twice.**
 In herrfors' `wp-cli.yml`, `@nat` is an **SSH alias into production** — following
 that advice would have run the command against the live site. The *local* sibling
 alias is `@herrforsnat.ddev`, and its `url:` is the ddev host, which
 production-canonical breaks. The honest instruction is `wp --url=https://www.herrforsnat.fi`,
-and `hostshift wp-cli` warns for every alias whose `url:` the database no longer
-holds rather than silently rewriting it — silently changing what `wp @ddev` means
-is worse than saying so, especially when some of these aliases are SSH into
-production.
+and `ddev hostshift wp-cli` leaves every alias exactly as written rather than
+silently rewriting it — silently changing what `wp @ddev` means is worse than
+leaving it alone, especially when some of these aliases are SSH into production.
+The M6 pilot's alias warning went with the Go implementation and has not been
+rebuilt in shell; `wp-cli.yml` is read-only to this command now.
 
 With the full generated override, test 29d passes on an unrewritten production
 database: `ddev wp option get home` returns `https://www.herrfors.fi` and
@@ -1335,8 +1342,16 @@ Bind `0.0.0.0` **inside the container** with no published host port — `127.0.0
 is unreachable from the DDEV router. When run as a bare binary, bind `127.0.0.1`.
 Never publish the port.
 
-Distribution: static binary, distroless image, and a DDEV add-on that is *only*
-a compose service — no `lib.sh`, no generated files, no hooks, no guard.
+Distribution: static binary, distroless image, and a DDEV add-on that is a
+compose service, the loopback override, and **one host command**. No `lib.sh`,
+no hooks, no guard — nothing runs during a request.
+
+The command exists because the binary refuses to. Deriving a slug from a git
+branch, deciding which hostnames `web` should keep, writing `.ddev/.env` and the
+generated `additional_hostnames`: all of that is opinionated setup, and a binary
+carrying it is a tool for one shop. `hostshift` maps origins and *reads* a DDEV
+project's declared hostnames as one source for that map; `ddev hostshift` does
+the rest, and can one day be its own repo without the binary noticing.
 
 ---
 

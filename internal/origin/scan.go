@@ -82,6 +82,17 @@ func (s *scanIter) fill() bool {
 		// discarded, exactly as before.
 		s.pos = sep + 1
 
+		// sepLen is -1 when this was a lone "\/" or "%2F" rather than the start
+		// of a separator: there is no separator here and nothing to read a host
+		// after. Adding it as an offset probed one byte *before* the match, and
+		// a one-byte canonical host matches there — a zero-width candidate the
+		// automaton never yields. For a non-alphanumeric one-byte host it even
+		// survived the anchor check and spliced bytes into a response the
+		// automaton would have left alone.
+		if sepLen < 0 {
+			continue
+		}
+
 		f := s.m.hostAt(s.b, sep+sepLen, enc)
 		if f == nil {
 			continue

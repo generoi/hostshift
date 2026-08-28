@@ -20,6 +20,7 @@
 package ddev
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -71,6 +72,19 @@ func load(dir string) (*config, string, error) {
 		if err != nil {
 			continue
 		}
+		// An override file may opt out of being read here by carrying the line
+		// `# hostshift:ignore`. Exactly one thing needs it, and it needs it
+		// badly: whatever registers the *variant* hostnames has to write them
+		// into a config.*.yaml for mkcert to cover them, and that file then
+		// becomes input to the next run. The variants come back as canonical
+		// hosts, get variants of their own, and additional_hostnames grows
+		// without bound — four entries, then sixteen — while the map fills with
+		// wt-b--wt-a--site.ddev.site. Reading one's own output is the bug; a
+		// marker the writer opts into is the narrowest fix, and it costs a
+		// reader who never writes such a file nothing.
+		if bytes.Contains(ob, []byte("hostshift:ignore")) {
+			continue
+		}
 		var o config
 		if err := yaml.Unmarshal(ob, &o); err != nil {
 			return nil, "", fmt.Errorf("%s: %w", g, err)
@@ -104,7 +118,7 @@ func load(dir string) (*config, string, error) {
 	return &d, path, nil
 }
 
-// ddevHostnames is every hostname the project registers with DDEV.
+// hostnames is every hostname the project registers with DDEV.
 func hostnames(d *config) []string {
 	if d == nil {
 		return nil
@@ -123,7 +137,7 @@ func hostnames(d *config) []string {
 	return appendUnique(nil, all)
 }
 
-// projectTLD is the project's DDEV TLD, defaulted the way DDEV defaults it.
+// tldOf is the project's DDEV TLD, defaulted the way DDEV defaults it.
 func tldOf(d *config) string {
 	if d == nil || d.ProjectTLD == "" {
 		return "ddev.site"
@@ -131,12 +145,12 @@ func tldOf(d *config) string {
 	return d.ProjectTLD
 }
 
-// DDEVProject reports what DDEV would call this project and what it answers to.
+// Load reports what DDEV would call this project and what it answers to.
 //
-// It is the shallow question — the project's own identity — as distinct from
-// Load's, which is what maps to what. `init` needs both, and for a worktree they
-// come from different directories: the map from the checkout whose database is
-// shared, the identity from the project being configured.
+// It answers the shallow question — this project's own identity — as distinct
+// from config.Load's, which is what maps to what. A worktree needs both, and for
+// it they come from different directories: the map from the checkout whose
+// database is shared, the identity from the project being configured.
 func Load(dir string) (*Project, error) {
 	d, _, err := load(dir)
 	if err != nil || d == nil {
@@ -162,7 +176,7 @@ func appendUnique(dst, src []string) []string {
 	return dst
 }
 
-// ddevConfig is the subset of .ddev/config.yaml hostshift reads. It is the only
+// config is the subset of .ddev/config.yaml hostshift reads. It is the only
 // third-party format hostshift understands (PLAN §5.3).
 type config struct {
 	Name                string   `yaml:"name"`

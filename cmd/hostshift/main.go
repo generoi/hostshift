@@ -96,7 +96,9 @@ func main() {
 	case "diff":
 		code, err = cmdDiff(os.Args[2:])
 	case "-h", "--help", "help":
-		fmt.Fprint(os.Stderr, usage)
+		// Asked for, so it is the answer and not a diagnostic: stdout, exit 0.
+		// `hostshift --help > notes.txt` produced an empty file.
+		fmt.Print(usage)
 	case "version", "--version":
 		fmt.Println(version)
 	default:
@@ -313,6 +315,16 @@ func cmdHosts(args []string) (int, error) {
 	if proj == nil {
 		return exitConfig, fmt.Errorf("no project config found in %s", *dir)
 	}
+	// One hostname per line is a contract, and a hostname with a space in it
+	// breaks it silently: the caller splits on whitespace and gets two. It is
+	// reachable — DDEV names an unnamed project after its directory, and a
+	// directory may be called "My Site" — and `map` rejects the same project with
+	// exit 2, so printing it here made the two disagree about the same config.
+	for _, h := range proj.Hosts {
+		if _, err := origin.Parse("https://" + h); err != nil {
+			return exitConfig, fmt.Errorf("%s declares %q, which is not a hostname: %w", ddev.Path(*dir), h, err)
+		}
+	}
 	for _, h := range proj.Hosts {
 		fmt.Println(h)
 	}
@@ -370,8 +382,13 @@ func cmdCheck(args []string) (int, error) {
 		return exitConfig, err
 	}
 	n := len(res.Map.Sites)
+	code := exitOK
 	if res.Map.Identity() {
+		// "no rewrite can occur" is the definition of not usable, and check
+		// documents itself as exiting 2 when the map is not usable. Exiting 0
+		// made it a status line rather than a check.
 		fmt.Fprintf(os.Stderr, "hostshift: %d site(s) from %s — identity map, no rewrite can occur\n", n, res.Source)
+		code = exitConfig
 	} else {
 		fmt.Fprintf(os.Stderr, "hostshift: %d site(s) from %s — map is injective and anchored\n", n, res.Source)
 	}
@@ -385,7 +402,7 @@ func cmdCheck(args []string) (int, error) {
 		}
 	}
 
-	return exitOK, nil
+	return code, nil
 }
 
 // cmdDiff is the corpus diff — PLAN §7's only test that validates against
