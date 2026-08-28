@@ -1,5 +1,13 @@
 # hostshift — container-scoped loopback containment (PLAN §4.4).
 #
+# Deliberately NOT marked #ddev-generated. This file has to be edited — the host
+# list below is the site's own production hostnames — and DDEV overwrites a file
+# carrying that marker on the next `ddev add-on get`. Which it did: the pilot
+# project's edited list was reverted to www.example.com, loopback containment
+# silently disappeared, and wp-cron went back to POSTing the client's live site.
+# Without the marker DDEV installs this once and never touches it again, which is
+# what a file the operator owns needs.
+#
 # WordPress makes internal HTTP requests to home_url() — wp-cron, Site Health,
 # some block-editor and REST paths. Under production-canonical, home_url() is
 # the production hostname, so without this file those requests leave the box and
@@ -15,8 +23,8 @@
 # WordPress is talking to itself using exactly the host its database expects.
 # The proxy is only ever in the browser's path.
 #
-# Copy to <repo>/.ddev/docker-compose.hostshift.yaml and replace the host list
-# with this site's canonical (production) hostnames — one per blog. DDEV merges
+# Replace the host list below with this site's canonical (production)
+# hostnames — one per blog. DDEV merges
 # `.ddev/docker-compose.*.yaml` overrides by design. Stock DDEV emits no
 # `extra_hosts` on `web`, so there is nothing to clobber.
 #

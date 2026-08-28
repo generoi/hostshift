@@ -381,6 +381,19 @@ func TestSelfRedirectGuard(t *testing.T) {
 		}
 	})
 
+	// The fleet's conf is `rewrite ^ https://host$request_uri redirect`, and
+	// nginx appends the query string *again* unless the replacement ends in "?".
+	// The Location is then one query longer than the request that produced it,
+	// the guard never matches, and each hop appends another copy until the
+	// browser gives up with 414 — observed live on herrfors.
+	//
+	// The guard deliberately does *not* absorb that. Ignoring the query here
+	// would make hostshift carry a workaround for a one-character bug in the
+	// fleet's own nginx snippet, and would silently pass through every redirect
+	// that changes only the query on the same path. The fix is `$request_uri?`
+	// in redirect-uploads.conf, which the rollout PR ships; `hostshift check`
+	// warns when a project still has the loop.
+
 	t.Run("an ordinary redirect is still rewritten", func(t *testing.T) {
 		// Test 1: a login redirect goes somewhere else, so the guard must not
 		// catch it.
@@ -629,6 +642,61 @@ func TestEditRoundTrip(t *testing.T) {
 	}
 	if bytes.Contains(got, []byte("herrfors.fi")) {
 		t.Errorf("a canonical origin reached the browser:\n%s", got)
+	}
+}
+
+// TestEqualLengthRewriteStillDropsValidators is the regression test for a bug
+// that used length equality as a proxy for "unchanged".
+//
+// A canonical and variant host of the same length rewrite in place. Keeping the
+// ETag then lets a conditional request return 304 and the browser serve a cached
+// canonical-bearing body — the silent failure test 15 exists to prevent, and one
+// that only appears for hostnames that happen to match in length.
+func TestEqualLengthRewriteStillDropsValidators(t *testing.T) {
+	const (
+		canon = "https://aaa.example.test"
+		vari  = "https://bbb.example.test"
+	)
+	if len(canon) != len(vari) {
+		t.Fatal("the fixture must have equal-length origins or it tests nothing")
+	}
+	m, err := origin.NewMap([]origin.Site{{
+		Name: "main", Canonical: origin.MustParse(canon), Variant: origin.MustParse(vari),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"link":"` + canon + `/x"}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"abc123"`)
+		io.WriteString(w, body)
+	}))
+	defer up.Close()
+	target, _ := url.Parse(up.URL)
+	p := &Proxy{Upstream: target, Map: m, Stats: rewrite.NewStats(false)}
+	front := httptest.NewServer(p.Handler())
+	defer front.Close()
+
+	req, _ := http.NewRequest("GET", front.URL+"/wp-json/", nil)
+	req.Host = "bbb.example.test"
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	if !bytes.Contains(got, []byte(vari)) {
+		t.Fatalf("the body was not rewritten: %s", got)
+	}
+	if len(got) != len(body) {
+		t.Fatalf("the fixture no longer exercises the equal-length case (%d vs %d)", len(got), len(body))
+	}
+	if v := res.Header.Get("ETag"); v != "" {
+		t.Errorf("ETag survived an equal-length rewrite: %q — a conditional request "+
+			"would now serve a cached canonical-bearing body", v)
 	}
 }
 

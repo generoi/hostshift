@@ -394,9 +394,28 @@ url: https://www.herrfors.fi
 
 - **no committed change in any repo**, so nothing to drift (§3)
 - it disappears the moment hostshift is not in use
-- WP-CLI merges it over `wp-cli.yml` with local taking precedence
-- sibling blogs keep working through the existing aliases — `wp @nat …` already
-  carries `www.herrforsnat.fi`
+
+**Two claims in this section were false, and the M6 pilot found both.**
+
+**`wp-cli.local.yml` does not merge — it replaces.** Measured with WP-CLI 2.12.0:
+a local file containing only `url:` loses `path:`, `require:` and *every* alias,
+leaving WP-CLI unable to find the installation at all ("This does not seem to be
+a WordPress installation"). So `hostshift wp-cli` emits the existing `wp-cli.yml`
+back with a root `url:` added, rather than a bare two-line file written over it.
+
+**"Sibling blogs keep working through the existing aliases" was wrong twice.**
+In herrfors' `wp-cli.yml`, `@nat` is an **SSH alias into production** — following
+that advice would have run the command against the live site. The *local* sibling
+alias is `@herrforsnat.ddev`, and its `url:` is the ddev host, which
+production-canonical breaks. The honest instruction is `wp --url=https://www.herrforsnat.fi`,
+and `hostshift wp-cli` warns for every alias whose `url:` the database no longer
+holds rather than silently rewriting it — silently changing what `wp @ddev` means
+is worse than saying so, especially when some of these aliases are SSH into
+production.
+
+With the full generated override, test 29d passes on an unrewritten production
+database: `ddev wp option get home` returns `https://www.herrfors.fi` and
+`ddev wp site list` returns both blogs on their production hostnames.
 
 Note the simplification this produces: under production-canonical the `@ddev` and
 `@production` aliases converge on the same `url:`, differing only in transport.
@@ -598,20 +617,42 @@ presented certificate is mkcert with
 — no production names — so unverified `curl` succeeds and verified `curl` returns
 `000`. Consequences:
 
-- **cron** (`sslverify => false`) — works
-- **Site Health** loopback probes (same) — work
+- **cron** (`sslverify => false`) — works. Confirmed live in M6: HTTP 200.
 - **`wp_safe_remote_get` paths** — the block editor's link-preview endpoint
   (`class-wp-rest-url-details-controller.php:254`) and internal oEmbed
-  (`class-wp-oembed.php:454`) — **fail cert validation**
+  (`class-wp-oembed.php:454`) — **fail cert validation**. Confirmed live:
+  `cURL error 60: SSL certificate problem`.
 
 Accept that. The alternative is issuing a locally-trusted certificate bearing a
 real production domain; even scoped to one container's trust store that is a bad
 trade for two non-critical features.
 
-**One more caveat:** `wp_http_validate_url` exempts `$same_host`, so blog 1's own
-loopback survives the private-IP check. A *sibling* blog's host is not
-`$same_host` and, resolving to `127.0.0.1`, is rejected as unsafe — cross-blog
-`wp_safe_remote_*` will fail. Document it.
+**Site Health loopback probes do *not* work, and the reason is not TLS.** This
+paragraph previously listed them alongside cron as working. Measured in M6 they
+fail with "Too many redirects", and the cause is one line of DDEV's nginx config:
+
+```nginx
+map $http_x_forwarded_proto $fcgi_https { … }   # /etc/nginx/nginx.conf
+```
+
+`$fcgi_https` is derived from the forwarded header **only**, never from
+`$scheme`. A request arriving directly on the container's own 443 listener — which
+is exactly what the `extra_hosts` loopback creates — carries no such header, so
+PHP is told the request is plain HTTP and WordPress canonical-redirects to the
+`https` URL it is already on. Forever. Supplying `X-Forwarded-Proto: https`
+turns the same request into a clean 200, which is how it was diagnosed.
+
+It is not hostshift's to fix: hostshift is not in the loopback path at all, and
+the file is `#ddev-generated`. §4.4's own fallback already covers it —
+"disabling cron loopback and accepting a failing Site Health check is a
+legitimate fallback for a development environment" — and cron, the one that
+matters, works.
+
+**One more caveat, with its mechanism corrected.** A *sibling* blog's host is not
+`$same_host`, so cross-blog `wp_safe_remote_*` fails. The prediction was that
+`wp_http_validate_url` would reject it as a private IP; measured, it gets as far
+as TLS and fails with the same `cURL error 60`. Same outcome, different
+mechanism — worth knowing when reading the error.
 
 Exposure is smaller than it first appears: `DISABLE_WP_CRON` (already referenced
 in `herrfors/config/application.php`) removes the most frequent loopback, leaving
@@ -665,8 +706,21 @@ request URL, emit the `Location` **unmodified** and count it as
 `self-redirect-passthrough`. It is loop-free, needs no per-repo config, and is
 narrow in the right way: it fires on the exact shape that loops.
 
-Two limits worth stating rather than discovering. It defuses **period-1** loops
-only — a period-2 cycle, where blog A's origin redirects to blog B's canonical
+**The guard compares whole URLs, query included, and must keep doing so.** The
+fleet writes the snippet as `rewrite ^ https://host$request_uri redirect`, and
+nginx appends the query string a *second* time unless the replacement ends in
+`?`. So the `Location` comes back one query longer than the request that
+produced it, the equality test never matches, and each hop appends another copy
+until the browser gives up at 414 — measured live on herrfors. M6 made the guard
+ignore the query to absorb that, and it was reverted: hostshift would then be
+carrying a workaround for a one-character bug in someone else's nginx config,
+and would silently pass through every redirect that changes only the query on
+the same path. The fix is `$request_uri?` in the repo, and `hostshift check`
+names the file and prints the offending line — 52 of the 53 fleet repos with
+this snippet still need it.
+
+Two further limits worth stating rather than discovering. It defuses **period-1**
+loops only — a period-2 cycle, where blog A's origin redirects to blog B's canonical
 host and back, is constructible in a multisite map and the equality test never
 fires. And because every `redirect-uploads.conf` hardcodes **one** origin, a miss
 on a *non-primary* blog redirects to blog 1's canonical host, which is not the
@@ -1426,7 +1480,7 @@ equality. Fixtures would not have caught the double-port bug; this would.
 
 **M0 — pre-flight (§4.5). Done 2026-08-27.** Usage survey and uploads-sync check,
 both recorded in §4.5 and `docs/m0-preflight.md`. `.ddev/docker-compose.hostshift.yaml`
-re-created from `templates/` and verified merged onto the `web` service via
+re-created from the template now in `ddev/` and verified merged onto the `web` service via
 `ddev debug compose-config`. Found the `redirect-uploads.conf` redirect loop
 (§4.4, test 32) and corrected five §4.2 claims. *No code.*
 
@@ -1581,10 +1635,54 @@ before it can fail, so a body labelled gzip that is not gzip loses however many
 bytes the header check read — the whole body, when it is short. The head is
 captured and put back.
 
-**M6 — packaging + pilot.** Binary, image, thin add-on, corpus diff against
-herrfors, and test 28 over the full crawl. Also tests 29a, 29b and 29d, moved
-here from M2: each needs a live DDEV project on an unrewritten production
-database, which is what this milestone stands up.
+**M6 — packaging + pilot. Packaging done 2026-08-27; pilot pending.**
+
+Done: static binaries for linux and darwin on both architectures (~7 MB each), a
+distroless image, the DDEV add-on — two compose files and an `install.yaml`, with
+a test asserting it stays that way — and `hostshift diff`, the corpus diff.
+
+The corpus diff is green against a local canonical site and the same site through
+the proxy: **16 pages, 16 byte-identical, 0 leaks, 0 errors**, with line counts
+preserved exactly. It reports byte equality, but the assertions that fail a run
+are the two that cannot be innocent on a live site — a canonical origin reaching
+the browser, and a page whose line count changed, which means something
+re-serialised.
+
+**Piloted against the running `herrfors` project**, read-only, with
+`canonical = the ddev hosts` (the map `.ddev/config.yaml` alone produces).
+**20 pages, 0 leaks, 0 errors, every line count identical.** Full write-up in
+`docs/m6-pilot.md`; one page byte-identical and the other nineteen differing
+only in CSP nonces, 158 of them, with equal byte counts.
+
+The pilot paid for itself immediately: it found 25 stragglers per crawl, and
+neither kind was a defect in the sweep. `sage-cachetags` emits a URL in an HTML
+comment on every cached page, and a privacy-policy paragraph quotes its own URL
+in visible prose. Both are now scanned in the structured pass, per §4.4's rule
+that every straggler is a bug to fix there. The prose case matters more than it
+looks: under production-canonical a visible URL pointing at production is exactly
+the hazard §4.4 opens with, since a developer copy-pastes it and lands on live
+production. After the change the sweep catches **zero** on real pages, which is
+what a backstop should do.
+
+**Pilot done, on canonical `herrfors` against an unrewritten production
+database.** `ddev snapshot pre-hostshift-pilot` first; full write-up in
+`docs/m6-pilot.md`.
+
+`wp_blogs.domain` holds `www.herrfors.fi` and `www.herrforsnat.fi`, exactly as
+production has them, and nothing rewrote it. **Tests 29a, 29b and 29d pass, and
+the corpus diff is green: 20 pages, 0 leaks, 0 errors, 0 stragglers, every line
+count identical.** pellervo's five blogs are green too — 12 pages, 0 leaks,
+including a real JPEG returned byte-identical through the proxy.
+
+Both halves of §8's "done when" corpus criterion are met. What remains is
+installing the add-on into a project and starting it, which the pilot ran around
+by driving `hostshift proxy` directly.
+
+One artifact worth knowing about, unrelated to hostshift: **every retained
+`db:pull` dump on this box begins with seven lines of PHP warnings** from
+`config/wp-cli/pre-ssh.php`, before the MariaDB header. `ddev import-db` fails on
+them, and it drops the database before it fails. That is a `db:pull` bug in the
+Genero repos, not this one, but it is the reason the snapshot mattered.
 
 This is not a small project. The previous revision's *"the tool is
 straightforward once these are green"* is the sentence most likely to mislead an

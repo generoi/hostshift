@@ -256,11 +256,11 @@ func TestEntityDecodeLeavesInnocentValuesAlone(t *testing.T) {
 // structured pass's genuine input offsets.
 func TestStragglerOffsetsAreInputOffsets(t *testing.T) {
 	m := realMatcher(t)
-	// Two rewrites first, so the streams are out of step; then an origin the
-	// structured pass does not touch — a comment is neither a tag nor text, so
-	// only the sweep sees it.
+	// Two rewrites first, so the streams are out of step; then an origin in a
+	// doctype, which is the one token kind the structured pass still passes
+	// through verbatim — so only the sweep sees it.
 	in := `<a href="https://www.canon.test/"></a><a href="https://www.canon.test/"></a>` +
-		`<!-- https://www.canon.test/z -->`
+		`<!DOCTYPE html SYSTEM "https://www.canon.test/z">`
 	want := strings.Index(in, "https://www.canon.test/z")
 
 	st := NewStats(true)

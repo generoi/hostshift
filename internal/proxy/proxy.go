@@ -485,9 +485,17 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 	rev := p.Map.Reverse()
 	explain := p.Stats.Explain()
 	var out []byte
-	if kind == bodyMultipart {
+	switch kind {
+	case bodyMultipart:
 		out = rewriteMultipart(buf, ct, rev, p.Stats, explain)
-	} else {
+	case bodyJSON:
+		// The same span-aware rewriter the response side uses. Running the raw
+		// matcher over a request body instead would rewrite origins in JSON
+		// *keys*, give --explain no RFC 6901 path, and half-rewrite malformed
+		// JSON rather than leaving it alone — three ways for a write to differ
+		// from the read that produced it.
+		out = rewrite.RewriteJSON(buf, rev, p.Stats, p.log(), explain)
+	default:
 		var ev []origin.Event
 		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
@@ -585,15 +593,16 @@ type bodyClass int
 const (
 	bodyOther bodyClass = iota
 	bodyFlat
+	bodyJSON
 	bodyMultipart
 )
 
 func bodyKind(ct string) bodyClass {
 	mt := strings.ToLower(mediaType(ct))
 	switch {
+	case mt == "application/json", strings.HasSuffix(mt, "+json"):
+		return bodyJSON
 	case mt == "application/x-www-form-urlencoded",
-		mt == "application/json",
-		strings.HasSuffix(mt, "+json"),
 		strings.HasPrefix(mt, "text/"):
 		return bodyFlat
 	case mt == "multipart/form-data":

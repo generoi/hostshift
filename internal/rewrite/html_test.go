@@ -158,16 +158,18 @@ func TestRawTextElementsAreScanned(t *testing.T) {
 // position is caught, rewritten and reported, and running the sweep twice is a
 // fixed point.
 //
-// The fixture is a comment, which is now the honest example of a position the
-// structured pass does not handle *by design* — comments are passed through
-// verbatim, and a URL in one is not dereferenceable by the browser. The
-// foreign-content case this used to use is handled properly now, see above.
+// The fixture is a doctype, which is what is left once attributes, every
+// raw-text element, body text and comments are all scanned. The
+// operationally important case is not this one but the oversize-token
+// passthrough in the proxy's transport tests: there the sweep is what makes a
+// bounded parser safe, and it is the reason exceeding the token cap can be a
+// degradation rather than an abort.
 func TestStragglerSweep(t *testing.T) {
 	m := pairMatcher(t, "https://c.example", "https://v.example")
-	const in = `<p>x</p><!-- see https://c.example/in-a-comment --><p>z</p>`
+	const in = `<!DOCTYPE html SYSTEM "https://c.example/in-a-doctype"><p>x</p>`
 
 	if got := run(t, in, m, Options{NoSweep: true, Log: quiet()}); !strings.Contains(got, "c.example") {
-		t.Fatalf("the structured pass now handles comments; this fixture no longer tests the sweep: %s", got)
+		t.Fatalf("the structured pass now handles doctypes; this fixture no longer tests the sweep: %s", got)
 	}
 
 	st := NewStats(true)
@@ -176,7 +178,7 @@ func TestStragglerSweep(t *testing.T) {
 	if strings.Contains(got, "c.example") {
 		t.Errorf("the sweep did not catch the straggler: %s", got)
 	}
-	if !strings.Contains(got, "https://v.example/in-a-comment") {
+	if !strings.Contains(got, "https://v.example/in-a-doctype") {
 		t.Errorf("the straggler was not rewritten correctly: %s", got)
 	}
 	if n := st.Rewrites(SurfaceStraggler); n != 1 {
@@ -199,7 +201,7 @@ func TestStragglerSweep(t *testing.T) {
 // missed. Feeding one byte at a time is the adversarial case.
 func TestSweepStreamsAcrossChunkBoundaries(t *testing.T) {
 	m := pairMatcher(t, "https://c.example", "https://v.example")
-	in := `<p>x</p><!-- https://c.example/x --><p>` + strings.Repeat("y", 200) + `</p>`
+	in := `<p>x</p><!DOCTYPE html SYSTEM "https://c.example/x"><p>` + strings.Repeat("y", 200) + `</p>`
 
 	for _, chunk := range []int{1, 3, 17, 4096} {
 		out, err := io.ReadAll(NewResponseBody(&chunkReader{b: []byte(in), n: chunk}, m, nil, Options{Log: quiet()}))
