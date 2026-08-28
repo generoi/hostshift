@@ -177,13 +177,17 @@ func cmdRewrite(args []string) (int, error) {
 			Stats:   st,
 			Log:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		})
-	case mt == "application/json" || strings.HasSuffix(mt, "+json"):
+	case mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json"):
 		// JSON is buffered, not streamed (PLAN §5.8).
 		body, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return exitRuntime, err
 		}
-		out := rewrite.RewriteJSON(body, m, st, *explain)
+		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		out := rewrite.RewriteJSON(body, m, st, log, *explain)
+		if !*noSweep {
+			out = rewrite.SweepBytes(out, m, st, log)
+		}
 		if *dryRun {
 			out = body
 		}

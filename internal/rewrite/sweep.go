@@ -158,6 +158,39 @@ func (s *Sweep) Close() error {
 	return nil
 }
 
+// SweepBytes is §4.4's straggler backstop for a body that is already buffered.
+//
+// The streaming Sweep exists because HTML bodies must not be held whole; JSON
+// is buffered anyway (§5.8's size cap), so it needs none of that machinery — no
+// carry-over window, no left-context byte, no offset map, because the whole
+// document is in hand and its offsets are already input offsets.
+//
+// M4 added an entire response surface without one. Every miss on the JSON path
+// was therefore a silent test 28 leak: the same post body that the HTML path
+// rewrote and, where it could not, reported, went out over /wp-json/ carrying a
+// production origin with no WARN and no non-zero counter — the exact inverse of
+// "each straggler is a gap in the structured pass and a bug to fix".
+func SweepBytes(b []byte, m *origin.Matcher, st *Stats, log *slog.Logger) []byte {
+	if len(b) == 0 || m.Identity() {
+		return b
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	out, events := m.Rewrite(b, SurfaceStraggler, true)
+	for _, e := range events {
+		if e.Action != origin.ActionRewrote {
+			continue
+		}
+		log.Warn("straggler swept — a canonical origin survived the structured pass",
+			"offset", e.Offset,
+			"origin", e.Text,
+			"context", context(b, e.Offset))
+	}
+	st.Record(SurfaceStraggler, 0, events)
+	return out
+}
+
 // context returns the bytes either side of a straggler, for the report.
 func context(b []byte, at int) string {
 	lo := max(0, at-48)

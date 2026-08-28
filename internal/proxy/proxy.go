@@ -330,13 +330,30 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			resp.Body = readCloser{io.MultiReader(bytes.NewReader(body), over), resp.Body}
 			return nil
 		}
-		out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.Stats.Explain())
+		out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.log(), p.Stats.Explain())
+		if !p.NoSweep {
+			// §4.4's backstop, which the JSON path was missing entirely. It is
+			// what turns a malformed-document pass-through — a duplicate object
+			// member is legal JSON and jsontext rejects it — from a silent leak
+			// into a rewrite plus a WARN.
+			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+		}
 		if p.DryRun {
 			out = body
 		}
-		resp.Body = io.NopCloser(bytes.NewReader(out))
-		if len(out) == len(body) && !changed {
+		// The upstream body is handed on as the Closer. ReverseProxy closes only
+		// what finishBody leaves in resp.Body, so wrapping the bytes in a
+		// NopCloser dropped the upstream stream on the floor — invisible over
+		// HTTP/1, where it is read to EOF anyway, and a leaked stream over
+		// HTTP/2. The over-cap branch above already did this correctly.
+		resp.Body = readCloser{bytes.NewReader(out), resp.Body}
+		if bytes.Equal(out, body) && !changed {
 			// Nothing moved, so the upstream's length and validators still hold.
+			//
+			// Length is not the test. Two hosts of equal length — the fleet has
+			// them — meant a rewritten body kept the upstream's ETag, so the
+			// next revalidation 304s and the browser serves whatever it cached
+			// under a validator that now names content the upstream never sent.
 			return nil
 		}
 
@@ -477,7 +494,11 @@ func rewritableHTML(ct string) bool {
 // rewriter's raw-text scan that handles it, not this.
 func rewritableJSON(ct string) bool {
 	mt := strings.ToLower(mediaType(ct))
-	return mt == "application/json" || strings.HasSuffix(mt, "+json")
+	// text/json is not registered, but it is what several WordPress plugins
+	// send, and bodyKind already treats text/* as rewritable on the request
+	// side — so leaving it out here had the two directions disagreeing about
+	// the same body.
+	return mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json")
 }
 
 // readCapped reads up to max bytes. When the body is longer it returns the bytes
