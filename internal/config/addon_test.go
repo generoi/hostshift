@@ -37,10 +37,27 @@ func TestAddonHasNoHooksOrScripts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The compose service, install.yaml, and the one command that scaffolds a
+	// project. §5.7 said "only a compose service — no lib.sh, no hooks, no
+	// guard", and that still holds for the request path: nothing here runs
+	// during a request, generates a guard, or wraps a task that should just
+	// work. What the command does is the setup the *binary* deliberately does
+	// not do, because scaffolding DDEV is opinionated and hostshift is not a
+	// DDEV tool.
 	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".yaml") {
-			t.Errorf("ddev/%s: the add-on is compose files and install.yaml only", e.Name())
+		if e.Name() == "commands" {
+			continue
 		}
+		if !strings.HasSuffix(e.Name(), ".yaml") {
+			t.Errorf("ddev/%s: the add-on is compose files, install.yaml and commands/", e.Name())
+		}
+	}
+	cmds, err := os.ReadDir("../../ddev/commands/host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cmds) != 1 || cmds[0].Name() != "hostshift" {
+		t.Errorf("ddev/commands/host holds %v; one command is the budget", cmds)
 	}
 
 	b, err := os.ReadFile("../../ddev/docker-compose.hostshift.yaml")

@@ -7,11 +7,16 @@
 // answers to, so for a single-environment site the map comes for free (§5.3's
 // layer 1) — plus the runtime files a project needs to route to the proxy.
 //
-// Keeping it in its own package is the point. §5.3 layers the map so that no
-// layer is required, and hostshift had drifted into reading .ddev/config.yaml
-// from the middle of map resolution and writing three .ddev/ files from `init`,
-// which makes a proxy look like a DDEV add-on. It is a binary that runs
-// anywhere, with a DDEV integration beside it.
+// It *reads* and does not scaffold, and that is the whole boundary. Reading a
+// project's declared hostnames costs no opinion — anyone running DDEV gets a map
+// for free, and anyone not running it loses nothing. Writing .ddev/ files,
+// guessing a slug from a branch, deciding which hostnames web should keep: all
+// of that is opinionated setup, and it belongs in the add-on where being
+// opinionated is the job. `ddev hostshift` does it; this package does not.
+//
+// The distinction matters beyond tidiness. hostshift should be usable by someone
+// who has never heard of DDEV, and a binary with a `ddev init` subcommand is a
+// tool for one shop.
 package ddev
 
 import (
@@ -164,29 +169,4 @@ type config struct {
 	ProjectTLD          string   `yaml:"project_tld"`
 	AdditionalHostnames []string `yaml:"additional_hostnames"`
 	AdditionalFQDNs     []string `yaml:"additional_fqdns"`
-}
-
-// Env is the two lists the compose service reads from .ddev/.env.
-//
-// The second is the non-obvious one. DDEV puts every additional hostname on
-// web's VIRTUAL_HOST, so unless it is narrowed, web and hostshift both claim
-// the variants and the router picks web — WordPress then sees a variant host,
-// fails to match wp_blogs.domain, and redirects to wp-signup.php.
-//
-// web keeps *this project's* hostnames minus the variants, not the canonical
-// set. The two coincide for a canonical project and diverge for a worktree
-// sharing canonical's database: there, canonical is a separate project that is
-// still running and still owns its own hostnames, and handing them to the
-// worktree's web container makes two projects claim one hostname.
-func Env(projectHosts, variants []string) (variantList, webHosts []string) {
-	isVariant := map[string]bool{}
-	for _, v := range variants {
-		isVariant[v] = true
-	}
-	for _, h := range projectHosts {
-		if !isVariant[h] {
-			webHosts = append(webHosts, h)
-		}
-	}
-	return variants, webHosts
 }
