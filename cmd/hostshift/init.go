@@ -100,12 +100,30 @@ func cmdInit(args []string) (int, error) {
 		}
 	}
 	if len(mine) < len(kept) {
+		// A note, not a warning, and the difference is the point.
+		//
+		// A worktree inherits the tracked .ddev/config.yaml, so a multisite's
+		// additional_hostnames come with it and the project registers hostnames
+		// belonging to the checkout it came from. DDEV appends override lists
+		// rather than replacing them — checked with `ddev debug configyaml` —
+		// so they cannot be subtracted there.
+		//
+		// It does not collide where it matters. DDEV builds the :80 and :443
+		// routers from each service's VIRTUAL_HOST, which is exactly what the
+		// generated .ddev/.env sets, so with those hostnames left out of
+		// HOSTSHIFT_WEB_HOSTS this project registers no route for them and the
+		// canonical site keeps serving them. Verified against a running
+		// worktree's Traefik config: web-443 carried only the project's own
+		// hostname. What is left is the auxiliary services — phpmyadmin on
+		// :8037, xhgui on :8142 — which build their routers from DDEV_HOSTNAME
+		// and will answer on the inherited names too, against the same shared
+		// database.
 		fmt.Fprintf(os.Stderr,
-			"hostshift: warning: this worktree also registers %d hostname(s) belonging to the\n"+
-				"  checkout it came from, because .ddev/config.yaml is tracked and\n"+
-				"  additional_hostnames comes with it. Two DDEV projects claiming one\n"+
-				"  hostname is a race the router settles by whichever started last. Move\n"+
-				"  additional_hostnames out of the tracked config.yaml to fix it properly.\n",
+			"hostshift: note: %d hostname(s) of the checkout this worktree came from are\n"+
+				"  registered here too, because .ddev/config.yaml is tracked. Routing is\n"+
+				"  unaffected — they are left out of HOSTSHIFT_WEB_HOSTS, so this project\n"+
+				"  serves neither. Only add-ons on their own ports (phpmyadmin, xhgui)\n"+
+				"  will answer on them.\n",
 			len(kept)-len(mine))
 	}
 	res.DDEVHosts, res.ProjectTLD = mine, tld
