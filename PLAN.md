@@ -234,14 +234,16 @@ domains**. That is the norm, not the exception:
 
 | repo | blogs | production domains |
 |---|---|---|
+| fsi | 9 | `fsi.idrott.fi`, `idrott.fi`, `esboif.fi`, `ngf.fi`, `gamlakarlebyif.fi`, `raseborgsskyttar.fi`, `piffotboll.idrott.fi`, … |
 | pellervo | 5 | `kodinpellervo.fi`, `maatilanpellervo.fi`, `omapiha.info`, … |
 | snellmanecom | 5 | `snellmanpetfood.com`, `shop.snellman.fi`, … |
 | steripolarnew | 4 | `steripolar.dk`, `*.steripolarnew.kinsta.cloud` |
-| fluo | 3 | `flpipe.fi`, `kesrec.fi`, `fluosites.kinsta.cloud` |
 | spfpension | 4 | |
+| fluo | 3 | `flpipe.fi`, `kesrec.fi`, `fluosites.kinsta.cloud` |
+| steripolar | 3 | `steripolar.fi`, `www.steripolarvet.fi`, `www.steripolar.se` |
 | beamex, mutti, panini, suomentyokalu, herrfors | 2 each | |
 
-12 multisite repos, N from 2 to 5. Any suffix-derived mapping is dead — and not
+12 multisite repos, N from 2 to **9**. Any suffix-derived mapping is dead — and not
 only on the production side. `snellmanecom`'s *local* hosts are
 `snellmanecom.ddev.site`, `shop.snellman.ddev.site` and
 `tilaus.figen.ddev.site`: three different bases.
@@ -284,11 +286,45 @@ This was the user's own instinct during the 2026-08-21 session — *"hmm could w
 make it 'speak' .ddev.config.yml? and anything else our projects have"* → *"or
 robo.yml"* — and it was not pursued.
 
-**Edge cases found in the fleet:** `spfpension` (`@staging` has 1 URL against 4
-elsewhere), `suomentyokalu` (`@staging` empty) and `snellmanecom` (`@kinsta` has 2
-against 5) carry unequal environment lists; `steripolarnew` carries extra
-`@legacy-*` environments with equal lists; `fsi` is `multisite: true` with no
-`url` lists at all. All must fail loudly rather than mis-align by index.
+**Edge cases found in the fleet** — re-measured across all 12 multisite repos in
+M0, which corrected three of the five claims this paragraph previously made:
+
+- `spfpension` — `@staging` has **1 URL** against 4 elsewhere, as revision 2 said.
+  It is written as a *scalar* — `url: 'https://stg-spfpension-staging.kinsta.cloud'`
+  — not a one-item list, which is the more useful fact: **the adapter must accept
+  both scalar and list forms** of `url:`, and this is the only instance of the
+  scalar form in the fleet. An M0 audit script counted list items, got 0, and
+  briefly "corrected" this paragraph into being wrong.
+- `snellmanecom` — `@kinsta` has 2 against 5. Confirmed.
+- `steripolarnew` — extra `@legacy-staging` / `@legacy-production` environments,
+  all with equal 4-entry lists. Confirmed.
+- `fsi` — **the previous claim that it has no `url` lists at all is false.** It
+  declares complete, index-aligned **9**-entry lists for `@ddev`, `@staging` and
+  `@production`, and is the largest multisite in the fleet across seven
+  registrable domains. Its `@staging` list is `http://`, not `https://` — direct
+  confirmation that the map must be origin→origin and carry both schemes (§5.3).
+- `suomentyokalu` — **the previous claim that its `@staging` is empty is false.**
+  It is aligned at 2. What it does carry, like `beamex`, is an extra `@vagrant`
+  environment; `mutti` carries `@dev`.
+
+Unequal lists must fail loudly rather than mis-align by index.
+
+Three further shapes the adapter has to survive, all present in these same files:
+
+- **The environment set is not fixed.** Fleet-wide the keys are `@ddev`, `@dev`,
+  `@kinsta`, `@legacy`, `@legacy-production`, `@legacy-staging`, `@netvisor`,
+  `@production`, `@staging`, `@vagrant` — and some files quote the key. Enumerate
+  them; do not assume a set. (An earlier draft of this paragraph listed five of
+  the ten, which rather made the point.)
+- **A URL can repeat inside one environment's list**, so the map derived from
+  `robo.yml` is **not injective**. `spfpension`'s `@ddev` lists
+  `https://osterbotten.spfpension.ddev.site` twice, against two *different*
+  canonical origins; `mutti` and `panini` repeat hosts too. §5.4 requires
+  injectivity in both directions, so the adapter must reject or resolve this
+  rather than emit a map hostshift will refuse at startup — which is test 29c
+  firing on real fleet data.
+- **Values interpolate** — `mutti`'s URLs are `http://${machine_name}.ddev.site`.
+  The adapter must expand `robo.yml`'s placeholders, not read them literally.
 
 ### 4.3 Why the proxy, and why canonical = production
 
@@ -371,7 +407,7 @@ The seven repos with a `wp-cli.yml` but no `wp-cli.local.yml` gitignore entry �
 need that line added; `hostshift check` should warn when it is missing rather
 than silently generating a file that would be committed.
 
-### 4.4 Two hazards this introduces
+### 4.4 Three hazards this introduces
 
 **A missed rewrite reaches live production.** This is the serious one and it is
 new. Under the status quo an unrewritten URL points at a host that does not
@@ -531,19 +567,117 @@ polluting the clone and breaking edit round trips. The transformation is
 **bidirectional on bodies** — variant → canonical on POST/PUT form data and REST
 JSON writes. See §5.1.
 
-### 4.5 Still to confirm before M1
+**The fleet's uploads redirect becomes an infinite redirect loop. Found in M0.**
+This is the third hazard and it was not anticipated anywhere above.
 
-Neither of these blocks the decision, but both are cheap and should be run first:
+**55 of the 63 DDEV repos** (87%) ship a committed uploads redirect —
+`.ddev/nginx/redirect-uploads.conf` in 49, `uploads-redirect.conf` in three,
+folded into `nginx_full/nginx-site.conf` in three more:
 
-- **Usage survey.** 1,373 of 1,413 subagent spawns need no environment at all,
-  and the 40 that isolate are all in a project showing 0.0% parallel-session
-  time. Confirm the population this serves is non-trivial.
-- **Uploads.** With production URLs in content, `https://www.herrfors.fi/app/uploads/…`
-  rewrites to the variant host and must resolve against locally synced uploads.
-  Verify the sync covers what content references.
+```nginx
+location ^~ /app/uploads/ {
+    absolute_redirect off;
+    try_files $uri @external;
+}
+location @external {
+    rewrite ^ https://www.herrfors.fi$request_uri redirect;
+}
+```
 
-§5 is the design. §4.5 lists two cheap checks to run before M1; neither blocks
-the decision.
+Every instance targets a hardcoded remote origin — the site's public production
+domain in most, a `*.kinsta.cloud` hosting hostname in about a third, but always
+a host the repo's own `robo.yml` declares. It fires only on a miss, and it is why
+nobody has noticed that uploads are barely synced (below).
+Under hostshift:
+
+1. browser requests `https://wt-a--herrfors.ddev.site/app/uploads/2025/07/x.jpg`
+2. hostshift maps `Host` → `www.herrfors.fi`, forwards to `web:80`
+3. nginx misses, `@external` fires: `302 Location: https://www.herrfors.fi/app/uploads/2025/07/x.jpg`
+4. `Location` is Tier 1 (§5.2), so hostshift rewrites it back to
+   `https://wt-a--herrfors.ddev.site/app/uploads/2025/07/x.jpg`
+5. → step 1. `ERR_TOO_MANY_REDIRECTS`.
+
+Today this works, because the browser is on the ddev host, no proxy is in the
+path, and the 302 simply leaves for production. **hostshift converts a working
+production fallback into a redirect loop on 87% of the fleet.**
+
+**Decision: a self-redirect guard, in the proxy, counted.** On a 3xx, if
+rewriting `Location` canonical→variant would yield a URL equal to the incoming
+request URL, emit the `Location` **unmodified** and count it as
+`self-redirect-passthrough`. It is loop-free, needs no per-repo config, and is
+narrow in the right way: it fires on the exact shape that loops.
+
+Two limits worth stating rather than discovering. It defuses **period-1** loops
+only — a period-2 cycle, where blog A's origin redirects to blog B's canonical
+host and back, is constructible in a multisite map and the equality test never
+fires. And because every `redirect-uploads.conf` hardcodes **one** origin, a miss
+on a *non-primary* blog redirects to blog 1's canonical host, which is not the
+request's own origin: the guard does not fire on the first hop, hostshift
+rewrites it to blog 1's variant, and the browser lands on the wrong blog before
+the guard catches it on the second. For `pellervo` that is four blogs of five. So
+test 32 must assert *terminates in a bounded number of hops and never loops*,
+not "exactly one 302", and must cover a non-primary blog.
+
+The cost is honest and must be stated: that response carries a production origin
+to the browser, so **test 28 gains an explicit, enumerated carve-out** for 3xx
+self-redirects. It is a read-only asset `GET`, not the write hazard §4.4 opens
+with, and the alternative — rewriting it into a loop, or 404ing — is a
+regression against what developers have today. `--strict-origins` turns the
+carve-out off and returns 404 instead, for the corpus diff and for test 28's
+full-crawl run in M6.
+
+Do **not** solve this by having hostshift fetch the upstream asset itself: that
+reintroduces production traffic on the server side, which is exactly what the
+`extra_hosts` override above exists to prevent.
+
+### 4.5 Confirmed in M0
+
+Both checks ran on 2026-08-27. Neither blocks the decision; both change what the
+project is justified by. Full method and numbers in `docs/m0-preflight.md`.
+
+**Usage survey — both halves hold.** **113 of the 184** top-level Claude Code
+sessions on this box are in DDEV repos — 61%, not the rounding error an earlier
+draft reported by dividing sessions by *all* transcripts including 5,648 subagent
+ones. And there are **19 worktree checkouts on disk** across the fleet, 18 of them
+`kokoomus/.claude/worktrees/agent-*`, created on 2026-08-20 in bursts of three to
+four inside a minute, with **57 worktrees registered** across 30 repos.
+
+That is parallel agents in worktrees, in a DDEV repo, at the concurrency this
+design serves. Note that kokoomus is the project §3 cites for "0.0%
+parallel-session time": its parallel agents are *subagents*, which a
+session-transcript metric cannot see, so §3's figure measures something narrower
+than it sounds.
+
+§4.3's other claim holds too, smaller than first stated: **8.6 GB across 19
+retained dump files**, of which 13 are production pulls and 11 belong to
+single-site repos, spanning 2025-08 → 2026-08. Both are one developer's box, so
+both generalise to the fleet by inference rather than measurement. §9's staging
+plan is unchanged.
+
+**Uploads — the sync does not cover content, and an nginx redirect has been
+hiding it.** On herrfors, content references **2,661 distinct** upload URLs
+(122,179 occurrences). **2,534 of them — 95.2% — are absent locally.** The local
+tree is 159 files and 1.2 MB, mostly hand-added SVGs. `web/app/uploads/*` is fully gitignored and
+`robo files:pull` has evidently never completed here.
+
+This is **not** a regression hostshift introduces — under the status quo those
+same 2,499 files are missing too. It matters for two other reasons:
+
+1. It is what makes the `redirect-uploads.conf` hazard above load-bearing rather
+   than theoretical: that redirect fires for the 95.2% of distinct upload URLs
+   that are absent locally.
+2. It quantifies §9 — with care about *what* it quantifies. **95.2% of the
+   distinct upload URLs** content references are absent locally, so with
+   hostshift not running they resolve against live production. That is a
+   distinct-URL rate, not a request rate: the files that *are* present are theme
+   SVGs, icons and fonts, which is what loads on every page view, so the share of
+   actual requests reaching production is lower and was not measured.
+
+Do not treat "sync the uploads properly" as a hostshift deliverable. It is
+`robo files:pull`'s job, it is orthogonal, and the self-redirect guard makes
+hostshift correct whether or not anyone does it.
+
+§5 is the design.
 
 ---
 
@@ -1133,7 +1267,10 @@ Numbers are stable identifiers — do not renumber.)*
     URL-valued position — HTML attribute values, CSS `url()`, JSON strings,
     JSON-LD, header values — and assert none has an origin in the canonical set.
     Bare hostnames in prose are explicitly out of scope and must **not** be
-    rewritten. Safety-critical
+    rewritten. Safety-critical.
+    **One enumerated carve-out (§4.4):** a 3xx whose `Location` the self-redirect
+    guard passed through. Assert the carve-out is *enumerated and counted*, not
+    merely tolerated, and that `--strict-origins` empties it
 29. Straggler sweep: a URL in a deliberately unhandled position is caught,
     rewritten, and reported — and running the sweep twice is a fixed point
 29c. Substring-overlapping canonical/variant sets are rejected at startup
@@ -1152,6 +1289,15 @@ Numbers are stable identifiers — do not renumber.)*
     variant
 31. A REST write (`POST /wp-json/wp/v2/posts`) with a variant URL in the body is
     stored canonical
+32. **Self-redirect guard (§4.4).** A missing `/app/uploads/` file behind the
+    fleet's `redirect-uploads.conf` reaches a remote `Location` in a bounded
+    number of hops and never loops, counted as `self-redirect-passthrough`.
+    Blog 1 takes one hop; a **non-primary blog takes two**, because the conf
+    hardcodes blog 1's origin — cover one, and assert the bound rather than the
+    count. Under `--strict-origins` the same request returns 404 and no canonical
+    origin leaves. Assert both halves, and assert that a 3xx whose `Location`
+    differs from the incoming request URL is still rewritten normally (a login
+    redirect, test 1, must not be caught by the guard)
 
 **Corpus diff — the only test that validates against reality.** Crawl N URLs on
 canonical and the same N through the proxy, normalise host, assert DOM
@@ -1161,9 +1307,11 @@ equality. Fixtures would not have caught the double-port bug; this would.
 
 ## 8. Milestones
 
-**M0 — pre-flight (§4.5).** Usage survey and uploads-sync check. The `extra_hosts`
-loopback mechanism is already verified (§4.4); re-create the override file, which
-was deleted after the experiment. *No code.*
+**M0 — pre-flight (§4.5). Done 2026-08-27.** Usage survey and uploads-sync check,
+both recorded in §4.5 and `docs/m0-preflight.md`. `.ddev/docker-compose.hostshift.yaml`
+re-created from `templates/` and verified merged onto the `web` service via
+`ddev debug compose-config`. Found the `redirect-uploads.conf` redirect loop
+(§4.4, test 32) and corrected five §4.2 claims. *No code.*
 
 **M1 — proxy shell, observability, and the identity invariant.** `httputil.ReverseProxy`
 skeleton; `hostshift rewrite` filter mode;
@@ -1175,8 +1323,8 @@ many silent-failure modes exist above, this precedes correctness work.
 **M2 — host map, request direction, and request bodies.** Config layering (DDEV defaults +
 `hostshift.yaml` + flags), variant generation,
 startup validation (§5.3–§5.4), then §5.1 in full: multisite inverse mapping,
-`Referer`, `X-Forwarded-Proto`, `Location`/`Link`/CSP. Tests 1, 8, 10, 10a–10e,
-2, 8, 10, 10a–10e, 11, 15, 16, 17, 20, 23, 29a, 29b, 29c, 29d.
+`Referer`, `X-Forwarded-Proto`, `Location`/`Link`/CSP, and §4.4's self-redirect
+guard. Tests 1, 2, 8, 10, 10a–10e, 11, 15, 16, 17, 20, 23, 29a, 29b, 29c, 29d, 32.
 
 **M3 — HTML.** Every-attribute scan, structured attributes, inline script/style
 accumulation, `<base href>`, the §4.4 straggler sweep. Tests 3, 5, 7, 12, 18, 19, 21, 25, 28, 29.
@@ -1205,13 +1353,23 @@ plan to remove things that are already gone. Do not delete it until M6 is proven
 
 ## 8a. Day-one setup
 
-`hostshift/` is not yet a git repository — no `.git`, no root `go.mod`, no
-LICENSE, only `PLAN.md` and `spike/`. M1 begins with `git init` and a module
-decision this plan does not make: module path, and a **minimum Go version**
-(`spike/go/go.mod` pins `go 1.26.5`, a patch-level directive that refuses to
-build on 1.26.4 — use `go 1.26`). `spike/.gitignore` already excludes build
-output. `spike/README.md` needs the same statistics corrections as §5.2 and does
-not yet document `go/main.go`, `go/rewriter/main.go` or `go/svg/main.go`.
+**Done in M0.** `hostshift/` is a git repository, `generoi/hostshift`, **private**
+— PLAN.md carries client domains, a production IP and fleet analysis, so it does
+not start public the way `generoi/ddev-worktree` did. Root `README.md` and
+`.gitignore` exist; there is still no root `go.mod` and no LICENSE.
+
+**Left for M1**, because this plan does not decide them: the module path, and a
+**minimum Go version** (`spike/go/go.mod` pins `go 1.26.5`, a patch-level
+directive that refuses to build on 1.26.4 — use `go 1.26`).
+
+**Toolchain note.** There is no `go` on `PATH` on this machine. Go 1.26.5 is in
+the nix store at
+`/nix/store/4im44k446822ixjai0mdaizqskc90qxr-go-1.26.5/bin/go` — the spike was
+run through it. M1 needs Go on `PATH` (nix profile, `devShell`, or a `flake.nix`
+in this repo) before `go build` works from a plain shell.
+
+`spike/README.md` needs the same statistics corrections as §5.2 and does not yet
+document `go/main.go`, `go/rewriter/main.go` or `go/svg/main.go`.
 
 ## 9. Risks
 
@@ -1219,7 +1377,9 @@ not yet document `go/main.go`, `go/rewriter/main.go` or `go/svg/main.go`.
   from `db:pull` makes hostshift a hard runtime dependency for every developer on
   all 63 repos, on day one, for an unproven hand-written proxy. Without it
   running, a freshly pulled site loads live production assets into the dev
-  browser (they *resolve*), and an admin action can write to production.
+  browser (they *resolve* — M0 measured 95.2% of the *distinct* upload URLs
+  referenced by herrfors' content as absent locally, §4.5), and an admin action
+  can write to production.
   **Stage it:** keep `db:pull`'s search-replace as the default through M6; make
   production-canonical opt-in per repo via the presence of `hostshift.yaml`; flip
   the fleet default only after the corpus diff is green on herrfors *and* on a
