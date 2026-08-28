@@ -121,37 +121,46 @@ hashed for all 51 fixtures in `spike/corpus` and `spike/adv`, crossed with four
 chunk sizes (1, 7, 4096, 1 MiB) and four maps (rewriting, identity, a shorter
 variant, a map matching nothing). **All 816 SHA-256 hashes are unchanged.**
 
-### The measurement that was missing, and the conclusion it overturned
+### The measurement that was missing, and what it did not justify
 
-An earlier revision of this file said the one-token-per-`Read` shape was
-load-bearing for throughput and should not be changed, because batching the
-reads measured **3.9% slower**. That measurement was real and the conclusion was
-wrong, because every benchmark here measured the rewriter in isolation — where
-`io.Copy` hands it a 32 KiB buffer and there is no HTTP layer.
+Every benchmark here measured the rewriter in isolation, where `io.Copy` hands it
+a 32 KiB buffer and there is no HTTP layer. `BenchmarkE2EPage` in
+`internal/proxy` measures a whole request, which is what a browser waits for, and
+it says something the others cannot.
 
-Profiling a whole request found the tokenizer, matcher and sweep together at
-**1.4% of CPU** and raw write syscalls at **78.8%**. `httputil`'s
-`flushInterval()` returns -1 — flush after every `Read` — whenever
-`res.ContentLength` is -1, and it ignores `p.FlushInterval` in that branch, so it
-cannot be overridden. hostshift sets `ContentLength` to -1 on every rewritten
-response, because every rewrite changes the length. `HTML.Read` returned one
-token, about 50 bytes. A 508 KB page was ten thousand chunked writes, ten
-thousand flushes, ten thousand syscalls.
+`httputil`'s `flushInterval()` returns -1 — flush after every `Read` — whenever
+`res.ContentLength` is -1, and ignores `p.FlushInterval` in that branch.
+hostshift sets `ContentLength` to -1 on every rewritten response because every
+rewrite changes the length, and `HTML.Read` returns one token, about 50 bytes. A
+508 KB page is therefore roughly **ten thousand chunked writes, ten thousand
+flushes and ten thousand write syscalls**. Profiling a whole request puts the
+tokenizer, matcher and sweep together at **1.4% of CPU** and raw syscalls at
+**78.8%**.
 
-Filling the caller's buffer instead: **13.55 ms → 4.38 ms per page, 3.1×.**
+Batching the reads measures **13.55 ms → 4.38 ms, 3.1×.** It is not taken.
 
-`BenchmarkE2EPage` in `internal/proxy` exists so this cannot happen again. It is
-the only number that tracks what a browser waits for, and with it the arithmetic
-inverts:
+Filling the caller's buffer means one more `Read` than there is data, which
+blocks — holding a progressively flushed response until 32 KiB accumulates or
+the operation ends. That is wp-admin's update and import screens, where watching
+progress is the point. Measured: the first flush never arrived. Two cheaper
+discriminators failed too. Asking the pipeline "have you more in hand" does not
+work, because a tokenizer's `Buffered()` being non-empty does not mean another
+token can be produced — a trailing text token is incomplete until the next `<`
+or EOF — and it blocked anyway. Gating on the upstream having sent a
+`Content-Length` is correct and useless: a WordPress page far exceeds nginx's
+FastCGI buffers, so it arrives chunked and the benchmark went straight back to
+12.9 ms. Decoupling production from consumption does work and costs a goroutine
+and a ring buffer in the response path; a first cut allocated **45 MB per page**,
+an 8 KiB chunk per 50-byte token.
 
-| | ms/page |
-|---|---|
-| end to end | 4.25 |
-| the rewriter alone | 4.05 |
+Which is where the arithmetic decides it. **13 ms against 4 ms, on a page
+WordPress spends 200 to 2000 ms generating.** Nobody perceives 9 ms; a progress
+screen that shows nothing until it finishes is very perceptible. §9 calls
+performance immaterial for dev and it is right — this is the shape of
+optimisation that buys an invisible win with a visible regression.
 
-**The rewriter is now ~95% of a request**, where before the fix it was 1.4%. Every
-optimisation in this document was tuning a quarter of the problem; from here they
-are tuning nearly all of it.
+`TestProgressiveResponseIsNotHeld` guards it, and `BenchmarkE2EPage` keeps the
+number honest if the trade ever changes.
 
 ### Measured and not taken
 
