@@ -1,6 +1,7 @@
 package origin
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"strings"
@@ -73,6 +74,11 @@ type pattern struct {
 	// them at match time, so a map may legitimately carry https://h and
 	// https://h:8080 as separate origins.
 	pairs []int
+	// repls is the replacement text for each of those pairs, precomputed.
+	// It depends only on the pattern's form and the pair's variant, both fixed
+	// at build time, so rebuilding it per match was three allocations of pure
+	// waste on the hottest path there is.
+	repls []string
 }
 
 // Matcher finds canonical origins in a bounded byte slice and splices variants
@@ -128,6 +134,15 @@ func NewMatcher(pairs []Pair) (*Matcher, error) {
 	add := func(text string, p pattern) {
 		if _, seen := byKey[text]; seen {
 			return
+		}
+		p.repls = make([]string, len(p.pairs))
+		for i, idx := range p.pairs {
+			v := pairs[idx].Variant
+			if p.relative {
+				p.repls[i] = p.enc.relSep() + p.enc.hostPort(v)
+			} else {
+				p.repls[i] = v.Scheme + p.enc.schemeSep() + p.enc.hostPort(v)
+			}
 		}
 		byKey[text] = len(m.pats)
 		m.pats = append(m.pats, p)
@@ -269,6 +284,14 @@ func okBeforeRelative(c byte) bool {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
+// The three separator spellings, one of which every pattern contains. Used as a
+// prefilter before the automaton.
+var (
+	sepRaw     = []byte("//")
+	sepJSON    = []byte(`\/`)
+	sepPercent = []byte("%2F")
+)
+
 // Rewrite replaces every canonical origin in b with its variant, treating b as
 // a complete value.
 //
@@ -307,10 +330,22 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		buf    []byte
 		last   int
 	)
-	emit := func(off int, text, action, reason string) {
+	// text is taken as a slice and converted only when the event is actually
+	// recorded: with --explain off, every skipped candidate was allocating a
+	// string nobody read.
+	emit := func(off int, text []byte, action, reason string) {
 		if explain || action == ActionRewrote {
-			events = append(events, Event{Offset: off, Surface: surface, Text: text, Action: action, Reason: reason})
+			events = append(events, Event{Offset: off, Surface: surface, Text: string(text), Action: action, Reason: reason})
 		}
+	}
+
+	// Every pattern contains one of these three, because every origin form
+	// spells its separator as "//", "\/\/" or "%2F%2F". Checking for them first
+	// is much cheaper than building the automaton's iterator, which allocates
+	// per call — and most attribute values on a page are class names, ids and
+	// data attributes that can never match.
+	if !bytes.Contains(b, sepRaw) && !bytes.Contains(b, sepJSON) && !bytes.Contains(b, sepPercent) {
+		return b, len(b), nil
 	}
 
 	// The library's findIter advances with `pos = end - len + 1`, i.e. one byte
@@ -344,7 +379,7 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		scanned = hostEnd
 
 		if p.relative && start > 0 && !okBeforeRelative(b[start-1]) {
-			emit(start, string(b[start:hostEnd]), ActionSkipped, ReasonUnanchored)
+			emit(start, b[start:hostEnd], ActionSkipped, ReasonUnanchored)
 			continue
 		}
 
@@ -375,7 +410,7 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		consumed = max(consumed, end)
 		if end < len(b) && !isDelim(b[end]) {
 			// The host is a prefix of a longer host, or this is prose.
-			emit(start, string(b[start:end]), ActionSkipped, ReasonNotAURL)
+			emit(start, b[start:end], ActionSkipped, ReasonNotAURL)
 			continue
 		}
 
@@ -383,34 +418,29 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		// this comparison: the map is keyed on origin, but content carries both
 		// schemes for the same host and both must be rewritten.
 		var pair *Pair
-		for _, i := range p.pairs {
-			c := m.pairs[i]
+		var repl string
+		for i, idx := range p.pairs {
+			c := m.pairs[idx]
 			schemeForPort := p.scheme
 			if p.relative {
 				schemeForPort = c.Canonical.Scheme
 			}
 			if NormalisePort(schemeForPort, port) == c.Canonical.Port {
-				pair = &m.pairs[i]
+				pair, repl = &m.pairs[idx], p.repls[i]
 				break
 			}
 		}
 		if pair == nil {
-			emit(start, string(b[start:end]), ActionSkipped, ReasonHostNotInMap)
+			emit(start, b[start:end], ActionSkipped, ReasonHostNotInMap)
 			continue
 		}
 		if pair.Identity() {
-			emit(start, string(b[start:end]), ActionSkipped, ReasonIdentityMap)
+			emit(start, b[start:end], ActionSkipped, ReasonIdentityMap)
 			continue
 		}
 
-		var repl string
-		if p.relative {
-			repl = p.enc.relSep() + p.enc.hostPort(pair.Variant)
-		} else {
-			repl = pair.Variant.Scheme + p.enc.schemeSep() + p.enc.hostPort(pair.Variant)
-		}
 		if repl == string(b[start:end]) {
-			emit(start, repl, ActionSkipped, ReasonIdentityMap)
+			emit(start, b[start:end], ActionSkipped, ReasonIdentityMap)
 			continue
 		}
 
@@ -420,7 +450,7 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		buf = append(buf, b[last:start]...)
 		buf = append(buf, repl...)
 		last = end
-		emit(start, string(b[start:end]), ActionRewrote, "")
+		emit(start, b[start:end], ActionRewrote, "")
 	}
 
 	if buf == nil {
