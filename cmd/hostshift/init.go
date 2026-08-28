@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	hostshift "github.com/generoi/hostshift"
 	"github.com/generoi/hostshift/internal/config"
 )
 
@@ -141,8 +142,28 @@ func cmdInit(args []string) (int, error) {
 			ddevProjectName(mainWorktree(c.dir))+"", c.slug)
 	}
 
+	// The compose service, if the project has not got one.
+	//
+	// Written rather than committed, which is what keeps the per-repo footprint
+	// at zero (PLAN §3). The alternative is that every project commits an
+	// 84-line file most of its developers never use — 31 of the fleet's 61 DDEV
+	// repos have done that for phpmyadmin, which reads as "whoever installed it
+	// committed the output" rather than a decision — or that every worktree runs
+	// `ddev add-on get` before it can start. The binary already carries the file.
+	//
+	// Never overwritten: a project that has installed the add-on, or pinned the
+	// service deliberately, keeps what it has.
+	composePath := filepath.Join(c.dir, ".ddev", "docker-compose.hostshift.yaml")
+	writeCompose := false
+	if _, err := os.Stat(composePath); os.IsNotExist(err) {
+		writeCompose = true
+	}
+
 	cfgPath := filepath.Join(c.dir, ".ddev", "config.hostshift.local.yaml")
 	if *dryRun {
+		if writeCompose {
+			fmt.Printf("--- %s\n(%d bytes, the add-on's compose service)\n", composePath, len(hostshift.ComposeService))
+		}
 		fmt.Printf("--- %s\n%s\n--- %s\n%s", cfgPath, cfg, envPath, merged)
 		return exitOK, nil
 	}
@@ -151,6 +172,12 @@ func cmdInit(args []string) (int, error) {
 	}
 	if err := os.WriteFile(envPath, []byte(merged), 0o644); err != nil {
 		return exitRuntime, err
+	}
+	if writeCompose {
+		if err := os.WriteFile(composePath, []byte(hostshift.ComposeService), 0o644); err != nil {
+			return exitRuntime, err
+		}
+		fmt.Fprintf(os.Stderr, "hostshift: wrote .ddev/docker-compose.hostshift.yaml\n")
 	}
 
 	fmt.Fprintf(os.Stderr, "hostshift: wrote .ddev/config.hostshift.local.yaml and .ddev/.env\n")
