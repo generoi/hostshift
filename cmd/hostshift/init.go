@@ -79,8 +79,37 @@ func cmdInit(args []string) (int, error) {
 			kept = append(kept, h)
 		}
 	}
-	res.DDEVHosts, res.ProjectTLD = kept, tld
-	own = kept
+	// And minus anything the parent checkout registers.
+	//
+	// A worktree inherits the tracked .ddev/config.yaml, so a multisite's
+	// additional_hostnames come with it: herrfors-wt-a registers
+	// nat.herrfors.ddev.site as well as its own name. Handing that to web makes
+	// two DDEV projects claim one hostname — and the one it belongs to is the
+	// canonical project, which is still running and still serving it.
+	parentHosts := map[string]bool{}
+	if main := mainWorktree(c.dir); main != "" && ddevProjectName(main) != ddevProjectName(c.dir) {
+		_, ph, _, _ := config.DDEVProject(main)
+		for _, h := range ph {
+			parentHosts[h] = true
+		}
+	}
+	mine := kept[:0]
+	for _, h := range kept {
+		if !parentHosts[h] {
+			mine = append(mine, h)
+		}
+	}
+	if len(mine) < len(kept) {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: warning: this worktree also registers %d hostname(s) belonging to the\n"+
+				"  checkout it came from, because .ddev/config.yaml is tracked and\n"+
+				"  additional_hostnames comes with it. Two DDEV projects claiming one\n"+
+				"  hostname is a race the router settles by whichever started last. Move\n"+
+				"  additional_hostnames out of the tracked config.yaml to fix it properly.\n",
+			len(kept)-len(mine))
+	}
+	res.DDEVHosts, res.ProjectTLD = mine, tld
+	own = mine
 	variants, webHosts := res.DDEVEnv()
 
 	// Every hostname the project should register: its own, plus the variants.
