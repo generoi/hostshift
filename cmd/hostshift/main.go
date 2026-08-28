@@ -52,6 +52,12 @@ DDEV defaults in .ddev/config.yaml, then hostshift.yaml, then these flags.
   --upstream    upstream base URL, e.g. http://web:80
 `
 
+// version is set by the linker: -X main.version=… in the Makefile and
+// Dockerfile. It must stay declared here — an -X flag naming a variable that
+// does not exist is silently ignored, so the binary would have reported nothing
+// and no build would have failed.
+var version = "dev"
+
 // exit codes, per PLAN §5.8
 const (
 	exitOK      = 0
@@ -81,6 +87,8 @@ func main() {
 		code, err = cmdDiff(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, usage)
+	case "version", "--version":
+		fmt.Println(version)
 	default:
 		fmt.Fprintf(os.Stderr, "hostshift: unknown subcommand %q\n\n%s", os.Args[1], usage)
 		code = exitConfig

@@ -332,8 +332,16 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			out = body
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(out))
-		if len(out) == len(body) && !changed {
-			// Nothing moved, so the upstream's length and validators still hold.
+		if bytes.Equal(out, body) && !changed {
+			// Genuinely untouched, so the upstream's length and validators
+			// still hold.
+			//
+			// This compares bytes, not lengths. Equal lengths do not mean equal
+			// bodies: a canonical and variant host of the same length —
+			// https://a.example.com to https://b.example.com — rewrites in
+			// place. Keeping the ETag then lets a conditional request return
+			// 304 and the browser serve a cached canonical-bearing body, which
+			// is the silent failure test 15 exists to prevent.
 			return nil
 		}
 
@@ -409,9 +417,17 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 	rev := p.Map.Reverse()
 	explain := p.Stats.Explain()
 	var out []byte
-	if kind == bodyMultipart {
+	switch kind {
+	case bodyMultipart:
 		out = rewriteMultipart(buf, ct, rev, p.Stats, explain)
-	} else {
+	case bodyJSON:
+		// The same span-aware rewriter the response side uses. Running the raw
+		// matcher over a request body instead would rewrite origins in JSON
+		// *keys*, give --explain no RFC 6901 path, and half-rewrite malformed
+		// JSON rather than leaving it alone — three ways for a write to differ
+		// from the read that produced it.
+		out = rewrite.RewriteJSON(buf, rev, p.Stats, explain)
+	default:
 		var ev []origin.Event
 		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
@@ -505,15 +521,16 @@ type bodyClass int
 const (
 	bodyOther bodyClass = iota
 	bodyFlat
+	bodyJSON
 	bodyMultipart
 )
 
 func bodyKind(ct string) bodyClass {
 	mt := strings.ToLower(mediaType(ct))
 	switch {
+	case mt == "application/json", strings.HasSuffix(mt, "+json"):
+		return bodyJSON
 	case mt == "application/x-www-form-urlencoded",
-		mt == "application/json",
-		strings.HasSuffix(mt, "+json"),
 		strings.HasPrefix(mt, "text/"):
 		return bodyFlat
 	case mt == "multipart/form-data":

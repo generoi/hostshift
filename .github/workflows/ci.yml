@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+
+      # The invariant that guards everything else (PLAN §5.2). Run on its own so
+      # that when it breaks, the log says so rather than burying it among the
+      # rest.
+      - name: identity map is byte-identical
+        run: go test ./internal/rewrite/ -run 'TestIdentityMap|TestIdentityHolds' -v
+
+      - run: go test ./... -race
+
+      - name: build for every target platform
+        run: make dist
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Build only — publishing to GHCR is deliberately not wired up yet
+      # (see issue #8). This asserts the Dockerfile still builds.
+      - run: docker build -t hostshift:ci .
