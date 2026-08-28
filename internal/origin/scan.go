@@ -165,25 +165,30 @@ func (m *Matcher) hostAt(b []byte, i int, enc encoding) *scanForm {
 
 // schemeBefore reports the explicit-scheme pattern ending at sep, if the bytes
 // before it spell one.
+// schemePrefixes is "https"+schemeSep and "http"+schemeSep for each encoding,
+// built once. Concatenating them per call allocated a string per candidate —
+// about 1,100 on a corpus page, 19% of a whole request's allocations.
+var schemePrefixes = [3][2][]byte{
+	encRaw:     {[]byte("https" + "://"), []byte("http" + "://")},
+	encJSON:    {[]byte(`https:\/\/`), []byte(`http:\/\/`)},
+	encPercent: {[]byte("https%3A%2F%2F"), []byte("http%3A%2F%2F")},
+}
+
 func (m *Matcher) schemeBefore(b []byte, sep int, enc encoding, f *scanForm) (*pattern, int) {
-	for _, c := range []struct {
-		lit string
-		p   *pattern
-	}{
-		{"https" + enc.schemeSep(), f.https},
-		{"http" + enc.schemeSep(), f.http},
-	} {
-		if c.p == nil {
+	lits := &schemePrefixes[enc]
+	for i, p := range [2]*pattern{f.https, f.http} {
+		if p == nil {
 			continue
 		}
+		lit := lits[i]
 		// The separator is the tail of the scheme prefix, so the prefix starts
 		// this far back.
-		start := sep + len(enc.relSep()) - len(c.lit)
+		start := sep + len(enc.relSep()) - len(lit)
 		if start < 0 {
 			continue
 		}
-		if hasFoldPrefix(b[start:], []byte(c.lit)) {
-			return c.p, start
+		if hasFoldPrefix(b[start:], lit) {
+			return p, start
 		}
 	}
 	return nil, 0

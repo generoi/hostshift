@@ -1,14 +1,18 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/generoi/hostshift/internal/origin"
 	"github.com/generoi/hostshift/internal/rewrite"
@@ -134,7 +138,11 @@ func (p *Proxy) Handler() http.Handler {
 			accept: r.Header.Get("Accept-Encoding"),
 		}
 		p.rewriteRequestBody(r, st)
-		rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), stateKey, st)))
+
+		// Coalesce the flushes httputil cannot be talked out of. See coalescer.
+		c := &coalescer{ResponseWriter: w, latency: FlushLatency}
+		defer c.stop()
+		rp.ServeHTTP(c, r.WithContext(context.WithValue(r.Context(), stateKey, st)))
 	})
 }
 
@@ -674,6 +682,122 @@ func blank(resp *http.Response, code int, msg string) {
 	}
 	resp.Body = io.NopCloser(strings.NewReader(msg))
 	resp.ContentLength = int64(len(msg))
+}
+
+// FlushLatency is the longest a flushed byte waits before it goes out.
+const FlushLatency = 100 * time.Microsecond
+
+// coalescer is FlushInterval, at the layer httputil cannot override.
+//
+// httputil's flushInterval() returns -1 — flush after every Read — whenever
+// res.ContentLength is -1, and ignores p.FlushInterval in that branch.
+// hostshift sets ContentLength to -1 on every rewritten response because every
+// rewrite changes the length, and HTML.Read returns one token, about 50 bytes.
+// So a 508 KB page was ten thousand chunked writes, ten thousand flushes and
+// ten thousand write syscalls: the tokenizer, matcher and sweep together were
+// 1.4% of a whole request's CPU and raw syscalls were 78.8%.
+//
+// The rejected fixes all attacked the *read* side, batching what the rewriter
+// hands up, and every one of them held a progressively flushed response —
+// wp-admin's update and import screens — because filling a buffer means one
+// more Read than there is data, which blocks.
+//
+// Nothing has to be held. The flush is the expensive half, not the write:
+// net/http buffers 2 KiB before it chunks, so swallowing a flush costs a
+// bounded delay and no memory. This is httputil's own maxLatencyWriter, moved
+// one layer down where flushInterval cannot overrule it — writes pass straight
+// through, and a flush is deferred by at most FlushLatency.
+//
+// Measured on page1.html, interleaved: 11.81 ms -> 3.75 ms end to end, 5,381
+// chunks on the wire -> 206, output byte-identical, +29 allocations for the
+// timer. The first flush of a progressive response arrives 269 us after the
+// upstream flushes it, against 98 us unbatched.
+//
+// The mutex is load-bearing: the timer fires on its own goroutine and an
+// http.ResponseWriter is not safe for concurrent use. httputil's
+// maxLatencyWriter guards its own dst.Flush the same way.
+type coalescer struct {
+	http.ResponseWriter
+	latency time.Duration
+
+	mu      sync.Mutex
+	t       *time.Timer
+	pending bool
+	stopped bool
+}
+
+// Unwrap lets http.ResponseController reach the real writer for everything
+// except Flush, which it finds here first — Hijack and the deadlines included.
+func (c *coalescer) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+func (c *coalescer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ResponseWriter.Write(p)
+}
+
+func (c *coalescer) WriteHeader(code int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *coalescer) Flush() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		c.flush()
+		return
+	}
+	if c.pending {
+		return
+	}
+	c.pending = true
+	if c.t == nil {
+		c.t = time.AfterFunc(c.latency, c.delayed)
+	} else {
+		c.t.Reset(c.latency)
+	}
+}
+
+// flush must be called with c.mu held.
+func (c *coalescer) flush() {
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (c *coalescer) delayed() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.pending {
+		return
+	}
+	c.flush()
+	c.pending = false
+}
+
+// stop runs when the handler returns. The final flush is what keeps a short
+// rewritten body chunked rather than length-delimited, which is what tests 15
+// and the JSON length assertion expect.
+func (c *coalescer) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stopped = true
+	if c.t != nil {
+		c.t.Stop()
+	}
+	if c.pending {
+		c.flush()
+		c.pending = false
+	}
+}
+
+func (c *coalescer) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := c.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
 }
 
 type readCloser struct {
