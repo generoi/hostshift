@@ -1,0 +1,34 @@
+# hostshift — container-scoped loopback containment (PLAN §4.4).
+#
+# WordPress makes internal HTTP requests to home_url() — wp-cron, Site Health,
+# some block-editor and REST paths. Under production-canonical, home_url() is
+# the production hostname, so without this file those requests leave the box and
+# hit live production. `wp-includes/cron.php:985` passes `sslverify => false`,
+# so TLS is not even a speed bump.
+#
+# Pointing the production hostnames at 127.0.0.1 *inside the web container*
+# keeps loopback on the machine. It is container-scoped, so the developer's own
+# browser is unaffected and real production stays reachable from the host — which
+# is why this is used instead of /etc/hosts (PLAN §4.4 rejects that).
+#
+# Loopback then stays entirely in canonical space and needs no rewriting at all:
+# WordPress is talking to itself using exactly the host its database expects.
+# The proxy is only ever in the browser's path.
+#
+# Copy to <repo>/.ddev/docker-compose.hostshift.yaml and replace the host list
+# with this site's canonical (production) hostnames — one per blog. DDEV merges
+# `.ddev/docker-compose.*.yaml` overrides by design. Stock DDEV emits no
+# `extra_hosts` on `web`, so there is nothing to clobber.
+#
+# Known and accepted (PLAN §4.4, test 29b): the presented certificate is mkcert
+# with no production names in its SAN, so `wp_safe_remote_*` callers fail
+# validation — the block editor's link-preview endpoint and internal oEmbed.
+# `sslverify => false` callers (cron, Site Health) work. A sibling blog's host is
+# not `$same_host`, so `wp_http_validate_url` rejects it as a private IP;
+# cross-blog `wp_safe_remote_*` will fail.
+
+services:
+  web:
+    extra_hosts:
+      - "www.example.com:127.0.0.1"
+      - "www.example-blog2.com:127.0.0.1"
