@@ -140,6 +140,15 @@ func (c *common) register(fs *flag.FlagSet) {
 }
 
 func (c *common) load() (*config.Resolved, error) {
+	// Every map-using subcommand guesses the slug the same way init does, so
+	// `hostshift wp-cli` and `hostshift check` work in a worktree without
+	// repeating what the branch already says. Only when nothing was passed, and
+	// silently on failure — the commands that genuinely need one say so.
+	if c.slug == "" {
+		if slug, _, err := deriveSlug(c.dir); err == nil {
+			c.slug = slug
+		}
+	}
 	return config.Load(c.dir, config.Flags{
 		Upstream: c.upstream,
 		Slug:     c.slug,
