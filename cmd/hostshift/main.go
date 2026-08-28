@@ -304,6 +304,15 @@ func cmdCheck(args []string) (int, error) {
 		fmt.Fprintf(os.Stderr, "hostshift: %d site(s) from %s — map is injective and anchored\n", n, res.Source)
 	}
 
+	if len(res.Uncovered) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: warning: DDEV registers %d hostname(s) this map does not cover; "+
+				"requests for them get a 421:\n", len(res.Uncovered))
+		for _, h := range res.Uncovered {
+			fmt.Fprintf(os.Stderr, "  %s\n", h)
+		}
+	}
+
 	// Warn rather than silently generate a file that would be committed
 	// (PLAN §4.3). Seven repos in the fleet lack this gitignore entry.
 	if warn := gitignoreWarning(c.dir); warn != "" {

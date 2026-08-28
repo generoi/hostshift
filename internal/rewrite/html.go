@@ -32,7 +32,8 @@ type HTML struct {
 	rawText string
 	pend    bytes.Buffer
 	done    bool
-	inOff   int // cumulative input-stream offset, for --explain
+	err     error // a non-EOF tokenizer error, surfaced once pending bytes are out
+	inOff   int   // cumulative input-stream offset, for --explain
 }
 
 // Options configures a rewriter.
@@ -144,10 +145,24 @@ func (w *HTML) Read(p []byte) (int, error) {
 	for w.pend.Len() == 0 && !w.done {
 		tt := w.z.Next()
 		if tt == html.ErrorToken {
-			// Buffered() is whatever the tokenizer had read but not tokenised.
-			// Emitting it is what makes truncated input round-trip byte-exactly.
+			// Both halves, and in this order. When the tokenizer hits EOF part
+			// way through a tag, the partial tag is in Raw() and Buffered() is
+			// empty — so emitting only Buffered() silently drops those bytes.
+			// Measured before this was fixed: 129 of the 244 prefixes of an
+			// ordinary document lost bytes, with exit status 0 and no
+			// diagnostic, which also breaks test 24 for any truncated input.
+			w.pend.Write(w.z.Raw())
 			w.pend.Write(w.z.Buffered())
 			w.done = true
+
+			// io.EOF is the ordinary end of a body. Anything else is a real
+			// failure — an upstream that closed early, a read error — and
+			// converting it to io.EOF turns a *detectable* truncation into an
+			// undetectable one, because the rewritten response is chunked and
+			// has no Content-Length for the client to check against.
+			if err := w.z.Err(); err != nil && err != io.EOF {
+				w.err = err
+			}
 			break
 		}
 
@@ -166,7 +181,11 @@ func (w *HTML) Read(p []byte) (int, error) {
 		switch tt {
 		case html.StartTagToken, html.SelfClosingTagToken:
 			name, _ := w.z.TagName()
-			if tt == html.StartTagToken && rawTextElement(string(name)) {
+			// Self-closing too: x/net/html sets its own raw-text state for
+			// `<script/>` and returns SelfClosingTagToken, so gating on
+			// StartTagToken alone left that spelling's contents unscanned —
+			// and inline script is where the JS URLs actually are (§5.2).
+			if rawTextElement(string(name)) {
 				w.rawText = string(name)
 			}
 			w.pend.Write(w.rewriteTag(raw, off))
@@ -204,6 +223,9 @@ func (w *HTML) Read(p []byte) (int, error) {
 		}
 	}
 	if w.pend.Len() == 0 && w.done {
+		if w.err != nil {
+			return 0, w.err
+		}
 		return 0, io.EOF
 	}
 	return w.pend.Read(p)
