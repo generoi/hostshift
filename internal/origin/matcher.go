@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	aho "github.com/petar-dambovaliev/aho-corasick"
+	"golang.org/x/net/idna"
 )
 
 // Pair is one canonical→variant mapping. Under an identity map the two are equal
@@ -128,16 +129,35 @@ func NewMatcher(pairs []Pair) (*Matcher, error) {
 	}
 	for _, h := range hostNames {
 		idx := hosts[h]
-		for _, enc := range []encoding{encRaw, encJSON, encPercent} {
-			// Both schemes for every canonical host: the fleet's databases carry
-			// http:// forms of hosts declared as https (M0 measured
-			// nat.acmecorp.ddev.site appearing 165 times over http and zero over
-			// https). A host-keyed map would be wrong; matching both schemes and
-			// replacing with the *variant's* declared origin is right.
-			for _, scheme := range []string{"https", "http"} {
-				add(scheme+enc.schemeSep()+h, pattern{enc: enc, scheme: scheme, host: h, pairs: idx})
+		// Both labels. Origin.Parse normalises to the A-label, but WordPress
+		// does not punycode siteurl — a site declared as https://hämeen.fi has
+		// the U-label in its database and in every rendered page, so building
+		// patterns from the A-label alone matched nothing at all and the whole
+		// page leaked. §5.5 calls IDN "real for .fi client domains".
+		forms := []string{h}
+		if u, err := idna.Punycode.ToUnicode(h); err == nil && u != h {
+			// The automaton folds ASCII case only, so a non-ASCII letter has to
+			// be carried in both cases explicitly. That covers "hämeen.fi" and
+			// "HÄMEEN.FI"; the ASCII folding covers every mix of the ASCII
+			// letters around them. A host with only *some* of its non-ASCII
+			// letters capitalised is not matched, which no real siteurl is.
+			forms = append(forms, u)
+			if up := strings.ToUpper(u); up != u {
+				forms = append(forms, up)
 			}
-			add(enc.relSep()+h, pattern{enc: enc, relative: true, host: h, pairs: idx})
+		}
+		for _, hf := range forms {
+			for _, enc := range []encoding{encRaw, encJSON, encPercent} {
+				// Both schemes for every canonical host: the fleet's databases carry
+				// http:// forms of hosts declared as https (M0 measured
+				// nat.acmecorp.ddev.site appearing 165 times over http and zero over
+				// https). A host-keyed map would be wrong; matching both schemes and
+				// replacing with the *variant's* declared origin is right.
+				for _, scheme := range []string{"https", "http"} {
+					add(scheme+enc.schemeSep()+hf, pattern{enc: enc, scheme: scheme, host: hf, pairs: idx})
+				}
+				add(enc.relSep()+hf, pattern{enc: enc, relative: true, host: hf, pairs: idx})
+			}
 		}
 	}
 
@@ -219,21 +239,74 @@ type Event struct {
 	Reason  string `json:"reason,omitempty"`
 }
 
-// isDelim implements PLAN §4.4's right-hand anchor: a match is only an origin if
-// what follows the host terminates it.
+// isHostByte reports whether a byte can appear in a hostname. Everything else
+// terminates one.
 //
-// Two additions to the set §4.4 lists, both required rather than defensive:
-//   - '%' — without it the percent-encoded form can never match, since
-//     "https%3A%2F%2Fhost%2Fpath" continues with '%'. That form is exactly the
-//     redirect_to= case §5.5 names.
-//   - ',' — srcset, ping and Link headers separate on it.
-func isDelim(c byte) bool {
-	switch c {
-	case '/', ':', '?', '#', '"', '\'', '<', '>', '\\', '&', '%', ',',
-		' ', '\t', '\n', '\r', '\f', '\v':
+// This replaces the enumerated delimiter list §4.4 sketches. An allowlist of
+// terminators is the same mistake as an allowlist of attributes: it guarantees a
+// long tail of misses, and the tail was real — ';' is how a CSP source list ends
+// a directive, so `default-src 'self' https://canonical; script-src …` was left
+// untouched and the delivered policy named only the canonical host, blocking
+// every resource on the variant. ')' closes `@import url(…)`. ']' and '|' and
+// '=' were missing too. Asking what a hostname *can* contain has no tail.
+func isHostByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '-' || c == '.' || c == '_':
 		return true
 	}
 	return false
+}
+
+// delimAt implements PLAN §4.4's right-hand anchor: a match is only an origin if
+// what follows the host terminates it. End of input terminates.
+//
+// '%' needs care rather than a blanket yes. It is not a host byte, but in the
+// percent encoding it introduces one: "%2E" is a dot and "%2D" a hyphen, so
+//
+//	https://www.example.com%2Eattacker.test/p
+//
+// is a URL whose real host is www.example.com.attacker.test — a different
+// registrable domain, which this code correctly refuses when the dot is
+// written literally. Treating '%' as an unconditional terminator rewrote it.
+// So the escape is decoded and the same question asked of the byte it denotes.
+func delimAt(b []byte, i int) bool {
+	if i >= len(b) {
+		return true
+	}
+	if b[i] == '%' {
+		if c, ok := unhex(b, i+1); ok {
+			return !isHostByte(c)
+		}
+		return true // a stray '%' is not a host byte either
+	}
+	return !isHostByte(b[i])
+}
+
+// unhex decodes the two hex digits at i.
+func unhex(b []byte, i int) (byte, bool) {
+	if i+1 >= len(b) {
+		return 0, false
+	}
+	hi, ok1 := hexVal(b[i])
+	lo, ok2 := hexVal(b[i+1])
+	if !ok1 || !ok2 {
+		return 0, false
+	}
+	return hi<<4 | lo, true
+}
+
+func hexVal(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 // okBeforeRelative guards the left side of a protocol-relative match. "//host"
@@ -271,10 +344,13 @@ func (m *Matcher) rewrite(b []byte, surface string, explain bool) ([]byte, []Eve
 		buf    []byte
 		last   int
 	)
+	// Every candidate is emitted, not only rewrites and not only under
+	// --explain. Recording skips exclusively when explaining meant the `--json`
+	// counters always showed candidates == rewrites, which reads as "nothing was
+	// skipped" when in fact skips were simply never counted — the one number a
+	// reader would use to decide whether the map is missing a host.
 	emit := func(off int, text, action, reason string) {
-		if explain || action == ActionRewrote {
-			events = append(events, Event{Offset: off, Surface: surface, Text: text, Action: action, Reason: reason})
-		}
+		events = append(events, Event{Offset: off, Surface: surface, Text: text, Action: action, Reason: reason})
 	}
 
 	// The library's findIter advances with `pos = end - len + 1`, i.e. one byte
@@ -302,19 +378,32 @@ func (m *Matcher) rewrite(b []byte, surface string, explain bool) ([]byte, []Eve
 			continue
 		}
 
-		// Optional :port. A ':' not followed by digits is itself a delimiter.
+		// Optional port, in either spelling. The percent form matters: "%3A" is
+		// how a port separator appears inside redirect_to= and friends, and
+		// reading only ':' meant "https%3A%2F%2Fh%3A8443%2Fx" had its port
+		// treated as a *terminator* — so an origin on a different port was
+		// rewritten to the variant host. That is the port family of the
+		// double-port bug this design exists to avoid.
 		end, port := hostEnd, ""
+		sep := 0
 		if end < len(b) && b[end] == ':' {
-			j := end + 1
+			sep = 1
+		} else if end < len(b) && b[end] == '%' {
+			if c, ok := unhex(b, end+1); ok && c == ':' {
+				sep = 3
+			}
+		}
+		if sep > 0 {
+			j := end + sep
 			for j < len(b) && isDigit(b[j]) {
 				j++
 			}
-			if j > end+1 {
-				port, end = string(b[end+1:j]), j
+			if j > end+sep {
+				port, end = string(b[end+sep:j]), j
 			}
 		}
 		scanned = end
-		if end < len(b) && !isDelim(b[end]) {
+		if !delimAt(b, end) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, string(b[start:end]), ActionSkipped, ReasonNotAURL)
 			continue
