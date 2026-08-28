@@ -632,6 +632,61 @@ func TestEditRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEqualLengthRewriteStillDropsValidators is the regression test for a bug
+// that used length equality as a proxy for "unchanged".
+//
+// A canonical and variant host of the same length rewrite in place. Keeping the
+// ETag then lets a conditional request return 304 and the browser serve a cached
+// canonical-bearing body — the silent failure test 15 exists to prevent, and one
+// that only appears for hostnames that happen to match in length.
+func TestEqualLengthRewriteStillDropsValidators(t *testing.T) {
+	const (
+		canon = "https://aaa.example.test"
+		vari  = "https://bbb.example.test"
+	)
+	if len(canon) != len(vari) {
+		t.Fatal("the fixture must have equal-length origins or it tests nothing")
+	}
+	m, err := origin.NewMap([]origin.Site{{
+		Name: "main", Canonical: origin.MustParse(canon), Variant: origin.MustParse(vari),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"link":"` + canon + `/x"}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"abc123"`)
+		io.WriteString(w, body)
+	}))
+	defer up.Close()
+	target, _ := url.Parse(up.URL)
+	p := &Proxy{Upstream: target, Map: m, Stats: rewrite.NewStats(false)}
+	front := httptest.NewServer(p.Handler())
+	defer front.Close()
+
+	req, _ := http.NewRequest("GET", front.URL+"/wp-json/", nil)
+	req.Host = "bbb.example.test"
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	if !bytes.Contains(got, []byte(vari)) {
+		t.Fatalf("the body was not rewritten: %s", got)
+	}
+	if len(got) != len(body) {
+		t.Fatalf("the fixture no longer exercises the equal-length case (%d vs %d)", len(got), len(body))
+	}
+	if v := res.Header.Get("ETag"); v != "" {
+		t.Errorf("ETag survived an equal-length rewrite: %q — a conditional request "+
+			"would now serve a cached canonical-bearing body", v)
+	}
+}
+
 // TestJSONOverCapPassesThrough: above the cap a JSON response streams through
 // untouched (PLAN §5.8).
 func TestJSONOverCapPassesThrough(t *testing.T) {
