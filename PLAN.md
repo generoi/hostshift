@@ -1464,16 +1464,55 @@ Requiring an environment variable to build a distributed binary is not a trade
 worth making, so `github.com/go-json-experiment/json/jsontext` is used, exactly
 as §5.7 anticipated. Swap the import when the standard library one lands.
 
-**HTML-in-JSON needs no HTML rewriter, and must not have one.** §5.2 says
-`content.rendered` "is a full HTML blob a URL-only rule skips" and that the value
-should be "decoded, rewritten, re-encoded and spliced back". That was written
-against an allowlist of URL-valued keys. With the anchored automaton running over
-the *raw, still-escaped* bytes of every string value, the origins inside
-`content.rendered` are already found — they appear literally as
-`https:\/\/host\/…`, and the JSON-escaped form is in the token set. Decoding and
-re-encoding would be strictly worse: re-encoding is re-serialisation, and §5.2's
-core property is that output is byte-identical everywhere a rewrite did not
-occur. The depth-2 recursion limit is therefore unnecessary and is not built.
+**HTML-in-JSON needs no HTML rewriter — but it does need an escape carve-out.**
+§5.2 says `content.rendered` "is a full HTML blob a URL-only rule skips" and that
+the value should be "decoded, rewritten, re-encoded and spliced back". That was
+written against an allowlist of URL-valued keys. With the anchored automaton
+running over the *raw, still-escaped* bytes of every string value, the origins
+inside `content.rendered` are found without any of it — they appear as
+`https:\/\/host\/…` and the JSON-escaped form is in the token set. Decoding and
+re-encoding every value would be strictly worse: re-encoding is
+re-serialisation, and §5.2's core property is that output is byte-identical
+everywhere a rewrite did not occur. The depth-2 recursion limit is unnecessary
+and is not built.
+
+The first draft of this paragraph went further and said such a value "must not"
+be decoded at all. That is wrong, and three real spellings show why — each one a
+dereferenceable production origin reaching the browser, i.e. test 28:
+
+- **`\uXXXX`.** PHP's `json_encode` escapes every non-ASCII rune unless
+  `JSON_UNESCAPED_UNICODE` is passed, and `wp_json_encode` does not pass it. So
+  an IDN client site — §5.5 calls those real for `.fi` — serves
+  `"https:\/\/hämeen.fi\/x"`, which no raw-byte scan can see. The page
+  rewrites and the REST API does not, so Gutenberg and every JS fetch get
+  production URLs.
+- **HTML character references** inside `content.rendered`, the class §5.3 closes
+  for attribute values. The identical post body is clean as `text/html` and
+  leaks as `application/json`.
+- **Double-escaped JSON-in-JSON**, `"https:\\/\\/host"`, from a block attribute
+  holding JSON that is itself serialised into JSON.
+
+So a string is unquoted, entity-decoded and re-matched, and re-encoded **only**
+when that finds an origin the raw pass did not. A document that is already
+correct never takes the path, byte-identity under an identity map is untouched,
+and it is counted under its own surface, `json-escape`, because a non-zero count
+means content is storing origins in a form §5.3 does not model.
+
+**The JSON path gets §4.4's straggler sweep too.** M4 added a whole response
+surface without one, so every miss on it was silent — the same post body clean
+as `text/html` and carrying production as `application/json`, with no WARN and
+no non-zero counter. JSON is buffered anyway, so the sweep needs none of the
+streaming machinery: no carry-over window, no left-context byte, no offset map.
+
+**A body that does not parse is passed through, and *reported*.** Leaving it
+alone is right — half-rewritten JSON is worse than unrewritten JSON — but the
+first implementation folded each value's events into the counters as it scanned,
+so a decoder error part way through returned the original bytes while the
+counters kept rewrites that had been undone. A duplicate object member is legal
+JSON that `jsontext` rejects by default; it printed two production origins under
+`"rewrites": {"json-string": 1}`, `"skips": {}`, exit 0. Events are held back
+until the document parses, and the pass-through logs and counts a
+`encoding-not-decodable` skip — the same treatment the size cap already got.
 
 What the span scanner *does* earn is key/value discrimination — an origin in a
 JSON key is not a link and is left alone — and an RFC 6901 path in `--explain`,
