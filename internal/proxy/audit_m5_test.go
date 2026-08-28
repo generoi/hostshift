@@ -243,20 +243,31 @@ func TestCompressIsANoOpUnderAnIdentityMap(t *testing.T) {
 	}
 }
 
-// TestProgressiveResponseIsNotHeld guards the reason response bodies are not
-// batched.
+// TestProgressiveResponseIsNotHeld guards the property that decided how the
+// flush storm was fixed.
 //
-// Batching reads is worth 3.1x end to end and is not taken: filling the caller's
-// buffer means one more Read than there is data, which blocks, and that holds a
-// progressively flushed response — wp-admin's update and import screens, which
-// emit a few hundred bytes over a long operation — until 32 KiB has accumulated
-// or the operation ends. See the note above readAhead's grave in proxy.go.
+// Every attempt that batched the *read* side held a progressively flushed
+// response — wp-admin's update and import screens, which emit a few hundred
+// bytes over a long operation — because filling a buffer means one more Read
+// than there is data, which blocks. The coalescer defers the *flush* instead,
+// which holds nothing.
+//
+// The bound is asserted, not just the arrival. An earlier version of this test
+// allowed five seconds, which would have passed at a fifty-millisecond
+// coalescing latency and stopped guarding what its own comment claimed.
 //
 // The chunk is a kilobyte because §4.4's carry-over window sets a floor that has
-// nothing to do with batching: the sweep holds back MaxMatchLen bytes so no
+// nothing to do with flushing: the sweep holds back MaxMatchLen bytes so no
 // match can straddle a boundary, so anything smaller is buffered whatever the
-// reader above it does.
+// layers above it do.
 func TestProgressiveResponseIsNotHeld(t *testing.T) {
+	// Far above FlushLatency and far below anything a person would call a
+	// hang — this fails on "held until the operation ends", not on a slow box.
+	const bound = 500 * time.Millisecond
+	if FlushLatency > bound/100 {
+		t.Fatalf("FlushLatency %v has grown past what this test can distinguish", FlushLatency)
+	}
+
 	step := make(chan struct{})
 	var once sync.Once
 	release := func() { once.Do(func() { close(step) }) }
@@ -282,20 +293,28 @@ func TestProgressiveResponseIsNotHeld(t *testing.T) {
 	}
 	defer res.Body.Close()
 
-	got := make(chan string, 1)
+	type chunk struct {
+		s  string
+		at time.Duration
+	}
+	got := make(chan chunk, 1)
+	start := time.Now()
 	go func() {
 		buf := make([]byte, 32*1024)
 		n, _ := res.Body.Read(buf)
-		got <- string(buf[:n])
+		got <- chunk{string(buf[:n]), time.Since(start)}
 	}()
 
 	select {
-	case s := <-got:
-		if !strings.Contains(s, "step one") {
-			t.Errorf("first chunk was %q, want the first flush", s)
+	case c := <-got:
+		if !strings.Contains(c.s, "step one") {
+			t.Errorf("first chunk was %q, want the first flush", c.s)
 		}
-	case <-time.After(5 * time.Second):
-		t.Error("the first flush never reached the client: a progressive response is being held")
+		if c.at > bound {
+			t.Errorf("the first flush took %v to reach the client, bound %v", c.at, bound)
+		}
+	case <-time.After(bound):
+		t.Errorf("no flush reached the client within %v: a progressive response is being held", bound)
 	}
 
 	release()

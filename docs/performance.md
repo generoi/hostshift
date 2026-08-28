@@ -153,14 +153,48 @@ FastCGI buffers, so it arrives chunked and the benchmark went straight back to
 and a ring buffer in the response path; a first cut allocated **45 MB per page**,
 an 8 KiB chunk per 50-byte token.
 
-Which is where the arithmetic decides it. **13 ms against 4 ms, on a page
-WordPress spends 200 to 2000 ms generating.** Nobody perceives 9 ms; a progress
-screen that shows nothing until it finishes is very perceptible. §9 calls
-performance immaterial for dev and it is right — this is the shape of
-optimisation that buys an invisible win with a visible regression.
+**Every one of those attacked the read side, and blocking is inherent there.**
+The expensive half is the flush, not the write — net/http buffers 2 KiB before
+it chunks, so swallowing a flush costs a bounded delay and no memory at all.
 
-`TestProgressiveResponseIsNotHeld` guards it, and `BenchmarkE2EPage` keeps the
-number honest if the trade ever changes.
+`httputil` calls `http.NewResponseController(dst).Flush` after every write, and
+`dst` is the `ResponseWriter` hostshift hands it. So wrap it. `coalescer` passes
+`Write` straight through and defers `Flush` by at most 100 µs: it is httputil's
+own `maxLatencyWriter`, moved one layer down where `flushInterval` cannot
+overrule it. **11.81 ms → 3.75 ms, 3.15×, and 5,381 chunks on the wire → 206.**
+Output byte-identical, the whole suite green unmodified, `-race` clean, and the
+first flush of a progressive response arrives 269 µs after the upstream sends
+it, against 98 µs unbatched.
+
+Confirmed on the live stack rather than only on loopback. Traefik does coalesce
+toward the browser — the client sees a few hundred reads, not 5,381 — but
+hostshift still pays for the storm. Container CPU per byte, measured through the
+real browser → Traefik → hostshift → nginx path: **27.0 and 36.4 ms/MB for
+rewritten HTML against 1.35–2.24 ms/MB for a pass-through JS file** on the same
+path. Twelve to twenty-seven times the CPU per byte, about 12 ms per page.
+
+Nobody perceives 8 ms of a 280 ms page, and §9 is still right that performance
+is immaterial for dev. It is taken because the *cost* side collapsed rather than
+because the win grew: the reason batching was rejected does not apply to this
+shape, and what is left is that hostshift stops burning 12 ms of laptop CPU per
+page and stops making Traefik perform five thousand reads, on a machine already
+running Docker, a browser, an IDE and several DDEV projects.
+
+`TestProgressiveResponseIsNotHeld` guards it and now asserts a *bound* — it
+allowed five seconds, which would have passed at a fifty-millisecond coalescing
+latency and stopped guarding what its comment claimed. `BenchmarkE2EPage` keeps
+the number honest.
+
+One consequence worth knowing: `flushInterval` returns -1 for
+`text/event-stream` too, and the coalescer sits below that, so SSE events gain
+up to 100 µs. Harmless, and a two-line exemption in `WriteHeader` if it ever is
+not.
+
+Profiling allocations over a *whole request* rather than the rewriter also put
+`schemeBefore` at **19% of all objects**: it concatenated `"https" + schemeSep()`
+per candidate, about 1,100 a page. A precomputed table fixes it — a matcher hit
+goes **331 → 197 ns** and 8 → 4 allocations, a miss **117 → 82 ns** and 2 → 0,
+and `RewriteWithSweep` sheds another 2,920 allocations a page.
 
 ### Measured and not taken
 
