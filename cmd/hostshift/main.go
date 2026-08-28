@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -165,14 +166,28 @@ func cmdRewrite(args []string) (int, error) {
 	}
 
 	st := rewrite.NewStats(*explain)
+	mt := strings.ToLower(strings.TrimSpace(strings.SplitN(*ctype, ";", 2)[0]))
+
 	var src io.Reader = os.Stdin
-	if strings.EqualFold(strings.TrimSpace(strings.SplitN(*ctype, ";", 2)[0]), "text/html") {
+	switch {
+	case mt == "text/html":
 		src = rewrite.NewResponseBody(os.Stdin, m, nil, rewrite.Options{
 			DryRun:  *dryRun,
 			NoSweep: *noSweep,
 			Stats:   st,
 			Log:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
 		})
+	case mt == "application/json" || strings.HasSuffix(mt, "+json"):
+		// JSON is buffered, not streamed (PLAN §5.8).
+		body, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return exitRuntime, err
+		}
+		out := rewrite.RewriteJSON(body, m, st, *explain)
+		if *dryRun {
+			out = body
+		}
+		src = bytes.NewReader(out)
 	}
 	// Anything else streams through untouched and never enters a rewriter —
 	// which is what test 25's per-surface counter of zero proves.

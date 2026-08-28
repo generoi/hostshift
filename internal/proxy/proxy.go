@@ -279,15 +279,46 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 }
 
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
-	if !rewritableHTML(resp.Header.Get("Content-Type")) {
+	ct := resp.Header.Get("Content-Type")
+	switch {
+	case rewritableHTML(ct):
+		resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
+			DryRun:  p.DryRun,
+			NoSweep: p.NoSweep,
+			Stats:   p.Stats,
+			Log:     p.log(),
+		})
+
+	case rewritableJSON(ct):
+		// JSON is buffered rather than streamed, and capped (PLAN §5.8). Above
+		// the cap it passes through untouched and the skip is logged.
+		body, over, err := readCapped(resp.Body, p.maxBody())
+		if err != nil {
+			return err
+		}
+		if over != nil {
+			p.log().Warn("JSON body exceeds the size cap, passing through untouched",
+				"cap", p.maxBody(), "content-type", ct)
+			p.Stats.Record(rewrite.SurfaceJSONString, 0, []origin.Event{{
+				Surface: rewrite.SurfaceJSONString, Action: origin.ActionSkipped,
+				Reason: origin.ReasonSizeCap,
+			}})
+			resp.Body = readCloser{io.MultiReader(bytes.NewReader(body), over), resp.Body}
+			return nil
+		}
+		out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.Stats.Explain())
+		if p.DryRun {
+			out = body
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(out))
+		if len(out) == len(body) && !changed {
+			// Nothing moved, so the upstream's length and validators still hold.
+			return nil
+		}
+
+	default:
 		return nil
 	}
-	resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
-		DryRun:  p.DryRun,
-		NoSweep: p.NoSweep,
-		Stats:   p.Stats,
-		Log:     p.log(),
-	})
 	changed = true
 
 	if changed && !p.DryRun {
@@ -409,6 +440,28 @@ func (p *Proxy) isCanonicalDomain(d string) bool {
 // Tier 2: 88 CSS and 185 JS files in the fleet's themes, zero absolute URLs.
 func rewritableHTML(ct string) bool {
 	return strings.EqualFold(mediaType(ct), "text/html")
+}
+
+// rewritableJSON covers the REST API and everything modelled on it. JSON-LD
+// arrives inside a <script> tag rather than as a response, so it is the HTML
+// rewriter's raw-text scan that handles it, not this.
+func rewritableJSON(ct string) bool {
+	mt := strings.ToLower(mediaType(ct))
+	return mt == "application/json" || strings.HasSuffix(mt, "+json")
+}
+
+// readCapped reads up to max bytes. When the body is longer it returns the bytes
+// read plus a reader for the rest, so the caller can pass the whole thing
+// through untouched without having lost anything.
+func readCapped(r io.Reader, max int64) (body []byte, over io.Reader, err error) {
+	b, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if int64(len(b)) > max {
+		return b, r, nil
+	}
+	return b, nil, nil
 }
 
 func mediaType(ct string) string {
