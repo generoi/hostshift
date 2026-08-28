@@ -360,12 +360,12 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	ct := resp.Header.Get("Content-Type")
 	switch {
 	case rewritableHTML(ct):
-		resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
+		resp.Body = filled{rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
 			DryRun:  p.DryRun,
 			NoSweep: p.NoSweep,
 			Stats:   p.Stats,
 			Log:     p.log(),
-		})
+		})}
 
 	case rewritableJSON(ct):
 		// JSON is buffered rather than streamed, and capped (PLAN §5.8). Above
@@ -680,6 +680,51 @@ type readCloser struct {
 	io.Reader
 	io.Closer
 }
+
+// filled makes one Read return as much as the caller asked for, instead of one
+// token.
+//
+// This is worth 3.1x end to end, and none of it is in the rewriter. Profiling a
+// whole request found the tokenizer, matcher and sweep together at 1.4% of CPU
+// and raw write syscalls at 78.8%. The cause is a rule in httputil: when
+// res.ContentLength is -1, flushInterval() returns -1 — flush after every Read —
+// and there is no way to override it, since it ignores p.FlushInterval in that
+// branch. hostshift sets ContentLength to -1 on every rewritten response,
+// because every rewrite changes the length. HTML.Read returns one token, about
+// 50 bytes. So a 508 KB page became roughly ten thousand chunked writes, ten
+// thousand flushes and ten thousand syscalls.
+//
+// The streaming bound is unchanged: this fills the *caller's* buffer, which is
+// the 32 KiB io.Copy already allocates, and nothing new is retained. What does
+// change is that a progressively flushed response reaches the browser in 32 KiB
+// steps rather than token by token — acceptable here because PHP-FPM sends a
+// WordPress page as one burst, and because text/event-stream never arrives:
+// rewritableHTML is an exact match on text/html, and httputil flushes SSE
+// immediately on its own Content-Type check regardless.
+//
+// Measured on spike/corpus/page1.html through an httptest proxy: 13.55 ms ->
+// 4.38 ms, 37.5 -> 116 MB/s.
+type filled struct{ rc io.ReadCloser }
+
+func (f filled) Read(p []byte) (int, error) {
+	n := 0
+	for n < len(p) {
+		m, err := f.rc.Read(p[n:])
+		n += m
+		if err != nil {
+			if n > 0 && err == io.EOF {
+				return n, nil // report the EOF on the next call, with no bytes
+			}
+			return n, err
+		}
+		if m == 0 {
+			break // a reader with nothing to add and no error; do not spin
+		}
+	}
+	return n, nil
+}
+
+func (f filled) Close() error { return f.rc.Close() }
 
 func itoa(n int) string {
 	if n == 0 {
