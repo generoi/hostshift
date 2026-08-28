@@ -32,6 +32,7 @@ func cmdInit(args []string) (int, error) {
 	var c common
 	c.register(fs)
 	dryRun := fs.Bool("dry-run", false, "print the files that would be written, write nothing")
+	db := fs.String("db", "shared", "`shared` to serve the parent checkout's database, `own` to run one of this worktree's own")
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -179,8 +180,25 @@ func cmdInit(args []string) (int, error) {
 	// by name with no override. §4.1 names DATABASE_URL as Bedrock's escape
 	// hatch; it goes in web_environment rather than the project's own .env so
 	// nothing outside .ddev/ is touched.
+	// Which database this worktree serves is the one thing about it that is a
+	// choice rather than a deduction.
+	//
+	//   --db shared  the parent checkout's, which is the point of the feature:
+	//                no per-worktree pull, and the branch is previewed against
+	//                the data the site actually has.
+	//   --db own     a database of this project's own, for a branch that
+	//                migrates schema or activates a plugin — the writes a
+	//                shared database is not safe for.
+	//
+	// hostshift is needed either way. A fresh `db:pull` into a worktree is
+	// search-replaced to the *canonical* ddev hostname, not the worktree's, so
+	// the map is identical; only the container and the uploads differ.
+	if *db != "shared" && *db != "own" {
+		return exitConfig, fmt.Errorf("--db is `shared` or `own`, not %q", *db)
+	}
 	parent := mainWorktree(c.dir)
-	sharing := parent != "" && ddevProjectName(parent) != "" && ddevProjectName(parent) != ddevProjectName(c.dir)
+	sharing := *db == "shared" && parent != "" &&
+		ddevProjectName(parent) != "" && ddevProjectName(parent) != ddevProjectName(c.dir)
 	if sharing {
 		cfg += "\n# The database belongs to " + filepath.Base(parent) + ". This project runs none\n" +
 			"# of its own and points the application at that one.\n" +
@@ -271,6 +289,11 @@ func cmdInit(args []string) (int, error) {
 					"  every image 404s and a plugin reading one server-side is fatal. Set\n"+
 					"  upload_dirs in .ddev/config.yaml, which DDEV wants anyway, and rerun.\n")
 		}
+	} else if *db == "own" {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: this worktree runs a database of its own, and it starts empty.\n"+
+				"  Fill it — `ddev import-db`, a snapshot, or a fresh pull — and hostshift\n"+
+				"  maps whichever canonical hostname it ends up holding.\n")
 	}
 	fmt.Fprintf(os.Stderr, "hostshift: now run `ddev restart`\n")
 	return exitOK, nil

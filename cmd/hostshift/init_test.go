@@ -436,3 +436,48 @@ func TestInitDoesNotShareInTheMainCheckout(t *testing.T) {
 		t.Errorf("claimed to share a database with itself:\n%s", errOut)
 	}
 }
+
+// TestInitOwnDatabase is the third worktree shape: its own hostname *and* its
+// own database, for a branch that migrates schema or activates a plugin — the
+// writes a shared database is not safe for.
+//
+// hostshift is still needed. A fresh pull into a worktree is search-replaced to
+// the canonical ddev hostname, not the worktree's, so the map is identical to
+// the shared case; only the container and the uploads differ.
+func TestInitOwnDatabase(t *testing.T) {
+	root := t.TempDir()
+	main := filepath.Join(root, "acme")
+	writeFile(t, main, ".ddev/config.yaml", "type: wordpress\ndocroot: web\n")
+	writeFile(t, main, "web/app/uploads/a.png", "x")
+	git(t, main, "init", "-q", "-b", "master")
+	git(t, main, "add", "-A")
+	git(t, main, "commit", "-qm", "init")
+	wt := filepath.Join(root, "acme-wt-a")
+	git(t, main, "worktree", "add", "-q", wt, "-b", "wt-a")
+
+	code, _, errOut := run(t, "", cmdInit, "-C", wt, "--db", "own")
+	if code != exitOK {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+	cfg := readAll(t, filepath.Join(wt, ".ddev", "config.hostshift.local.yaml"))
+	if strings.Contains(cfg, "omit_containers") || strings.Contains(cfg, "DATABASE_URL") {
+		t.Errorf("--db own still took the parent's database:\n%s", cfg)
+	}
+	if _, err := os.Stat(filepath.Join(wt, ".ddev", "docker-compose.hostshift-uploads.yaml")); err == nil {
+		t.Error("--db own mounted the parent's uploads")
+	}
+	if !strings.Contains(errOut, "starts empty") {
+		t.Errorf("did not say the database needs filling:\n%s", errOut)
+	}
+	// The map is the same either way — that is the point.
+	if !strings.Contains(readAll(t, filepath.Join(wt, "hostshift.yaml")), "canonical: https://acme.ddev.site") {
+		t.Error("the map differs from the shared case")
+	}
+}
+
+func TestInitRejectsAnUnknownDatabaseChoice(t *testing.T) {
+	wt := worktree(t, "acme", "acme-wt-a", "wt-a")
+	if code, _, errOut := run(t, "", cmdInit, "-C", wt, "--db", "borrowed"); code != exitConfig {
+		t.Errorf("exit %d, want %d\n%s", code, exitConfig, errOut)
+	}
+}
