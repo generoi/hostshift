@@ -890,9 +890,16 @@ sites:
 ```
 
 Variants are **derived**, not written out: `--slug wt-a` yields
-`https://wt-a--herrfors.ddev.site` and `https://nat.wt-a--herrfors.ddev.site`.
+`https://wt-a--herrfors.ddev.site` and `https://wt-a--nat.herrfors.ddev.site`.
 An explicit `variant:` on a site overrides derivation for the rare case that
 needs it.
+
+(Revision 2 wrote the second one as `nat.wt-a--herrfors.ddev.site`, which
+contradicted both §5.4's rule — "prefixing the leftmost label" — and §5.6's own
+example, `wt-a--nat.herrfors.ddev.site`. Corrected in M2 to the leftmost-label
+form, which is the only one that is a function of `base` alone: it needs no
+knowledge of which label is the DDEV project name, so it derives correctly for
+`snellmanecom`'s three unrelated local bases as readily as for herrfors'.)
 
 **The map is origin→origin (scheme + host + port), never host→host.**
 `application.php:59` hardcodes `https://`, so every canonical URL in output is
@@ -1212,7 +1219,13 @@ Numbers are stable identifiers — do not renumber.)*
 14. Upstream 5xx / connection failure surfaced, not swallowed
 15. A rewritten response carries no stale `Content-Length` and no upstream `ETag`
 16. A request `Host` absent from the map is rejected with **421**, never proxied
-17. **Suffix-overlapping host sets rejected at startup**
+17. **Suffix-overlapping host sets rejected at startup** — but read this and 29c
+    against §5.4, which they contradict as originally worded. Containment is
+    *permitted*: `wt-a--herrfors.ddev.site` contains `herrfors.ddev.site` and the
+    whole leftmost-label scheme depends on that being legal. What is rejected is
+    a map in which the automaton **matches** a variant origin, so a second pass
+    would rewrite again. Assert both halves — the containing map is accepted, the
+    matched one is refused
 18. `<base href>` rewritten or stripped
 19. Full wp-admin login round trip, including `redirect_to` and `wp_get_referer()`
 20. `FORCE_SSL_ADMIN` site does not redirect-loop
@@ -1238,7 +1251,10 @@ Numbers are stable identifiers — do not renumber.)*
     merely tolerated, and that `--strict-origins` empties it
 29. Straggler sweep: a URL in a deliberately unhandled position is caught,
     rewritten, and reported — and running the sweep twice is a fixed point
-29c. Substring-overlapping canonical/variant sets are rejected at startup
+29c. Substring-overlapping canonical/variant sets are rejected at startup — with
+     the same correction as test 17: it is *matching*, not containment, that is
+     refused. An identity map (variant == its own canonical) is a legal, no-op
+     configuration and must not be rejected, or test 24 has nothing to run on
 29d. `ddev wp option get home` and `ddev wp site list` resolve correctly on a
      multisite repo with an unrewritten production database
 29a. Server-side loopback (Site Health, an internal REST request) resolves
@@ -1292,11 +1308,20 @@ One library gotcha worth not rediscovering: `petar-dambovaliev/aho-corasick`'s
 caller; without that, `https://h` is matched and then `//h` again six bytes
 inside it.
 
-**M2 — host map, request direction, and request bodies.** Config layering (DDEV defaults +
-`hostshift.yaml` + flags), variant generation,
-startup validation (§5.3–§5.4), then §5.1 in full: multisite inverse mapping,
-`Referer`, `X-Forwarded-Proto`, `Location`/`Link`/CSP, and §4.4's self-redirect
-guard. Tests 1, 2, 8, 10, 10a–10e, 11, 15, 16, 17, 20, 23, 29a, 29b, 29c, 29d, 32.
+**M2 — host map, request direction, and request bodies. Done 2026-08-27.** Config
+layering (DDEV defaults + `hostshift.yaml` + flags), variant derivation, startup
+validation (§5.3–§5.4), then §5.1 in full: multisite inverse mapping, `Referer`,
+`Origin`, `X-Forwarded-Proto`, request line and query, request bodies including a
+splice-based multipart rewriter, `Location`/`Link`/CSP, `Set-Cookie` `Domain=`,
+§4.4's self-redirect guard, and `wp-cli.local.yml` generation.
+
+Tests 1, 2, 8, 10, 10a–10e, 11, 15, 16, 17, 20, 23, 29c, 32 green, plus the
+request halves of 19, 30 and 31.
+
+**29a, 29b and 29d are deferred to M6**, and were mis-scheduled here. All three
+need a live DDEV project running against an unrewritten production database —
+which is precisely the "done when" criterion M6 exists to prove. Nothing in M2's
+code blocks them; they cannot be asserted before the pilot stands up.
 
 **M3 — HTML.** Every-attribute scan, structured attributes, inline script/style
 accumulation, `<base href>`, the §4.4 straggler sweep. Tests 3, 5, 7, 12, 18, 19, 21, 25, 28, 29.
@@ -1309,7 +1334,9 @@ built — §5.2 Tiers 2 and 3.
 `Range`. Tests 9, 13, 14, 26.
 
 **M6 — packaging + pilot.** Binary, image, thin add-on, corpus diff against
-herrfors, and test 28 over the full crawl.
+herrfors, and test 28 over the full crawl. Also tests 29a, 29b and 29d, moved
+here from M2: each needs a live DDEV project on an unrewritten production
+database, which is what this milestone stands up.
 
 This is not a small project. The previous revision's *"the tool is
 straightforward once these are green"* is the sentence most likely to mislead an

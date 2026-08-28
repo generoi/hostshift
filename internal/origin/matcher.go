@@ -165,7 +165,12 @@ func (m *Matcher) Validate() error {
 			return fmt.Errorf("origin: canonical %s declared by both %q and %q", p.Canonical, prev, p.Name)
 		}
 		seen[p.Canonical] = p.Name
-		if prev, dup := rev[p.Variant]; dup {
+		// Injectivity is asserted between *sites*, not between pairs. A site
+		// legitimately maps several canonical origins to one variant — §4.2's
+		// {production_i, staging_i, ddev_i} → variant_i — so that residual URLs
+		// left by an imperfect db:pull are corrected too. Two different sites
+		// sharing a variant is the error.
+		if prev, dup := rev[p.Variant]; dup && prev != p.Name {
 			return fmt.Errorf("origin: variant %s produced by both %q and %q — map is not injective", p.Variant, prev, p.Name)
 		}
 		rev[p.Variant] = p.Name
