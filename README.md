@@ -11,9 +11,11 @@ for. Nothing in the database is ever rewritten.
 [`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
 for completed milestones live in [`docs/`](docs/).
 
-**Status: M5.** The rewrite engine, the anchored origin matcher, the host map,
-both request and response directions, HTML, JSON and transport are in place.
-Packaging and the pilot are M6; `PLAN.md` §8 has the rest.
+**Status: M6, packaging done.** The engine, the host map, both directions, HTML,
+JSON, transport, the binaries, the image, the DDEV add-on and the corpus diff are
+in place. What remains is the live pilot — a DDEV project running against an
+unrewritten production database — which is also what tests 29a, 29b and 29d wait
+on. `PLAN.md` §8 has the detail.
 
 ## Using it
 
@@ -100,6 +102,54 @@ missing `/app/uploads/` request to a hardcoded production origin. Rewriting that
 redirect loop. hostshift detects it and passes the `Location` through unmodified,
 counted as `self-redirect`. That is the single enumerated exception to "no
 production origin reaches the browser"; `--strict-origins` returns 404 instead.
+
+## The DDEV add-on
+
+The whole add-on is two compose files and an `install.yaml`. No `lib.sh`, no
+hooks, no guard — §3 measured what happens when per-repo footprint is not held
+to, and the answer was 42 repos carrying 14 different pinned SHAs of the same
+submodule.
+
+```
+ddev add-on get generoi/hostshift
+```
+
+Then, per project:
+
+1. **Declare the map** — `.ddev/config.yaml` alone is enough for a
+   single-environment site; `hostshift.yaml` for production-canonical.
+2. **Set the variant hostnames** in `.ddev/.env` (`HOSTSHIFT_SLUG`,
+   `HOSTSHIFT_VARIANTS`) *and* in `additional_hostnames`, or mkcert issues no SAN
+   for them and the browser gets a TLS interstitial instead of a site. A
+   three-label variant host is not covered by the `*.ddev.site` wildcard, so it
+   needs registering regardless. `hostshift map --slug wt-a` prints the list.
+3. **`hostshift wp-cli > wp-cli.local.yml`** if the database holds production
+   hostnames — without it every `ddev wp` on a multisite fails to resolve a site.
+4. **List this site's production hostnames** in
+   `.ddev/docker-compose.hostshift-loopback.yaml`, or WordPress's internal
+   requests (wp-cron, Site Health) leave the machine for live production.
+
+Routing is DDEV's router's job and it already does it: the add-on names the
+variant hostnames in `VIRTUAL_HOST` and exposes 80/443 → 8080, the same
+mechanism the phpmyadmin add-on uses. Everything not named there keeps going to
+`web`, so the canonical site stays reachable alongside the variant.
+
+## The corpus diff
+
+The only test that validates against reality. Fixtures would not have caught the
+double-port bug; this would.
+
+```
+hostshift diff -n 20
+hostshift diff --canonical-base http://127.0.0.1:8091 --variant-base http://127.0.0.1:8090
+```
+
+It crawls N pages on the canonical site, fetches the same N through the proxy,
+runs the canonical bytes through the same engine the proxy uses, and compares.
+Byte equality is reported, but the assertions that fail the run are the ones that
+cannot be innocent: **a canonical origin reaching the browser**, and **a page
+whose line count changed** — splicing never rebuilds whitespace, so a line-count
+change means something re-serialised.
 
 ## Building
 

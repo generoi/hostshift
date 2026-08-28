@@ -1,0 +1,62 @@
+#ddev-generated
+# hostshift — the whole DDEV add-on.
+#
+# One compose service. No lib.sh, no hooks, no guard, no generated files beyond
+# wp-cli.local.yml, which is already gitignored fleet-wide. PLAN §3's constraint
+# is near-zero per-repo footprint, and 42 repos carrying 14 different pinned
+# SHAs of .claude/agency is what happens when that is not held to.
+#
+# Routing is DDEV's router's job and it already does it. The router reaches a
+# service through VIRTUAL_HOST / HTTP_EXPOSE / HTTPS_EXPOSE and the com.ddev.*
+# labels — the same mechanism the phpmyadmin add-on uses. Pointing the *variant*
+# hostnames at this service rather than at `web` needs nothing more than naming
+# them here (PLAN §5.6).
+#
+# The variant hostnames must also be in the project's additional_hostnames, or
+# the mkcert certificate carries no SAN for them and the browser gets a TLS
+# interstitial instead of a site. A three-label variant host is not covered by
+# the *.ddev.site wildcard, so it needs registering regardless of hostshift.
+#
+# Substitutions DDEV performs: $DDEV_SITENAME, $DDEV_APPROOT, $DDEV_TLD.
+# HOSTSHIFT_VARIANTS and HOSTSHIFT_SLUG come from the project's .ddev/.env.
+
+services:
+  hostshift:
+    container_name: ddev-${DDEV_SITENAME}-hostshift
+    image: ghcr.io/generoi/hostshift:latest
+    restart: "no"
+    command:
+      - proxy
+      - -C
+      - /project
+      - --listen
+      - 0.0.0.0:8080
+      - --upstream
+      - http://web:80
+      - --slug
+      - ${HOSTSHIFT_SLUG:-wt}
+    labels:
+      com.ddev.site-name: ${DDEV_SITENAME}
+      com.ddev.approot: ${DDEV_APPROOT}
+    environment:
+      # The hostnames the router should send here. Everything else keeps going
+      # to `web`, so the canonical site stays reachable alongside the variant.
+      VIRTUAL_HOST: ${HOSTSHIFT_VARIANTS}
+      # external:internal. hostshift listens plain on 8080 and never terminates
+      # TLS; DDEV's router does that, as it does for `web`.
+      HTTP_EXPOSE: 80:8080
+      HTTPS_EXPOSE: 443:8080
+    expose:
+      - "8080"
+    volumes:
+      # Read-only, and only for hostshift.yaml and .ddev/config.yaml — the two
+      # files §5.3's config layering reads.
+      - ".:/project:ro"
+    depends_on:
+      - web
+    networks: [default, ddev_default]
+
+networks:
+  ddev_default:
+    name: ddev_default
+    external: true

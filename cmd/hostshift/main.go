@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/generoi/hostshift/internal/config"
+	"github.com/generoi/hostshift/internal/corpus"
+	"github.com/generoi/hostshift/internal/origin"
 	"github.com/generoi/hostshift/internal/proxy"
 	"github.com/generoi/hostshift/internal/rewrite"
 )
@@ -35,6 +37,7 @@ const usage = `hostshift — serve a site from a hostname other than the one in 
   hostshift map     print the resolved host map
   hostshift check   validate the config; exit 2 if invalid
   hostshift wp-cli  print wp-cli.local.yml for this project
+  hostshift diff    corpus diff: crawl N pages canonical and through the proxy
 
 The map is resolved from three layers, each overriding the last (PLAN §5.3):
 DDEV defaults in .ddev/config.yaml, then hostshift.yaml, then these flags.
@@ -72,6 +75,8 @@ func main() {
 		code, err = cmdCheck(os.Args[2:])
 	case "wp-cli":
 		code, err = cmdWPCLI(os.Args[2:])
+	case "diff":
+		code, err = cmdDiff(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, usage)
 	default:
@@ -359,6 +364,68 @@ func cmdWPCLI(args []string) (int, error) {
 		fmt.Fprintf(os.Stderr,
 			"hostshift: root url: is blog 1 (%s); sibling blogs keep working through the existing wp-cli.yml aliases\n",
 			first.Canonical)
+	}
+	return exitOK, nil
+}
+
+// cmdDiff is the corpus diff — PLAN §7's only test that validates against
+// reality. Fixtures would not have caught the double-port bug; this would.
+func cmdDiff(args []string) (int, error) {
+	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	var c common
+	c.register(fs)
+	canonicalBase := fs.String("canonical-base", "", "base URL to crawl; defaults to site 1's canonical origin")
+	variantBase := fs.String("variant-base", "", "base URL the proxy serves; defaults to site 1's variant origin")
+	n := fs.Int("n", 20, "how many pages to compare")
+	pathList := fs.String("paths", "", "file of paths to compare, one per line; skips the crawl")
+	timeout := fs.Duration("timeout", 30*time.Second, "per-request timeout")
+	if err := fs.Parse(args); err != nil {
+		return exitConfig, nil
+	}
+	res, err := c.load()
+	if err != nil {
+		return exitConfig, err
+	}
+	site := res.Map.Sites[0]
+
+	base := func(flagVal string, def origin.Origin) (*url.URL, error) {
+		if flagVal == "" {
+			flagVal = def.String()
+		}
+		return url.Parse(flagVal)
+	}
+	cb, err := base(*canonicalBase, site.Canonical)
+	if err != nil {
+		return exitConfig, fmt.Errorf("--canonical-base: %w", err)
+	}
+	vb, err := base(*variantBase, site.Variant)
+	if err != nil {
+		return exitConfig, fmt.Errorf("--variant-base: %w", err)
+	}
+
+	var paths []string
+	if *pathList != "" {
+		b, err := os.ReadFile(*pathList)
+		if err != nil {
+			return exitConfig, err
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+				paths = append(paths, line)
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "corpus diff: %s vs %s\n", cb, vb)
+	results, err := corpus.Run(context.Background(), corpus.Options{
+		Canonical: cb, Variant: vb, Map: res.Map,
+		N: *n, Paths: paths, Timeout: *timeout,
+	})
+	if err != nil {
+		return exitRuntime, err
+	}
+	if !corpus.WriteReport(os.Stdout, results) {
+		return exitRuntime, nil
 	}
 	return exitOK, nil
 }
