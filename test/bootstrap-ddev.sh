@@ -151,21 +151,21 @@ YAML
 
   # Every Bedrock repo in the fleet has a wp-cli.yml carrying at least `path`.
   # A stock download does not, and without it WP-CLI searches upward from
-  # /var/www/html and never finds WordPress under web/. `hostshift wp-cli`
+  # /var/www/html and never finds WordPress under web/. `ddev hostshift wp-cli`
   # preserves whatever is here and adds the root url:.
   cat > "$ROOT/wp-cli.yml" <<'YAML'
 path: web
 YAML
   printf 'wp-cli.local.yml\n' > "$ROOT/.gitignore"
 
-  # DDEV puts every additional hostname on web's VIRTUAL_HOST, so web and
-  # hostshift both claim the variants and the router picks web. `map --env`
-  # emits the list that narrows web back to the canonical hosts.
-  (cd "$ROOT" && "$REPO/hostshift" map --slug "$SLUG" --env 2>/dev/null > .ddev/.env) \
+  # Through the add-on's own command, which is the thing that scaffolds a DDEV
+  # project — the binary deliberately does not. It needs hostshift on PATH.
+  export PATH="$REPO:$PATH"
+  (cd "$ROOT" && ddev hostshift init --slug "$SLUG" >/dev/null) \
     || { echo "build the binary first: (cd $REPO && make build)"; exit 1; }
 
   say "generating wp-cli.local.yml"
-  (cd "$ROOT" && "$REPO/hostshift" wp-cli --slug "$SLUG" > wp-cli.local.yml 2>/dev/null)
+  (cd "$ROOT" && ddev hostshift wp-cli --slug "$SLUG" > wp-cli.local.yml)
 
   say "restarting with hostshift in place"
   (cd "$ROOT" && ddev restart >/dev/null)

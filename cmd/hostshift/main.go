@@ -24,6 +24,7 @@ import (
 
 	"github.com/generoi/hostshift/internal/config"
 	"github.com/generoi/hostshift/internal/corpus"
+	"github.com/generoi/hostshift/internal/ddev"
 	"github.com/generoi/hostshift/internal/origin"
 	"github.com/generoi/hostshift/internal/proxy"
 	"github.com/generoi/hostshift/internal/rewrite"
@@ -39,6 +40,7 @@ rest.
   hostshift rewrite   a filter — bytes on stdin, rewritten bytes on stdout
   hostshift proxy     the same rewriting in front of an upstream
   hostshift map       print the resolved map
+  hostshift hosts     print the hostnames a project declares, one per line
   hostshift check     validate it; exit 2 if it is not usable
   hostshift diff      crawl a site two ways and compare, to verify a deployment
 
@@ -85,6 +87,8 @@ func main() {
 		code, err = cmdRewrite(os.Args[2:])
 	case "proxy":
 		code, err = cmdProxy(os.Args[2:])
+	case "hosts":
+		code, err = cmdHosts(os.Args[2:])
 	case "map":
 		code, err = cmdMap(os.Args[2:])
 	case "check":
@@ -286,6 +290,32 @@ func cmdProxy(args []string) (int, error) {
 		return exitRuntime, err
 	}
 	p.Stats.WriteReport(os.Stderr)
+	return exitOK, nil
+}
+
+// cmdHosts prints the hostnames a project declares — the raw material a map is
+// derived from, before any of it is decided.
+//
+// It reads; it does not scaffold. Something has to answer "what does the
+// checkout at this path answer to", and a tool that already reads DDEV config
+// as a map source may as well say what it read. Doing it in shell means parsing
+// YAML with its override merging, which is how the careful parts get lost.
+func cmdHosts(args []string) (int, error) {
+	fs := flag.NewFlagSet("hosts", flag.ContinueOnError)
+	dir := fs.String("C", ".", "project directory")
+	if err := fs.Parse(args); err != nil {
+		return exitConfig, nil
+	}
+	proj, err := ddev.Load(*dir)
+	if err != nil {
+		return exitConfig, err
+	}
+	if proj == nil {
+		return exitConfig, fmt.Errorf("no project config found in %s", *dir)
+	}
+	for _, h := range proj.Hosts {
+		fmt.Println(h)
+	}
 	return exitOK, nil
 }
 
