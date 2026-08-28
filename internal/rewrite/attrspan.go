@@ -27,14 +27,37 @@ func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'
 }
 
-// scanAttrs returns the attribute spans of a start or self-closing tag.
-// raw must be exactly what Tokenizer.Raw() returned.
-func scanAttrs(raw []byte) []Attr {
-	var out []Attr
+// tagNameOf returns the element name of a start or self-closing tag, as a slice
+// of raw rather than a copy.
+//
+// It stops exactly where scanAttrs starts, on the same terminator set, which is
+// also x/net/html's readTagName. Deriving it here is what lets the tokenizer's
+// TagName() go unused: that function is bytes.ReplaceAll over the tag name, and
+// Go's bytes.Replace copies even when it replaces nothing — so every start tag
+// paid a copy of its name purely to be compared against ten constants.
+//
+// It also removes the *second* copy that comparison forced. TagName() may
+// invalidate Raw(), an undocumented lifetime the code could only hedge against
+// by cloning every raw tag first. With TagName() and TagAttr() never called,
+// the aliasing hazard at spike/go/full/main.go:100-105 cannot recur at all.
+func tagNameOf(raw []byte) []byte {
 	i := 1 // skip '<'
 	for i < len(raw) && !isSpace(raw[i]) && raw[i] != '>' && raw[i] != '/' {
 		i++
 	}
+	return raw[1:i]
+}
+
+// scanAttrs returns the attribute spans of a start or self-closing tag.
+// raw must be exactly what Tokenizer.Raw() returned.
+func scanAttrs(raw []byte) []Attr { return scanAttrsInto(nil, raw) }
+
+// scanAttrsInto is scanAttrs with a caller-supplied buffer, so one page's worth
+// of tags reuses a single slice instead of allocating per tag. The spans are
+// offsets into raw and are consumed before the next token, so nothing outlives
+// the reuse.
+func scanAttrsInto(out []Attr, raw []byte) []Attr {
+	i := len(tagNameOf(raw)) + 1
 	for i < len(raw) {
 		for i < len(raw) && isSpace(raw[i]) {
 			i++

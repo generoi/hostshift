@@ -13,7 +13,7 @@ merely immaterial, it was a bug.
 |---|---|---|---|
 | Passthrough (no origin on the page) | 156 → **199 MB/s** | 1.80 → **0.86 MB** | 36,780 → **14,173** |
 | Identity map (every origin matches, none rewritten) | 139 → **192 MB/s** | 1.84 → **0.96 MB** | 39,033 → **16,289** |
-| Rewrite (~1,100 origins spliced) | 124 → **158 MB/s** | 2.27 → **1.32 MB** | 40,572 → **17,523** |
+| Rewrite (~1,100 origins spliced) | 124 → **185 MB/s** | 2.27 → **1.32 MB** | 40,572 → **17,523** |
 | **Rewrite + straggler sweep — what the proxy runs** | **23.6 → 128 MB/s** | **179.5 → 1.54 MB** | 62,141 → **19,240** |
 
 The full pipeline is **5.4× faster and allocates 117× less**.
@@ -80,3 +80,82 @@ is the wrong trade for a proxy that builds one map and then serves from it.
 **Memory is bounded by the largest token, not the response** (test 13): a 5 MB
 page streams with a **42-byte** peak token buffer. Throughput mattered less than
 that bound, and the bound was already right.
+
+
+## Second pass, 2026-08-28
+
+An architectural audit found that the biggest remaining cost was work done for
+data hostshift never reads.
+
+| | throughput | allocated per page | allocs |
+|---|---|---|---|
+| Passthrough | 202 → **211 MB/s** | 0.86 → **0.31 MB** | 14,173 → **8,128** |
+| Identity map | 191 → **200 MB/s** | 0.96 → **0.41 MB** | 16,289 → **10,244** |
+| Rewrite | 185 → **194 MB/s** | 1.32 → **0.77 MB** | 17,523 → **11,477** |
+| **Rewrite + straggler sweep** | 130 → **132 MB/s** | 1.54 → **0.99 MB** | 19,240 → **13,194** |
+
+**42% fewer allocations and 64% less garbage on a page with nothing to rewrite**,
+which is most pages.
+
+**`Tokenizer.TagName()` is `bytes.ReplaceAll`, and Go's `bytes.Replace` copies
+even when it replaces nothing.** Every start tag paid a copy of its element name
+purely to be compared against ten constants. The name is `raw[1:i]` where `i` is
+where `scanAttrs` already stops — the same terminator set `readTagName` uses —
+so `tagNameOf` returns a slice and `bytes.EqualFold` answers the comparison
+without allocating.
+
+**That copy forced a second one.** `TagName()`/`TagAttr()` may invalidate
+`Raw()`; the docs promise only the partition guarantee, and safety rested on
+`TagAttr` happening to allocate before its in-place unescape. So every raw start
+tag was cloned defensively. With neither function called any more the hazard is
+*gone* rather than guarded against — the aliasing bug at
+`spike/go/full/main.go:100-105` cannot recur — and two allocations per start tag
+go with it. Worth 3,279 allocations a page.
+
+**`scanAttrs` allocated a fresh span slice per tag.** The spans are offsets into
+`raw` and are consumed before the next token, so one buffer serves the whole
+page. Worth 2,766 allocations a page.
+
+Verified byte-identical rather than argued: the full `NewResponseBody` output was
+hashed for all 51 fixtures in `spike/corpus` and `spike/adv`, crossed with four
+chunk sizes (1, 7, 4096, 1 MiB) and four maps (rewriting, identity, a shorter
+variant, a map matching nothing). **All 816 SHA-256 hashes are unchanged.**
+
+### One thing that is load-bearing by accident
+
+`HTML.Read` returns **one token at a time**, roughly 50 bytes. Draining whole
+batches into the caller's buffer instead is an obvious-looking win — it cut the
+sweep's marginal cost from 1,714 allocations to about 60, and peak heap *fell* —
+and it measured **3.9% slower**.
+
+The reason is the separator prefilter. Small chunks mostly contain no `//`,
+`\/`, `%2F` or `%2f`, so the automaton never runs on them; the prefilter is
+skipping most of the page. Feed the sweep 32 KB chunks and every chunk contains
+a separator somewhere, so the automaton scans all 508 KB —
+`leftmostFindAtNoStateImp` went from 25.4% to 33.6% of CPU. **Do not "fix" the
+one-token-per-Read shape.**
+
+### Measured and not taken
+
+- **`x/net/html`'s attribute dedup map** is 50–81% of what remains: a
+  `bytes.Clone`, a `string` and a map insert per attribute, to dedupe names for
+  `TagAttr()` — which hostshift never calls. Patching it locally takes
+  passthrough to **1,503 allocations a page, 9.4× below where this started**.
+  It belongs upstream: forking the tokenizer is the one dependency not worth
+  forking, because test 24 rests entirely on its `Raw()` partition guarantee.
+- **Lock-free `Stats` counters.** The mutex profile looks damning — 2.66 s of
+  contended delay at `-cpu 10`, 96% of it in `Stats.Record` — and replacing the
+  mutex with per-key atomics measured **no change at all** (p=0.667, n=14). The
+  contention is real and off the critical path.
+- **Short-circuiting the pipeline under an identity map.** It would make
+  `BenchmarkIdentity` free and gut the guard rail: test 24 is meaningful because
+  it drives the real tokenizer, splicer and sweep. A bypassed test asserts that
+  `return r` returns `r`.
+- **A reusable Aho–Corasick iterator.** `findIter` and `prefilterState` are
+  unexported and `IterByte` allocates both per call, so this means forking the
+  library — for ~52% of what is left, in a proxy §9 calls "immaterial for dev",
+  in the exact component that has already leaked twice.
+- **Request-direction fixes.** `Site.CanonicalSet()` allocates per call and
+  `rewriteRequest` assigns unconditionally; fixing both moved a small GET from
+  192 to 190 allocations. hostshift's own share of a request is ~20%; the rest is
+  `net/http` and `httputil.ReverseProxy`.
