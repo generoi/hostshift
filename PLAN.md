@@ -1424,6 +1424,22 @@ are the two that cannot be innocent on a live site — a canonical origin reachi
 the browser, and a page whose line count changed, which means something
 re-serialised.
 
+**Piloted against the running `herrfors` project**, read-only, with
+`canonical = the ddev hosts` (the map `.ddev/config.yaml` alone produces).
+**20 pages, 0 leaks, 0 errors, every line count identical.** Full write-up in
+`docs/m6-pilot.md`; one page byte-identical and the other nineteen differing
+only in CSP nonces, 158 of them, with equal byte counts.
+
+The pilot paid for itself immediately: it found 25 stragglers per crawl, and
+neither kind was a defect in the sweep. `sage-cachetags` emits a URL in an HTML
+comment on every cached page, and a privacy-policy paragraph quotes its own URL
+in visible prose. Both are now scanned in the structured pass, per §4.4's rule
+that every straggler is a bug to fix there. The prose case matters more than it
+looks: under production-canonical a visible URL pointing at production is exactly
+the hazard §4.4 opens with, since a developer copy-pastes it and lands on live
+production. After the change the sweep catches **zero** on real pages, which is
+what a backstop should do.
+
 **Pending, and it needs a decision rather than more code:** the live pilot, and
 with it tests 29a, 29b, 29d and test 28 over a full crawl. All four need a DDEV
 project running against an **unrewritten production database**, which means
