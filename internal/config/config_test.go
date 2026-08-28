@@ -532,3 +532,32 @@ func TestDDEVProjectTLDOverride(t *testing.T) {
 		t.Errorf("tld=%q hosts=%v", tld, hosts)
 	}
 }
+
+// TestOwnHostnameIsNotReportedUncovered. The uncovered-hostname warning fired
+// on every correctly configured worktree, because a worktree's own DDEV project
+// name is *supposed* to be absent from the map — it is what web answers to, and
+// web is where mailpit and `ddev launch` live. A warning that is always wrong is
+// how people learn to skip warnings.
+func TestOwnHostnameIsNotReportedUncovered(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, ".ddev/config.yaml",
+		"name: acmecorp-wt-a\nadditional_hostnames:\n  - stray.acmecorp\n")
+	write(t, dir, "hostshift.yaml",
+		"version: 1\nsites:\n  - {name: main, canonical: https://acmecorp.ddev.site, base: https://acmecorp.ddev.site}\n")
+
+	res, err := Load(dir, Flags{Slug: "wt-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range res.Uncovered {
+		if h == "acmecorp-wt-a.ddev.site" {
+			t.Errorf("the project's own hostname was reported as uncovered: %v", res.Uncovered)
+		}
+	}
+	// But a genuinely undeclared one still is — that is the fsi shape the
+	// warning was written for, where a hostshift.yaml declares three blogs of
+	// nine and the rest have nowhere to be previewed.
+	if len(res.Uncovered) != 1 || res.Uncovered[0] != "stray.acmecorp.ddev.site" {
+		t.Errorf("Uncovered = %v, want just the undeclared hostname", res.Uncovered)
+	}
+}
