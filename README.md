@@ -223,9 +223,24 @@ worktree's own hostname, and only the variant reaches hostshift.
 
 ### Worked example: a multisite
 
-Two blogs, so two hostnames in `wp_blogs.domain`, and this one **does** need a
-committed `hostshift.yaml` — a multisite's canonical hostnames are production
-hostnames, and no DDEV config anywhere declares those.
+Two blogs, so two hostnames in `wp_blogs.domain`. **This still needs no map
+file.** Whatever pulled the database search-replaced to the DDEV hostnames, and
+`.ddev/config.yaml` already declares every one of them:
+
+```yaml
+# .ddev/config.yaml, in the parent checkout
+additional_hostnames:
+  - shop.acme
+```
+
+so `ddev hostshift init` in a worktree derives both sites on its own, exactly as
+the single-site case does — `acme.ddev.site` and `shop.acme.ddev.site` mapping to
+`wt-a--acme.ddev.site` and `wt-a--shop.acme.ddev.site`.
+
+A `hostshift.yaml` is for the two things a DDEV config genuinely cannot say:
+**alias hostnames**, so a residual staging URL an imperfect pull left behind is
+corrected too, and **production-canonical**, where the database was never
+search-replaced at all and the canonical hostnames are the live ones.
 
 ```yaml
 # hostshift.yaml, committed
@@ -248,10 +263,14 @@ sites:
 
 `canonical` is what the database holds. `base` is what the variant is derived
 from, so `--slug wt-a` gives `wt-a--acme.ddev.site`. `aliases` are other
-hostnames the same blog has been served at, so a URL an imperfect database pull
-left behind is corrected too. To browse a *pristine* production database instead
-— nothing search-replaced — set `canonical` to the production hostname
+hostnames the same blog has been served at — that is the part worth committing a
+file for. To browse a *pristine* production database instead — nothing
+search-replaced — set `canonical` to the production hostname
 (`https://www.example.com`) and leave `base` alone.
+
+Declaring the map also *replaces* the DDEV layer rather than merging with it, so
+a hostname the file leaves out has no variant and cannot be previewed.
+`hostshift check` names any that the project registers and the map does not.
 
 ```console
 $ ddev hostshift init
