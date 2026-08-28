@@ -9,9 +9,9 @@ for. Nothing in the database is ever rewritten.
 
 **What it is for: worktrees.** One project, one database, and a second hostname
 so a branch or an agent can be previewed without a database of its own —
-`acmecorp.ddev.site` served also at `wt-a--acmecorp.ddev.site`. `robo db:pull`
-keeps its search-replace and the main site is unaffected; nothing about a normal
-pull changes.
+`acme.ddev.site` served also at `wt-a--acme.ddev.site`. Whatever pulls the
+database keeps its search-replace and the main site is unaffected; nothing about
+a normal pull changes.
 
 **Production-canonical is the same engine pointed further.** Declare production
 hostnames in `hostshift.yaml` and a pristine, unrewritten dump can be browsed
@@ -23,16 +23,15 @@ matters once `home_url()` is a hostname that resolves off the box.
 [`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
 for completed milestones live in [`docs/`](docs/).
 
-**Status: M6 done.** Piloted against `acmecorp` running on a genuinely
-unrewritten production database — `wp_blogs.domain` holding `www.acmecorp.fi` —
-and against `bravoinc`'s five blogs. Both corpus diffs green: 0 leaks, 0
-stragglers, every line count identical. `docs/m6-pilot.md` has the numbers and
-the four `PLAN.md` claims the pilot corrected.
+**Status: M6 done.** Piloted against two real client sites: a two-blog multisite
+running on a genuinely unrewritten production database — `wp_blogs.domain`
+holding production hostnames — and a five-blog one. Both corpus diffs green: 0
+leaks, 0 stragglers, every line count identical. `docs/m6-pilot.md` has the
+numbers and the four `PLAN.md` claims the pilot corrected.
 
 Not yet done at pilot time: installing the DDEV add-on into a project and
-starting it — the pilot drove `hostshift proxy` directly. Both adoption PRs
-(generoi/acmecorp, generoi/transformerco) now document that path, and CI's e2e
-job installs through the add-on.
+starting it — the pilot drove `hostshift proxy` directly. Two adoption PRs now
+document that path, and CI's e2e job installs through the add-on.
 
 ## Using it
 
@@ -70,17 +69,17 @@ version: 1
 upstream: http://web:80
 sites:
   - name: main
-    canonical: https://www.acmecorp.fi
-    base:      https://acmecorp.ddev.site
-    aliases:   [https://acmecorp.example-dev.com]
-  - name: nat
-    canonical: https://www.acmecorpnat.fi
-    base:      https://nat.acmecorp.ddev.site
+    canonical: https://www.example.com
+    base:      https://acme.ddev.site
+    aliases:   [https://acme.staging.example.net]
+  - name: shop
+    canonical: https://shop.example.com
+    base:      https://shop.acme.ddev.site
 ```
 
 Variants are derived, not written out: `--slug wt-a` prefixes the leftmost label
-of each site's base host, giving `wt-a--acmecorp.ddev.site` and
-`wt-a--nat.acmecorp.ddev.site`. An explicit `variant:` overrides that.
+of each site's base host, giving `wt-a--acme.ddev.site` and
+`wt-a--shop.acme.ddev.site`. An explicit `variant:` overrides that.
 
 Listing the other environments as `aliases` is what lets a residual `@production`
 or `@staging` URL left behind by an imperfect `db:pull` be corrected too.
@@ -174,38 +173,38 @@ mechanism the phpmyadmin add-on uses. Everything not named there keeps going to
 
 ### Worked example: a single WordPress site
 
-transformerco. One site, one hostname, and `.ddev/config.yaml` deliberately
-has no `name:` — so DDEV names each project after its own directory, and a
-worktree is automatically a DDEV project of its own with nothing configured.
+One site, one hostname, and `.ddev/config.yaml` deliberately has no `name:` — so
+DDEV names each project after its own directory, and a worktree is automatically
+a DDEV project of its own with nothing configured.
 
 ```console
-$ git worktree add ../transformerco-wt-a -b wt-a
-$ cd ../transformerco-wt-a
+$ git worktree add ../acme-wt-a -b wt-a
+$ cd ../acme-wt-a
 $ ddev add-on get generoi/hostshift
 $ ddev hostshift init
 hostshift: slug "wt-a", from the git branch wt-a
-hostshift: canonical hostnames from /Users/…/transformerco, whose database this shares
+hostshift: canonical hostnames from /Users/you/Projects/acme, whose database this shares
 hostshift: wrote .ddev/.env and .ddev/config.hostshift.local.yaml
 map from --from/--to
-site1  https://transformerco.ddev.site  ->  https://wt-a--transformerco.ddev.site
+site1  https://acme.ddev.site  ->  https://wt-a--acme.ddev.site
 hostshift: now run `ddev restart`
 ```
 
-**Nothing is committed and no map is declared.** The hostnames the database
-holds are the *parent* checkout's — `db:pull` search-replaced to
-`transformerco.ddev.site`, not to the worktree's — so the command reads them
-from there rather than from the project it is configuring. Getting this wrong is
-silent: a map built from the worktree's own config names
-`transformerco-wt-a.ddev.site`, which appears nowhere in the database, so
-every page loads and every link is still the parent's.
+**Nothing is committed and no map is declared.** The hostnames the database holds
+are the *parent* checkout's — whatever pulled the database search-replaced to
+`acme.ddev.site`, not to the worktree's hostname — so the command reads them from
+there rather than from the project it is configuring. Getting this wrong is
+silent: a map built from the worktree's own config names `acme-wt-a.ddev.site`,
+which appears nowhere in the database, so every page loads and every link is
+still the parent's.
 
 Two gitignored files come out of it:
 
 ```yaml
 # .ddev/.env
 HOSTSHIFT_SLUG=wt-a
-HOSTSHIFT_VARIANTS=wt-a--transformerco.ddev.site
-HOSTSHIFT_WEB_HOSTS=transformerco-wt-a.ddev.site
+HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site
+HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
 ```
 
 ```yaml
@@ -213,20 +212,20 @@ HOSTSHIFT_WEB_HOSTS=transformerco-wt-a.ddev.site
 # generated by `ddev hostshift init` — delete it to undo, rerun to update.
 # hostshift:ignore — hostshift must not read its own output back as input.
 additional_hostnames:
-  - transformerco-wt-a
-  - wt-a--transformerco
+  - acme-wt-a
+  - wt-a--acme
 ```
 
-`ddev restart`, and `https://wt-a--transformerco.ddev.site` serves the
-worktree while `https://transformerco.ddev.site` goes on serving the parent
-checkout. `HOSTSHIFT_WEB_HOSTS` is what keeps the two apart: `web` answers on
-the worktree's own hostname, and only the variant reaches hostshift.
+`ddev restart`, and `https://wt-a--acme.ddev.site` serves the worktree while
+`https://acme.ddev.site` goes on serving the parent checkout.
+`HOSTSHIFT_WEB_HOSTS` is what keeps the two apart: `web` answers on the
+worktree's own hostname, and only the variant reaches hostshift.
 
 ### Worked example: a multisite
 
-acmecorp. Two blogs, so two hostnames in `wp_blogs.domain`, and this one
-**does** need a committed `hostshift.yaml` — a multisite's canonical hostnames
-are production hostnames, and no DDEV config anywhere declares those.
+Two blogs, so two hostnames in `wp_blogs.domain`, and this one **does** need a
+committed `hostshift.yaml` — a multisite's canonical hostnames are production
+hostnames, and no DDEV config anywhere declares those.
 
 ```yaml
 # hostshift.yaml, committed
@@ -235,42 +234,42 @@ upstream: http://web:80
 
 sites:
   - name: main
-    canonical: https://acmecorp.ddev.site
-    base: https://acmecorp.ddev.site
+    canonical: https://acme.ddev.site
+    base: https://acme.ddev.site
     aliases:
-      - https://acmecorp.example-dev.com
+      - https://acme.staging.example.net
 
-  - name: nat
-    canonical: https://nat.acmecorp.ddev.site
-    base: https://nat.acmecorp.ddev.site
+  - name: shop
+    canonical: https://shop.acme.ddev.site
+    base: https://shop.acme.ddev.site
     aliases:
-      - https://nat.acmecorp.example-dev.com
+      - https://shop.acme.staging.example.net
 ```
 
 `canonical` is what the database holds. `base` is what the variant is derived
-from, so `--slug wt-a` gives `wt-a--acmecorp.ddev.site`. `aliases` are other
-hostnames the same blog has been served at, so a URL an imperfect `db:pull` left
-behind is corrected too. To browse a *pristine* production database instead —
-nothing search-replaced — set `canonical` to the production hostname and leave
-`base` alone.
+from, so `--slug wt-a` gives `wt-a--acme.ddev.site`. `aliases` are other
+hostnames the same blog has been served at, so a URL an imperfect database pull
+left behind is corrected too. To browse a *pristine* production database instead
+— nothing search-replaced — set `canonical` to the production hostname
+(`https://www.example.com`) and leave `base` alone.
 
 ```console
 $ ddev hostshift init
 hostshift: slug "wt-a", from the git branch wt-a
 hostshift: wrote .ddev/.env and .ddev/config.hostshift.local.yaml
 map from hostshift.yaml
-main  https://acmecorp.ddev.site           ->  https://wt-a--acmecorp.ddev.site
-      https://acmecorp.example-dev.com          (alias)
-nat   https://nat.acmecorp.ddev.site       ->  https://wt-a--nat.acmecorp.ddev.site
-      https://nat.acmecorp.example-dev.com      (alias)
+main  https://acme.ddev.site                 ->  https://wt-a--acme.ddev.site
+      https://acme.staging.example.net           (alias)
+shop  https://shop.acme.ddev.site            ->  https://wt-a--shop.acme.ddev.site
+      https://shop.acme.staging.example.net      (alias)
 hostshift: now run `ddev restart`
 ```
 
 ```yaml
 # .ddev/.env
 HOSTSHIFT_SLUG=wt-a
-HOSTSHIFT_VARIANTS=wt-a--acmecorp.ddev.site,wt-a--nat.acmecorp.ddev.site
-HOSTSHIFT_WEB_HOSTS=acmecorp-wt-a.ddev.site
+HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site,wt-a--shop.acme.ddev.site
+HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
 ```
 
 ```yaml
@@ -278,11 +277,15 @@ HOSTSHIFT_WEB_HOSTS=acmecorp-wt-a.ddev.site
 # generated by `ddev hostshift init` — delete it to undo, rerun to update.
 # hostshift:ignore — hostshift must not read its own output back as input.
 additional_hostnames:
-  - acmecorp-wt-a
-  - nat.acmecorp
-  - wt-a--acmecorp
-  - wt-a--nat.acmecorp
+  - acme-wt-a
+  - shop.acme
+  - wt-a--acme
+  - wt-a--shop.acme
 ```
+
+Both variants are registered so mkcert covers them; `shop.acme` is there because
+`.ddev/config.yaml` declares it and the file replaces that list rather than
+adding to it.
 
 A multisite needs one more step, because WP-CLI resolves a site by URL and every
 `ddev wp` would otherwise fail with "Site not found":
@@ -291,11 +294,11 @@ A multisite needs one more step, because WP-CLI resolves a site by URL and every
 $ ddev hostshift wp-cli > wp-cli.local.yml
 ```
 
-That emits the project's existing `wp-cli.yml` back verbatim — every alias,
-every path — with a root `url:` appended. It replaces rather than merges,
-because WP-CLI's own precedence does: measured with 2.12.0, a local file
-containing only `url:` loses `path:`, `require:` and every alias, and WP-CLI
-then cannot find the installation at all.
+That emits the project's existing `wp-cli.yml` back verbatim — every alias, every
+path — with a root `url:` appended. It replaces rather than merges, because
+WP-CLI's own precedence does: measured with 2.12.0, a local file containing only
+`url:` loses `path:`, `require:` and every alias, and WP-CLI then cannot find the
+installation at all.
 
 ```yaml
 # wp-cli.local.yml, gitignored
@@ -303,18 +306,26 @@ then cannot find the installation at all.
 path: web/wp
 require:
   - config/wp-cli/pre-ssh.php
+
 '@ddev':
   path: /var/www/html/web/wp
-  url: acmecorp.ddev.site
+  url: acme.ddev.site
+
 '@production':
-  ssh: acmecorp@…/current/web/wp
-  url: www.acmecorp.fi
-url: https://acmecorp.ddev.site
+  ssh: deploy@ssh.example.net:22/srv/acme/current/web/wp
+  url: www.example.com
+
+'@shop':
+  ssh: deploy@ssh.example.net:22/srv/acme/current/web/wp
+  url: shop.example.com
+
+url: https://acme.ddev.site
 ```
 
 Aliases are left exactly as written. Some of them are SSH into production, and
-silently changing what `wp @nat` means is worse than leaving it alone — the
-honest instruction for a sibling blog is `wp --url=https://nat.acmecorp.ddev.site`.
+silently changing what `wp @shop` means is worse than leaving it alone — the
+honest instruction for a sibling blog is
+`wp --url=https://shop.acme.ddev.site`.
 
 ## The corpus diff
 
