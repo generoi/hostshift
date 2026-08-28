@@ -1,3 +1,4 @@
+#ddev-generated
 # hostshift — container-scoped loopback containment (PLAN §4.4).
 #
 # WordPress makes internal HTTP requests to home_url() — wp-cron, Site Health,

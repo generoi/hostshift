@@ -1312,7 +1312,7 @@ equality. Fixtures would not have caught the double-port bug; this would.
 
 **M0 — pre-flight (§4.5). Done 2026-08-27.** Usage survey and uploads-sync check,
 both recorded in §4.5 and `docs/m0-preflight.md`. `.ddev/docker-compose.hostshift.yaml`
-re-created from `templates/` and verified merged onto the `web` service via
+re-created from the template now in `ddev/` and verified merged onto the `web` service via
 `ddev debug compose-config`. Found the `redirect-uploads.conf` redirect loop
 (§4.4, test 32) and corrected five §4.2 claims. *No code.*
 
@@ -1411,10 +1411,25 @@ before it can fail, so a body labelled gzip that is not gzip loses however many
 bytes the header check read — the whole body, when it is short. The head is
 captured and put back.
 
-**M6 — packaging + pilot.** Binary, image, thin add-on, corpus diff against
-herrfors, and test 28 over the full crawl. Also tests 29a, 29b and 29d, moved
-here from M2: each needs a live DDEV project on an unrewritten production
-database, which is what this milestone stands up.
+**M6 — packaging + pilot. Packaging done 2026-08-27; pilot pending.**
+
+Done: static binaries for linux and darwin on both architectures (~7 MB each), a
+distroless image, the DDEV add-on — two compose files and an `install.yaml`, with
+a test asserting it stays that way — and `hostshift diff`, the corpus diff.
+
+The corpus diff is green against a local canonical site and the same site through
+the proxy: **16 pages, 16 byte-identical, 0 leaks, 0 errors**, with line counts
+preserved exactly. It reports byte equality, but the assertions that fail a run
+are the two that cannot be innocent on a live site — a canonical origin reaching
+the browser, and a page whose line count changed, which means something
+re-serialised.
+
+**Pending, and it needs a decision rather than more code:** the live pilot, and
+with it tests 29a, 29b, 29d and test 28 over a full crawl. All four need a DDEV
+project running against an **unrewritten production database**, which means
+importing a 524 MB dump over an existing local database. That is not reversible
+by hostshift and is not hostshift's to decide; `ddev snapshot` first, and prefer
+the existing `herrfors-wt-pilot` worktree over canonical `herrfors`.
 
 This is not a small project. The previous revision's *"the tool is
 straightforward once these are green"* is the sentence most likely to mislead an

@@ -184,7 +184,8 @@ rewriting lands.
 ## 4. Loopback override re-created
 
 `herrfors/.ddev/docker-compose.hostshift.yaml`, from
-[`templates/docker-compose.hostshift.yaml`](../templates/docker-compose.hostshift.yaml).
+[`ddev/docker-compose.hostshift-loopback.yaml`](../ddev/docker-compose.hostshift-loopback.yaml),
+which M6 folded into the DDEV add-on so there is only one copy of it.
 Verified merged onto the `web` service without starting the project:
 
 ```
