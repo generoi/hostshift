@@ -59,6 +59,12 @@ type Resolved struct {
 	Map      *origin.Map
 	Upstream string
 	Source   string // where the map came from, for diagnostics
+
+	// DDEVHosts is every hostname this DDEV project registers — `name` plus
+	// `additional_hostnames`, suffixed with the project TLD. It is read even
+	// when hostshift.yaml supplies the map, because `map --env` needs to know
+	// which of the project's hostnames belong to `web` and which to hostshift.
+	DDEVHosts []string
 }
 
 // Load resolves the map for a project directory.
@@ -79,6 +85,15 @@ func Load(dir string, f Flags) (*Resolved, error) {
 		pattern = DefaultVariantPattern
 	)
 
+	// The DDEV config is read whether or not it supplies the map, because
+	// `map --env` needs the project's full hostname list to work out which
+	// hostnames stay with `web`. In a worktree those are not the canonical
+	// hosts at all — canonical is a different project, still running.
+	ddev, ddevPath, err := loadDDEV(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	switch hf, path, err := loadFile(dir); {
 	case err != nil:
 		return nil, err
@@ -96,15 +111,11 @@ func Load(dir string, f Flags) (*Resolved, error) {
 	default:
 		// Layer 1. For a single-environment site with no extra aliases this is
 		// sufficient on its own and no hostshift.yaml is needed at all.
-		d, path, err := loadDDEV(dir)
-		if err != nil {
-			return nil, err
-		}
-		if d == nil {
+		if ddev == nil {
 			return nil, fmt.Errorf("no map: found neither hostshift.yaml nor .ddev/config.yaml in %s, and no --from/--to given", dir)
 		}
-		source = path + " (DDEV defaults)"
-		if sites, err = sitesFromDDEV(d, pattern, f.Slug); err != nil {
+		source = ddevPath + " (DDEV defaults)"
+		if sites, err = sitesFromDDEV(ddev, pattern, f.Slug); err != nil {
 			return nil, err
 		}
 	}
@@ -113,7 +124,49 @@ func Load(dir string, f Flags) (*Resolved, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Resolved{Map: m, Upstream: up, Source: source}, nil
+	return &Resolved{Map: m, Upstream: up, Source: source, DDEVHosts: ddevHostnames(ddev)}, nil
+}
+
+// DDEVEnv returns the two lists the DDEV add-on needs in .ddev/.env.
+//
+// The second is the non-obvious one. DDEV puts every additional hostname on
+// web's VIRTUAL_HOST, so unless it is narrowed, web and hostshift both claim the
+// variants and the router picks web — WordPress then sees a variant host,
+// fails to match wp_blogs.domain, and redirects to wp-signup.php.
+//
+// web keeps *this project's* hostnames minus the variants, not the canonical
+// set. The two coincide for a canonical project and diverge for a worktree
+// sharing canonical's database: there, canonical is a separate project that is
+// still running and still owns its own hostnames, and handing them to the
+// worktree's web container makes two projects claim one hostname.
+func (r *Resolved) DDEVEnv() (variants, webHosts []string) {
+	isVariant := map[string]bool{}
+	for _, s := range r.Map.Sites {
+		variants = append(variants, s.Variant.Host)
+		isVariant[s.Variant.Host] = true
+	}
+	for _, h := range r.DDEVHosts {
+		if !isVariant[h] {
+			webHosts = append(webHosts, h)
+		}
+	}
+	return variants, webHosts
+}
+
+// ddevHostnames is every hostname the project registers with DDEV.
+func ddevHostnames(d *ddevConfig) []string {
+	if d == nil {
+		return nil
+	}
+	tld := d.ProjectTLD
+	if tld == "" {
+		tld = "ddev.site"
+	}
+	hosts := []string{d.Name + "." + tld}
+	for _, h := range d.AdditionalHostnames {
+		hosts = append(hosts, h+"."+tld)
+	}
+	return append(hosts, d.AdditionalFQDNs...)
 }
 
 func mapFromFlags(f Flags) (*origin.Map, error) {
@@ -289,6 +342,18 @@ func sitesFromDDEV(d *ddevConfig, pattern, slug string) ([]origin.Site, error) {
 
 	sites := make([]origin.Site, 0, len(hosts))
 	for i, h := range hosts {
+		// Skip hostnames that are already variants for this slug.
+		//
+		// The add-on requires the variants to be in additional_hostnames, or
+		// mkcert issues no certificate for them and the browser gets a TLS
+		// interstitial. But DDEV defaults turn every registered hostname into a
+		// canonical site, so without this the variants become canonical *and*
+		// derived, and startup fails with "variant collides with a canonical
+		// origin". That is a chicken-and-egg in exactly the configuration this
+		// layer exists to serve: a worktree with no hostshift.yaml at all.
+		if slug != "" && strings.HasPrefix(h, slug+"--") {
+			continue
+		}
 		c, err := origin.Parse("https://" + h)
 		if err != nil {
 			return nil, err

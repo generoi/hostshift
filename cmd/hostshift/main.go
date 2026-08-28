@@ -293,19 +293,7 @@ func cmdMap(args []string) (int, error) {
 		return exitConfig, err
 	}
 	if *asEnv {
-		// Both lists are needed, and the second is the non-obvious one: DDEV
-		// puts every additional hostname on web's VIRTUAL_HOST, so without
-		// narrowing it back to the canonical hosts, web and hostshift both claim
-		// the variants and the router sends them to web.
-		var variants, webHosts []string
-		for _, s := range res.Map.Sites {
-			variants = append(variants, s.Variant.Host)
-			for _, a := range s.CanonicalSet() {
-				if strings.HasSuffix(a.Host, ".ddev.site") {
-					webHosts = append(webHosts, a.Host)
-				}
-			}
-		}
+		variants, webHosts := res.DDEVEnv()
 		fmt.Printf("HOSTSHIFT_SLUG=%s\n", c.slug)
 		fmt.Printf("HOSTSHIFT_VARIANTS=%s\n", strings.Join(variants, ","))
 		fmt.Printf("HOSTSHIFT_WEB_HOSTS=%s\n", strings.Join(webHosts, ","))
