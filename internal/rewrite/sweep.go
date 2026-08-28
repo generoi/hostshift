@@ -39,12 +39,16 @@ type Sweep struct {
 	dryRun bool
 
 	pending []byte
-	out     bytes.Buffer
-	offset  int // cumulative offset into the stream being swept
-	prev    int // the last byte consumed, as left context; origin.NoPrev at the start
-	src2in  inputOffsetMapper
-	eof     bool
-	closer  io.Closer
+	// read is reused across Read calls. Allocating it per call cost 179 MB of
+	// garbage on a single 500 KB page, because the tokenizer upstream hands back
+	// one small token at a time and each one drove a fresh 32 KB allocation.
+	read   []byte
+	out    bytes.Buffer
+	offset int // cumulative offset into the stream being swept
+	prev   int // the last byte consumed, as left context; origin.NoPrev at the start
+	src2in inputOffsetMapper
+	eof    bool
+	closer io.Closer
 }
 
 // inputOffsetMapper is implemented by an upstream stage that changes lengths,
@@ -82,11 +86,13 @@ func NewSweep(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) *Sweep
 }
 
 func (s *Sweep) Read(p []byte) (int, error) {
+	if s.read == nil {
+		s.read = make([]byte, 32*1024)
+	}
 	for s.out.Len() == 0 && !s.eof {
-		buf := make([]byte, 32*1024)
-		n, err := s.src.Read(buf)
+		n, err := s.src.Read(s.read)
 		if n > 0 {
-			s.pending = append(s.pending, buf[:n]...)
+			s.pending = append(s.pending, s.read[:n]...)
 		}
 		if err == io.EOF {
 			s.eof = true

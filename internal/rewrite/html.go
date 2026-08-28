@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"log/slog"
-	"strings"
 
 	"golang.org/x/net/html"
 
@@ -180,25 +179,40 @@ func rawTextElement(n string) bool {
 	return false
 }
 
-// structuredAttr names the values §5.2 expected to need their grammar parsed
-// rather than plain origin substitution. M3 established that none of them does
-// — anchoring finds an origin wherever it sits, so commas, descriptors and
-// "N;url=" never have to be understood — so this only feeds the counter that
-// would show a regression there first. See Stats.Structured.
-func structuredAttr(name string) bool {
-	switch name {
-	case "srcset", "imagesrcset", "ping", "srcdoc", "content":
-		return true
+// structuredAttrNames are the values §5.2 listed as needing their grammar
+// parsed. M3 established that none of them does — anchoring finds origins
+// wherever they sit — so these are counted for visibility, not parsed.
+var structuredAttrNames = [][]byte{
+	[]byte("srcset"), []byte("imagesrcset"), []byte("ping"), []byte("srcdoc"), []byte("content"),
+}
+
+// structuredAttr matches on the raw name bytes, case-insensitively. Lowercasing
+// every attribute name to a string first cost one allocation per attribute —
+// 37,280 of them across the corpus — for a check that five byte comparisons
+// answer.
+func structuredAttr(name []byte) []byte {
+	for _, s := range structuredAttrNames {
+		if len(name) == len(s) && bytes.EqualFold(name, s) {
+			return s
+		}
 	}
-	return false
+	return nil
 }
 
 // rewriteValue is the single seam every value passes through.
-func (w *HTML) rewriteValue(surface, name string, base int, v []byte) []byte {
-	if name != "" && structuredAttr(name) {
-		w.stats.Structured(name)
+func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []byte {
+	if s := structuredAttr(name); s != nil {
+		w.stats.Structured(string(s))
 	}
-	out, events := w.m.Rewrite(v, surface, w.stats.Explain())
+	// An attribute value is a value; a text node, a comment and the contents of
+	// a raw-text element are prose. The distinction is one byte wide — whether
+	// a trailing root dot at the end of the buffer is the host's root label or
+	// a full stop — and only the caller can make it. See Matcher.RewriteText.
+	rw := w.m.RewriteText
+	if surface == SurfaceHTMLAttr {
+		rw = w.m.Rewrite
+	}
+	out, events := rw(v, surface, w.stats.Explain())
 	w.stats.Record(surface, base, events)
 	if surface == SurfaceHTMLAttr {
 		out = w.decodeEntityLeak(base, out)
@@ -253,7 +267,7 @@ func (w *HTML) rewriteTag(raw []byte, tagOff int) []byte {
 		if a.ValueStart < 0 {
 			continue
 		}
-		name := strings.ToLower(string(raw[a.NameStart:a.NameEnd]))
+		name := raw[a.NameStart:a.NameEnd]
 		val := raw[a.ValueStart:a.ValueEnd]
 		nv := w.rewriteValue(SurfaceHTMLAttr, name, tagOff+a.ValueStart, val)
 		if bytes.Equal(nv, val) {
@@ -354,7 +368,11 @@ func (w *HTML) Read(p []byte) (int, error) {
 			break
 		}
 
-		// Copy Raw() before touching TagName()/TagAttr().
+		raw := w.z.Raw()
+		off := w.inOff
+		w.inOff += len(raw)
+
+		// Copy Raw() before touching TagName()/TagAttr(), and *only* then.
 		//
 		// spike/go/full/main.go:100-105 aliased it across a TagName() call. The
 		// docs make no lifetime promise about Raw() — the partition guarantee is
@@ -362,9 +380,14 @@ func (w *HTML) Read(p []byte) (int, error) {
 		// allocate before its in-place unescape, which is an implementation
 		// detail. The slices from Text()/TagName()/TagAttr() *are* documented to
 		// change on the next Next(), so none of them are retained either.
-		raw := append([]byte(nil), w.z.Raw()...)
-		off := w.inOff
-		w.inOff += len(raw)
+		//
+		// Every other token type is written straight to the pending buffer,
+		// which copies, and TagName/TagAttr are never called for them — so the
+		// defensive copy is pure garbage there. Restricting it to start tags
+		// removes roughly a third of the allocations on a page with no rewrites.
+		if tt == html.StartTagToken || tt == html.SelfClosingTagToken {
+			raw = append([]byte(nil), raw...)
+		}
 
 		switch tt {
 		case html.StartTagToken, html.SelfClosingTagToken:
@@ -398,14 +421,34 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// bare hostname (test 28).
 			switch w.rawText {
 			case "":
-				w.write(off, len(raw), raw)
+				// Ordinary body text. The M6 pilot found real pages carrying
+				// "https://host/path" in visible prose — a privacy-policy
+				// paragraph quoting its own URL — which the sweep was then
+				// catching. Under production-canonical that is precisely the
+				// hazard §4.4 opens with: a developer copy-pastes it and lands
+				// on live production.
+				//
+				// §4.4 already accepts the consequence: "a page that
+				// intentionally links to production, as a URL, is rewritten too.
+				// On a development clone that is almost always what you want."
+				// Anchoring is what keeps test 28's exclusion intact — a bare
+				// hostname in prose has no scheme and cannot match.
+				w.write(off, len(raw), w.rewriteValue(SurfaceText, nil, off, raw))
 			case "script":
-				w.write(off, len(raw), w.rewriteValue(SurfaceInlineScript, "", off, raw))
+				w.write(off, len(raw), w.rewriteValue(SurfaceInlineScript, nil, off, raw))
 			case "style":
-				w.write(off, len(raw), w.rewriteValue(SurfaceInlineStyle, "", off, raw))
+				w.write(off, len(raw), w.rewriteValue(SurfaceInlineStyle, nil, off, raw))
 			default:
-				w.write(off, len(raw), w.rewriteValue(SurfaceRawText, "", off, raw))
+				w.write(off, len(raw), w.rewriteValue(SurfaceRawText, nil, off, raw))
 			}
+		case html.CommentToken:
+			// Not dereferenceable by the browser, but the fleet puts real URLs
+			// here: sage-cachetags emits "<!-- sage-cachetags Url: https://… -->"
+			// on every cached page, and the M6 pilot found 20-odd per crawl
+			// going to the sweep. §4.4 wants every straggler to be a bug in the
+			// structured pass, so this belongs here rather than in the backstop.
+			w.write(off, len(raw), w.rewriteValue(SurfaceComment, nil, off, raw))
+
 		default:
 			w.write(off, len(raw), raw)
 		}

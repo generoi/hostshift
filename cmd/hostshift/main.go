@@ -23,7 +23,11 @@ import (
 	"syscall"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/generoi/hostshift/internal/config"
+	"github.com/generoi/hostshift/internal/corpus"
+	"github.com/generoi/hostshift/internal/origin"
 	"github.com/generoi/hostshift/internal/proxy"
 	"github.com/generoi/hostshift/internal/rewrite"
 )
@@ -35,6 +39,7 @@ const usage = `hostshift — serve a site from a hostname other than the one in 
   hostshift map     print the resolved host map
   hostshift check   validate the config; exit 2 if invalid
   hostshift wp-cli  print wp-cli.local.yml for this project
+  hostshift diff    corpus diff: crawl N pages canonical and through the proxy
 
 The map is resolved from three layers, each overriding the last (PLAN §5.3):
 DDEV defaults in .ddev/config.yaml, then hostshift.yaml, then these flags.
@@ -46,6 +51,12 @@ DDEV defaults in .ddev/config.yaml, then hostshift.yaml, then these flags.
   --map C=V     the same thing written as one argument
   --upstream    upstream base URL, e.g. http://web:80
 `
+
+// version is set by the linker: -X main.version=… in the Makefile and
+// Dockerfile. It must stay declared here — an -X flag naming a variable that
+// does not exist is silently ignored, so the binary would have reported nothing
+// and no build would have failed.
+var version = "dev"
 
 // exit codes, per PLAN §5.8
 const (
@@ -72,8 +83,12 @@ func main() {
 		code, err = cmdCheck(os.Args[2:])
 	case "wp-cli":
 		code, err = cmdWPCLI(os.Args[2:])
+	case "diff":
+		code, err = cmdDiff(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, usage)
+	case "version", "--version":
+		fmt.Println(version)
 	default:
 		fmt.Fprintf(os.Stderr, "hostshift: unknown subcommand %q\n\n%s", os.Args[1], usage)
 		code = exitConfig
@@ -273,12 +288,31 @@ func cmdMap(args []string) (int, error) {
 	var c common
 	c.register(fs)
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
+	asEnv := fs.Bool("env", false, "emit the .ddev/.env block the DDEV add-on needs")
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
 	res, err := c.load()
 	if err != nil {
 		return exitConfig, err
+	}
+	if *asEnv {
+		variants, webHosts := res.DDEVEnv()
+		fmt.Printf("HOSTSHIFT_SLUG=%s\n", c.slug)
+		fmt.Printf("HOSTSHIFT_VARIANTS=%s\n", strings.Join(variants, ","))
+		fmt.Printf("HOSTSHIFT_WEB_HOSTS=%s\n", strings.Join(webHosts, ","))
+		fmt.Fprintf(os.Stderr,
+			"\nhostshift: add these to .ddev/additional_hostnames as well, or mkcert\n"+
+				"issues no certificate for them and the browser gets a TLS interstitial:\n")
+		// The project's own TLD, not a hardcoded one. DDEV appends the TLD to
+		// each additional_hostnames entry, so under a project_tld override this
+		// printed the whole hostname and registered it twice-suffixed — and
+		// mkcert then issues no SAN for the variant, which is the TLS
+		// interstitial this message exists to prevent.
+		for _, v := range variants {
+			fmt.Fprintf(os.Stderr, "  - %s\n", strings.TrimSuffix(v, "."+res.ProjectTLD))
+		}
+		return exitOK, nil
 	}
 	if *asJSON {
 		type site struct {
@@ -339,7 +373,65 @@ func cmdCheck(args []string) (int, error) {
 	if warn := gitignoreWarning(c.dir); warn != "" {
 		fmt.Fprintln(os.Stderr, "hostshift: warning:", warn)
 	}
+
+	if _, webHosts := res.DDEVEnv(); len(webHosts) == 0 && len(res.DDEVHosts) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: warning: every hostname this DDEV project registers is a variant, so\n"+
+				"  HOSTSHIFT_WEB_HOSTS is empty and web gets no VIRTUAL_HOST — mailpit,\n"+
+				"  `ddev launch` and the canonical site stop routing. Give the project a\n"+
+				"  hostname of its own in .ddev/config.yaml that the slug does not claim.\n")
+	}
+
+	for _, w := range uploadsRedirectWarnings(c.dir) {
+		fmt.Fprintln(os.Stderr, "hostshift: warning:", w)
+	}
 	return exitOK, nil
+}
+
+// uploadsRedirectWarnings finds the fleet's uploads-redirect loop.
+//
+// 55 of 63 DDEV repos ship a snippet that 302s a missing /app/uploads/ file to
+// production, and it is written `rewrite ^ https://host$request_uri redirect`.
+// nginx appends the query string *again* unless the replacement ends in "?", so
+// the Location comes back one query longer than the request that produced it —
+// the self-redirect guard never matches, and each hop appends another copy
+// until the browser gives up with 414 URI Too Long. Measured live on acmecorp.
+//
+// hostshift deliberately does not absorb this. Making the guard ignore the
+// query would carry a workaround for a one-character bug in the fleet's own
+// nginx config, and would silently pass through every redirect that changes
+// only the query on the same path. The fix belongs in the repo; this says so,
+// by name, with the edit to make.
+func uploadsRedirectWarnings(dir string) []string {
+	var out []string
+	matches, _ := filepath.Glob(filepath.Join(dir, ".ddev", "nginx*", "*.conf"))
+	more, _ := filepath.Glob(filepath.Join(dir, ".ddev", "nginx*", "*", "*.conf"))
+	for _, f := range append(matches, more...) {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			t := strings.TrimSpace(line)
+			if !strings.HasPrefix(t, "rewrite ") || !strings.Contains(t, "$request_uri") {
+				continue
+			}
+			// "$request_uri?" is the fixed form: the trailing "?" stops nginx
+			// re-appending the query.
+			if strings.Contains(t, "$request_uri?") {
+				continue
+			}
+			rel, err := filepath.Rel(dir, f)
+			if err != nil {
+				rel = f
+			}
+			out = append(out, fmt.Sprintf(
+				"%s redirects with $request_uri and no trailing \"?\", so nginx appends the\n"+
+					"  query a second time and each hop grows the URL until the browser hits 414.\n"+
+					"  Change it to end in \"$request_uri?\":\n    %s", rel, t))
+		}
+	}
+	return out
 }
 
 // cmdWPCLI prints wp-cli.local.yml.
@@ -363,15 +455,155 @@ func cmdWPCLI(args []string) (int, error) {
 		return exitConfig, err
 	}
 	first := res.Map.Sites[0]
-	fmt.Printf("# generated by hostshift — do not commit\nurl: %s\n", first.Canonical)
+
+	// wp-cli.local.yml *replaces* wp-cli.yml rather than merging with it —
+	// measured with WP-CLI 2.12.0 in the M6 pilot, where a file containing only
+	// `url:` lost `path:`, `require:` and every alias, and left WP-CLI unable to
+	// find the installation at all. So the existing config is carried through
+	// verbatim with the root url added, rather than a bare two-line file being
+	// written over it.
+	//
+	// Reading wp-cli.yml is WP-CLI's own format, inside the WordPress adapter
+	// §10 describes, not the Genero-specific coupling §4.2 rules out.
+	out := map[string]any{}
+	if b, err := os.ReadFile(filepath.Join(c.dir, "wp-cli.yml")); err == nil {
+		if err := yaml.Unmarshal(b, &out); err != nil {
+			return exitConfig, fmt.Errorf("wp-cli.yml: %w", err)
+		}
+	}
+	out["url"] = first.Canonical.String()
+
+	body, err := yaml.Marshal(out)
+	if err != nil {
+		return exitRuntime, err
+	}
+	fmt.Printf("# generated by hostshift — do not commit\n"+
+		"# wp-cli.local.yml replaces wp-cli.yml rather than merging with it, so this\n"+
+		"# is the whole config with a root url: added.\n%s", body)
 
 	if warn := gitignoreWarning(c.dir); warn != "" {
 		fmt.Fprintln(os.Stderr, "hostshift: warning:", warn)
 	}
 	if len(res.Map.Sites) > 1 {
 		fmt.Fprintf(os.Stderr,
-			"hostshift: root url: is blog 1 (%s); sibling blogs keep working through the existing wp-cli.yml aliases\n",
-			first.Canonical)
+			"hostshift: root url: is blog 1 (%s); reach a sibling blog with --url, e.g. `wp --url=%s`\n",
+			first.Canonical, res.Map.Sites[1].Canonical)
+	}
+	// An alias whose url: is one of a site's *alias* origins — its ddev or
+	// staging host — no longer resolves, because the database now holds the
+	// canonical hostname and get_site_by_path matches exactly. Warn rather than
+	// rewrite it: silently changing what `wp @ddev` means is worse than saying
+	// so, especially when some of these aliases are SSH into production.
+	stale := map[string]string{}
+	for _, s := range res.Map.Sites {
+		for _, a := range s.Aliases {
+			stale[a.Host] = s.Canonical.String()
+		}
+	}
+	for k, v := range out {
+		if !strings.HasPrefix(k, "@") {
+			continue
+		}
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		raw, _ := m["url"].(string)
+		if raw == "" {
+			continue
+		}
+		host := strings.TrimPrefix(strings.TrimPrefix(raw, "https://"), "http://")
+		host, _, _ = strings.Cut(host, "/")
+		if canon, bad := stale[strings.ToLower(host)]; bad {
+			fmt.Fprintf(os.Stderr,
+				"hostshift: warning: alias %s points at %s, which the database no longer holds; use %s\n",
+				k, host, canon)
+		}
+	}
+	return exitOK, nil
+}
+
+// cmdDiff is the corpus diff — PLAN §7's only test that validates against
+// reality. Fixtures would not have caught the double-port bug; this would.
+func cmdDiff(args []string) (int, error) {
+	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
+	var c common
+	c.register(fs)
+	canonicalBase := fs.String("canonical-base", "", "base URL to crawl; defaults to site 1's canonical origin")
+	variantBase := fs.String("variant-base", "", "base URL the proxy serves; defaults to site 1's variant origin")
+	n := fs.Int("n", 20, "how many pages to compare")
+	pathList := fs.String("paths", "", "file of paths to compare, one per line; skips the crawl")
+	timeout := fs.Duration("timeout", 30*time.Second, "per-request timeout")
+	var resolve, headers repeatable
+	fs.Var(&resolve, "resolve", "host:port:addr:port, like curl's --resolve; repeatable.\n"+
+		"Under production-canonical the canonical base IS the production hostname,\n"+
+		"so without this the crawl would hit the client's live site.")
+	fs.Var(&headers, "canonical-header", "'Name: Value' added to the canonical fetch only; repeatable.\n"+
+		"Use it to supply what the TLS-terminating router would have added when\n"+
+		"--resolve points past it, e.g. 'X-Forwarded-Proto: https'.")
+	if err := fs.Parse(args); err != nil {
+		return exitConfig, nil
+	}
+	headerMap := map[string]string{}
+	for _, h := range headers {
+		k, v, ok := strings.Cut(h, ":")
+		if !ok {
+			return exitConfig, fmt.Errorf("--canonical-header %q: want 'Name: Value'", h)
+		}
+		headerMap[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	resolveMap := map[string]string{}
+	for _, r := range resolve {
+		parts := strings.Split(r, ":")
+		if len(parts) != 4 {
+			return exitConfig, fmt.Errorf("--resolve %q: want host:port:addr:port", r)
+		}
+		resolveMap[parts[0]+":"+parts[1]] = parts[2] + ":" + parts[3]
+	}
+	res, err := c.load()
+	if err != nil {
+		return exitConfig, err
+	}
+	site := res.Map.Sites[0]
+
+	base := func(flagVal string, def origin.Origin) (*url.URL, error) {
+		if flagVal == "" {
+			flagVal = def.String()
+		}
+		return url.Parse(flagVal)
+	}
+	cb, err := base(*canonicalBase, site.Canonical)
+	if err != nil {
+		return exitConfig, fmt.Errorf("--canonical-base: %w", err)
+	}
+	vb, err := base(*variantBase, site.Variant)
+	if err != nil {
+		return exitConfig, fmt.Errorf("--variant-base: %w", err)
+	}
+
+	var paths []string
+	if *pathList != "" {
+		b, err := os.ReadFile(*pathList)
+		if err != nil {
+			return exitConfig, err
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+				paths = append(paths, line)
+			}
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "corpus diff: %s vs %s\n", cb, vb)
+	results, err := corpus.Run(context.Background(), corpus.Options{
+		Canonical: cb, Variant: vb, Map: res.Map,
+		N: *n, Paths: paths, Timeout: *timeout, Resolve: resolveMap, CanonicalHeaders: headerMap,
+	})
+	if err != nil {
+		return exitRuntime, err
+	}
+	if !corpus.WriteReport(os.Stdout, results) {
+		return exitRuntime, nil
 	}
 	return exitOK, nil
 }
