@@ -113,6 +113,13 @@ contains "an unreadable parent is a warning, not a silent wrong map" \
   "no DDEV" "$out"
 mv "$main/.ddev/hidden.yaml" "$main/.ddev/config.yaml"
 
+# ...but a same-project worktree is not that case, and must not be warned about.
+out="$(cd "$same" && "$cmd" env --slug wt-b 2>&1 || true)"
+case "$out" in
+  *"no DDEV"*) fail "a same-project worktree is not warned about" "$out" ;;
+  *) pass "a same-project worktree is not warned about" ;;
+esac
+
 # hostshift.yaml is a deliberate statement about which hostnames the database
 # holds; --from would override it.
 printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n' > "$wt/hostshift.yaml"
