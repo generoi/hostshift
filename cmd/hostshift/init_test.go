@@ -250,3 +250,93 @@ func TestInitDoesNotClobberAnInstalledAddon(t *testing.T) {
 		t.Errorf("an existing compose service was overwritten:\n%s", got)
 	}
 }
+
+// TestInitRefreshesItsOwnFiles. Refusing to overwrite anything protects a
+// hand-written hostshift.yaml — which is the production-canonical declaration
+// and must never be clobbered — but the same guard pinned a *generated* one
+// forever. Add a blog to the checkout a worktree came from and the worktree
+// kept the old map, silently, for as long as it existed.
+func TestInitRefreshesItsOwnFiles(t *testing.T) {
+	root := t.TempDir()
+	main := filepath.Join(root, "acme")
+	writeFile(t, main, ".ddev/config.yaml", "type: wordpress\n")
+	git(t, main, "init", "-q", "-b", "master")
+	git(t, main, "add", "-A")
+	git(t, main, "commit", "-qm", "init")
+
+	wt := filepath.Join(root, "acme-wt-a")
+	git(t, main, "worktree", "add", "-q", wt, "-b", "wt-a")
+
+	if code, _, errOut := run(t, "", cmdInit, "-C", wt); code != exitOK {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+	if got := readAll(t, filepath.Join(wt, "hostshift.yaml")); strings.Contains(got, "nat.acme") {
+		t.Fatalf("test setup wrong:\n%s", got)
+	}
+
+	// A blog is added to the parent, the way a real one would be.
+	writeFile(t, main, ".ddev/config.yaml",
+		"type: wordpress\nadditional_hostnames:\n  - nat.acme\n")
+
+	// check says so before anything is rerun.
+	_, _, errOut := run(t, "", cmdCheck, "-C", wt)
+	if !strings.Contains(errOut, "nat.acme.ddev.site") || !strings.Contains(errOut, "rerun") {
+		t.Errorf("drift was not reported:\n%s", errOut)
+	}
+
+	// And rerunning init picks it up.
+	if code, _, e := run(t, "", cmdInit, "-C", wt); code != exitOK {
+		t.Fatalf("exit %d\n%s", code, e)
+	}
+	got := readAll(t, filepath.Join(wt, "hostshift.yaml"))
+	if !strings.Contains(got, "https://nat.acme.ddev.site") {
+		t.Errorf("a generated map was not refreshed:\n%s", got)
+	}
+	if _, _, errOut := run(t, "", cmdCheck, "-C", wt); strings.Contains(errOut, "rerun") {
+		t.Errorf("still reports drift after a refresh:\n%s", errOut)
+	}
+}
+
+// TestInitNeverTouchesAHandWrittenMap is the other half, and the reason the
+// rule is keyed on the marker rather than on the file existing.
+func TestInitNeverTouchesAHandWrittenMap(t *testing.T) {
+	wt := worktree(t, "acme", "acme-wt-a", "wt-a")
+	const declared = "version: 1\nsites:\n  - {name: main, canonical: https://www.acme.test, base: https://acme.ddev.site}\n"
+	writeFile(t, wt, "hostshift.yaml", declared)
+
+	if code, _, errOut := run(t, "", cmdInit, "-C", wt, "--slug", "wt-a"); code != exitOK {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+	if got := readAll(t, filepath.Join(wt, "hostshift.yaml")); got != declared {
+		t.Errorf("a hand-written map was overwritten:\n%s", got)
+	}
+	// And it is not reported as drifted: disagreeing with DDEV is the entire
+	// point of a production-canonical declaration.
+	if _, _, errOut := run(t, "", cmdCheck, "-C", wt, "--slug", "wt-a"); strings.Contains(errOut, "rerun") {
+		t.Errorf("a hand-written map was reported as stale:\n%s", errOut)
+	}
+}
+
+// TestInitRefreshesTheComposeService: same rule, DDEV's own marker. A project
+// that removed the marker to own the file keeps it.
+func TestInitRefreshesTheComposeService(t *testing.T) {
+	wt := worktree(t, "acme", "acme-wt-a", "wt-a")
+	p := filepath.Join(wt, ".ddev", "docker-compose.hostshift.yaml")
+
+	writeFile(t, wt, ".ddev/docker-compose.hostshift.yaml", "#ddev-generated\nservices: {}\n")
+	if code, _, e := run(t, "", cmdInit, "-C", wt, "--slug", "wt-a"); code != exitOK {
+		t.Fatalf("exit %d\n%s", code, e)
+	}
+	if !strings.Contains(readAll(t, p), "ghcr.io/generoi/hostshift") {
+		t.Error("a stale generated compose service was not refreshed")
+	}
+
+	const owned = "services:\n  hostshift:\n    image: ghcr.io/generoi/hostshift:v0.1.0\n"
+	writeFile(t, wt, ".ddev/docker-compose.hostshift.yaml", owned)
+	if code, _, e := run(t, "", cmdInit, "-C", wt, "--slug", "wt-a"); code != exitOK {
+		t.Fatalf("exit %d\n%s", code, e)
+	}
+	if readAll(t, p) != owned {
+		t.Error("a file the project owns was overwritten")
+	}
+}

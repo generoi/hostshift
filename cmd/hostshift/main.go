@@ -398,7 +398,51 @@ func cmdCheck(args []string) (int, error) {
 	for _, w := range uploadsRedirectWarnings(c.dir) {
 		fmt.Fprintln(os.Stderr, "hostshift: warning:", w)
 	}
+	if w := staleMapWarning(c.dir, res); w != "" {
+		fmt.Fprintln(os.Stderr, "hostshift: warning:", w)
+	}
 	return exitOK, nil
+}
+
+// staleMapWarning reports a generated hostshift.yaml that no longer matches the
+// checkout it was generated from.
+//
+// Rerunning `init` fixes it, but only if you know to. A blog added to the parent
+// after a worktree was set up is invisible otherwise: the worktree goes on
+// serving the map it was given, and the new blog 421s with nothing to say why.
+// Only generated maps are checked — a hand-written one is a declaration, and
+// disagreeing with DDEV is the entire point of production-canonical.
+func staleMapWarning(dir string, res *config.Resolved) string {
+	path := filepath.Join(dir, "hostshift.yaml")
+	if !hasMarker(path, generatedBy) {
+		return ""
+	}
+	main := mainWorktree(dir)
+	if main == "" {
+		return ""
+	}
+	_, hosts, _, err := config.DDEVProject(main)
+	if err != nil || len(hosts) == 0 {
+		return ""
+	}
+	declared := map[string]bool{}
+	for _, s := range res.Map.Sites {
+		for _, o := range s.CanonicalSet() {
+			declared[o.Host] = true
+		}
+	}
+	var missing []string
+	for _, h := range hosts {
+		if !declared[h] {
+			missing = append(missing, h)
+		}
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("hostshift.yaml was generated from %s, which has since gained %s.\n"+
+		"  Those hostnames 421 here until you rerun `hostshift init`.",
+		filepath.Base(main), strings.Join(missing, ", "))
 }
 
 // uploadsRedirectWarnings finds the fleet's uploads-redirect loop.
