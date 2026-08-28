@@ -7,6 +7,18 @@ A reverse proxy that maps origins in both directions: the browser talks to a
 variant hostname, the application sees the hostname its database was written
 for. Nothing in the database is ever rewritten.
 
+**What it is for: worktrees.** One project, one database, and a second hostname
+so a branch or an agent can be previewed without a database of its own —
+`acmecorp.ddev.site` served also at `wt-a--acmecorp.ddev.site`. `robo db:pull`
+keeps its search-replace and the main site is unaffected; nothing about a normal
+pull changes.
+
+**Production-canonical is the same engine pointed further.** Declare production
+hostnames in `hostshift.yaml` and a pristine, unrewritten dump can be browsed
+directly. It is supported and piloted, opt-in per repo, and it is where the
+hazards live — see PLAN §4.4, particularly loopback containment, which only
+matters once `home_url()` is a hostname that resolves off the box.
+
 [`PLAN.md`](PLAN.md) is the authoritative design and is not re-decided here.
 [`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
 for completed milestones live in [`docs/`](docs/).
