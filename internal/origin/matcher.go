@@ -224,7 +224,7 @@ func (m *Matcher) Validate() error {
 	for _, p := range m.pairs {
 		for _, enc := range []encoding{encRaw, encJSON, encPercent} {
 			probe := p.Variant.Scheme + enc.schemeSep() + enc.hostPort(p.Variant)
-			out, _, ev := m.rewrite([]byte(probe), len(probe), NoPrev, "validate", false)
+			out, _, ev := m.rewrite([]byte(probe), len(probe), NoPrev, true, "validate", false)
 			if string(out) != probe {
 				return fmt.Errorf("origin: variant %s is matched by a canonical origin — rewriting it yields %q; "+
 					"the map is not a fixed point and would double-rewrite (PLAN §5.4)", p.Variant, out)
@@ -360,9 +360,10 @@ func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 // The three separator spellings, one of which every pattern contains. Used as a
 // prefilter before the automaton.
 var (
-	sepRaw     = []byte("//")
-	sepJSON    = []byte(`\/`)
-	sepPercent = []byte("%2F")
+	sepRaw          = []byte("//")
+	sepJSON         = []byte(`\/`)
+	sepPercentUpper = []byte("%2F")
+	sepPercentLower = []byte("%2f")
 )
 
 // hostTerminated reports whether the host ends at end, allowing one root dot
@@ -411,7 +412,25 @@ func endsHost(b []byte, i int, wholeValue bool) bool {
 // It returns b itself when nothing changed, so an unmodified value is not merely
 // equal to the input but the same bytes.
 func (m *Matcher) Rewrite(b []byte, surface string, explain bool) (out []byte, events []Event) {
-	out, _, events = m.rewrite(b, len(b), NoPrev, surface, explain)
+	out, _, events = m.rewrite(b, len(b), NoPrev, true, surface, explain)
+	return out, events
+}
+
+// RewriteText is Rewrite for a buffer that is prose rather than a single value:
+// a text node, a comment, the contents of a raw-text element.
+//
+// The difference is one byte, and it is the trailing root dot. In an attribute
+// value "https://www.example.fi." the dot is the root label — M0 found five of
+// those in herrfors' database, and rejecting them as not-a-url leaks a
+// dereferenceable production origin (test 28). At the end of a text node it is
+// a full stop, and absorbing it deletes a character from the rendered page.
+//
+// Position cannot tell the two apart. An earlier attempt used "the match starts
+// at offset 0", which reads a paragraph that opens with its own URL — a list of
+// links, or the privacy-policy prose M6 added SurfaceText for — as a bare value
+// and ate its full stop. The caller knows which it has; nothing else does.
+func (m *Matcher) RewriteText(b []byte, surface string, explain bool) (out []byte, events []Event) {
+	out, _, events = m.rewrite(b, len(b), NoPrev, false, surface, explain)
 	return out, events
 }
 
@@ -442,10 +461,13 @@ const NoPrev = -1
 // document rewrote differently depending on where the 32 KiB read boundary
 // happened to fall.
 func (m *Matcher) RewritePrefix(b []byte, limit int, prev int, surface string, explain bool) (out []byte, consumed int, events []Event) {
-	return m.rewrite(b, limit, prev, surface, explain)
+	// Never value semantics: a stream chunk is not a complete value, so the end
+	// of this buffer is not the end of anything.
+	return m.rewrite(b, limit, prev, false, surface, explain)
 }
 
-func (m *Matcher) rewrite(b []byte, limit int, prev int, surface string, explain bool) ([]byte, int, []Event) {
+// value says whether b is a complete URL-bearing value — see RewriteText.
+func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface string, explain bool) ([]byte, int, []Event) {
 	if limit < 0 {
 		limit = 0
 	}
@@ -475,13 +497,32 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, surface string, explain
 		events = append(events, e)
 	}
 
-	// Every pattern contains one of these three, because every origin form
-	// spells its separator as "//", "\/\/" or "%2F%2F". Checking for them first
-	// is much cheaper than building the automaton's iterator, which allocates
-	// per call — and most attribute values on a page are class names, ids and
-	// data attributes that can never match.
-	if !bytes.Contains(b, sepRaw) && !bytes.Contains(b, sepJSON) && !bytes.Contains(b, sepPercent) {
-		return b, len(b), nil
+	// Every pattern contains one of these separators, because every origin form
+	// spells it as "//", "\/\/" or "%2F%2F". Checking for them first is much
+	// cheaper than building the automaton's iterator, which allocates per call
+	// — and most attribute values on a page are class names, ids and data
+	// attributes that can never match.
+	//
+	// Both hex cases, because the automaton is built AsciiCaseInsensitive and
+	// the prefilter must not be narrower than the thing it is filtering for.
+	// Testing only "%2F" short-circuited every lowercase spelling the automaton
+	// would have matched — redirect_to=https%3a%2f%2fwww.example.fi%2f went out
+	// untouched, and the sweep could not catch it because the sweep runs through
+	// this same filter. It also made the proxy non-idempotent, since whether a
+	// lowercase origin was rewritten depended on whether some unrelated "//"
+	// happened to land in the same buffer: test 7.
+	//
+	// consumed is limit, not len(b). Returning len(b) handed the caller the
+	// whole buffer and told it nothing was left over, which discarded §4.4's
+	// carry-over window whenever a chunk held no separator — so an origin
+	// straddling a read boundary went out unrewritten, exactly the
+	// "depending on where the boundary fell" failure §4.4 forbids.
+	if !bytes.Contains(b, sepRaw) && !bytes.Contains(b, sepJSON) &&
+		!bytes.Contains(b, sepPercentUpper) && !bytes.Contains(b, sepPercentLower) {
+		if limit >= len(b) {
+			return b, len(b), nil
+		}
+		return b[:limit], limit, nil
 	}
 
 	// The library's findIter advances with `pos = end - len + 1`, i.e. one byte
@@ -543,18 +584,15 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, surface string, explain
 		// is common. "c.example.evil/" still falls through to the not-a-url
 		// rejection either way.
 		//
-		// End of buffer counts as structure only when the origin *is* the whole
-		// buffer — href="https://www.example.fi." and nothing else. M6 made
-		// that distinction load-bearing by rewriting body text token by token:
-		// the text node in "<p>see https://www.example.fi.</p>" ends at the
-		// dot, so "end of buffer" alone started eating full stops again, in the
-		// commonest prose shape there is.
+		// End of buffer counts as structure only in a *value* — an attribute,
+		// a header, a JSON string — where the buffer ending is the URL ending.
+		// In prose it is a full stop. See RewriteText: position cannot tell the
+		// two apart, and the caller can.
 		//
 		// When the dot is *not* consumed the match still stands — see
 		// hostTerminated. Rejecting it instead would leave the whole origin
 		// unrewritten, which is the test 28 leak this rule exists to close.
-		wholeValue := start == 0 && prev < 0
-		if end < len(b) && b[end] == '.' && endsHost(b, end+1, wholeValue) {
+		if end < len(b) && b[end] == '.' && endsHost(b, end+1, value) {
 			end++
 		}
 

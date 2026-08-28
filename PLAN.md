@@ -706,8 +706,21 @@ request URL, emit the `Location` **unmodified** and count it as
 `self-redirect-passthrough`. It is loop-free, needs no per-repo config, and is
 narrow in the right way: it fires on the exact shape that loops.
 
-Two limits worth stating rather than discovering. It defuses **period-1** loops
-only — a period-2 cycle, where blog A's origin redirects to blog B's canonical
+**The guard compares whole URLs, query included, and must keep doing so.** The
+fleet writes the snippet as `rewrite ^ https://host$request_uri redirect`, and
+nginx appends the query string a *second* time unless the replacement ends in
+`?`. So the `Location` comes back one query longer than the request that
+produced it, the equality test never matches, and each hop appends another copy
+until the browser gives up at 414 — measured live on herrfors. M6 made the guard
+ignore the query to absorb that, and it was reverted: hostshift would then be
+carrying a workaround for a one-character bug in someone else's nginx config,
+and would silently pass through every redirect that changes only the query on
+the same path. The fix is `$request_uri?` in the repo, and `hostshift check`
+names the file and prints the offending line — 52 of the 53 fleet repos with
+this snippet still need it.
+
+Two further limits worth stating rather than discovering. It defuses **period-1**
+loops only — a period-2 cycle, where blog A's origin redirects to blog B's canonical
 host and back, is constructible in a multisite map and the equality test never
 fires. And because every `redirect-uploads.conf` hardcodes **one** origin, a miss
 on a *non-primary* blog redirects to blog 1's canonical host, which is not the
