@@ -420,3 +420,12 @@ func TestVersionIsStamped(t *testing.T) {
 		t.Fatal("main.version is empty; -X has nothing to write to")
 	}
 }
+
+func readAll(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
