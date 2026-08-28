@@ -86,30 +86,35 @@ hosts="$(hostshift hosts)"
 # hostnames are the canonical side.
 parent=""
 parent_hosts=""
+unreadable_parent=""
 common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
 if [ -n "$common" ] && [ "$common" != "$gitdir" ]; then
-  parent="$(dirname "$common")"
-  parent_hosts="$(hostshift hosts -C "$parent" 2>/dev/null || true)"
-  # A worktree of a repo that pins `name:` in tracked config.yaml is the same
-  # DDEV project as its parent, sharing its containers and its hostnames. There
-  # is nothing to derive from elsewhere and nothing to subtract.
-  if [ "$parent_hosts" = "$hosts" ]; then
-    parent=""
-    parent_hosts=""
-  fi
+  dir="$(dirname "$common")"
+  ph="$(hostshift hosts -C "$dir" 2>/dev/null || true)"
+  case "$ph" in
+    # Nothing readable there. Distinct from the case below, and the two must not
+    # be confused: this one is a problem and that one is not.
+    "") unreadable_parent="$dir" ;;
+    # A repo that pins `name:` in its tracked config.yaml gives every worktree
+    # the *same* DDEV project — same containers, same hostnames. There is nothing
+    # to derive from elsewhere and nothing to subtract.
+    "$hosts") : ;;
+    *) parent="$dir"; parent_hosts="$ph" ;;
+  esac
 fi
 
 # hostshift.yaml, where a project has one, is a deliberate statement about which
-# hostnames the database holds — a multisite's canonical hostnames are not
-# derivable from any DDEV config. Passing --from would override it.
+# hostnames the database holds — usually because it names alias hostnames from
+# other environments, or production ones the database was never search-replaced
+# away from. Passing --from would override it.
 map_args=()
-if [ ! -f hostshift.yaml ] && [ -n "$common" ] && [ "$common" != "$gitdir" ] && [ -z "$parent_hosts" ]; then
+if [ ! -f hostshift.yaml ] && [ -n "$unreadable_parent" ]; then
   # A linked worktree whose parent declares nothing readable. Falling through
   # silently is the failure this whole path exists to prevent: the map gets built
   # against the hostname the worktree is *served at*, every page loads, every
   # link stays wrong, and `check` calls it injective and anchored.
-  echo "hostshift: warning: this is a worktree of $(dirname "$common"), but no DDEV" >&2
+  echo "hostshift: warning: this is a worktree of $unreadable_parent, but no DDEV" >&2
   echo "  config could be read there, so the map falls back to this project's own" >&2
   echo "  hostnames. If the database came from that checkout it holds *its*" >&2
   echo "  hostnames, and nothing will be rewritten. Declare them in hostshift.yaml." >&2
