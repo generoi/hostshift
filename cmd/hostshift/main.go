@@ -27,6 +27,7 @@ import (
 
 	"github.com/generoi/hostshift/internal/config"
 	"github.com/generoi/hostshift/internal/corpus"
+	"github.com/generoi/hostshift/internal/ddev"
 	"github.com/generoi/hostshift/internal/origin"
 	"github.com/generoi/hostshift/internal/proxy"
 	"github.com/generoi/hostshift/internal/rewrite"
@@ -34,13 +35,18 @@ import (
 
 const usage = `hostshift — serve a site from a hostname other than the one in its database
 
-  hostshift init    configure this DDEV project; the usual first command
-  hostshift rewrite --from https://a --to https://b < in.html > out.html
   hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --slug wt-a
+  hostshift rewrite --from https://a --to https://b < in.html > out.html
   hostshift map     print the resolved host map
   hostshift check   validate the config; exit 2 if invalid
-  hostshift wp-cli  print wp-cli.local.yml for this project
   hostshift diff    corpus diff: crawl N pages canonical and through the proxy
+
+Integrations, each narrower than the last. The proxy needs none of them: give it
+a map with --map, --from/--to or hostshift.yaml and it runs anywhere.
+
+  hostshift ddev init    configure this DDEV project; the usual first command
+  hostshift ddev env     print .ddev/.env for the compose service
+  hostshift wp-cli       print wp-cli.local.yml — WordPress, narrower still
 
 The map is resolved from three layers, each overriding the last (PLAN §5.3):
 DDEV defaults in .ddev/config.yaml, then hostshift.yaml, then these flags.
@@ -75,8 +81,8 @@ func main() {
 	var err error
 	code := exitOK
 	switch os.Args[1] {
-	case "init":
-		code, err = cmdInit(os.Args[2:])
+	case "ddev":
+		code, err = cmdDDEV(os.Args[2:])
 	case "rewrite":
 		code, err = cmdRewrite(os.Args[2:])
 	case "proxy":
@@ -301,31 +307,12 @@ func cmdMap(args []string) (int, error) {
 	var c common
 	c.register(fs)
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
-	asEnv := fs.Bool("env", false, "emit the .ddev/.env block the DDEV add-on needs")
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
 	res, err := c.load()
 	if err != nil {
 		return exitConfig, err
-	}
-	if *asEnv {
-		variants, webHosts := res.DDEVEnv()
-		fmt.Printf("HOSTSHIFT_SLUG=%s\n", c.slug)
-		fmt.Printf("HOSTSHIFT_VARIANTS=%s\n", strings.Join(variants, ","))
-		fmt.Printf("HOSTSHIFT_WEB_HOSTS=%s\n", strings.Join(webHosts, ","))
-		fmt.Fprintf(os.Stderr,
-			"\nhostshift: add these to .ddev/additional_hostnames as well, or mkcert\n"+
-				"issues no certificate for them and the browser gets a TLS interstitial:\n")
-		// The project's own TLD, not a hardcoded one. DDEV appends the TLD to
-		// each additional_hostnames entry, so under a project_tld override this
-		// printed the whole hostname and registered it twice-suffixed — and
-		// mkcert then issues no SAN for the variant, which is the TLS
-		// interstitial this message exists to prevent.
-		for _, v := range variants {
-			fmt.Fprintf(os.Stderr, "  - %s\n", strings.TrimSuffix(v, "."+res.ProjectTLD))
-		}
-		return exitOK, nil
 	}
 	if *asJSON {
 		type site struct {
@@ -387,7 +374,16 @@ func cmdCheck(args []string) (int, error) {
 		fmt.Fprintln(os.Stderr, "hostshift: warning:", warn)
 	}
 
-	if _, webHosts := res.DDEVEnv(); len(webHosts) == 0 && len(res.DDEVHosts) > 0 {
+	proj, _ := ddev.Load(c.dir)
+	var webHosts []string
+	if proj != nil {
+		var mapped []string
+		for _, st := range res.Map.Sites {
+			mapped = append(mapped, st.Variant.Host)
+		}
+		_, webHosts = ddev.Env(proj.Hosts, mapped)
+	}
+	if proj != nil && len(webHosts) == 0 && len(proj.Hosts) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"hostshift: warning: every hostname this DDEV project registers is a variant, so\n"+
 				"  HOSTSHIFT_WEB_HOSTS is empty and web gets no VIRTUAL_HOST — mailpit,\n"+
@@ -421,10 +417,11 @@ func staleMapWarning(dir string, res *config.Resolved) string {
 	if main == "" {
 		return ""
 	}
-	_, hosts, _, err := config.DDEVProject(main)
-	if err != nil || len(hosts) == 0 {
+	mp, err := ddev.Load(main)
+	if err != nil || mp == nil || len(mp.Hosts) == 0 {
 		return ""
 	}
+	hosts := mp.Hosts
 	declared := map[string]bool{}
 	for _, s := range res.Map.Sites {
 		for _, o := range s.CanonicalSet() {

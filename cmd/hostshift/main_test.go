@@ -302,12 +302,12 @@ func TestCheckExitCodes(t *testing.T) {
 	})
 }
 
-// TestMapEnv is what the DDEV add-on's .ddev/.env is generated from, so its
+// TestDDEVEnv is what the DDEV add-on's .ddev/.env is generated from, so its
 // shape is load-bearing: three variables, and web keeping the hostnames the
 // slug does not claim.
-func TestMapEnv(t *testing.T) {
+func TestDDEVEnv(t *testing.T) {
 	dir := ddevProject(t, "")
-	code, out, errOut := run(t, "", cmdMap, "-C", dir, "--slug", "wt-a", "--env")
+	code, out, errOut := run(t, "", cmdDDEVEnv, "-C", dir, "--slug", "wt-a")
 	if code != exitOK {
 		t.Fatalf("exit %d\n%s", code, errOut)
 	}
@@ -338,10 +338,10 @@ func TestMapEnv(t *testing.T) {
 }
 
 // TestMapEnvHonoursProjectTLD: three of the 64 local fleet projects override it.
-func TestMapEnvHonoursProjectTLD(t *testing.T) {
+func TestDDEVEnvHonoursProjectTLD(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, ".ddev/config.yaml", "name: fsi\nproject_tld: ddev.local\n")
-	_, out, errOut := run(t, "", cmdMap, "-C", dir, "--slug", "wt-a", "--env")
+	_, out, errOut := run(t, "", cmdDDEVEnv, "-C", dir, "--slug", "wt-a")
 	if !strings.Contains(out, "wt-a--fsi.ddev.local") {
 		t.Errorf("variant does not use the project TLD:\n%s", out)
 	}

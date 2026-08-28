@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	hostshift "github.com/generoi/hostshift"
-	"github.com/generoi/hostshift/internal/config"
+	"github.com/generoi/hostshift/internal/ddev"
 )
 
 // cmdInit writes the two files a DDEV project needs before hostshift can serve
@@ -61,10 +61,14 @@ func cmdInit(args []string) (int, error) {
 	if err != nil {
 		return exitConfig, err
 	}
-	_, own, tld, err := config.DDEVProject(c.dir)
+	proj, err := ddev.Load(c.dir)
 	if err != nil {
 		return exitConfig, err
 	}
+	if proj == nil {
+		return exitConfig, fmt.Errorf("no .ddev/config.yaml in %s: this configures a DDEV project", c.dir)
+	}
+	own, tld := proj.Hosts, proj.TLD
 	if len(own) == 0 {
 		return exitConfig, fmt.Errorf("no .ddev/config.yaml in %s: init configures a DDEV project", c.dir)
 	}
@@ -88,9 +92,10 @@ func cmdInit(args []string) (int, error) {
 	// canonical project, which is still running and still serving it.
 	parentHosts := map[string]bool{}
 	if main := mainWorktree(c.dir); main != "" && ddevProjectName(main) != ddevProjectName(c.dir) {
-		_, ph, _, _ := config.DDEVProject(main)
-		for _, h := range ph {
-			parentHosts[h] = true
+		if pp, _ := ddev.Load(main); pp != nil {
+			for _, h := range pp.Hosts {
+				parentHosts[h] = true
+			}
 		}
 	}
 	mine := kept[:0]
@@ -126,9 +131,12 @@ func cmdInit(args []string) (int, error) {
 				"  will answer on them.\n",
 			len(kept)-len(mine))
 	}
-	res.DDEVHosts, res.ProjectTLD = mine, tld
 	own = mine
-	variants, webHosts := res.DDEVEnv()
+	var mapped []string
+	for _, st := range res.Map.Sites {
+		mapped = append(mapped, st.Variant.Host)
+	}
+	variants, webHosts := ddev.Env(own, mapped)
 
 	// Every hostname the project should register: its own, plus the variants.
 	// The full list rather than only the new ones, because DDEV's own
@@ -139,8 +147,8 @@ func cmdInit(args []string) (int, error) {
 	// TLD to additional_hostnames; anything else is an FQDN and goes in the
 	// other list.
 	var short, fqdns []string
-	for _, h := range append(append([]string{}, res.DDEVHosts...), variants...) {
-		if s, ok := strings.CutSuffix(h, "."+res.ProjectTLD); ok {
+	for _, h := range append(append([]string{}, own...), variants...) {
+		if s, ok := strings.CutSuffix(h, "."+tld); ok {
 			short = append(short, s)
 		} else {
 			fqdns = append(fqdns, h)
@@ -325,10 +333,11 @@ func writeMapFromParent(dir, slug string) (string, error) {
 	if !ours(path) {
 		return "", nil
 	}
-	_, hosts, _, err := config.DDEVProject(main)
-	if err != nil {
+	p, err := ddev.Load(main)
+	if err != nil || p == nil {
 		return "", err
 	}
+	hosts := p.Hosts
 	if len(hosts) == 0 {
 		return "", fmt.Errorf("%s has no .ddev/config.yaml, so there is nothing to inherit: pass --map or write hostshift.yaml", main)
 	}
@@ -358,11 +367,11 @@ func ddevProjectName(dir string) string {
 	if dir == "" {
 		return ""
 	}
-	name, _, _, err := config.DDEVProject(dir)
-	if err != nil {
+	p, err := ddev.Load(dir)
+	if err != nil || p == nil {
 		return ""
 	}
-	return name
+	return p.Name
 }
 
 func gitOutput(dir string, args ...string) string {
@@ -454,4 +463,76 @@ func dedupe(in []string) []string {
 		}
 	}
 	return out
+}
+
+// cmdDDEV is the DDEV integration's own namespace.
+//
+// It is a namespace rather than a set of top-level commands so that `--help`
+// says what hostshift is: a proxy that maps origins, with DDEV as one way to
+// tell it what to map and one place to write the files a project needs. The
+// proxy needs none of it — a map given with --map, --from/--to or hostshift.yaml
+// runs anywhere.
+func cmdDDEV(args []string) (int, error) {
+	if len(args) == 0 {
+		fmt.Fprint(os.Stderr, ddevUsage)
+		return exitConfig, nil
+	}
+	switch args[0] {
+	case "init":
+		return cmdInit(args[1:])
+	case "env":
+		return cmdDDEVEnv(args[1:])
+	case "-h", "--help", "help":
+		fmt.Fprint(os.Stderr, ddevUsage)
+		return exitOK, nil
+	}
+	return exitConfig, fmt.Errorf("unknown ddev subcommand %q\n\n%s", args[0], ddevUsage)
+}
+
+const ddevUsage = `hostshift ddev — the DDEV integration
+
+  hostshift ddev init   work out the slug, write the project's runtime config
+  hostshift ddev env    print .ddev/.env for the compose service
+
+init is the one to run. env is what it writes, for a project that would rather
+generate that file itself.
+`
+
+// cmdDDEVEnv prints the .ddev/.env the compose service reads. `ddev init`
+// writes it; this is for a project that would rather generate the file itself.
+func cmdDDEVEnv(args []string) (int, error) {
+	fs := flag.NewFlagSet("ddev env", flag.ContinueOnError)
+	var c common
+	c.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return exitConfig, nil
+	}
+	res, err := c.load()
+	if err != nil {
+		return exitConfig, err
+	}
+	proj, err := ddev.Load(c.dir)
+	if err != nil || proj == nil {
+		return exitConfig, fmt.Errorf("--env needs a DDEV project in %s", c.dir)
+	}
+	var mapped []string
+	for _, st := range res.Map.Sites {
+		mapped = append(mapped, st.Variant.Host)
+	}
+	variants, webHosts := ddev.Env(proj.Hosts, mapped)
+	fmt.Printf("HOSTSHIFT_SLUG=%s\n", c.slug)
+	fmt.Printf("HOSTSHIFT_VARIANTS=%s\n", strings.Join(variants, ","))
+	fmt.Printf("HOSTSHIFT_WEB_HOSTS=%s\n", strings.Join(webHosts, ","))
+	fmt.Fprintf(os.Stderr,
+		"\nhostshift: add these to .ddev/additional_hostnames as well, or mkcert\n"+
+			"issues no certificate for them and the browser gets a TLS interstitial:\n")
+	// The project's own TLD, not a hardcoded one. DDEV appends the TLD to
+	// each additional_hostnames entry, so under a project_tld override this
+	// printed the whole hostname and registered it twice-suffixed — and
+	// mkcert then issues no SAN for the variant, which is the TLS
+	// interstitial this message exists to prevent.
+	for _, v := range variants {
+		fmt.Fprintf(os.Stderr, "  - %s\n", strings.TrimSuffix(v, "."+proj.TLD))
+	}
+	return exitOK, nil
 }

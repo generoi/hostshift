@@ -11,11 +11,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/generoi/hostshift/internal/ddev"
 	"github.com/generoi/hostshift/internal/origin"
 )
 
@@ -60,20 +60,6 @@ type Resolved struct {
 	Upstream string
 	Source   string // where the map came from, for diagnostics
 
-	// DDEVHosts is every hostname this DDEV project registers — `name` plus
-	// `additional_hostnames`, suffixed with the project TLD. It is read even
-	// when hostshift.yaml supplies the map, because `map --env` needs to know
-	// which of the project's hostnames belong to `web` and which to hostshift.
-	DDEVHosts []string
-
-	// ProjectTLD is the DDEV project TLD, "ddev.site" unless overridden. Three
-	// of the 64 local fleet projects override it, and `map --env` has to strip
-	// the right suffix when it prints what to add to additional_hostnames —
-	// DDEV appends the TLD itself, so trimming ".ddev.site" from a
-	// ".ddev.local" host printed the whole hostname and registered
-	// "wt-a--fsi.ddev.local.ddev.local", which mkcert then issues no SAN for.
-	ProjectTLD string
-
 	// Uncovered lists hostnames DDEV registers for this project that the map
 	// does not mention, so they have no variant and cannot be reached here — a
 	// hostshift.yaml declaring three of nine blogs leaves the other six with
@@ -100,13 +86,16 @@ func Load(dir string, f Flags) (*Resolved, error) {
 		pattern = DefaultVariantPattern
 	)
 
-	// The DDEV config is read whether or not it supplies the map, for two
-	// reasons. `map --env` needs the project's full hostname list to work out
-	// which hostnames stay with `web` — in a worktree those are not the
-	// canonical hosts at all, since canonical is a different project still
-	// running. And a hostshift.yaml that omits some of the project's registered
-	// hostnames can then be reported rather than silently 421ing them.
-	ddev, ddevPath, err := loadDDEV(dir)
+	// Layer 1 of §5.3, and the only place the core knows DDEV exists: a project
+	// already declares the hostnames it answers to, so a single-environment site
+	// gets its map for free. It is read even when hostshift.yaml supplies the
+	// map, so that a yaml omitting some of those hostnames can be reported
+	// rather than silently leaving them unreachable.
+	//
+	// Everything else DDEV-shaped — writing .ddev/ files, the env the compose
+	// service reads — lives in internal/ddev and cmd/hostshift/ddev.go. This is
+	// a binary that runs anywhere, with a DDEV integration beside it.
+	proj, err := ddev.Load(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -128,11 +117,11 @@ func Load(dir string, f Flags) (*Resolved, error) {
 	default:
 		// Layer 1. For a single-environment site with no extra aliases this is
 		// sufficient on its own and no hostshift.yaml is needed at all.
-		if ddev == nil {
+		if proj == nil {
 			return nil, fmt.Errorf("no map: found neither hostshift.yaml nor .ddev/config.yaml in %s, and no --from/--to given", dir)
 		}
-		source = ddevPath + " (DDEV defaults)"
-		if sites, err = sitesFromDDEV(ddev, pattern, f.Slug); err != nil {
+		source = ddev.Path(dir) + " (DDEV defaults)"
+		if sites, err = sitesFromHosts(proj.Hosts, pattern, f.Slug); err != nil {
 			return nil, err
 		}
 	}
@@ -141,8 +130,7 @@ func Load(dir string, f Flags) (*Resolved, error) {
 	if err = err2; err != nil {
 		return nil, err
 	}
-	res := &Resolved{Map: m, Upstream: up, Source: source,
-		DDEVHosts: ddevHostnames(ddev), ProjectTLD: projectTLD(ddev)}
+	res := &Resolved{Map: m, Upstream: up, Source: source}
 
 	// A hostshift.yaml *replaces* the DDEV layer rather than merging with it:
 	// an explicit map is a statement about which hosts this project serves, and
@@ -150,7 +138,7 @@ func Load(dir string, f Flags) (*Resolved, error) {
 	// project whose .ddev/config.yaml registers nine hostnames and whose
 	// hostshift.yaml declares three will 421 the other six with no explanation,
 	// which is a plausible fsi or bravoinc shape. Say so.
-	if ddev != nil && len(sites) > 0 {
+	if proj != nil && len(sites) > 0 {
 		covered := map[string]bool{}
 		for _, st := range sites {
 			for _, o := range st.CanonicalSet() {
@@ -164,67 +152,14 @@ func Load(dir string, f Flags) (*Resolved, error) {
 		// warning about it fires on every correctly configured worktree, which
 		// is how people learn to skip warnings. In a canonical project it is a
 		// canonical host anyway and never reaches here.
-		own := ddev.Name + "." + projectTLD(ddev)
-		for _, h := range ddevHostnames(ddev) {
+		own := proj.Name + "." + proj.TLD
+		for _, h := range proj.Hosts {
 			if !covered[h] && h != own {
 				res.Uncovered = append(res.Uncovered, h)
 			}
 		}
 	}
 	return res, nil
-}
-
-// DDEVEnv returns the two lists the DDEV add-on needs in .ddev/.env.
-//
-// The second is the non-obvious one. DDEV puts every additional hostname on
-// web's VIRTUAL_HOST, so unless it is narrowed, web and hostshift both claim the
-// variants and the router picks web — WordPress then sees a variant host,
-// fails to match wp_blogs.domain, and redirects to wp-signup.php.
-//
-// web keeps *this project's* hostnames minus the variants, not the canonical
-// set. The two coincide for a canonical project and diverge for a worktree
-// sharing canonical's database: there, canonical is a separate project that is
-// still running and still owns its own hostnames, and handing them to the
-// worktree's web container makes two projects claim one hostname.
-func (r *Resolved) DDEVEnv() (variants, webHosts []string) {
-	isVariant := map[string]bool{}
-	for _, s := range r.Map.Sites {
-		variants = append(variants, s.Variant.Host)
-		isVariant[s.Variant.Host] = true
-	}
-	for _, h := range r.DDEVHosts {
-		if !isVariant[h] {
-			webHosts = append(webHosts, h)
-		}
-	}
-	return variants, webHosts
-}
-
-// projectTLD is the project's DDEV TLD, defaulted the way DDEV defaults it.
-func projectTLD(d *ddevConfig) string {
-	if d == nil || d.ProjectTLD == "" {
-		return "ddev.site"
-	}
-	return d.ProjectTLD
-}
-
-// ddevHostnames is every hostname the project registers with DDEV.
-func ddevHostnames(d *ddevConfig) []string {
-	if d == nil {
-		return nil
-	}
-	tld := projectTLD(d)
-	all := []string{d.Name + "." + tld}
-	for _, h := range d.AdditionalHostnames {
-		all = append(all, h+"."+tld)
-	}
-	all = append(all, d.AdditionalFQDNs...)
-	// Deduped as a whole, not pairwise: a generated config.*.local.yaml lists
-	// the project's own hostname alongside the variants, so after the merge
-	// `name` and an entry in additional_hostnames are the same host. Answering
-	// to it twice is meaningless, and it reached HOSTSHIFT_WEB_HOSTS as a
-	// repeated value.
-	return appendUnique(nil, all)
 }
 
 func mapFromFlags(f Flags) (*origin.Map, error) {
@@ -399,124 +334,15 @@ func applyPattern(pattern, slug, host string) (string, error) {
 	return newLabel + "." + rest, nil
 }
 
-// ddevConfig is the subset of .ddev/config.yaml hostshift reads. It is the only
-// third-party format hostshift understands (PLAN §5.3).
-type ddevConfig struct {
-	Name                string   `yaml:"name"`
-	ProjectTLD          string   `yaml:"project_tld"`
-	AdditionalHostnames []string `yaml:"additional_hostnames"`
-	AdditionalFQDNs     []string `yaml:"additional_fqdns"`
-}
-
-func loadDDEV(dir string) (*ddevConfig, string, error) {
-	path := filepath.Join(dir, ".ddev", "config.yaml")
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, "", nil
-	}
-	if err != nil {
-		return nil, "", err
-	}
-	var d ddevConfig
-	if err := yaml.Unmarshal(b, &d); err != nil {
-		return nil, "", fmt.Errorf("%s: %w", path, err)
-	}
-
-	// DDEV merges every .ddev/config.*.yaml over config.yaml, and reading only
-	// the base file made hostshift's view of the project differ from DDEV's.
-	//
-	// That is not academic: config.*.local.yaml is gitignored by DDEV's own
-	// .ddev/.gitignore, which makes it the natural place for a worktree to give
-	// itself a project name of its own — two DDEV projects cannot share one
-	// name, and .ddev/config.yaml is tracked, so overriding it there is the only
-	// way that does not dirty the worktree. hostshift would have gone on
-	// resolving the map against the parent's name while DDEV served the
-	// worktree's, and every request would have 421'd.
-	//
-	// Scalars overwrite, lists append and dedupe, which is what DDEV does and
-	// what the pilot's own override demonstrates: it repeats a hostname already
-	// in config.yaml and the project ends up with one of it, not two.
-	globs, _ := filepath.Glob(filepath.Join(dir, ".ddev", "config.*.yaml"))
-	sort.Strings(globs)
-	for _, g := range globs {
-		ob, err := os.ReadFile(g)
-		if err != nil {
-			continue
-		}
-		var o ddevConfig
-		if err := yaml.Unmarshal(ob, &o); err != nil {
-			return nil, "", fmt.Errorf("%s: %w", g, err)
-		}
-		if o.Name != "" {
-			d.Name = o.Name
-		}
-		if o.ProjectTLD != "" {
-			d.ProjectTLD = o.ProjectTLD
-		}
-		d.AdditionalHostnames = appendUnique(d.AdditionalHostnames, o.AdditionalHostnames)
-		d.AdditionalFQDNs = appendUnique(d.AdditionalFQDNs, o.AdditionalFQDNs)
-	}
-
-	if d.Name == "" {
-		// DDEV defaults the project name to the directory name, and hostshift
-		// has to agree with it or the map is built for a project that does not
-		// exist. Verified against `ddev debug configyaml`.
-		//
-		// It is also the thing that makes a worktree work with no configuration
-		// at all: two DDEV projects cannot share a name, and .ddev/config.yaml
-		// is tracked — so a repo that *omits* `name` gives every worktree its
-		// own project for free, named after its own directory. Requiring the
-		// field turned that into an error instead.
-		abs, err := filepath.Abs(dir)
-		if err != nil {
-			return nil, "", err
-		}
-		d.Name = filepath.Base(abs)
-	}
-	return &d, path, nil
-}
-
-func appendUnique(dst, src []string) []string {
-	seen := make(map[string]bool, len(dst))
-	for _, s := range dst {
-		seen[s] = true
-	}
-	for _, s := range src {
-		if !seen[s] {
-			seen[s] = true
-			dst = append(dst, s)
-		}
-	}
-	return dst
-}
-
-// DDEVProject reports what DDEV would call this project and what it answers to.
+// sitesFromHosts derives a map from a list of hostnames a site already answers
+// to: each one is canonical, and its variant is that host with the slug
+// prefixed. Canonical is the local host itself, which is the right map for
+// browsing a db:pull'd database from a worktree.
 //
-// It is the shallow question — the project's own identity — as distinct from
-// Load's, which is what maps to what. `init` needs both, and for a worktree they
-// come from different directories: the map from the checkout whose database is
-// shared, the identity from the project being configured.
-func DDEVProject(dir string) (name string, hosts []string, tld string, err error) {
-	d, _, err := loadDDEV(dir)
-	if err != nil || d == nil {
-		return "", nil, "", err
-	}
-	return d.Name, ddevHostnames(d), projectTLD(d), nil
-}
-
-// sitesFromDDEV builds the ordered list of local hosts for free: `name` plus
-// `additional_hostnames`, each suffixed with the project TLD. Canonical is the
-// ddev host itself, which is the right map for browsing a db:pull'd database
-// from a worktree.
-func sitesFromDDEV(d *ddevConfig, pattern, slug string) ([]origin.Site, error) {
-	tld := projectTLD(d)
-	hosts := []string{d.Name + "." + tld}
-	for _, h := range d.AdditionalHostnames {
-		hosts = append(hosts, h+"."+tld)
-	}
-	// additional_fqdns are already fully qualified.
-	hosts = append(hosts, d.AdditionalFQDNs...)
-
+// It takes hostnames rather than a DDEV project on purpose. Where the list came
+// from is not this function's business, and it is the seam that keeps DDEV an
+// integration: anything that can produce a list of hostnames can seed a map.
+func sitesFromHosts(hosts []string, pattern, slug string) ([]origin.Site, error) {
 	sites := make([]origin.Site, 0, len(hosts))
 	for i, h := range hosts {
 		// Skip hostnames that are already variants for this slug.
