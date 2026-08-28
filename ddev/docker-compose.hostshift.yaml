@@ -21,6 +21,18 @@
 # HOSTSHIFT_VARIANTS and HOSTSHIFT_SLUG come from the project's .ddev/.env.
 
 services:
+  # The variant hostnames have to be in additional_hostnames so that DDEV
+  # registers them and mkcert issues a certificate covering them — but DDEV puts
+  # *every* additional hostname on web's VIRTUAL_HOST, so web and hostshift both
+  # claim them and the router sends them to web. WordPress then sees the variant
+  # host, fails to match wp_blogs.domain, and redirects to wp-signup.php.
+  #
+  # So web's list is narrowed back to the canonical hostnames. Everything not
+  # named here keeps going to web; only the variants reach hostshift.
+  web:
+    environment:
+      VIRTUAL_HOST: ${HOSTSHIFT_WEB_HOSTS}
+
   hostshift:
     container_name: ddev-${DDEV_SITENAME}-hostshift
     image: ghcr.io/generoi/hostshift:latest
@@ -51,7 +63,11 @@ services:
     volumes:
       # Read-only, and only for hostshift.yaml and .ddev/config.yaml — the two
       # files §5.3's config layering reads.
-      - ".:/project:ro"
+      #
+      # $DDEV_APPROOT, not ".": a docker-compose.*.yaml in .ddev/ resolves
+      # relative paths against .ddev/, so "." would mount the config directory
+      # and hostshift would find neither file.
+      - "${DDEV_APPROOT}:/project:ro"
     depends_on:
       - web
     networks: [default, ddev_default]

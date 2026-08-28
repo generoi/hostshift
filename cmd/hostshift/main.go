@@ -276,12 +276,38 @@ func cmdMap(args []string) (int, error) {
 	var c common
 	c.register(fs)
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
+	asEnv := fs.Bool("env", false, "emit the .ddev/.env block the DDEV add-on needs")
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
 	res, err := c.load()
 	if err != nil {
 		return exitConfig, err
+	}
+	if *asEnv {
+		// Both lists are needed, and the second is the non-obvious one: DDEV
+		// puts every additional hostname on web's VIRTUAL_HOST, so without
+		// narrowing it back to the canonical hosts, web and hostshift both claim
+		// the variants and the router sends them to web.
+		var variants, webHosts []string
+		for _, s := range res.Map.Sites {
+			variants = append(variants, s.Variant.Host)
+			for _, a := range s.CanonicalSet() {
+				if strings.HasSuffix(a.Host, ".ddev.site") {
+					webHosts = append(webHosts, a.Host)
+				}
+			}
+		}
+		fmt.Printf("HOSTSHIFT_SLUG=%s\n", c.slug)
+		fmt.Printf("HOSTSHIFT_VARIANTS=%s\n", strings.Join(variants, ","))
+		fmt.Printf("HOSTSHIFT_WEB_HOSTS=%s\n", strings.Join(webHosts, ","))
+		fmt.Fprintf(os.Stderr,
+			"\nhostshift: add these to .ddev/additional_hostnames as well, or mkcert\n"+
+				"issues no certificate for them and the browser gets a TLS interstitial:\n")
+		for _, v := range variants {
+			fmt.Fprintf(os.Stderr, "  - %s\n", strings.TrimSuffix(v, ".ddev.site"))
+		}
+		return exitOK, nil
 	}
 	if *asJSON {
 		type site struct {
