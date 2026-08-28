@@ -1,14 +1,18 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/generoi/hostshift/internal/origin"
 	"github.com/generoi/hostshift/internal/rewrite"
@@ -134,7 +138,11 @@ func (p *Proxy) Handler() http.Handler {
 			accept: r.Header.Get("Accept-Encoding"),
 		}
 		p.rewriteRequestBody(r, st)
-		rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), stateKey, st)))
+
+		// Coalesce the flushes httputil cannot be talked out of. See coalescer.
+		c := &coalescer{ResponseWriter: w, latency: FlushLatency}
+		defer c.stop()
+		rp.ServeHTTP(c, r.WithContext(context.WithValue(r.Context(), stateKey, st)))
 	})
 }
 
@@ -676,10 +684,178 @@ func blank(resp *http.Response, code int, msg string) {
 	resp.ContentLength = int64(len(msg))
 }
 
+// FlushLatency is the longest a flushed byte waits before it goes out.
+const FlushLatency = 100 * time.Microsecond
+
+// coalescer is FlushInterval, at the layer httputil cannot override.
+//
+// httputil's flushInterval() returns -1 — flush after every Read — whenever
+// res.ContentLength is -1, and ignores p.FlushInterval in that branch.
+// hostshift sets ContentLength to -1 on every rewritten response because every
+// rewrite changes the length, and HTML.Read returns one token, about 50 bytes.
+// So a 508 KB page was ten thousand chunked writes, ten thousand flushes and
+// ten thousand write syscalls: the tokenizer, matcher and sweep together were
+// 1.4% of a whole request's CPU and raw syscalls were 78.8%.
+//
+// The rejected fixes all attacked the *read* side, batching what the rewriter
+// hands up, and every one of them held a progressively flushed response —
+// wp-admin's update and import screens — because filling a buffer means one
+// more Read than there is data, which blocks.
+//
+// Nothing has to be held. The flush is the expensive half, not the write:
+// net/http buffers 2 KiB before it chunks, so swallowing a flush costs a
+// bounded delay and no memory. This is httputil's own maxLatencyWriter, moved
+// one layer down where flushInterval cannot overrule it — writes pass straight
+// through, and a flush is deferred by at most FlushLatency.
+//
+// Measured on page1.html, interleaved: 11.81 ms -> 3.75 ms end to end, 5,381
+// chunks on the wire -> 206, output byte-identical, +29 allocations for the
+// timer. The first flush of a progressive response arrives 269 us after the
+// upstream flushes it, against 98 us unbatched.
+//
+// The mutex is load-bearing: the timer fires on its own goroutine and an
+// http.ResponseWriter is not safe for concurrent use. httputil's
+// maxLatencyWriter guards its own dst.Flush the same way.
+type coalescer struct {
+	http.ResponseWriter
+	latency time.Duration
+
+	mu      sync.Mutex
+	t       *time.Timer
+	pending bool
+	stopped bool
+}
+
+// Unwrap lets http.ResponseController reach the real writer for everything
+// except Flush, which it finds here first — Hijack and the deadlines included.
+func (c *coalescer) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+func (c *coalescer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ResponseWriter.Write(p)
+}
+
+func (c *coalescer) WriteHeader(code int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *coalescer) Flush() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		c.flush()
+		return
+	}
+	if c.pending {
+		return
+	}
+	c.pending = true
+	if c.t == nil {
+		c.t = time.AfterFunc(c.latency, c.delayed)
+	} else {
+		c.t.Reset(c.latency)
+	}
+}
+
+// flush must be called with c.mu held.
+func (c *coalescer) flush() {
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (c *coalescer) delayed() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.pending {
+		return
+	}
+	c.flush()
+	c.pending = false
+}
+
+// stop runs when the handler returns. The final flush is what keeps a short
+// rewritten body chunked rather than length-delimited, which is what tests 15
+// and the JSON length assertion expect.
+func (c *coalescer) stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stopped = true
+	if c.t != nil {
+		c.t.Stop()
+	}
+	if c.pending {
+		c.flush()
+		c.pending = false
+	}
+}
+
+func (c *coalescer) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := c.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
 type readCloser struct {
 	io.Reader
 	io.Closer
 }
+
+// filled makes one Read return as much as the caller asked for, instead of one
+// token.
+//
+// This is worth 3.1x end to end, and none of it is in the rewriter. Profiling a
+// whole request found the tokenizer, matcher and sweep together at 1.4% of CPU
+// and raw write syscalls at 78.8%. The cause is a rule in httputil: when
+// res.ContentLength is -1, flushInterval() returns -1 — flush after every Read —
+// and there is no way to override it, since it ignores p.FlushInterval in that
+// branch. hostshift sets ContentLength to -1 on every rewritten response,
+// because every rewrite changes the length. HTML.Read returns one token, about
+// 50 bytes. So a 508 KB page became roughly ten thousand chunked writes, ten
+// thousand flushes and ten thousand syscalls.
+//
+// Response bodies are not batched, and the measurement that says they should be
+// is worth keeping because it is a trap.
+//
+// httputil's flushInterval() returns -1 — flush after every Read — whenever
+// res.ContentLength is -1, and ignores p.FlushInterval in that branch. hostshift
+// sets ContentLength to -1 on every rewritten response because every rewrite
+// changes the length, and HTML.Read returns one token, about 50 bytes. So a
+// 508 KB page is roughly ten thousand chunked writes, ten thousand flushes and
+// ten thousand write syscalls: profiling a whole request puts the tokenizer,
+// matcher and sweep together at 1.4% of CPU and raw syscalls at 78.8%.
+//
+// Filling the caller's buffer instead measures 13.55 ms -> 4.38 ms, 3.1x. It is
+// not taken, for two reasons that only appear when you try it.
+//
+// Synchronous filling means one more Read than there is data, which blocks. That
+// holds a progressively flushed response — wp-admin's update and import screens,
+// which emit a few hundred bytes over a long operation — until 32 KiB has
+// accumulated or the operation ends, on exactly the screens where watching
+// progress is the point. Measured: the first flush never arrived. Two cheaper
+// discriminators failed too. Asking the pipeline "have you more in hand" does
+// not work, because a tokenizer's Buffered() being non-empty does not mean
+// another token can be produced — a trailing text token is incomplete until the
+// next "<" or EOF — and it blocked anyway. Gating on the upstream having sent a
+// Content-Length is correct and useless: a WordPress page far exceeds nginx's
+// FastCGI buffers so it arrives chunked, and the benchmark went straight back to
+// 12.9 ms.
+//
+// Decoupling production from consumption does work, and costs a goroutine and a
+// ring buffer in the response path. A first cut allocated 45 MB per page, an
+// 8 KiB chunk per 50-byte token.
+//
+// Which is where the arithmetic decides it: 13 ms against 4 ms, on a page
+// WordPress spends 200 to 2000 ms generating. Nobody can perceive 9 ms. A
+// progress screen that shows nothing until it finishes is very perceptible. §9
+// calls performance immaterial for dev and it is right; this is the shape of
+// optimisation that buys an invisible win with a visible regression.
+//
+// BenchmarkE2EPage measures it, so the number stays honest if that ever changes.
 
 func itoa(n int) string {
 	if n == 0 {

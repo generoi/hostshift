@@ -18,37 +18,47 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/generoi/hostshift/internal/config"
 	"github.com/generoi/hostshift/internal/corpus"
+	"github.com/generoi/hostshift/internal/ddev"
 	"github.com/generoi/hostshift/internal/origin"
 	"github.com/generoi/hostshift/internal/proxy"
 	"github.com/generoi/hostshift/internal/rewrite"
 )
 
-const usage = `hostshift — serve a site from a hostname other than the one in its database
+const usage = `hostshift — rewrite origins in HTTP traffic, in both directions
 
-  hostshift rewrite --from https://a --to https://b < in.html > out.html
-  hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --slug wt-a
-  hostshift map     print the resolved host map
-  hostshift check   validate the config; exit 2 if invalid
-  hostshift wp-cli  print wp-cli.local.yml for this project
-  hostshift diff    corpus diff: crawl N pages canonical and through the proxy
+A site's content refers to one hostname; you want to reach it at another.
+hostshift maps between them: responses get the hostname the browser is on,
+requests get the hostname the content was written for. Nothing is rewritten at
+rest.
 
-The map is resolved from three layers, each overriding the last (PLAN §5.3):
-DDEV defaults in .ddev/config.yaml, then hostshift.yaml, then these flags.
+  hostshift rewrite   a filter — bytes on stdin, rewritten bytes on stdout
+  hostshift proxy     the same rewriting in front of an upstream
+  hostshift map       print the resolved map
+  hostshift hosts     print the hostnames a project declares, one per line
+  hostshift check     validate it; exit 2 if it is not usable
+  hostshift diff      crawl a site two ways and compare, to verify a deployment
+
+Give it a map and it runs anywhere:
+
+  --map C=V     canonical=variant, repeatable
+  --from/--to   the same thing as two index-aligned lists
+  hostshift.yaml         a file, when there are aliases or many sites
+  .ddev/config.yaml      read, not written — a DDEV project already declares
+                         the hostnames it answers to, so the map comes for free
+
+It scaffolds nothing: no config files written, no slug guessed from a branch,
+no knowledge of any CMS. That work is opinionated and belongs to whatever knows
+the stack — for DDEV, the add-on, as "ddev hostshift".
 
   -C dir        project directory (default ".")
-  --slug        worktree slug; variants are derived by prefixing the leftmost
-                label of each site's base host
-  --from/--to   explicit index-aligned map; replaces the config files entirely
-  --map C=V     the same thing written as one argument
+  --slug        derive each variant by prefixing the leftmost label of its
+                canonical host
   --upstream    upstream base URL, e.g. http://web:80
 `
 
@@ -77,16 +87,18 @@ func main() {
 		code, err = cmdRewrite(os.Args[2:])
 	case "proxy":
 		code, err = cmdProxy(os.Args[2:])
+	case "hosts":
+		code, err = cmdHosts(os.Args[2:])
 	case "map":
 		code, err = cmdMap(os.Args[2:])
 	case "check":
 		code, err = cmdCheck(os.Args[2:])
-	case "wp-cli":
-		code, err = cmdWPCLI(os.Args[2:])
 	case "diff":
 		code, err = cmdDiff(os.Args[2:])
 	case "-h", "--help", "help":
-		fmt.Fprint(os.Stderr, usage)
+		// Asked for, so it is the answer and not a diagnostic: stdout, exit 0.
+		// `hostshift --help > notes.txt` produced an empty file.
+		fmt.Print(usage)
 	case "version", "--version":
 		fmt.Println(version)
 	default:
@@ -97,6 +109,26 @@ func main() {
 		fmt.Fprintln(os.Stderr, "hostshift:", err)
 	}
 	os.Exit(code)
+}
+
+// describe gives a subcommand's flag dump a first line saying what the
+// subcommand is for, and sends an explicitly requested help to stdout with exit
+// 0 rather than to stderr with exit 2. `hostshift check --help` printed nine
+// flags and not one word about what it checks.
+func describe(fs *flag.FlagSet, args []string, what string) (helped bool) {
+	fs.Usage = func() {
+		w := fs.Output()
+		fmt.Fprintf(w, "hostshift %s — %s\n\nusage: hostshift %s [flags]\n\n", fs.Name(), what, fs.Name())
+		fs.PrintDefaults()
+	}
+	for _, a := range args {
+		if a == "-h" || a == "--help" || a == "-help" {
+			fs.SetOutput(os.Stdout)
+			fs.Usage()
+			return true
+		}
+	}
+	return false
 }
 
 // repeatable collects a flag that may be given more than once.
@@ -168,6 +200,9 @@ func cmdRewrite(args []string) (int, error) {
 	asJSON := fs.Bool("json", false, "emit counters as JSON on stderr")
 	quiet := fs.Bool("quiet", false, "suppress the counter report")
 	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
+	if describe(fs, args, "the whole engine as a Unix filter: bytes on stdin, rewritten bytes on stdout") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -233,6 +268,9 @@ func cmdProxy(args []string) (int, error) {
 	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
 	compress := fs.Bool("compress", false, "re-encode responses per the client's Accept-Encoding, for performance work")
 	maxBody := fs.Int64("max-body", proxy.DefaultMaxBody, "request-body buffering cap in bytes")
+	if describe(fs, args, "the same rewriting in front of an upstream") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -283,36 +321,59 @@ func cmdProxy(args []string) (int, error) {
 	return exitOK, nil
 }
 
+// cmdHosts prints the hostnames a project declares — the raw material a map is
+// derived from, before any of it is decided.
+//
+// It reads; it does not scaffold. Something has to answer "what does the
+// checkout at this path answer to", and a tool that already reads DDEV config
+// as a map source may as well say what it read. Doing it in shell means parsing
+// YAML with its override merging, which is how the careful parts get lost.
+func cmdHosts(args []string) (int, error) {
+	fs := flag.NewFlagSet("hosts", flag.ContinueOnError)
+	dir := fs.String("C", ".", "project directory")
+	if describe(fs, args, "print the hostnames a project declares, one per line") {
+		return exitOK, nil
+	}
+	if err := fs.Parse(args); err != nil {
+		return exitConfig, nil
+	}
+	proj, err := ddev.Load(*dir)
+	if err != nil {
+		return exitConfig, err
+	}
+	if proj == nil {
+		return exitConfig, fmt.Errorf("no project config found in %s", *dir)
+	}
+	// One hostname per line is a contract, and a hostname with a space in it
+	// breaks it silently: the caller splits on whitespace and gets two. It is
+	// reachable — DDEV names an unnamed project after its directory, and a
+	// directory may be called "My Site" — and `map` rejects the same project with
+	// exit 2, so printing it here made the two disagree about the same config.
+	for _, h := range proj.Hosts {
+		if _, err := origin.Parse("https://" + h); err != nil {
+			return exitConfig, fmt.Errorf("%s declares %q, which is not a hostname: %w", ddev.Path(*dir), h, err)
+		}
+	}
+	for _, h := range proj.Hosts {
+		fmt.Println(h)
+	}
+	return exitOK, nil
+}
+
 func cmdMap(args []string) (int, error) {
 	fs := flag.NewFlagSet("map", flag.ContinueOnError)
 	var c common
 	c.register(fs)
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
-	asEnv := fs.Bool("env", false, "emit the .ddev/.env block the DDEV add-on needs")
+	if describe(fs, args, "print the resolved map, and where it came from") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
 	res, err := c.load()
 	if err != nil {
 		return exitConfig, err
-	}
-	if *asEnv {
-		variants, webHosts := res.DDEVEnv()
-		fmt.Printf("HOSTSHIFT_SLUG=%s\n", c.slug)
-		fmt.Printf("HOSTSHIFT_VARIANTS=%s\n", strings.Join(variants, ","))
-		fmt.Printf("HOSTSHIFT_WEB_HOSTS=%s\n", strings.Join(webHosts, ","))
-		fmt.Fprintf(os.Stderr,
-			"\nhostshift: add these to .ddev/additional_hostnames as well, or mkcert\n"+
-				"issues no certificate for them and the browser gets a TLS interstitial:\n")
-		// The project's own TLD, not a hardcoded one. DDEV appends the TLD to
-		// each additional_hostnames entry, so under a project_tld override this
-		// printed the whole hostname and registered it twice-suffixed — and
-		// mkcert then issues no SAN for the variant, which is the TLS
-		// interstitial this message exists to prevent.
-		for _, v := range variants {
-			fmt.Fprintf(os.Stderr, "  - %s\n", strings.TrimSuffix(v, "."+res.ProjectTLD))
-		}
-		return exitOK, nil
 	}
 	if *asJSON {
 		type site struct {
@@ -345,6 +406,9 @@ func cmdCheck(args []string) (int, error) {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	var c common
 	c.register(fs)
+	if describe(fs, args, "validate the map; exit 2 if it is not usable") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -353,174 +417,27 @@ func cmdCheck(args []string) (int, error) {
 		return exitConfig, err
 	}
 	n := len(res.Map.Sites)
+	code := exitOK
 	if res.Map.Identity() {
+		// "no rewrite can occur" is the definition of not usable, and check
+		// documents itself as exiting 2 when the map is not usable. Exiting 0
+		// made it a status line rather than a check.
 		fmt.Fprintf(os.Stderr, "hostshift: %d site(s) from %s — identity map, no rewrite can occur\n", n, res.Source)
+		code = exitConfig
 	} else {
 		fmt.Fprintf(os.Stderr, "hostshift: %d site(s) from %s — map is injective and anchored\n", n, res.Source)
 	}
 
 	if len(res.Uncovered) > 0 {
 		fmt.Fprintf(os.Stderr,
-			"hostshift: warning: DDEV registers %d hostname(s) this map does not cover; "+
-				"requests for them get a 421:\n", len(res.Uncovered))
+			"hostshift: warning: DDEV registers %d hostname(s) this map does not cover, so they\n"+
+				"  have no variant and cannot be previewed here:\n", len(res.Uncovered))
 		for _, h := range res.Uncovered {
 			fmt.Fprintf(os.Stderr, "  %s\n", h)
 		}
 	}
 
-	// Warn rather than silently generate a file that would be committed
-	// (PLAN §4.3). Seven repos in the fleet lack this gitignore entry.
-	if warn := gitignoreWarning(c.dir); warn != "" {
-		fmt.Fprintln(os.Stderr, "hostshift: warning:", warn)
-	}
-
-	if _, webHosts := res.DDEVEnv(); len(webHosts) == 0 && len(res.DDEVHosts) > 0 {
-		fmt.Fprintf(os.Stderr,
-			"hostshift: warning: every hostname this DDEV project registers is a variant, so\n"+
-				"  HOSTSHIFT_WEB_HOSTS is empty and web gets no VIRTUAL_HOST — mailpit,\n"+
-				"  `ddev launch` and the canonical site stop routing. Give the project a\n"+
-				"  hostname of its own in .ddev/config.yaml that the slug does not claim.\n")
-	}
-
-	for _, w := range uploadsRedirectWarnings(c.dir) {
-		fmt.Fprintln(os.Stderr, "hostshift: warning:", w)
-	}
-	return exitOK, nil
-}
-
-// uploadsRedirectWarnings finds the fleet's uploads-redirect loop.
-//
-// 55 of 63 DDEV repos ship a snippet that 302s a missing /app/uploads/ file to
-// production, and it is written `rewrite ^ https://host$request_uri redirect`.
-// nginx appends the query string *again* unless the replacement ends in "?", so
-// the Location comes back one query longer than the request that produced it —
-// the self-redirect guard never matches, and each hop appends another copy
-// until the browser gives up with 414 URI Too Long. Measured live on acmecorp.
-//
-// hostshift deliberately does not absorb this. Making the guard ignore the
-// query would carry a workaround for a one-character bug in the fleet's own
-// nginx config, and would silently pass through every redirect that changes
-// only the query on the same path. The fix belongs in the repo; this says so,
-// by name, with the edit to make.
-func uploadsRedirectWarnings(dir string) []string {
-	var out []string
-	matches, _ := filepath.Glob(filepath.Join(dir, ".ddev", "nginx*", "*.conf"))
-	more, _ := filepath.Glob(filepath.Join(dir, ".ddev", "nginx*", "*", "*.conf"))
-	for _, f := range append(matches, more...) {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(b), "\n") {
-			t := strings.TrimSpace(line)
-			if !strings.HasPrefix(t, "rewrite ") || !strings.Contains(t, "$request_uri") {
-				continue
-			}
-			// "$request_uri?" is the fixed form: the trailing "?" stops nginx
-			// re-appending the query.
-			if strings.Contains(t, "$request_uri?") {
-				continue
-			}
-			rel, err := filepath.Rel(dir, f)
-			if err != nil {
-				rel = f
-			}
-			out = append(out, fmt.Sprintf(
-				"%s redirects with $request_uri and no trailing \"?\", so nginx appends the\n"+
-					"  query a second time and each hop grows the URL until the browser hits 414.\n"+
-					"  Change it to end in \"$request_uri?\":\n    %s", rel, t))
-		}
-	}
-	return out
-}
-
-// cmdWPCLI prints wp-cli.local.yml.
-//
-// Under production-canonical there is no HTTP_HOST during `ddev wp`, so
-// application.php falls through to the ddev host while the pristine dump's
-// wp_blogs.domain is the production one, matched exactly by get_site_by_path().
-// WP-CLI's url: sets $_SERVER['HTTP_HOST'] before WordPress bootstraps, which
-// satisfies the first branch of that match with no environment variables and no
-// code change. What is missing fleet-wide is a *root-level* url: — 0 of 60 repos
-// have one (PLAN §4.3, measured again in M0).
-func cmdWPCLI(args []string) (int, error) {
-	fs := flag.NewFlagSet("wp-cli", flag.ContinueOnError)
-	var c common
-	c.register(fs)
-	if err := fs.Parse(args); err != nil {
-		return exitConfig, nil
-	}
-	res, err := c.load()
-	if err != nil {
-		return exitConfig, err
-	}
-	first := res.Map.Sites[0]
-
-	// wp-cli.local.yml *replaces* wp-cli.yml rather than merging with it —
-	// measured with WP-CLI 2.12.0 in the M6 pilot, where a file containing only
-	// `url:` lost `path:`, `require:` and every alias, and left WP-CLI unable to
-	// find the installation at all. So the existing config is carried through
-	// verbatim with the root url added, rather than a bare two-line file being
-	// written over it.
-	//
-	// Reading wp-cli.yml is WP-CLI's own format, inside the WordPress adapter
-	// §10 describes, not the Genero-specific coupling §4.2 rules out.
-	out := map[string]any{}
-	if b, err := os.ReadFile(filepath.Join(c.dir, "wp-cli.yml")); err == nil {
-		if err := yaml.Unmarshal(b, &out); err != nil {
-			return exitConfig, fmt.Errorf("wp-cli.yml: %w", err)
-		}
-	}
-	out["url"] = first.Canonical.String()
-
-	body, err := yaml.Marshal(out)
-	if err != nil {
-		return exitRuntime, err
-	}
-	fmt.Printf("# generated by hostshift — do not commit\n"+
-		"# wp-cli.local.yml replaces wp-cli.yml rather than merging with it, so this\n"+
-		"# is the whole config with a root url: added.\n%s", body)
-
-	if warn := gitignoreWarning(c.dir); warn != "" {
-		fmt.Fprintln(os.Stderr, "hostshift: warning:", warn)
-	}
-	if len(res.Map.Sites) > 1 {
-		fmt.Fprintf(os.Stderr,
-			"hostshift: root url: is blog 1 (%s); reach a sibling blog with --url, e.g. `wp --url=%s`\n",
-			first.Canonical, res.Map.Sites[1].Canonical)
-	}
-	// An alias whose url: is one of a site's *alias* origins — its ddev or
-	// staging host — no longer resolves, because the database now holds the
-	// canonical hostname and get_site_by_path matches exactly. Warn rather than
-	// rewrite it: silently changing what `wp @ddev` means is worse than saying
-	// so, especially when some of these aliases are SSH into production.
-	stale := map[string]string{}
-	for _, s := range res.Map.Sites {
-		for _, a := range s.Aliases {
-			stale[a.Host] = s.Canonical.String()
-		}
-	}
-	for k, v := range out {
-		if !strings.HasPrefix(k, "@") {
-			continue
-		}
-		m, ok := v.(map[string]any)
-		if !ok {
-			continue
-		}
-		raw, _ := m["url"].(string)
-		if raw == "" {
-			continue
-		}
-		host := strings.TrimPrefix(strings.TrimPrefix(raw, "https://"), "http://")
-		host, _, _ = strings.Cut(host, "/")
-		if canon, bad := stale[strings.ToLower(host)]; bad {
-			fmt.Fprintf(os.Stderr,
-				"hostshift: warning: alias %s points at %s, which the database no longer holds; use %s\n",
-				k, host, canon)
-		}
-	}
-	return exitOK, nil
+	return code, nil
 }
 
 // cmdDiff is the corpus diff — PLAN §7's only test that validates against
@@ -541,6 +458,9 @@ func cmdDiff(args []string) (int, error) {
 	fs.Var(&headers, "canonical-header", "'Name: Value' added to the canonical fetch only; repeatable.\n"+
 		"Use it to supply what the TLS-terminating router would have added when\n"+
 		"--resolve points past it, e.g. 'X-Forwarded-Proto: https'.")
+	if describe(fs, args, "crawl a site two ways and compare, to verify a deployment") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -606,21 +526,4 @@ func cmdDiff(args []string) (int, error) {
 		return exitRuntime, nil
 	}
 	return exitOK, nil
-}
-
-// gitignoreWarning reports when wp-cli.local.yml would not be ignored by git.
-func gitignoreWarning(dir string) string {
-	if _, err := os.Stat(filepath.Join(dir, "wp-cli.yml")); err != nil {
-		return ""
-	}
-	b, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
-	if err != nil {
-		return "no .gitignore: add wp-cli.local.yml to it before generating one, or it will be committed"
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.Contains(strings.TrimSpace(line), "wp-cli.local.yml") {
-			return ""
-		}
-	}
-	return "wp-cli.local.yml is not in .gitignore; add it before generating one, or it will be committed"
 }

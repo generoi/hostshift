@@ -261,7 +261,7 @@ func TestOriginNormalisation(t *testing.T) {
 		{"http://example.com:80", "http://example.com"},
 		{"https://example.com:8080", "https://example.com:8080"},
 		{"https://example.com.", "https://example.com"}, // trailing root dot
-		{"https://example.com/a/b?c#d", "https://example.com"},
+		{"https://example.com/", "https://example.com"}, // people write it this way
 	}
 	for _, c := range cases {
 		o, err := Parse(c.in)
@@ -273,7 +273,14 @@ func TestOriginNormalisation(t *testing.T) {
 			t.Errorf("Parse(%q) = %q, want %q", c.in, o.String(), c.want)
 		}
 	}
-	for _, bad := range []string{"//example.com", "example.com", "ftp://example.com", "https://"} {
+	// A path is refused rather than dropped. hostshift maps origins, not URL
+	// prefixes, so https://a.example/blog cannot do what its author meant, and
+	// discarding the path silently let them believe it had.
+	for _, bad := range []string{
+		"//example.com", "example.com", "ftp://example.com", "https://",
+		"https://example.com/a/b?c#d", "https://example.com/blog",
+		"https://example.com?a=1", "https://user@example.com",
+	} {
 		if _, err := Parse(bad); err == nil {
 			t.Errorf("Parse(%q) should have failed", bad)
 		}

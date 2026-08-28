@@ -29,16 +29,33 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 	}
 	delim := []byte("--" + boundary)
 
-	// Delimiter positions: at the very start, or preceded by CRLF.
-	var starts []int
+	// Delimiter positions: at the very start, or preceded by a line ending.
+	//
+	// A bare LF counts. RFC 2046 requires CRLF and every browser sends it, but
+	// bodies assembled by hand — a PHP client building the parts as a string, a
+	// JS test fixture, curl reading a file that has been through a text editor
+	// — routinely use LF, and requiring CRLF meant those bodies matched no
+	// delimiter at all and passed through with their variant origins intact.
+	// The write then stores dev hostnames in the database, which is what §5.1's
+	// request direction exists to prevent (tests 30 and 31).
+	//
+	// The leading line ending is recorded per delimiter rather than assumed for
+	// the whole body, because it is what the previous part's content has to
+	// stop short of, and a hand-built body can mix the two.
+	var starts []delimiter
 	for i := 0; ; {
 		j := bytes.Index(body[i:], delim)
 		if j < 0 {
 			break
 		}
 		at := i + j
-		if at == 0 || (at >= 2 && body[at-2] == '\r' && body[at-1] == '\n') {
-			starts = append(starts, at)
+		switch {
+		case at == 0:
+			starts = append(starts, delimiter{at: at})
+		case at >= 2 && body[at-2] == '\r' && body[at-1] == '\n':
+			starts = append(starts, delimiter{at: at, eol: 2})
+		case at >= 1 && body[at-1] == '\n':
+			starts = append(starts, delimiter{at: at, eol: 1})
 		}
 		i = at + len(delim)
 	}
@@ -49,24 +66,25 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 	var out []byte
 	last := 0
 	for k := 0; k+1 < len(starts); k++ {
-		// Part content runs from just after this delimiter's trailing CRLF to
-		// just before the next delimiter's leading CRLF.
-		p := starts[k] + len(delim)
-		if p+1 >= len(body) || body[p] != '\r' || body[p+1] != '\n' {
+		// Part content runs from just after this delimiter's trailing line
+		// ending to just before the next delimiter's leading one.
+		p := starts[k].at + len(delim)
+		n := eolAt(body, p)
+		if n == 0 {
 			continue // closing delimiter ("--BOUNDARY--") or malformed
 		}
-		p += 2
-		end := starts[k+1] - 2 // strip the CRLF that belongs to the next delimiter
+		p += n
+		end := starts[k+1].at - starts[k+1].eol
 		if end < p {
 			continue
 		}
 
-		hdrEnd := bytes.Index(body[p:end], []byte("\r\n\r\n"))
+		hdrEnd, sep := headerEnd(body[p:end])
 		if hdrEnd < 0 {
 			continue
 		}
 		headers := body[p : p+hdrEnd]
-		bodyStart := p + hdrEnd + 4
+		bodyStart := p + hdrEnd + sep
 		if !rewritablePart(headers) {
 			continue
 		}
@@ -89,12 +107,47 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 	return append(out, body[last:]...)
 }
 
+// delimiter is one boundary occurrence and the length of the line ending
+// immediately before it — 0 at the very start of the body.
+type delimiter struct{ at, eol int }
+
+// eolAt returns the length of the line ending at i: 2 for CRLF, 1 for a bare
+// LF, 0 for neither.
+func eolAt(b []byte, i int) int {
+	if i+1 < len(b) && b[i] == '\r' && b[i+1] == '\n' {
+		return 2
+	}
+	if i < len(b) && b[i] == '\n' {
+		return 1
+	}
+	return 0
+}
+
+// headerEnd finds the blank line separating a part's headers from its body,
+// returning its offset and the length of the separator. Whichever spelling
+// comes first wins, so a body that mixes them still splits where the reader on
+// the other end will split it.
+func headerEnd(b []byte) (int, int) {
+	crlf := bytes.Index(b, []byte("\r\n\r\n"))
+	lf := bytes.Index(b, []byte("\n\n"))
+	switch {
+	case crlf >= 0 && (lf < 0 || crlf <= lf):
+		return crlf, 4
+	case lf >= 0:
+		return lf, 2
+	}
+	return -1, 0
+}
+
 // rewritablePart reports whether a part's body may be rewritten: only parts
 // whose Content-Disposition carries no filename= and whose type is text (or
 // absent, which is the norm for a plain form field).
 func rewritablePart(headers []byte) bool {
 	var disposition, ctype string
-	for _, line := range strings.Split(string(headers), "\r\n") {
+	// Split on LF and drop a trailing CR, so a header block written with either
+	// line ending parses the same way.
+	for _, line := range strings.Split(string(headers), "\n") {
+		line = strings.TrimSuffix(line, "\r")
 		k, v, ok := strings.Cut(line, ":")
 		if !ok {
 			continue

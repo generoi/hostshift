@@ -19,8 +19,14 @@ build:
 	$(GO) build -ldflags '$(LDFLAGS)' -o hostshift ./cmd/hostshift
 
 .PHONY: test
-test:
+test: test-addon
 	$(GO) test ./...
+
+# The add-on command is shell, and it is where the opinions live. No Docker and
+# no DDEV needed — it wants `hostshift` on PATH, git, and a .ddev/ directory.
+.PHONY: test-addon
+test-addon:
+	GO=$(GO) bash test/addon-command.sh
 
 # The invariant that guards everything else (PLAN §5.2). If this goes red,
 # nothing downstream of it is trustworthy.

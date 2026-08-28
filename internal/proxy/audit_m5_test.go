@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -240,4 +241,82 @@ func TestCompressIsANoOpUnderAnIdentityMap(t *testing.T) {
 	if ce := res.Header.Get("Content-Encoding"); ce != "" {
 		t.Errorf("identity map + --compress set Content-Encoding %q", ce)
 	}
+}
+
+// TestProgressiveResponseIsNotHeld guards the property that decided how the
+// flush storm was fixed.
+//
+// Every attempt that batched the *read* side held a progressively flushed
+// response — wp-admin's update and import screens, which emit a few hundred
+// bytes over a long operation — because filling a buffer means one more Read
+// than there is data, which blocks. The coalescer defers the *flush* instead,
+// which holds nothing.
+//
+// The bound is asserted, not just the arrival. An earlier version of this test
+// allowed five seconds, which would have passed at a fifty-millisecond
+// coalescing latency and stopped guarding what its own comment claimed.
+//
+// The chunk is a kilobyte because §4.4's carry-over window sets a floor that has
+// nothing to do with flushing: the sweep holds back MaxMatchLen bytes so no
+// match can straddle a boundary, so anything smaller is buffered whatever the
+// layers above it do.
+func TestProgressiveResponseIsNotHeld(t *testing.T) {
+	// Far above FlushLatency and far below anything a person would call a
+	// hang — this fails on "held until the operation ends", not on a slow box.
+	const bound = 500 * time.Millisecond
+	if FlushLatency > bound/100 {
+		t.Fatalf("FlushLatency %v has grown past what this test can distinguish", FlushLatency)
+	}
+
+	step := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(step) }) }
+	defer release() // never leave the upstream handler parked
+
+	first := "<p>" + strings.Repeat("step one ", 120) + "</p>\n"
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		io.WriteString(w, first)
+		w.(http.Flusher).Flush()
+		<-step // hold the connection open, as a long operation would
+		io.WriteString(w, "<p>step two</p>\n")
+	})
+
+	req, err := http.NewRequest("GET", h.front.URL+"/wp-admin/update-core.php", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = variantHost
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	type chunk struct {
+		s  string
+		at time.Duration
+	}
+	got := make(chan chunk, 1)
+	start := time.Now()
+	go func() {
+		buf := make([]byte, 32*1024)
+		n, _ := res.Body.Read(buf)
+		got <- chunk{string(buf[:n]), time.Since(start)}
+	}()
+
+	select {
+	case c := <-got:
+		if !strings.Contains(c.s, "step one") {
+			t.Errorf("first chunk was %q, want the first flush", c.s)
+		}
+		if c.at > bound {
+			t.Errorf("the first flush took %v to reach the client, bound %v", c.at, bound)
+		}
+	case <-time.After(bound):
+		t.Errorf("no flush reached the client within %v: a progressive response is being held", bound)
+	}
+
+	release()
+	io.Copy(io.Discard, res.Body)
 }
