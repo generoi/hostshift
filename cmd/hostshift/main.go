@@ -304,8 +304,13 @@ func cmdMap(args []string) (int, error) {
 		fmt.Fprintf(os.Stderr,
 			"\nhostshift: add these to .ddev/additional_hostnames as well, or mkcert\n"+
 				"issues no certificate for them and the browser gets a TLS interstitial:\n")
+		// The project's own TLD, not a hardcoded one. DDEV appends the TLD to
+		// each additional_hostnames entry, so under a project_tld override this
+		// printed the whole hostname and registered it twice-suffixed — and
+		// mkcert then issues no SAN for the variant, which is the TLS
+		// interstitial this message exists to prevent.
 		for _, v := range variants {
-			fmt.Fprintf(os.Stderr, "  - %s\n", strings.TrimSuffix(v, ".ddev.site"))
+			fmt.Fprintf(os.Stderr, "  - %s\n", strings.TrimSuffix(v, "."+res.ProjectTLD))
 		}
 		return exitOK, nil
 	}
@@ -368,7 +373,65 @@ func cmdCheck(args []string) (int, error) {
 	if warn := gitignoreWarning(c.dir); warn != "" {
 		fmt.Fprintln(os.Stderr, "hostshift: warning:", warn)
 	}
+
+	if _, webHosts := res.DDEVEnv(); len(webHosts) == 0 && len(res.DDEVHosts) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: warning: every hostname this DDEV project registers is a variant, so\n"+
+				"  HOSTSHIFT_WEB_HOSTS is empty and web gets no VIRTUAL_HOST — mailpit,\n"+
+				"  `ddev launch` and the canonical site stop routing. Give the project a\n"+
+				"  hostname of its own in .ddev/config.yaml that the slug does not claim.\n")
+	}
+
+	for _, w := range uploadsRedirectWarnings(c.dir) {
+		fmt.Fprintln(os.Stderr, "hostshift: warning:", w)
+	}
 	return exitOK, nil
+}
+
+// uploadsRedirectWarnings finds the fleet's uploads-redirect loop.
+//
+// 55 of 63 DDEV repos ship a snippet that 302s a missing /app/uploads/ file to
+// production, and it is written `rewrite ^ https://host$request_uri redirect`.
+// nginx appends the query string *again* unless the replacement ends in "?", so
+// the Location comes back one query longer than the request that produced it —
+// the self-redirect guard never matches, and each hop appends another copy
+// until the browser gives up with 414 URI Too Long. Measured live on acmecorp.
+//
+// hostshift deliberately does not absorb this. Making the guard ignore the
+// query would carry a workaround for a one-character bug in the fleet's own
+// nginx config, and would silently pass through every redirect that changes
+// only the query on the same path. The fix belongs in the repo; this says so,
+// by name, with the edit to make.
+func uploadsRedirectWarnings(dir string) []string {
+	var out []string
+	matches, _ := filepath.Glob(filepath.Join(dir, ".ddev", "nginx*", "*.conf"))
+	more, _ := filepath.Glob(filepath.Join(dir, ".ddev", "nginx*", "*", "*.conf"))
+	for _, f := range append(matches, more...) {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			t := strings.TrimSpace(line)
+			if !strings.HasPrefix(t, "rewrite ") || !strings.Contains(t, "$request_uri") {
+				continue
+			}
+			// "$request_uri?" is the fixed form: the trailing "?" stops nginx
+			// re-appending the query.
+			if strings.Contains(t, "$request_uri?") {
+				continue
+			}
+			rel, err := filepath.Rel(dir, f)
+			if err != nil {
+				rel = f
+			}
+			out = append(out, fmt.Sprintf(
+				"%s redirects with $request_uri and no trailing \"?\", so nginx appends the\n"+
+					"  query a second time and each hop grows the URL until the browser hits 414.\n"+
+					"  Change it to end in \"$request_uri?\":\n    %s", rel, t))
+		}
+	}
+	return out
 }
 
 // cmdWPCLI prints wp-cli.local.yml.

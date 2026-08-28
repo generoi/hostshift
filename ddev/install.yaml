@@ -32,10 +32,14 @@ post_install_actions:
     echo "   name and additional_hostnames are enough on their own. For"
     echo "   production-canonical, write hostshift.yaml — see the README."
     echo
-    echo "2. Set the variant hostnames, in .ddev/.env:"
+    echo "2. Set the variant hostnames, in .ddev/.env — all three, since"
+    echo "   HOSTSHIFT_WEB_HOSTS has no default and an unset one blanks web's"
+    echo "   VIRTUAL_HOST, which stops mailpit and 'ddev launch' routing:"
     echo "       HOSTSHIFT_SLUG=wt-a"
     echo "       HOSTSHIFT_VARIANTS=wt-a--<project>.ddev.site,..."
-    echo "   and add the same names to additional_hostnames in .ddev/config.yaml,"
+    echo "       HOSTSHIFT_WEB_HOSTS=<project>.ddev.site,..."
+    echo "   'hostshift map --slug wt-a --env' prints all three, ready to paste."
+    echo "   Add the variant names to additional_hostnames in .ddev/config.yaml,"
     echo "   or the mkcert certificate carries no SAN for them and the browser"
     echo "   gets a TLS interstitial instead of a site."
     echo
@@ -51,6 +55,8 @@ post_install_actions:
     echo "4. Edit .ddev/docker-compose.hostshift-loopback.yaml to list this"
     echo "   site's production hostnames, or WordPress's internal requests"
     echo "   (wp-cron, Site Health) leave the machine for live production."
+    echo "   That file carries no #ddev-generated marker, so your edit survives"
+    echo "   the next 'ddev add-on get'."
     echo
 
 removal_actions:

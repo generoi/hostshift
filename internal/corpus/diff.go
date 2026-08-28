@@ -154,13 +154,30 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// differs between two fetches for a dozen innocent reasons (nonces,
 	// timestamps, ad slots), but a canonical origin reaching the browser is
 	// never innocent.
-	for _, o := range o.Map.Sites {
-		for _, c := range o.CanonicalSet() {
-			r.Leaks += strings.Count(string(variant), "//"+c.Host+"/")
-			r.Leaks += strings.Count(string(variant), `\/\/`+c.Host+`\/`)
+	//
+	// Counted by running the matcher, not by counting two spellings. Looking for
+	// "//host/" and "\/\/host\/" missed a homepage link (https://host"), a
+	// query-only URL (https://host?w=1) and every percent-encoded form — so the
+	// one test §7 calls "the only test that validates against reality" reported
+	// GREEN on the leak class the prefilter bug produced. The matcher is by
+	// definition exactly the set of origins the proxy claims to rewrite, which
+	// makes this assertion say what it means: anything it still finds in the
+	// variant body is one the proxy should have caught and did not.
+	r.Leaks = countLeaks(o.Map.Forward(), variant)
+	return r
+}
+
+// countLeaks reports how many canonical origins the matcher still finds in a
+// body that has already been through the proxy.
+func countLeaks(m *origin.Matcher, body []byte) int {
+	_, events := m.Rewrite(body, "leak-check", true)
+	n := 0
+	for _, e := range events {
+		if e.Action == origin.ActionRewrote {
+			n++
 		}
 	}
-	return r
+	return n
 }
 
 func fetch(ctx context.Context, o Options, base *url.URL, path string) ([]byte, error) {

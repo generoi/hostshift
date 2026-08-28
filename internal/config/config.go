@@ -65,6 +65,14 @@ type Resolved struct {
 	// which of the project's hostnames belong to `web` and which to hostshift.
 	DDEVHosts []string
 
+	// ProjectTLD is the DDEV project TLD, "ddev.site" unless overridden. Three
+	// of the 64 local fleet projects override it, and `map --env` has to strip
+	// the right suffix when it prints what to add to additional_hostnames —
+	// DDEV appends the TLD itself, so trimming ".ddev.site" from a
+	// ".ddev.local" host printed the whole hostname and registered
+	// "wt-a--fsi.ddev.local.ddev.local", which mkcert then issues no SAN for.
+	ProjectTLD string
+
 	// Uncovered lists hostnames DDEV registers for this project that the map
 	// does not mention. Requests for them reach hostshift and get a 421, so a
 	// developer wondering why one blog of nine is dead wants this named.
@@ -130,7 +138,8 @@ func Load(dir string, f Flags) (*Resolved, error) {
 	if err = err2; err != nil {
 		return nil, err
 	}
-	res := &Resolved{Map: m, Upstream: up, Source: source, DDEVHosts: ddevHostnames(ddev)}
+	res := &Resolved{Map: m, Upstream: up, Source: source,
+		DDEVHosts: ddevHostnames(ddev), ProjectTLD: projectTLD(ddev)}
 
 	// A hostshift.yaml *replaces* the DDEV layer rather than merging with it:
 	// an explicit map is a statement about which hosts this project serves, and
@@ -181,15 +190,20 @@ func (r *Resolved) DDEVEnv() (variants, webHosts []string) {
 	return variants, webHosts
 }
 
+// projectTLD is the project's DDEV TLD, defaulted the way DDEV defaults it.
+func projectTLD(d *ddevConfig) string {
+	if d == nil || d.ProjectTLD == "" {
+		return "ddev.site"
+	}
+	return d.ProjectTLD
+}
+
 // ddevHostnames is every hostname the project registers with DDEV.
 func ddevHostnames(d *ddevConfig) []string {
 	if d == nil {
 		return nil
 	}
-	tld := d.ProjectTLD
-	if tld == "" {
-		tld = "ddev.site"
-	}
+	tld := projectTLD(d)
 	hosts := []string{d.Name + "." + tld}
 	for _, h := range d.AdditionalHostnames {
 		hosts = append(hosts, h+"."+tld)
@@ -402,10 +416,7 @@ func loadDDEV(dir string) (*ddevConfig, string, error) {
 // ddev host itself, which is the right map for browsing a db:pull'd database
 // from a worktree.
 func sitesFromDDEV(d *ddevConfig, pattern, slug string) ([]origin.Site, error) {
-	tld := d.ProjectTLD
-	if tld == "" {
-		tld = "ddev.site"
-	}
+	tld := projectTLD(d)
 	hosts := []string{d.Name + "." + tld}
 	for _, h := range d.AdditionalHostnames {
 		hosts = append(hosts, h+"."+tld)

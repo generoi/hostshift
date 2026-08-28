@@ -29,4 +29,7 @@ EXPOSE 8080
 
 USER nonroot:nonroot
 ENTRYPOINT ["/hostshift"]
-CMD ["proxy", "--listen", "0.0.0.0:8080", "--upstream", "http://web:80"]
+# -C /project so the image's own default works. Without it a bare `docker run`
+# resolves the map from the container's working directory, finds no config and
+# exits 2 — the compose service overrides `command` and so never noticed.
+CMD ["proxy", "-C", "/project", "--listen", "0.0.0.0:8080", "--upstream", "http://web:80"]

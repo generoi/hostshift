@@ -204,7 +204,15 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	if s := structuredAttr(name); s != nil {
 		w.stats.Structured(string(s))
 	}
-	out, events := w.m.Rewrite(v, surface, w.stats.Explain())
+	// An attribute value is a value; a text node, a comment and the contents of
+	// a raw-text element are prose. The distinction is one byte wide — whether
+	// a trailing root dot at the end of the buffer is the host's root label or
+	// a full stop — and only the caller can make it. See Matcher.RewriteText.
+	rw := w.m.RewriteText
+	if surface == SurfaceHTMLAttr {
+		rw = w.m.Rewrite
+	}
+	out, events := rw(v, surface, w.stats.Explain())
 	w.stats.Record(surface, base, events)
 	if surface == SurfaceHTMLAttr {
 		out = w.decodeEntityLeak(base, out)
