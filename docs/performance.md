@@ -121,19 +121,37 @@ hashed for all 51 fixtures in `spike/corpus` and `spike/adv`, crossed with four
 chunk sizes (1, 7, 4096, 1 MiB) and four maps (rewriting, identity, a shorter
 variant, a map matching nothing). **All 816 SHA-256 hashes are unchanged.**
 
-### One thing that is load-bearing by accident
+### The measurement that was missing, and the conclusion it overturned
 
-`HTML.Read` returns **one token at a time**, roughly 50 bytes. Draining whole
-batches into the caller's buffer instead is an obvious-looking win — it cut the
-sweep's marginal cost from 1,714 allocations to about 60, and peak heap *fell* —
-and it measured **3.9% slower**.
+An earlier revision of this file said the one-token-per-`Read` shape was
+load-bearing for throughput and should not be changed, because batching the
+reads measured **3.9% slower**. That measurement was real and the conclusion was
+wrong, because every benchmark here measured the rewriter in isolation — where
+`io.Copy` hands it a 32 KiB buffer and there is no HTTP layer.
 
-The reason is the separator prefilter. Small chunks mostly contain no `//`,
-`\/`, `%2F` or `%2f`, so the automaton never runs on them; the prefilter is
-skipping most of the page. Feed the sweep 32 KB chunks and every chunk contains
-a separator somewhere, so the automaton scans all 508 KB —
-`leftmostFindAtNoStateImp` went from 25.4% to 33.6% of CPU. **Do not "fix" the
-one-token-per-Read shape.**
+Profiling a whole request found the tokenizer, matcher and sweep together at
+**1.4% of CPU** and raw write syscalls at **78.8%**. `httputil`'s
+`flushInterval()` returns -1 — flush after every `Read` — whenever
+`res.ContentLength` is -1, and it ignores `p.FlushInterval` in that branch, so it
+cannot be overridden. hostshift sets `ContentLength` to -1 on every rewritten
+response, because every rewrite changes the length. `HTML.Read` returned one
+token, about 50 bytes. A 508 KB page was ten thousand chunked writes, ten
+thousand flushes, ten thousand syscalls.
+
+Filling the caller's buffer instead: **13.55 ms → 4.38 ms per page, 3.1×.**
+
+`BenchmarkE2EPage` in `internal/proxy` exists so this cannot happen again. It is
+the only number that tracks what a browser waits for, and with it the arithmetic
+inverts:
+
+| | ms/page |
+|---|---|
+| end to end | 4.25 |
+| the rewriter alone | 4.05 |
+
+**The rewriter is now ~95% of a request**, where before the fix it was 1.4%. Every
+optimisation in this document was tuning a quarter of the problem; from here they
+are tuning nearly all of it.
 
 ### Measured and not taken
 
