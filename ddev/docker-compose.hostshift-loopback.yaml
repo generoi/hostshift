@@ -1,12 +1,16 @@
 # hostshift — container-scoped loopback containment (PLAN §4.4).
 #
-# Deliberately NOT marked #ddev-generated. This file has to be edited — the host
-# list below is the site's own production hostnames — and DDEV overwrites a file
-# carrying that marker on the next `ddev add-on get`. Which it did: the pilot
+# This file carries no generated-file marker, deliberately. It has to be edited —
+# the host list below is the site's own production hostnames — and DDEV
+# overwrites a marked file on the next `ddev add-on get`. Which it did: the pilot
 # project's edited list was reverted to www.example.com, loopback containment
 # silently disappeared, and wp-cron went back to POSTing the client's live site.
-# Without the marker DDEV installs this once and never touches it again, which is
-# what a file the operator owns needs.
+# Unmarked, DDEV installs this once and never touches it again, which is what a
+# file the operator owns needs.
+#
+# (The marker is not spelled out anywhere above, because DDEV greps for the
+# literal string and warns about "unexpected" ones — a comment explaining its
+# absence would trip that warning on every start.)
 #
 # WordPress makes internal HTTP requests to home_url() — wp-cron, Site Health,
 # some block-editor and REST paths. Under production-canonical, home_url() is

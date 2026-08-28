@@ -75,6 +75,10 @@ jobs:
       - name: build the CLI the bootstrap uses
         run: make build
 
+      # The bootstrap builds the container image itself, from this checkout —
+      # see the comment there. Nothing in this job pulls a published image, so
+      # the suite tests the code in the PR rather than the last release.
+
       - name: bootstrap a stock DDEV multisite and run the suite
         env:
           HOSTSHIFT_TEST_ROOT: ${{ runner.temp }}/hostshift-e2e
