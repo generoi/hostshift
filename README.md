@@ -38,9 +38,17 @@ pilot drove `hostshift proxy` directly.
 hostshift rewrite < in.html > out.html   the whole engine as a Unix filter
 hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --slug wt-a
 hostshift map     print the resolved host map
-hostshift check   validate the config; exit 2 if invalid
-hostshift wp-cli  print wp-cli.local.yml for this project
+hostshift hosts   print the hostnames a project declares, one per line
+hostshift check   validate the map; exit 2 if it is not usable
+hostshift diff    crawl a site two ways and compare
 ```
+
+**It scaffolds nothing.** No config files written, no slug guessed from a
+branch, no knowledge of any CMS. It *reads* a DDEV project's declared hostnames
+as one source for the map, because that costs no opinion — anyone running DDEV
+gets a map for free and anyone else loses nothing — but setting a project up is
+opinionated work and lives in the add-on, as `ddev hostshift`. One day that is
+its own repo.
 
 ### The map
 
@@ -133,13 +141,15 @@ Then, per project:
 
 1. **Declare the map** — `.ddev/config.yaml` alone is enough for a
    single-environment site; `hostshift.yaml` for production-canonical.
-2. **Set the variant hostnames** in `.ddev/.env` (`HOSTSHIFT_SLUG`,
-   `HOSTSHIFT_VARIANTS`) *and* in `additional_hostnames`, or mkcert issues no SAN
-   for them and the browser gets a TLS interstitial instead of a site. A
-   three-label variant host is not covered by the `*.ddev.site` wildcard, so it
-   needs registering regardless. `hostshift map --slug wt-a` prints the list.
-3. **`hostshift wp-cli > wp-cli.local.yml`** if the database holds production
-   hostnames — without it every `ddev wp` on a multisite fails to resolve a site.
+2. **`ddev hostshift init`** writes the variant hostnames into `.ddev/.env`
+   (`HOSTSHIFT_SLUG`, `HOSTSHIFT_VARIANTS`, `HOSTSHIFT_WEB_HOSTS`) and into
+   `additional_hostnames`, without which mkcert issues no SAN for them and the
+   browser gets a TLS interstitial instead of a site — a three-label variant
+   host is not covered by the `*.ddev.site` wildcard, so it needs registering
+   regardless of hostshift.
+3. **`ddev hostshift wp-cli > wp-cli.local.yml`** if the database holds
+   production hostnames — without it every `ddev wp` on a multisite fails to
+   resolve a site.
 4. **List this site's production hostnames** in
    `.ddev/docker-compose.hostshift-loopback.yaml`, or WordPress's internal
    requests (wp-cron, Site Health) leave the machine for live production.
