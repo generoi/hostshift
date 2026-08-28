@@ -111,6 +111,26 @@ func main() {
 	os.Exit(code)
 }
 
+// describe gives a subcommand's flag dump a first line saying what the
+// subcommand is for, and sends an explicitly requested help to stdout with exit
+// 0 rather than to stderr with exit 2. `hostshift check --help` printed nine
+// flags and not one word about what it checks.
+func describe(fs *flag.FlagSet, args []string, what string) (helped bool) {
+	fs.Usage = func() {
+		w := fs.Output()
+		fmt.Fprintf(w, "hostshift %s — %s\n\nusage: hostshift %s [flags]\n\n", fs.Name(), what, fs.Name())
+		fs.PrintDefaults()
+	}
+	for _, a := range args {
+		if a == "-h" || a == "--help" || a == "-help" {
+			fs.SetOutput(os.Stdout)
+			fs.Usage()
+			return true
+		}
+	}
+	return false
+}
+
 // repeatable collects a flag that may be given more than once.
 type repeatable []string
 
@@ -180,6 +200,9 @@ func cmdRewrite(args []string) (int, error) {
 	asJSON := fs.Bool("json", false, "emit counters as JSON on stderr")
 	quiet := fs.Bool("quiet", false, "suppress the counter report")
 	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
+	if describe(fs, args, "the whole engine as a Unix filter: bytes on stdin, rewritten bytes on stdout") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -245,6 +268,9 @@ func cmdProxy(args []string) (int, error) {
 	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
 	compress := fs.Bool("compress", false, "re-encode responses per the client's Accept-Encoding, for performance work")
 	maxBody := fs.Int64("max-body", proxy.DefaultMaxBody, "request-body buffering cap in bytes")
+	if describe(fs, args, "the same rewriting in front of an upstream") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -305,6 +331,9 @@ func cmdProxy(args []string) (int, error) {
 func cmdHosts(args []string) (int, error) {
 	fs := flag.NewFlagSet("hosts", flag.ContinueOnError)
 	dir := fs.String("C", ".", "project directory")
+	if describe(fs, args, "print the hostnames a project declares, one per line") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -336,6 +365,9 @@ func cmdMap(args []string) (int, error) {
 	var c common
 	c.register(fs)
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
+	if describe(fs, args, "print the resolved map, and where it came from") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -374,6 +406,9 @@ func cmdCheck(args []string) (int, error) {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	var c common
 	c.register(fs)
+	if describe(fs, args, "validate the map; exit 2 if it is not usable") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -423,6 +458,9 @@ func cmdDiff(args []string) (int, error) {
 	fs.Var(&headers, "canonical-header", "'Name: Value' added to the canonical fetch only; repeatable.\n"+
 		"Use it to supply what the TLS-terminating router would have added when\n"+
 		"--resolve points past it, e.g. 'X-Forwarded-Proto: https'.")
+	if describe(fs, args, "crawl a site two ways and compare, to verify a deployment") {
+		return exitOK, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
