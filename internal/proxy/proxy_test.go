@@ -766,3 +766,57 @@ func TestDryRunServesUnmodified(t *testing.T) {
 		t.Error("--dry-run counted no rewrites; it must still report what it would have done")
 	}
 }
+
+// TestSelfRedirectCarveOutIsOneHeader: the guard used to `return` early, which
+// jumped over every other Tier 1 header and the Set-Cookie Domain= drop. Test 28
+// enumerates the carve-out as *one* header — Location — not the whole response.
+func TestSelfRedirectCarveOutIsOneHeader(t *testing.T) {
+	const path = "/app/uploads/x.jpg"
+	h := newHarness(t, herrforsMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", canonical+r.URL.Path)
+		w.Header().Set("Link", "<"+canonical+"/wp-json/>; rel=\"x\"")
+		w.Header().Set("Content-Security-Policy", "default-src "+canonical)
+		w.Header().Add("Set-Cookie", "s=1; Domain=.www.herrfors.fi; Path=/")
+		w.WriteHeader(http.StatusFound)
+	})
+	res, _ := h.get(t, variantHost, path)
+
+	if got := res.Header.Get("Location"); got != canonical+path {
+		t.Errorf("Location is %q; the carve-out should pass it through", got)
+	}
+	for _, k := range []string{"Link", "Content-Security-Policy"} {
+		if v := res.Header.Get(k); strings.Contains(v, canonical) {
+			t.Errorf("%s still names the canonical host: %q", k, v)
+		}
+	}
+	if c := res.Header.Get("Set-Cookie"); strings.Contains(c, "Domain=") {
+		t.Errorf("the canonical cookie Domain survived: %q", c)
+	}
+}
+
+// TestSelfRedirectOnlyForSafeMethods: the carve-out's stated justification is
+// that it is "a read-only asset GET, not the write hazard §4.4 opens with" —
+// but there was no method test, so a POST answered with a self-redirect sent the
+// browser to live production on a write path.
+func TestSelfRedirectOnlyForSafeMethods(t *testing.T) {
+	const path = "/wp-admin/admin-post.php"
+	h := newHarness(t, herrforsMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", canonical+r.URL.Path)
+		w.WriteHeader(http.StatusFound)
+	})
+	res, _ := h.do(t, "POST", variantHost, path, "application/x-www-form-urlencoded", []byte("a=1"))
+	if got := res.Header.Get("Location"); strings.Contains(got, "herrfors.fi") {
+		t.Errorf("a POST self-redirect was passed through to production: %q", got)
+	}
+}
+
+// TestXForwardedHostIsNotForwarded: SetXForwarded fills it with the *variant*
+// host, so anything preferring it over Host puts the variant straight back
+// inside WordPress — undoing the request mapping.
+func TestXForwardedHostIsNotForwarded(t *testing.T) {
+	h := newHarness(t, herrforsMap(t), html("<p>x</p>"))
+	h.get(t, variantHost, "/")
+	if got := h.seen.Header.Get("X-Forwarded-Host"); got != "" {
+		t.Errorf("X-Forwarded-Host reached upstream as %q", got)
+	}
+}
