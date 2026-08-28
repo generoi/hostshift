@@ -25,9 +25,15 @@ const (
 	// resolves, so these are test 28 leaks the raw scan cannot see. A non-zero
 	// count is worth looking at: it means content is storing origins in a form
 	// §5.3's three encodings do not model.
-	SurfaceHTMLEntity  = "html-entity"
-	SurfaceHeader      = "header"
-	SurfaceJSONString  = "json-string"
+	SurfaceHTMLEntity = "html-entity"
+	SurfaceHeader     = "header"
+	SurfaceJSONString = "json-string"
+	// SurfaceJSONEscape is a JSON string whose origin was only visible after
+	// the string was unquoted — a \uXXXX-escaped IDN host, an HTML character
+	// reference inside content.rendered, or double-escaped JSON-in-JSON. Like
+	// html-entity, a non-zero count means content is storing origins in a form
+	// §5.3 does not model.
+	SurfaceJSONEscape  = "json-escape"
 	SurfaceRequestLine = "request-line"
 	SurfaceRequestBody = "request-body"
 )
@@ -219,7 +225,11 @@ func (s *Stats) WriteReport(w io.Writer) {
 			if reason == "" {
 				reason = "-"
 			}
-			fmt.Fprintf(w, "  %8d  %-14s %-8s %-22s %s\n", e.Offset, e.Surface, e.Action, reason, e.Text)
+			where := e.Surface
+			if e.Path != "" {
+				where += " " + e.Path
+			}
+			fmt.Fprintf(w, "  %8d  %-8s %-22s %-40s %s\n", e.Offset, e.Action, reason, where, e.Text)
 		}
 	}
 }

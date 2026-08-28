@@ -1452,9 +1452,78 @@ than delegated to the sweep. Test 28 runs over the corpus with an extractor that
 does not share code with the matcher: 51 documents, 10,271 URL-valued positions,
 zero canonical origins.
 
-**M4 — structured bodies.** JSON incl. HTML-in-JSON and JSON-LD; the JSON
-span-scanner (§5.7). Tests 4, 22, 30, 31. XML and standalone CSS/JS are **not**
-built — §5.2 Tiers 2 and 3.
+**M4 — structured bodies. Done 2026-08-27.** JSON responses and the `jsontext`
+span-scanner, with `application/json` and `application/*+json` added to the
+rewritable set — until M4 the REST API was passing canonical origins straight to
+the browser. Tests 4, 22 green; 30 and 31 green as far as the proxy can carry
+them (see below). XML and standalone CSS/JS are **not** built — §5.2 Tiers 2 and 3.
+
+`GOEXPERIMENT=jsonv2` is confirmed still required on Go 1.26.5 — a plain import
+of `encoding/json/jsontext` fails with "build constraints exclude all Go files".
+Requiring an environment variable to build a distributed binary is not a trade
+worth making, so `github.com/go-json-experiment/json/jsontext` is used, exactly
+as §5.7 anticipated. Swap the import when the standard library one lands.
+
+**HTML-in-JSON needs no HTML rewriter — but it does need an escape carve-out.**
+§5.2 says `content.rendered` "is a full HTML blob a URL-only rule skips" and that
+the value should be "decoded, rewritten, re-encoded and spliced back". That was
+written against an allowlist of URL-valued keys. With the anchored automaton
+running over the *raw, still-escaped* bytes of every string value, the origins
+inside `content.rendered` are found without any of it — they appear as
+`https:\/\/host\/…` and the JSON-escaped form is in the token set. Decoding and
+re-encoding every value would be strictly worse: re-encoding is
+re-serialisation, and §5.2's core property is that output is byte-identical
+everywhere a rewrite did not occur. The depth-2 recursion limit is unnecessary
+and is not built.
+
+The first draft of this paragraph went further and said such a value "must not"
+be decoded at all. That is wrong, and three real spellings show why — each one a
+dereferenceable production origin reaching the browser, i.e. test 28:
+
+- **`\uXXXX`.** PHP's `json_encode` escapes every non-ASCII rune unless
+  `JSON_UNESCAPED_UNICODE` is passed, and `wp_json_encode` does not pass it. So
+  an IDN client site — §5.5 calls those real for `.fi` — serves
+  `"https:\/\/hämeen.fi\/x"`, which no raw-byte scan can see. The page
+  rewrites and the REST API does not, so Gutenberg and every JS fetch get
+  production URLs.
+- **HTML character references** inside `content.rendered`, the class §5.3 closes
+  for attribute values. The identical post body is clean as `text/html` and
+  leaks as `application/json`.
+- **Double-escaped JSON-in-JSON**, `"https:\\/\\/host"`, from a block attribute
+  holding JSON that is itself serialised into JSON.
+
+So a string is unquoted, entity-decoded and re-matched, and re-encoded **only**
+when that finds an origin the raw pass did not. A document that is already
+correct never takes the path, byte-identity under an identity map is untouched,
+and it is counted under its own surface, `json-escape`, because a non-zero count
+means content is storing origins in a form §5.3 does not model.
+
+**The JSON path gets §4.4's straggler sweep too.** M4 added a whole response
+surface without one, so every miss on it was silent — the same post body clean
+as `text/html` and carrying production as `application/json`, with no WARN and
+no non-zero counter. JSON is buffered anyway, so the sweep needs none of the
+streaming machinery: no carry-over window, no left-context byte, no offset map.
+
+**A body that does not parse is passed through, and *reported*.** Leaving it
+alone is right — half-rewritten JSON is worse than unrewritten JSON — but the
+first implementation folded each value's events into the counters as it scanned,
+so a decoder error part way through returned the original bytes while the
+counters kept rewrites that had been undone. A duplicate object member is legal
+JSON that `jsontext` rejects by default; it printed two production origins under
+`"rewrites": {"json-string": 1}`, `"skips": {}`, exit 0. Events are held back
+until the document parses, and the pass-through logs and counts a
+`encoding-not-decodable` skip — the same treatment the size cap already got.
+
+What the span scanner *does* earn is key/value discrimination — an origin in a
+JSON key is not a link and is left alone — and an RFC 6901 path in `--explain`,
+which is the difference between "something in this 200-URL REST response leaked"
+and `/_links/self/0/href`.
+
+**Tests 30 and 31 are split.** The proxy half is asserted now, against an
+upstream that stores exactly the bytes it receives: a Gutenberg save carrying
+variant URLs is stored canonical, and reading it back returns the variant. The
+database half — asserting against real `wp_posts` rows — needs a live WordPress
+and lands with the M6 pilot.
 
 **M5 — transport.** Compression, streaming bounds, error surfacing, `Vary`,
 `Range`. Tests 9, 13, 14, 26.
