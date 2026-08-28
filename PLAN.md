@@ -345,10 +345,27 @@ is never rewritten at all.**
 | Application changes | none | shared `db:pull` task + multisite handling | **none committed** — one generated, already-gitignored file |
 
 `robo db:pull` today runs a multisite `--precise` search-replace across a 548 MB
-dump. Under this design that step disappears — not merely for worktrees, but for
-every pull, for everyone. That is a materially larger prize than revision 1
-claimed, and it removes the one risk that made normalisation uncertain: nothing
-ever rewrites serialized data, so nothing can corrupt it.
+dump. Production-canonical would let that step disappear — not merely for
+worktrees, but for every pull, for everyone — and it removes the one risk that
+made normalisation uncertain: nothing ever rewrites serialized data, so nothing
+can corrupt it.
+
+**That is the ceiling, not the plan.** Decided 2026-08-28: `db:pull` keeps its
+search-replace, the main DDEV site keeps a database written for
+`<project>.ddev.site`, and hostshift's job is **worktrees** — serving that same
+database at a second hostname so an agent or a branch can be previewed without a
+database of its own. Canonical is then the ddev host, not the production one,
+and the map is `<project>.ddev.site → wt-a--<project>.ddev.site`.
+
+Everything below still holds, because the engine does not care which hostname is
+canonical: it maps origin to origin. What changes is which risks are live.
+Production-canonical is what makes §4.4's loopback containment load-bearing —
+under ddev-canonical `home_url()` is already a local hostname, so WordPress
+talking to itself never leaves the box — and it is what makes a leak reach the
+client's live site rather than a neighbouring dev host. Those hazards do not
+disappear; they become opt-in, per repo, via a `hostshift.yaml` that declares
+production hostnames. herrfors and pellervo are piloted that way and stay that
+way.
 
 The map is unchanged in structure — the same index-aligned bijection (§4.2) —
 only paired `@production ↔ variant` instead of `@ddev ↔ variant`.
@@ -1725,10 +1742,15 @@ document `go/main.go`, `go/rewriter/main.go` or `go/svg/main.go`.
   browser (they *resolve* — M0 measured 95.2% of the *distinct* upload URLs
   referenced by herrfors' content as absent locally, §4.5), and an admin action
   can write to production.
-  **Stage it:** keep `db:pull`'s search-replace as the default through M6; make
-  production-canonical opt-in per repo via the presence of `hostshift.yaml`; flip
-  the fleet default only after the corpus diff is green on herrfors *and* on a
-  five-blog site (pellervo). The prize is the payoff, not the entry ticket
+  **Resolved 2026-08-28: the flip is not happening, at least not now.**
+  `db:pull` keeps its search-replace and the main site keeps a `.ddev.site`
+  database. hostshift is deployed for **worktrees**, where the whole point is
+  that there is no second database to rewrite — so nothing about a normal pull
+  changes and nobody acquires a runtime dependency they did not ask for.
+  Production-canonical remains supported and piloted (herrfors, pellervo,
+  both green), opt-in per repo via `hostshift.yaml`. This retires the risk
+  rather than staging it: the fleet-wide coupling only ever existed because of
+  the flip
 - A documented **fallback to search-replace per site** must remain supported
 - Performance: immaterial for dev, and the Aho–Corasick prefilter means most
   responses are never parsed at all
