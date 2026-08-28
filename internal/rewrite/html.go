@@ -27,13 +27,24 @@ type HTML struct {
 	z       *html.Tokenizer
 	m       *origin.Matcher
 	stats   *Stats
+	log     *slog.Logger
 	dryRun  bool
 	src     io.Closer
+	raw     io.Reader // the original source, for the passthrough fallback
 	rawText string
 	pend    bytes.Buffer
 	done    bool
 	inOff   int // cumulative input-stream offset, for --explain
+	maxPend int // high-water mark of the token buffer, for test 13
+	tail    io.Reader
 }
+
+// DefaultMaxToken caps the tokenizer's buffer, which bounds memory by the size
+// of the largest single token rather than by the response size (test 13).
+//
+// It has to be generous: a raw-text element arrives as one token, and a 700 KB
+// inline script is normal. Exceeding it is not fatal — see Read.
+const DefaultMaxToken = 4 << 20
 
 // Options configures a rewriter.
 type Options struct {
@@ -45,6 +56,8 @@ type Options struct {
 	NoSweep bool
 	Stats   *Stats
 	Log     *slog.Logger
+	// MaxToken caps the tokenizer's buffer. Zero means DefaultMaxToken.
+	MaxToken int
 }
 
 // NewResponseBody is the full response-side pipeline: the tokenizer-based
@@ -68,14 +81,30 @@ func NewHTML(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) *HTML {
 	if st == nil {
 		st = NewStats(false)
 	}
+	log := opt.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	maxTok := opt.MaxToken
+	if maxTok == 0 {
+		maxTok = DefaultMaxToken
+	}
+	z := html.NewTokenizer(r)
+	z.SetMaxBuf(maxTok)
 	return &HTML{
-		z:      html.NewTokenizer(r),
+		z:      z,
 		m:      m,
 		stats:  st,
+		log:    log,
 		dryRun: opt.DryRun,
 		src:    src,
+		raw:    r,
 	}
 }
+
+// MaxBuffered is the high-water mark of the token buffer, in bytes. Test 13
+// asserts it is bounded by the largest token rather than by the response size.
+func (w *HTML) MaxBuffered() int { return w.maxPend }
 
 // rawTextElement reports elements whose content the tokenizer returns as a
 // single text token rather than parsing.
@@ -141,12 +170,41 @@ func (w *HTML) rewriteTag(raw []byte, tagOff int) []byte {
 }
 
 func (w *HTML) Read(p []byte) (int, error) {
+	if w.tail != nil {
+		return w.tail.Read(p)
+	}
 	for w.pend.Len() == 0 && !w.done {
 		tt := w.z.Next()
 		if tt == html.ErrorToken {
 			// Buffered() is whatever the tokenizer had read but not tokenised.
 			// Emitting it is what makes truncated input round-trip byte-exactly.
-			w.pend.Write(w.z.Buffered())
+			buffered := w.z.Buffered()
+
+			if err := w.z.Err(); err != nil && err != io.EOF {
+				// A single token larger than the cap. Headers are already sent
+				// by now, so this cannot become an error response (PLAN §5.7) —
+				// and aborting the connection would be a worse answer than a
+				// page with one unrewritten region.
+				//
+				// Instead the remainder streams through untouched. §4.4's
+				// straggler sweep sits downstream of this reader, so origins in
+				// the passthrough tail are still caught and reported rather than
+				// leaking.
+				w.log.Warn("token exceeds the buffer cap; the remainder of this response is passed through unparsed",
+					"err", err, "offset", w.inOff)
+				w.stats.Record(SurfaceHTMLAttr, w.inOff, []origin.Event{{
+					Surface: SurfaceHTMLAttr, Action: origin.ActionSkipped,
+					Reason: origin.ReasonSizeCap,
+				}})
+				w.tail = io.MultiReader(bytes.NewReader(append([]byte(nil), buffered...)), w.raw)
+				w.done = true
+				if w.pend.Len() > 0 {
+					break
+				}
+				return w.tail.Read(p)
+			}
+
+			w.pend.Write(buffered)
 			w.done = true
 			break
 		}
@@ -202,6 +260,9 @@ func (w *HTML) Read(p []byte) (int, error) {
 		default:
 			w.pend.Write(raw)
 		}
+	}
+	if n := w.pend.Len(); n > w.maxPend {
+		w.maxPend = n
 	}
 	if w.pend.Len() == 0 && w.done {
 		return 0, io.EOF

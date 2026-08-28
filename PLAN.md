@@ -1391,8 +1391,25 @@ variant URLs is stored canonical, and reading it back returns the variant. The
 database half — asserting against real `wp_posts` rows — needs a live WordPress
 and lands with the M6 pilot.
 
-**M5 — transport.** Compression, streaming bounds, error surfacing, `Vary`,
-`Range`. Tests 9, 13, 14, 26.
+**M5 — transport. Done 2026-08-27.** Compression, streaming bounds, error
+surfacing, `Vary`, `Range`. Tests 9, 13, 14, 26 green.
+
+Test 13 measured: a 5 MB response streams with a **42-byte** peak token buffer.
+The bound is asserted directly rather than through heap sampling, which GC timing
+makes unreliable.
+
+§7's note that `ErrBufferExceeded` "cannot become an error response once headers
+are sent" is resolved by **not making it an error at all**. A token larger than
+the cap makes the remainder of that response stream through unparsed, logged and
+counted. Aborting the connection would be a worse answer than a page with one
+unparsed region — and because §4.4's sweep sits *downstream* of the tokenizer,
+origins in the passthrough tail are still caught, so nothing leaks. That is a
+property worth stating explicitly: the sweep is what makes a bounded parser safe.
+
+One gzip detail worth not rediscovering: `gzip.NewReader` consumes the header
+before it can fail, so a body labelled gzip that is not gzip loses however many
+bytes the header check read — the whole body, when it is short. The head is
+captured and put back.
 
 **M6 — packaging + pilot.** Binary, image, thin add-on, corpus diff against
 herrfors, and test 28 over the full crawl. Also tests 29a, 29b and 29d, moved

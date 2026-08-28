@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -765,4 +766,10 @@ func TestDryRunServesUnmodified(t *testing.T) {
 	if h.stats.Total() == 0 {
 		t.Error("--dry-run counted no rewrites; it must still report what it would have done")
 	}
+}
+
+// discardLogger silences the deliberately loud diagnostics in tests that assert
+// on behaviour rather than on the log.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
