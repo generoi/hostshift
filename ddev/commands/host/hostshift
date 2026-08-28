@@ -105,6 +105,9 @@ fi
 # derivable from any DDEV config. Passing --from would override it.
 map_args=()
 if [ ! -f hostshift.yaml ] && [ -n "$parent_hosts" ]; then
+  # Said out loud, because "map from --from/--to" does not tell anyone which
+  # checkout those origins came from, and that is the one thing worth knowing.
+  echo "hostshift: canonical hostnames from $parent, whose database this shares" >&2
   while IFS= read -r h; do
     [ -n "$h" ] && map_args+=(--from "https://$h")
   done <<<"$parent_hosts"
