@@ -11,11 +11,14 @@ for. Nothing in the database is ever rewritten.
 [`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
 for completed milestones live in [`docs/`](docs/).
 
-**Status: M6, packaging done.** The engine, the host map, both directions, HTML,
-JSON, transport, the binaries, the image, the DDEV add-on and the corpus diff are
-in place. What remains is the live pilot — a DDEV project running against an
-unrewritten production database — which is also what tests 29a, 29b and 29d wait
-on. `PLAN.md` §8 has the detail.
+**Status: M6 done.** Piloted against `acmecorp` running on a genuinely
+unrewritten production database — `wp_blogs.domain` holding `www.acmecorp.fi` —
+and against `bravoinc`'s five blogs. Both corpus diffs green: 0 leaks, 0
+stragglers, every line count identical. `docs/m6-pilot.md` has the numbers and
+the four `PLAN.md` claims the pilot corrected.
+
+Not yet done: installing the DDEV add-on into a project and starting it — the
+pilot drove `hostshift proxy` directly.
 
 ## Using it
 
