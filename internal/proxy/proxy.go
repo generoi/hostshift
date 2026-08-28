@@ -180,6 +180,11 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// its own transparent gzip.
 	r.Out.Header.Set("Accept-Encoding", "identity")
 
+	// No ranges upstream. A 206 skips every rewriter, so forwarding Range let
+	// any client turn the engine off and read the document whole with its
+	// production origins intact (test 28).
+	stripRange(r.Out.Header)
+
 	// The query string, byte for byte. This is not optional:
 	// wp-login.php?redirect_to=… is validated by wp_validate_redirect() against
 	// home_url()'s host, so a variant origin is silently discarded and login
@@ -316,11 +321,39 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 }
 
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
+	// Vary first, before anything can return early.
+	//
+	// It used to sit after the content-type switch, whose default arm returns
+	// nil — so the responses that most need it never got it. A 302 whose
+	// Location had just been rewritten into variant space went out with no
+	// Vary at all, and a shared cache keyed on path alone (nginx
+	// proxy_cache_key $uri, a Varnish default with no host in the key — the
+	// deployment §5.5 is written for) then hands variant A's redirect to a
+	// browser sitting on variant B, which is bounced out of its own worktree.
+	// Headers are rewritten for every response, so every response varies.
+	if !p.DryRun {
+		addVary(resp.Header, "Host")
+	}
+
 	if isPartial(resp) {
 		p.log().Info("range response passed through unrewritten", "status", resp.StatusCode)
 		return nil
 	}
-	if !p.decodeBody(resp) {
+	// Decoding is a modification, so --dry-run must not do it. §5.8 defines
+	// that mode as safe to point at a live canonical checkout, and its whole
+	// value is that it cannot perturb what it measures — gunzipping the body
+	// and stripping Content-Encoding is exactly the v0.2 mistake compressBody's
+	// own comment says it exists to avoid.
+	//
+	// A compressed body therefore cannot be measured in that mode. Saying so is
+	// the point: a silent zero reads as "nothing to rewrite here".
+	if p.DryRun {
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(strings.TrimSpace(enc), "identity") {
+			p.log().Info("--dry-run leaves a compressed body untouched, so it is not measured", "encoding", enc)
+			p.skipEncoding(enc)
+			return nil
+		}
+	} else if !p.decodeBody(resp) {
 		return nil // an encoding hostshift cannot decode: byte-identical passthrough
 	}
 
@@ -403,10 +436,6 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		resp.Header.Del("Last-Modified")
 		resp.Header.Del("Accept-Ranges")
 	}
-
-	// The body varies with the request Host, so a shared cache downstream must
-	// not serve one variant's body to another (PLAN §5.5).
-	addVary(resp.Header, "Host")
 
 	if p.Compress && st != nil && !p.DryRun {
 		p.compressBody(resp, st.accept)

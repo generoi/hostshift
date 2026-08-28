@@ -295,11 +295,32 @@ func (w *HTML) Read(p []byte) (int, error) {
 					Surface: SurfaceHTMLAttr, Action: origin.ActionSkipped,
 					Reason: origin.ReasonSizeCap,
 				}})
-				w.tail = io.MultiReader(bytes.NewReader(append([]byte(nil), w.z.Buffered()...)), w.raw)
+				// Raw() and Buffered(), for the same reason the EOF path below
+				// gives — and here it is not an edge case but the main one.
+				//
+				// x/net/html's readByte advances raw.end *before* it tests
+				// maxBuf, so at the error the oversized token sits in Raw() and
+				// Buffered() holds only read-ahead. A text token is returned as
+				// a partial TextToken first, so text, <script> and comments
+				// survived; a *tag* token errors from inside readStartTag with
+				// the bytes still in Raw(), so emitting Buffered() alone deleted
+				// exactly MaxToken bytes. At the shipped 4 MiB cap that is a
+				// 5 MB page arriving 4 MiB short, status 200, no Content-Length
+				// to check it against, the opening <img src="data:image/png;
+				// base64, gone and the rest of its value rendered as visible
+				// text. An inlined LCP image or a multi-MB Elementor
+				// data-settings attribute is all it takes, and it broke test 24.
+				head := append([]byte(nil), w.z.Raw()...)
+				head = append(head, w.z.Buffered()...)
+				w.tail = io.MultiReader(bytes.NewReader(head), w.raw)
+
+				// The tail bypasses write(), so one last mark pins the mapping
+				// for everything after it: from here the two streams run 1:1
+				// again, and without this the sweep reports stragglers in the
+				// passthrough at output offsets — 4 MiB adrift in the case
+				// above.
+				w.marks = append(w.marks, mark{w.outOff, w.inOff})
 				w.done = true
-				if w.pend.Len() > 0 {
-					break
-				}
 				return w.tail.Read(p)
 			}
 
@@ -330,15 +351,6 @@ func (w *HTML) Read(p []byte) (int, error) {
 				w.err = err
 			}
 			w.done = true
-
-			// io.EOF is the ordinary end of a body. Anything else is a real
-			// failure — an upstream that closed early, a read error — and
-			// converting it to io.EOF turns a *detectable* truncation into an
-			// undetectable one, because the rewritten response is chunked and
-			// has no Content-Length for the client to check against.
-			if err := w.z.Err(); err != nil && err != io.EOF {
-				w.err = err
-			}
 			break
 		}
 
