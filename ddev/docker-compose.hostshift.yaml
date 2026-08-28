@@ -1,10 +1,12 @@
 #ddev-generated
 # hostshift — the whole DDEV add-on.
 #
-# One compose service. No lib.sh, no hooks, no guard, no generated files beyond
-# wp-cli.local.yml, which is already gitignored fleet-wide. PLAN §3's constraint
-# is near-zero per-repo footprint, and 42 repos carrying 14 different pinned
-# SHAs of .claude/agency is what happens when that is not held to.
+# One compose service, and one host command beside it. No lib.sh, no hooks, no
+# guard; nothing runs during a request. What the command writes is two files
+# DDEV's own .ddev/.gitignore already covers, plus wp-cli.local.yml, which is
+# gitignored fleet-wide. PLAN §3's constraint is near-zero per-repo footprint,
+# and 42 repos carrying 14 different pinned SHAs of .claude/agency is what
+# happens when that is not held to.
 #
 # Routing is DDEV's router's job and it already does it. The router reaches a
 # service through VIRTUAL_HOST / HTTP_EXPOSE / HTTPS_EXPOSE and the com.ddev.*
