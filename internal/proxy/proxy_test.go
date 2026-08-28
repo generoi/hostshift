@@ -381,6 +381,29 @@ func TestSelfRedirectGuard(t *testing.T) {
 		}
 	})
 
+	// The fleet's conf is `rewrite ^ https://host$request_uri redirect`, and
+	// nginx appends the query string *again* unless the replacement ends in "?".
+	// So the Location is one query longer than the request that produced it.
+	// Comparing whole URLs never matched, the guard never fired, and each hop
+	// appended another copy until the browser gave up with 414 URI Too Long —
+	// observed live on acmecorp before this was fixed.
+	t.Run("survives nginx duplicating the query string", func(t *testing.T) {
+		const path = "/app/uploads/2025/05/x.png?cb=20260410"
+		h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, canonical+r.URL.Path+"?"+r.URL.RawQuery+"?"+r.URL.RawQuery,
+				http.StatusFound)
+		})
+		res, _ := h.get(t, variantHost, path)
+		loc := res.Header.Get("Location")
+		if strings.Contains(loc, variantHost) {
+			t.Errorf("Location points back at the variant: %q\n"+
+				"each hop appends another query and the browser ends at 414", loc)
+		}
+		if !strings.HasPrefix(loc, canonical) {
+			t.Errorf("Location is %q, want the canonical origin passed through", loc)
+		}
+	})
+
 	t.Run("an ordinary redirect is still rewritten", func(t *testing.T) {
 		// Test 1: a login redirect goes somewhere else, so the guard must not
 		// catch it.
