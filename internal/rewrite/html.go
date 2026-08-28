@@ -34,6 +34,52 @@ type HTML struct {
 	done    bool
 	err     error // a non-EOF tokenizer error, surfaced once pending bytes are out
 	inOff   int   // cumulative input-stream offset, for --explain
+	outOff  int   // cumulative output-stream offset, to map the sweep's finds back
+	marks   []mark
+	markCur int
+}
+
+// mark records that output offset out corresponds to input offset in, from
+// there until the next mark. One is appended per length-changing token — not
+// per token — so the list is as long as the number of rewrites.
+type mark struct{ out, in int }
+
+// InputOffset maps an offset in this stage's output back to the offset in its
+// input, so §4.4's sweep can report a straggler where it sits in the *source*
+// document rather than in the rewritten stream it actually scans.
+//
+// Without it the two halves of one --explain event list use different
+// coordinate systems: the structured pass reports input offsets, and the
+// straggler's drifts by the total length change so far — on a page with 1000
+// rewrites of "https://www.herrfors.fi" to a nine-byte-longer variant, by 9000
+// bytes. Queries arrive in increasing order from the sweep's own goroutine, so
+// a cursor walks the list and consumed marks are compacted away.
+func (w *HTML) InputOffset(out int) int {
+	for w.markCur < len(w.marks) && w.marks[w.markCur].out <= out {
+		w.markCur++
+	}
+	if w.markCur > 512 {
+		w.marks = append(w.marks[:0], w.marks[w.markCur:]...)
+		w.markCur = 0
+		for w.markCur < len(w.marks) && w.marks[w.markCur].out <= out {
+			w.markCur++
+		}
+	}
+	if w.markCur == 0 {
+		return out // before the first rewrite the streams are aligned
+	}
+	m := w.marks[w.markCur-1]
+	return m.in + (out - m.out)
+}
+
+// write emits a token's output and records the correspondence when the token
+// changed length.
+func (w *HTML) write(inStart, inLen int, out []byte) {
+	w.outOff += len(out)
+	if len(out) != inLen {
+		w.marks = append(w.marks, mark{w.outOff, inStart + inLen})
+	}
+	w.pend.Write(out)
 }
 
 // Options configures a rewriter.
@@ -56,7 +102,23 @@ type Options struct {
 // — an assertion about a shared code path rather than a coincidence.
 func NewResponseBody(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) io.ReadCloser {
 	h := NewHTML(r, m, src, opt)
-	if opt.NoSweep {
+	// Dry run does not sweep, and cannot.
+	//
+	// The sweep is a re-scan of *rewritten* output: every canonical origin it
+	// finds is one the structured pass missed. Under --dry-run the structured
+	// pass deliberately emits the input unchanged, so the sweep re-scans the
+	// original document and reports every origin on the page as a straggler —
+	// roughly a thousand WARNs on a corpus page, each claiming a bug that does
+	// not exist, and every counter doubled. §5.8 calls --dry-run the mode you
+	// point at a live canonical checkout to assess a new site, which is exactly
+	// when a straggler report has to mean something.
+	//
+	// Making it mean something would take feeding the sweep the rewritten bytes
+	// while emitting the original ones, i.e. buffering the whole body. The
+	// census is dropped instead, and WriteReport says so rather than printing a
+	// zero that reads like proof of coverage.
+	if opt.NoSweep || opt.DryRun {
+		h.stats.SweepSkipped()
 		return h
 	}
 	return NewSweep(h, m, h, opt)
@@ -89,9 +151,11 @@ func rawTextElement(n string) bool {
 	return false
 }
 
-// structuredAttr names the values that need parsing rather than plain origin
-// substitution (PLAN §5.2). M1 substitutes plainly and counts them; M3 splits on
-// the separators.
+// structuredAttr names the values §5.2 expected to need their grammar parsed
+// rather than plain origin substitution. M3 established that none of them does
+// — anchoring finds an origin wherever it sits, so commas, descriptors and
+// "N;url=" never have to be understood — so this only feeds the counter that
+// would show a regression there first. See Stats.Structured.
 func structuredAttr(name string) bool {
 	switch name {
 	case "srcset", "imagesrcset", "ping", "srcdoc", "content":
@@ -107,9 +171,45 @@ func (w *HTML) rewriteValue(surface, name string, base int, v []byte) []byte {
 	}
 	out, events := w.m.Rewrite(v, surface, w.stats.Explain())
 	w.stats.Record(surface, base, events)
+	if surface == SurfaceHTMLAttr {
+		out = w.decodeEntityLeak(base, out)
+	}
 	if w.dryRun {
 		return v
 	}
+	return out
+}
+
+// decodeEntityLeak closes the one gap between the matcher's encodings and the
+// browser's: character references inside an attribute value.
+//
+// §5.3 models three encodings — raw "//", JSON "\/\/" and percent "%2F%2F" —
+// and none of them covers href="https:&#47;&#47;www.example.fi/x", which a
+// browser decodes before it resolves the URL and then dereferences straight to
+// production. That is test 28, which is safety-critical: an agent following
+// that link issues writes against the live site. Pattern variants cannot close
+// it, because "&#47;", "&#047;", "&#x2f;" and "&sol;" are one family of
+// unbounded size — leading zeros alone see to that.
+//
+// So the value is decoded and re-matched. If the decoded form carries an origin
+// the raw form did not, the decoded-and-rewritten text replaces the value. That
+// re-serialises the value, which §5.2 otherwise forbids; it is confined to
+// values that would *otherwise leak*, so it never runs on a page that is
+// already correct, and byte-identity is untouched because the identity map
+// rewrites nothing to begin with.
+//
+// Attribute values only: inside <script> and <style> the browser does not
+// decode references, so there is nothing there to decode.
+func (w *HTML) decodeEntityLeak(base int, v []byte) []byte {
+	dec, ok := decodeURLRefs(v)
+	if !ok {
+		return v
+	}
+	out, events := w.m.Rewrite(dec, SurfaceHTMLEntity, w.stats.Explain())
+	if bytes.Equal(out, dec) {
+		return v
+	}
+	w.stats.Record(SurfaceHTMLEntity, base, events)
 	return out
 }
 
@@ -151,8 +251,15 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// Measured before this was fixed: 129 of the 244 prefixes of an
 			// ordinary document lost bytes, with exit status 0 and no
 			// diagnostic, which also breaks test 24 for any truncated input.
+			tail := w.pend.Len()
 			w.pend.Write(w.z.Raw())
 			w.pend.Write(w.z.Buffered())
+			// Pass-through, so the two streams advance together and no mark is
+			// needed; the counters still have to move or InputOffset would map
+			// the tail against the last rewrite before it.
+			n := w.pend.Len() - tail
+			w.inOff += n
+			w.outOff += n
 			w.done = true
 
 			// io.EOF is the ordinary end of a body. Anything else is a real
@@ -188,10 +295,10 @@ func (w *HTML) Read(p []byte) (int, error) {
 			if rawTextElement(string(name)) {
 				w.rawText = string(name)
 			}
-			w.pend.Write(w.rewriteTag(raw, off))
+			w.write(off, len(raw), w.rewriteTag(raw, off))
 		case html.EndTagToken:
 			w.rawText = ""
-			w.pend.Write(raw)
+			w.write(off, len(raw), raw)
 		case html.TextToken:
 			// A raw-text element's content arrives as a single token — a 700 KB
 			// inline script is one token — so it is scanned directly, with no
@@ -210,16 +317,16 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// bare hostname (test 28).
 			switch w.rawText {
 			case "":
-				w.pend.Write(raw)
+				w.write(off, len(raw), raw)
 			case "script":
-				w.pend.Write(w.rewriteValue(SurfaceInlineScript, "", off, raw))
+				w.write(off, len(raw), w.rewriteValue(SurfaceInlineScript, "", off, raw))
 			case "style":
-				w.pend.Write(w.rewriteValue(SurfaceInlineStyle, "", off, raw))
+				w.write(off, len(raw), w.rewriteValue(SurfaceInlineStyle, "", off, raw))
 			default:
-				w.pend.Write(w.rewriteValue(SurfaceRawText, "", off, raw))
+				w.write(off, len(raw), w.rewriteValue(SurfaceRawText, "", off, raw))
 			}
 		default:
-			w.pend.Write(raw)
+			w.write(off, len(raw), raw)
 		}
 	}
 	if w.pend.Len() == 0 && w.done {

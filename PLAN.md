@@ -447,6 +447,32 @@ a match only when the byte following `H` is one of `/ : ? # " ' < > \ &`,
 whitespace, or end of input. `//herrfors.ddev.site/` then matches and
 `//wt-a--herrfors.ddev.site/` does not, because the left anchor fails.
 
+**A trailing root dot terminates the host but is not always consumed.**
+`https://www.herrfors.fi.` is the same origin and a browser dereferences it
+identically, so treating the dot as "host cut short" rejects the match and
+leaks — M0 counted five in herrfors' database. It is absorbed into the span
+only when real URL structure follows (`/ : ? #`, or end of value), because the
+variant is written in its root-less form and the dot is then dropped. In prose
+— "Read more at https://www.herrfors.fi. Thanks" — the dot is a full stop: the
+origin is still rewritten, and the dot stays where it is.
+
+**There is a fourth encoding, and it is unbounded: HTML character references.**
+A browser decodes them in an attribute value *before* it resolves the URL, so
+`href="https:&#47;&#47;www.herrfors.fi/x"` navigates to production — test 28,
+and §7 marks that safety-critical. Patterns cannot cover it: `&#47;`, `&#047;`,
+`&#x2f;` and `&sol;` are one family of infinitely many spellings. So attribute
+values are decoded and re-matched, and a value whose decoded form carries an
+origin the raw form did not is replaced with the decoded, rewritten text. That
+re-serialises a value, which §5.2 otherwise forbids — it is confined to values
+that would *otherwise leak*, so it never runs on a page that is already correct.
+The decode is deliberately narrow: whole-value unescaping would also apply the
+legacy no-semicolon forms and turn a query string's `&copy=1` into `©=1`, so
+only numeric references and the handful of named ones that spell URL structure
+are decoded, in place. Counted as its own surface, `html-entity`, because a
+non-zero count means content is storing origins in a form this section does not
+model. Inside `<script>` and `<style>` the browser does not decode references,
+so nothing is decoded there.
+
 With that construction:
 
 1. **Re-scan the rewritten output.** Any surviving canonical origin is a missed
@@ -459,10 +485,42 @@ With that construction:
 **It runs in-stream, not on a buffer.** The sweep retains a sliding window of
 `max_pattern_len - 1` bytes across chunk boundaries; a match is replaced before
 that window is emitted, so no already-written bytes need re-alignment and the
-body is never buffered whole. The replacement **changes length** —
+body is never buffered whole.
+
+**The window has a left half too, and it is one byte.** The sliding window above
+protects a match from being decided on bytes that have not arrived on the right.
+A protocol-relative `//H` is decided just as much by the byte on its *left* —
+after a letter it is a path segment, after a separator it is an origin — and
+that byte has usually already been emitted by the time the rest of the match
+arrives. Carrying it forward is not optional: without it a compaction that
+happens to leave the match at offset 0 reads as "start of stream", which
+anchors, so `.../cache//www.herrfors.fi/…` becomes the variant host **depending
+on where the 32 KiB read boundary fell**. That also breaks tests 7 and 29, since
+pass 1 changes the token lengths and pass 2's boundary lands elsewhere.
+
+**`--dry-run` does not sweep, and cannot.** The sweep re-scans *rewritten*
+output; §5.8's dry run deliberately emits the input unchanged, so a sweep behind
+it re-scans the original document and reports every origin on the page as a
+straggler — about a thousand false WARNs on a corpus page, each naming a bug
+that does not exist. Making the census meaningful under dry run would mean
+feeding the sweep rewritten bytes while emitting the original ones, i.e.
+buffering the whole body. The census is dropped instead, and the report says so
+rather than printing a zero that reads like proof of coverage.
+
+The replacement **changes length** —
 `https://www.herrfors.fi` is 23 bytes, `https://wt-a--herrfors.ddev.site` is 32 —
 so downstream framing is chunked per §5.2. `--explain` offsets are cumulative
 **input**-stream offsets, so they stay stable across a length-changing rewrite.
+
+That requirement binds the *sweep* hardest, and it is the one place it is not
+free. The sweep runs downstream of the structured pass and can only count the
+stream it actually scans, so its offsets drift by the total length change so far
+— on a page with a thousand rewrites of a nine-byte-longer variant, by nine
+thousand bytes, silently, in the same event list as the structured pass's
+genuine input offsets. The structured pass therefore hands the sweep a map from
+its output offsets back to its input ones. The map costs one entry per
+*length-changing token* rather than per token, and entries are dropped once the
+sweep has passed them, since it only ever asks about increasing offsets.
 
 Accepted limitation: a page that *intentionally* links to production, as a URL,
 is rewritten too. On a development clone that is almost always what you want.

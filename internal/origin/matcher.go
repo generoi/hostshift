@@ -209,7 +209,7 @@ func (m *Matcher) Validate() error {
 	for _, p := range m.pairs {
 		for _, enc := range []encoding{encRaw, encJSON, encPercent} {
 			probe := p.Variant.Scheme + enc.schemeSep() + enc.hostPort(p.Variant)
-			out, _, ev := m.rewrite([]byte(probe), len(probe), "validate", false)
+			out, _, ev := m.rewrite([]byte(probe), len(probe), NoPrev, "validate", false)
 			if string(out) != probe {
 				return fmt.Errorf("origin: variant %s is matched by a canonical origin — rewriting it yields %q; "+
 					"the map is not a fixed point and would double-rewrite (PLAN §5.4)", p.Variant, out)
@@ -339,15 +339,59 @@ func okBeforeRelative(c byte) bool {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
+// hostTerminated reports whether the host ends at end, allowing one root dot
+// to sit between it and the delimiter.
+//
+// Which is the whole reason the dot is not simply consumed. In prose —
+// "Read more at https://www.example.fi. Thanks" — the dot is a full stop, and
+// swallowing it into the span deletes a character from the rendered page,
+// because the variant is written in its root-less form. Rejecting the match
+// instead is worse: the origin then goes out unrewritten, dereferenceable, and
+// M0 counted five of those in herrfors' database. So the dot terminates the
+// host and stays where it is, and only the endsHost case above — where real
+// URL structure follows, so the dot is genuinely the root label — absorbs it.
+func hostTerminated(b []byte, end int) bool {
+	if delimAt(b, end) {
+		return true
+	}
+	return b[end] == '.' && delimAt(b, end+1)
+}
+
+// endsHost reports whether position i is where a URL's host component ends —
+// end of buffer, or one of the characters that can follow an authority. It is
+// deliberately narrower than delimAt, which answers the different question of
+// whether a host has been cut short by any non-host byte.
+func endsHost(b []byte, i int) bool {
+	if i >= len(b) {
+		return true
+	}
+	switch b[i] {
+	case '/', ':', '?', '#':
+		return true
+	case '%':
+		if c, ok := unhex(b, i+1); ok {
+			switch c {
+			case '/', ':', '?', '#':
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Rewrite replaces every canonical origin in b with its variant, treating b as
 // a complete value.
 //
 // It returns b itself when nothing changed, so an unmodified value is not merely
 // equal to the input but the same bytes.
 func (m *Matcher) Rewrite(b []byte, surface string, explain bool) (out []byte, events []Event) {
-	out, _, events = m.rewrite(b, len(b), surface, explain)
+	out, _, events = m.rewrite(b, len(b), NoPrev, surface, explain)
 	return out, events
 }
+
+// NoPrev is the prev argument for a buffer that begins at the start of its
+// value or stream, where there is no preceding byte to anchor against.
+const NoPrev = -1
 
 // RewritePrefix is Rewrite for a stream, where more bytes are still to come.
 //
@@ -361,11 +405,21 @@ func (m *Matcher) Rewrite(b []byte, surface string, explain bool) (out []byte, e
 // round. This is what lets §4.4's straggler sweep run in-stream: a match is
 // replaced before its bytes are emitted, so nothing already written needs
 // re-aligning and the body is never buffered whole.
-func (m *Matcher) RewritePrefix(b []byte, limit int, surface string, explain bool) (out []byte, consumed int, events []Event) {
-	return m.rewrite(b, limit, surface, explain)
+//
+// prev is the byte immediately before b[0] in the stream, or NoPrev at the very
+// start. The carry-over window protects a match from being decided on bytes
+// that have not arrived on the *right*; prev is the same protection on the
+// left, and it is not optional. A protocol-relative "//host" is only an origin
+// after a separator, so the byte before it decides the match — and that byte
+// has usually already been emitted and dropped by the time the rest arrives.
+// Passing NoPrev there says "start of stream", which anchors, so the same
+// document rewrote differently depending on where the 32 KiB read boundary
+// happened to fall.
+func (m *Matcher) RewritePrefix(b []byte, limit int, prev int, surface string, explain bool) (out []byte, consumed int, events []Event) {
+	return m.rewrite(b, limit, prev, surface, explain)
 }
 
-func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]byte, int, []Event) {
+func (m *Matcher) rewrite(b []byte, limit int, prev int, surface string, explain bool) ([]byte, int, []Event) {
 	if limit < 0 {
 		limit = 0
 	}
@@ -416,9 +470,17 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		}
 		scanned = hostEnd
 
-		if p.relative && start > 0 && !okBeforeRelative(b[start-1]) {
-			emit(start, string(b[start:hostEnd]), ActionSkipped, ReasonUnanchored)
-			continue
+		if p.relative {
+			// The byte before the match, which for start == 0 lives in the
+			// caller's stream rather than in b.
+			c, have := prev, prev >= 0
+			if start > 0 {
+				c, have = int(b[start-1]), true
+			}
+			if have && !okBeforeRelative(byte(c)) {
+				emit(start, string(b[start:hostEnd]), ActionSkipped, ReasonUnanchored)
+				continue
+			}
 		}
 
 		end, port := hostEnd, ""
@@ -428,9 +490,23 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		// identically, so leaving it unrewritten is a test 28 leak. M0 found
 		// five of them in herrfors' production database.
 		//
-		// The dot is only consumed when what follows terminates the host;
-		// "c.example.evil/" still falls through to the not-a-url rejection.
-		if end < len(b) && b[end] == '.' && delimAt(b, end+1) {
+		// It is consumed into the span and not re-emitted, because the variant
+		// is written in its own root-less form — which is why what follows has
+		// to be URL structure and not merely a delimiter. Accepting any
+		// delimiter ate the full stop in "Read more at https://www.example.fi.
+		// Thanks", deleting a character from rendered prose; that is a corpus
+		// diff, and prose is exactly where a bare origin followed by a period
+		// is common. "c.example.evil/" still falls through to the not-a-url
+		// rejection either way.
+		//
+		// End of buffer counts as structure, so a value that is nothing but an
+		// origin keeps working. The residue is a text node ending in a URL and
+		// a full stop with nothing after it, which still loses the stop.
+		//
+		// When the dot is *not* consumed the match still stands — see
+		// hostTerminated. Rejecting it instead would leave the whole origin
+		// unrewritten, which is the test 28 leak this rule exists to close.
+		if end < len(b) && b[end] == '.' && endsHost(b, end+1) {
 			end++
 		}
 
@@ -459,7 +535,7 @@ func (m *Matcher) rewrite(b []byte, limit int, surface string, explain bool) ([]
 		}
 		scanned = end
 		consumed = max(consumed, end)
-		if !delimAt(b, end) {
+		if !hostTerminated(b, end) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, string(b[start:end]), ActionSkipped, ReasonNotAURL)
 			continue
