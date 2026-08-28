@@ -241,7 +241,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	if st != nil && isRedirect(resp.StatusCode) {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceHeader, false)
-			if sameURL(string(rewritten), st.url) {
+			if sameTarget(string(rewritten), st.url) {
 				if p.StrictOrigins {
 					p.log().Warn("self-redirect suppressed by --strict-origins", "url", st.url)
 					blank(resp, http.StatusNotFound,
@@ -548,18 +548,33 @@ func isRedirect(code int) bool {
 	return false
 }
 
-// sameURL compares two absolute URLs for the self-redirect guard, ignoring a
-// default port and a trailing-slash-only difference on the path.
-func sameURL(a, b string) bool {
-	na, ok := normaliseURL(a)
+// sameTarget reports whether a redirect would send the browser back to the
+// resource it just asked for — host and path, deliberately ignoring the query.
+//
+// Ignoring the query is not sloppiness, it is the whole point. The fleet's
+// redirect-uploads.conf says
+//
+//	rewrite ^ https://www.herrfors.fi$request_uri redirect;
+//
+// and nginx *appends the query string again* unless the replacement ends in
+// "?". So the Location comes back as "…png?cb=X?cb=X" — one query longer than
+// the request that produced it. Comparing whole URLs therefore never matched,
+// the guard never fired, and each hop appended another copy until the browser
+// gave up with 414 URI Too Long. Measured live on herrfors.
+//
+// The cost is that a redirect which changes only the query on the same path is
+// now treated as a self-redirect and passed through unrewritten. That is a rare
+// shape, and the alternative it replaces is an infinite loop.
+func sameTarget(a, b string) bool {
+	na, ok := hostPath(a)
 	if !ok {
 		return false
 	}
-	nb, ok := normaliseURL(b)
+	nb, ok := hostPath(b)
 	return ok && na == nb
 }
 
-func normaliseURL(s string) (string, bool) {
+func hostPath(s string) (string, bool) {
 	u, err := url.Parse(s)
 	if err != nil || u.Host == "" {
 		return "", false
@@ -572,11 +587,7 @@ func normaliseURL(s string) (string, bool) {
 	if path == "" {
 		path = "/"
 	}
-	q := u.RawQuery
-	if q != "" {
-		q = "?" + q
-	}
-	return o.HostPort() + path + q, true
+	return o.HostPort() + path, true
 }
 
 // blank replaces a response with a plain-text status.
