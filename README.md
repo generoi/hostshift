@@ -11,42 +11,79 @@ for. Nothing in the database is ever rewritten.
 [`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
 for completed milestones live in [`docs/`](docs/).
 
-**Status: M1.** The rewrite engine, the anchored origin matcher and the proxy
-shell are in place. The host map, request direction and request bodies are M2;
-`PLAN.md` §8 has the rest.
+**Status: M2.** The rewrite engine, the anchored origin matcher, the host map and
+both request and response directions are in place. JSON is M4, transport is M5,
+packaging and the pilot are M6; `PLAN.md` §8 has the rest.
 
 ## Using it
 
-The rewriter works as a Unix filter, with no server involved. That is what makes
-it testable, pipeable and CI-friendly — and it is the same engine the proxy runs,
-which acceptance test 27 asserts.
-
 ```
-hostshift rewrite --from https://a --to https://b < in.html > out.html
-hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --from … --to …
-hostshift map     --from … --to …     print the resolved host map
-hostshift check   --from … --to …     validate the map; exit 2 if invalid
+hostshift rewrite < in.html > out.html   the whole engine as a Unix filter
+hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --slug wt-a
+hostshift map     print the resolved host map
+hostshift check   validate the config; exit 2 if invalid
+hostshift wp-cli  print wp-cli.local.yml for this project
 ```
 
-`--from` and `--to` are repeatable and index-aligned, one pair per blog. Config
-file layering (§5.3) lands in M2; until then the map is given on the command
-line.
+### The map
+
+Resolved from three layers, each overriding the last (§5.3). Discovery by probing
+is impossible and would be a silent no-op, so the map is always declared.
+
+1. **DDEV defaults.** `.ddev/config.yaml`'s `name` and `additional_hostnames`
+   give the ordered list of local hosts for free. For a single-environment site
+   with no extra aliases this is enough on its own and no config file is needed.
+2. **`hostshift.yaml`.** Adds the production hostnames, alias hosts from other
+   environments, the variant pattern and the upstream.
+3. **Flags.** `--slug`, `--upstream`, `--from`/`--to`, `--map C=V`.
+
+```yaml
+version: 1
+upstream: http://web:80
+sites:
+  - name: main
+    canonical: https://www.herrfors.fi
+    base:      https://herrfors.ddev.site
+    aliases:   [https://herrfors.genero-dev.com]
+  - name: nat
+    canonical: https://www.herrforsnat.fi
+    base:      https://nat.herrfors.ddev.site
+```
+
+Variants are derived, not written out: `--slug wt-a` prefixes the leftmost label
+of each site's base host, giving `wt-a--herrfors.ddev.site` and
+`wt-a--nat.herrfors.ddev.site`. An explicit `variant:` overrides that.
+
+Listing the other environments as `aliases` is what lets a residual `@production`
+or `@staging` URL left behind by an imperfect `db:pull` be corrected too.
+
+### Flags worth knowing
 
 - `--dry-run` counts every rewrite it would make and changes nothing, so it is
   safe to point at a live canonical checkout.
 - `--explain` traces every candidate that did *not* result in a rewrite, with the
-  reason — `not-a-url`, `host-not-in-map`, `unanchored`, `identity-map`. Given
-  how many silent-failure modes this design has, that trace is the difference
-  between a five-minute diagnosis and an afternoon.
+  reason — `not-a-url`, `host-not-in-map`, `unanchored`, `identity-map`,
+  `self-redirect`. Given how many silent-failure modes this design has, that
+  trace is the difference between a five-minute diagnosis and an afternoon.
+- `--strict-origins` turns off the self-redirect carve-out (see below).
 - stdout is data, stderr is diagnostics, in every subcommand. Exit codes are
   0 success, 1 runtime error, 2 invalid configuration.
 
 The corpus diff (§7) collapses to one line:
 
 ```bash
-curl -s https://canonical/page | hostshift rewrite --quiet --from … --to … \
+curl -s https://canonical/page | hostshift rewrite --quiet -C . --slug wt-a \
   | diff - <(curl -s https://variant/page)
 ```
+
+### The self-redirect carve-out
+
+53 of the fleet's 63 DDEV repos ship an nginx snippet that 302-redirects a
+missing `/app/uploads/` request to a hardcoded production origin. Rewriting that
+`Location` would send the browser back to the request it just made — an infinite
+redirect loop. hostshift detects it and passes the `Location` through unmodified,
+counted as `self-redirect`. That is the single enumerated exception to "no
+production origin reaches the browser"; `--strict-origins` returns 404 instead.
 
 ## Building
 
