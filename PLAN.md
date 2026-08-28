@@ -1102,8 +1102,27 @@ asserted by test 7 rather than assumed.
   is the round trip
 - **`data:` / base64 URIs** containing URLs — passthrough, stated as an accepted
   limitation
-- **`Range` requests** — rewriting a partial body is incoherent; bypass
-- **`Vary`** — ensure nothing downstream caches a variant-specific body
+- **`Range` requests** — rewriting a partial body is incoherent, so **bypass the
+  `Range`, not the rewriter**. This line originally said only "bypass", and M5
+  read it the other way: `Range` was forwarded upstream and a 206 skipped every
+  rewriter, so any client could turn the whole engine off by asking for
+  `bytes=0-<len-1>` and read the document whole with its production origins
+  intact. That is test 28, and unlike the self-redirect `Location` — which §7
+  enumerates as exactly one carve-out — it was selectable by whoever was
+  browsing. Whether a response is rewritable is not knowable until it arrives,
+  and a 206 cannot be turned back into something rewritable without a second
+  round trip, so `Range` and `If-Range` are stripped on the way out and
+  `Accept-Ranges` is dropped on the way back. RFC 9110 lets a server ignore
+  `Range`; nginx does not serve ranges for a PHP response, so on a page this
+  costs nothing, and on a media file it costs a re-fetch from zero on a seek,
+  over loopback.
+- **`Vary`** — ensure nothing downstream caches a variant-specific body. It
+  belongs on **every** response, not only the ones with a rewritten body:
+  headers are rewritten for all of them, and a 302 whose `Location` now names a
+  variant is precisely what a shared cache keyed on path alone — nginx
+  `proxy_cache_key $uri`, a Varnish default with no host in the key — will hand
+  to a browser sitting on a different variant, bouncing it out of its own
+  worktree on every login and post-save redirect.
 
 ### 5.6 Upstream selection — resolved
 
@@ -1525,8 +1544,42 @@ variant URLs is stored canonical, and reading it back returns the variant. The
 database half — asserting against real `wp_posts` rows — needs a live WordPress
 and lands with the M6 pilot.
 
-**M5 — transport.** Compression, streaming bounds, error surfacing, `Vary`,
-`Range`. Tests 9, 13, 14, 26.
+**M5 — transport. Done 2026-08-27.** Compression, streaming bounds, error
+surfacing, `Vary`, `Range`. Tests 9, 13, 14, 26 green.
+
+Test 13 measured: a 5 MB response streams with a **42-byte** peak token buffer.
+The bound is asserted directly rather than through heap sampling, which GC timing
+makes unreliable.
+
+§7's note that `ErrBufferExceeded` "cannot become an error response once headers
+are sent" is resolved by **not making it an error at all**. A token larger than
+the cap makes the remainder of that response stream through unparsed, logged and
+counted. Aborting the connection would be a worse answer than a page with one
+unparsed region — and because §4.4's sweep sits *downstream* of the tokenizer,
+origins in the passthrough tail are still caught, so nothing leaks. That is a
+property worth stating explicitly: the sweep is what makes a bounded parser safe.
+
+**The passthrough must start at `Raw()`, not at `Buffered()`.** x/net/html's
+`readByte` advances `raw.end` *before* it tests `maxBuf`, so at
+`ErrBufferExceeded` the oversized token is sitting in `Raw()` and `Buffered()`
+holds only read-ahead. A text token is handed back as a partial `TextToken`
+first, which is why text, `<script>` and comments survived; a *tag* errors from
+inside `readStartTag` with its bytes still in `Raw()`. Emitting `Buffered()`
+alone therefore deleted exactly `MaxToken` bytes — at the shipped 4 MiB default,
+a 5 MB page arriving 4 MiB short with status 200 and no `Content-Length` to
+check it against, the opening `<img src="data:image/png;base64,` gone and the
+rest of its value rendered as visible page text. An inlined LCP image or a
+multi-MB Elementor `data-settings` attribute is all it takes, and it broke test
+24, the guard rail that is supposed to make this class of bug impossible.
+
+The tail also bypasses the offset map §4.4 needs, so a final mark is recorded
+when it starts; without it every straggler reported after the cap was given an
+output offset, 4 MiB adrift on the page above.
+
+One gzip detail worth not rediscovering: `gzip.NewReader` consumes the header
+before it can fail, so a body labelled gzip that is not gzip loses however many
+bytes the header check read — the whole body, when it is short. The head is
+captured and put back.
 
 **M6 — packaging + pilot.** Binary, image, thin add-on, corpus diff against
 herrfors, and test 28 over the full crawl. Also tests 29a, 29b and 29d, moved
