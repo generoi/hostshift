@@ -393,6 +393,75 @@ func TestSelfRedirectGuard(t *testing.T) {
 	})
 }
 
+// TestLoginRoundTrip is acceptance test 19: the full wp-admin login round trip,
+// including redirect_to and wp_get_referer().
+//
+// The upstream stands in for wp-login.php and pluggable.php: it accepts the POST
+// only if redirect_to's host equals home_url()'s host, which is what
+// wp_validate_redirect() checks, and it echoes wp_get_referer()'s verdict.
+func TestLoginRoundTrip(t *testing.T) {
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			// Serve the form, with the variant's own redirect_to in it — that is
+			// what the browser will send back.
+			w.Header().Set("Content-Type", "text/html")
+			io.WriteString(w, `<form action="`+canonical+`/wp-login.php" method="post">`+
+				`<input name="redirect_to" value="`+canonical+`/wp-admin/"></form>`)
+		case "POST":
+			body, _ := io.ReadAll(r.Body)
+			form, _ := url.ParseQuery(string(body))
+			// wp_validate_redirect(): reject any host that is not home_url()'s.
+			u, err := url.Parse(form.Get("redirect_to"))
+			if err != nil || u.Host != "www.acmecorp.fi" {
+				http.Error(w, "redirect_to discarded, login returns to the wrong place", http.StatusBadRequest)
+				return
+			}
+			// wp_get_referer(): also run through wp_validate_redirect.
+			ref, err := url.Parse(r.Header.Get("Referer"))
+			if err != nil || ref.Host != "www.acmecorp.fi" {
+				http.Error(w, "wp_get_referer() is false", http.StatusBadRequest)
+				return
+			}
+			http.Redirect(w, r, form.Get("redirect_to"), http.StatusFound)
+		}
+	})
+
+	// 1. The browser fetches the form and sees only variant origins.
+	_, form := h.get(t, variantHost, "/wp-login.php?redirect_to="+
+		url.QueryEscape(variant+"/wp-admin/"))
+	if bytes.Contains(form, []byte(canonical)) {
+		t.Fatalf("the login form carried a canonical origin to the browser: %s", form)
+	}
+	if !bytes.Contains(form, []byte(variant+"/wp-admin/")) {
+		t.Fatalf("redirect_to was not rewritten into the form: %s", form)
+	}
+
+	// 2. The browser posts it back, with the variant Referer it would send.
+	req, _ := http.NewRequest("POST", h.front.URL+"/wp-login.php",
+		strings.NewReader("log=a&pwd=b&redirect_to="+url.QueryEscape(variant+"/wp-admin/")))
+	req.Host = variantHost
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", variant+"/wp-login.php")
+	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	if res.StatusCode != http.StatusFound {
+		t.Fatalf("login failed with %d: %s", res.StatusCode, msg)
+	}
+	// 3. And the browser is sent back to the variant, not to production.
+	if got := res.Header.Get("Location"); got != variant+"/wp-admin/" {
+		t.Errorf("Location is %q, want %q", got, variant+"/wp-admin/")
+	}
+}
+
 // TestSetCookieDomainDropped is acceptance test 2. ms_cookie_constants() defines
 // COOKIE_DOMAIN from the network domain on any subdomain multisite that does not
 // set it explicitly, so the cookie is discarded by the browser and login fails
@@ -539,7 +608,10 @@ func TestFilterMatchesProxyBytes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		filtered, err := io.ReadAll(rewrite.NewHTML(bytes.NewReader(in), m.Forward(), nil, rewrite.Options{}))
+		// NewResponseBody, not NewHTML: the filter and the proxy must compose
+		// the *same* pipeline, straggler sweep included, or test 27 asserts a
+		// coincidence rather than a shared code path.
+		filtered, err := io.ReadAll(rewrite.NewResponseBody(bytes.NewReader(in), m.Forward(), nil, rewrite.Options{}))
 		if err != nil {
 			t.Fatal(err)
 		}

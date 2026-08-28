@@ -151,6 +151,7 @@ func cmdRewrite(args []string) (int, error) {
 	explain := fs.Bool("explain", false, "trace every candidate that did not result in a rewrite")
 	asJSON := fs.Bool("json", false, "emit counters as JSON on stderr")
 	quiet := fs.Bool("quiet", false, "suppress the counter report")
+	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
@@ -166,7 +167,12 @@ func cmdRewrite(args []string) (int, error) {
 	st := rewrite.NewStats(*explain)
 	var src io.Reader = os.Stdin
 	if strings.EqualFold(strings.TrimSpace(strings.SplitN(*ctype, ";", 2)[0]), "text/html") {
-		src = rewrite.NewHTML(os.Stdin, m, nil, rewrite.Options{DryRun: *dryRun, Stats: st})
+		src = rewrite.NewResponseBody(os.Stdin, m, nil, rewrite.Options{
+			DryRun:  *dryRun,
+			NoSweep: *noSweep,
+			Stats:   st,
+			Log:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		})
 	}
 	// Anything else streams through untouched and never enters a rewriter —
 	// which is what test 25's per-surface counter of zero proves.
@@ -190,6 +196,7 @@ func cmdProxy(args []string) (int, error) {
 	dryRun := fs.Bool("dry-run", false, "serve responses unmodified while logging every rewrite it would have made")
 	explain := fs.Bool("explain", false, "trace every candidate that did not result in a rewrite")
 	strict := fs.Bool("strict-origins", false, "return 404 instead of passing a self-redirect through (PLAN §4.4)")
+	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
 	maxBody := fs.Int64("max-body", proxy.DefaultMaxBody, "request-body buffering cap in bytes")
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
@@ -213,6 +220,7 @@ func cmdProxy(args []string) (int, error) {
 		Stats:         rewrite.NewStats(*explain),
 		DryRun:        *dryRun,
 		StrictOrigins: *strict,
+		NoSweep:       *noSweep,
 		MaxBody:       *maxBody,
 		Log:           log,
 	}
