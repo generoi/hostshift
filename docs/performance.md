@@ -186,3 +186,53 @@ number honest if the trade ever changes.
   `rewriteRequest` assigns unconditionally; fixing both moved a small GET from
   192 to 190 allocations. hostshift's own share of a request is ~20%; the rest is
   `net/http` and `httputil.ReverseProxy`.
+
+
+## Third pass, 2026-08-28 — the automaton goes
+
+Aho–Corasick is the right structure for thousands of patterns. This map has
+tens: nine blogs is 81 patterns, and most are a handful of hosts spelled three
+ways. Against that it cost 2.9 ms and 257,000 allocations to build, allocated an
+iterator and a prefilter state on every `IterByte`, and stepped a transition
+table byte by byte through a document that is 99.8% uninteresting.
+
+| | before | after |
+|---|---|---|
+| Passthrough | 211 MB/s | **248 MB/s** |
+| Identity map | 200 MB/s | **237 MB/s** |
+| **Rewrite + straggler sweep** | 132 MB/s | **181 MB/s** |
+| One value, hit | 517 ns | **331 ns** |
+| One value, miss | 242 ns | **117 ns** |
+| Building the map | 2.98 ms, 257,385 allocs | **14 µs, 361 allocs** |
+
+The pattern set is what makes something simpler possible. Every pattern contains
+a separator, and every explicit-scheme pattern *ends with* its relative form —
+`https://H` is `https:` followed by `//H`. So finding the separator finds every
+candidate: the host reads forwards from it, the scheme backwards. `bytes.Index`
+skips to the next separator at whatever speed the platform manages, and page1
+has one per ~480 bytes.
+
+**Nothing about matching changed.** The swap is confined to which candidates are
+offered; anchoring, ports, the root dot, port disambiguation and replacement are
+the same code, and the scanner deliberately reproduces the automaton's
+*sequence* — leftmost-longest, one candidate per position, advancing one byte
+past each match start — so even the skipped-candidate events are identical.
+
+Proven, not argued. The automaton is still built, in `scan_ac_test.go`, purely
+as the oracle: it is the implementation every audit ran against. The two are
+compared on identical output, `consumed` and full event stream over every shape
+the audits turned up, all 51 corpus and adversarial fixtures at three limits and
+both value/prose semantics, 20,000 random-byte inputs, four different maps, and
+**40,000 composed fuzz cases of which 23,429 produce candidates and 25,228
+produce rewrites** — the counts are asserted, because a fuzz that matches
+nothing proves nothing, and the first attempt at one matched in 502 cases out of
+40,000.
+
+`go build` links neither the automaton nor its construction cost; `go version -m`
+on the binary reports no `aho-corasick`. It stays in `go.mod` as a test
+dependency, which is the point — the oracle survives the thing it replaced.
+
+None of this is visible end to end (13 ms, unchanged), for the reason the
+previous section gives: syscalls dominate. It is taken because it is a straight
+substitution with no behavioural trade, and it removes a dependency from the
+shipped binary.

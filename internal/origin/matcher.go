@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strings"
 
-	aho "github.com/petar-dambovaliev/aho-corasick"
 	"golang.org/x/net/idna"
 )
 
@@ -94,10 +93,25 @@ type pattern struct {
 type Matcher struct {
 	pairs  []Pair
 	pats   []pattern
-	ac     aho.AhoCorasick
 	ident  bool // every pair maps to itself
 	maxPat int
+
+	// byEnc indexes the patterns for scan.go's finder, grouped by the encoding
+	// that spells their separator.
+	byEnc [3][]scanForm
+
+	// acOracle makes rewrite take its candidates from the Aho–Corasick
+	// automaton instead of the scanner. Only scan_ac_test.go sets it, and the
+	// automaton lives there too, so this costs the binary one bool and one nil
+	// function pointer.
+	acOracle bool
 }
+
+// acFinder is installed by scan_ac_test.go. It is the automaton every audit ran
+// against, kept as the oracle the scanner is checked against — and kept in a
+// test file, so `go build` links neither it nor the 257,000 allocations of DFA
+// construction its Build costs.
+var acFinder func(*Matcher, []byte) func() (candidate, bool)
 
 // MaxMatchLen is the longest run of bytes a single match can span: the longest
 // pattern, plus room for a trailing root dot, ":port" and the delimiter that
@@ -131,7 +145,6 @@ func NewMatcher(pairs []Pair) (*Matcher, error) {
 	}
 	sort.Strings(hostNames) // deterministic pattern ids
 
-	var texts []string
 	add := func(text string, p pattern) {
 		if _, seen := byKey[text]; seen {
 			return
@@ -147,7 +160,6 @@ func NewMatcher(pairs []Pair) (*Matcher, error) {
 		}
 		byKey[text] = len(m.pats)
 		m.pats = append(m.pats, p)
-		texts = append(texts, text)
 		m.maxPat = max(m.maxPat, len(text))
 	}
 	for _, h := range hostNames {
@@ -184,12 +196,35 @@ func NewMatcher(pairs []Pair) (*Matcher, error) {
 		}
 	}
 
-	b := aho.NewAhoCorasickBuilder(aho.Opts{
-		AsciiCaseInsensitive: true, // PLAN §5.5: hosts and schemes compare case-insensitively
-		MatchKind:            aho.LeftMostLongestMatch,
-		DFA:                  true,
-	})
-	m.ac = b.Build(texts)
+	// The same patterns, indexed for scan.go. Built from m.pats once it is
+	// complete, so the pointers cannot be invalidated by a later append.
+	type fkey struct {
+		enc  encoding
+		host string
+	}
+	tmp := map[fkey]*scanForm{}
+	var order []fkey
+	for i := range m.pats {
+		p := &m.pats[i]
+		k := fkey{p.enc, p.host}
+		f, seen := tmp[k]
+		if !seen {
+			f = &scanForm{host: []byte(p.host)}
+			tmp[k] = f
+			order = append(order, k)
+		}
+		switch {
+		case p.relative:
+			f.rel = p
+		case p.scheme == "https":
+			f.https = p
+		default:
+			f.http = p
+		}
+	}
+	for _, k := range order {
+		m.byEnc[k.enc] = append(m.byEnc[k.enc], *tmp[k])
+	}
 	return m, nil
 }
 
@@ -541,10 +576,16 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 	// no match is ever split across two rounds of a streaming scan.
 	consumed := limit
 
-	iter := m.ac.IterByte(b)
-	for match := iter.Next(); match != nil; match = iter.Next() {
-		p := m.pats[match.Pattern()]
-		start, hostEnd := match.Start(), match.End()
+	next := m.scan(b).Next
+	if m.acOracle && acFinder != nil {
+		next = acFinder(m, b)
+	}
+	for {
+		c, ok := next()
+		if !ok {
+			break
+		}
+		p, start, hostEnd := *c.p, c.start, c.hostEnd
 		if start >= limit {
 			// Beyond the safe point: the bytes that decide this match may not
 			// have arrived yet. Leave it for the next round.
