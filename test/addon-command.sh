@@ -156,14 +156,20 @@ check ".env stays world-readable" "-rw-r--r--" "$perms"
 # issue no SAN for the real host.
 fq="$work/fq"; newproject "$fq" 'name: fq\nadditional_fqdns:\n  - fq.test.example.com'
 (cd "$fq" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero (fqdn)" ""
-gen="$(sed -n '/^additional_hostnames:/,$p' "$fq/.ddev/config.hostshift.local.yaml")"
-check "each hostname is written under the key DDEV reads it with" \
-"additional_hostnames:
-  - fq
-  - wt-a--fq
-additional_fqdns:
-  - fq.test.example.com
+gen="$(sed -n '/^additional_fqdns:/,$p' "$fq/.ddev/config.hostshift.local.yaml")"
+check "an FQDN variant is written under the key DDEV reads it with" \
+"additional_fqdns:
   - wt-a--fq.test.example.com" "$gen"
+
+# Only the variants. `name` gives the project its own hostname on its own, and
+# anything in the tracked config.yaml is inherited because DDEV appends override
+# lists — so re-listing them changed nothing DDEV serves, and re-listing the
+# project's own name made it a duplicate of `name` after the merge.
+onlyvariants="$(cd "$wt" && "$cmd" init --dry-run --slug wt-a 2>/dev/null | sed -n '/^additional_hostnames:/,$p')"
+check "only the variants are registered" \
+"additional_hostnames:
+  - wt-a--acme
+  - wt-a--nat.acme" "$onlyvariants"
 
 echo "== wp-cli"
 
