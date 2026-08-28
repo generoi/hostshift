@@ -114,3 +114,66 @@ func TestTextJSONIsRewritten(t *testing.T) {
 		t.Errorf("text/json left unrewritten: %s", got)
 	}
 }
+
+// TestMultipartLineEndings is F7 from the M2 audit, left open until now.
+//
+// RFC 2046 requires CRLF and every browser sends it, but bodies assembled by
+// hand — a PHP client building the parts as a string, a JS fixture, curl
+// reading a file that has been through an editor — routinely use LF. Requiring
+// CRLF meant those matched no delimiter at all, so the whole body passed
+// through with its variant origins intact and the write stored dev hostnames in
+// the database: the failure §5.1's request direction exists to prevent
+// (tests 30 and 31).
+func TestMultipartLineEndings(t *testing.T) {
+	const boundary = "----X"
+	part := func(eol, name, ctype, body string) string {
+		h := "--" + boundary + eol + `Content-Disposition: form-data; name="` + name + `"` + eol
+		if ctype != "" {
+			h += "Content-Type: " + ctype + eol
+		}
+		return h + eol + body + eol
+	}
+
+	for _, eol := range []string{"\r\n", "\n"} {
+		name := "CRLF"
+		if eol == "\n" {
+			name = "LF"
+		}
+		t.Run(name, func(t *testing.T) {
+			body := part(eol, "content", "text/plain", `<a href="`+variant+`/x">k</a>`) +
+				"--" + boundary + "--" + eol
+			h := newHarness(t, herrforsMap(t), func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+			h.do(t, "POST", variantHost, "/wp-admin/post.php",
+				"multipart/form-data; boundary="+boundary, []byte(body))
+
+			got, _ := io.ReadAll(h.seen.Body)
+			if strings.Contains(string(got), variantHost) {
+				t.Errorf("a variant origin reached the database:\n%s", got)
+			}
+			if !strings.Contains(string(got), canonical+"/x") {
+				t.Errorf("not rewritten to canonical:\n%s", got)
+			}
+		})
+	}
+
+	// A file part still passes through byte-identical, whichever ending it uses.
+	t.Run("LF file part is untouched", func(t *testing.T) {
+		file := "\x89PNG\r\n\x1a\n" + variant + "/not-a-url-here"
+		body := "--" + boundary + "\n" +
+			`Content-Disposition: form-data; name="f"; filename="a.png"` + "\n" +
+			"Content-Type: image/png\n\n" + file + "\n" +
+			"--" + boundary + "--\n"
+		h := newHarness(t, herrforsMap(t), func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		h.do(t, "POST", variantHost, "/wp-admin/async-upload.php",
+			"multipart/form-data; boundary="+boundary, []byte(body))
+
+		got, _ := io.ReadAll(h.seen.Body)
+		if string(got) != body {
+			t.Errorf("a file part was modified:\n got %q\nwant %q", got, body)
+		}
+	})
+}
