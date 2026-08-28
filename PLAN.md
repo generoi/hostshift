@@ -1705,11 +1705,27 @@ This is not a small project. The previous revision's *"the tool is
 straightforward once these are green"* is the sentence most likely to mislead an
 implementing agent. Delete that expectation.
 
-**Relationship to `generoi/ddev-worktree`:** if this ships, that add-on reduces
-to a compose service. Note that `wt-up`, `wt-guard` and `wt-wp` were already
-removed in v0.2 per its README (though `install.yaml` still ships `wt-up` and
-`wt-wp`), and no `sunrise.php` generation exists anywhere in the repo — do not
-plan to remove things that are already gone. Do not delete it until M6 is proven.
+**Relationship to `generoi/ddev-worktree` — decided 2026-08-28: hostshift.**
+
+The two are different answers to one question. `generoi-worktree` gives each
+worktree its own database and reaches it on a port, `:808x` behind Caddy;
+hostshift shares one database and gives each worktree a hostname. M6 proved the
+second, and the choice is made: hostshift.
+
+The difference that decided it is the database. A forked database per worktree
+is a `db:pull` apiece — 548 MB on herrfors — and it diverges from the moment it
+is taken, so a worktree is testing against data the site no longer has. Sharing
+one means a worktree is testing the real thing, and the price is the hostname
+mapping this document is about. Ports also make the *browser* the thing that
+knows which worktree it is on, which absolute URLs in a database defeat: WordPress
+redirects to the hostname it was told, and the port is not part of it.
+
+Note that `wt-up`, `wt-guard` and `wt-wp` were already removed in v0.2 per its
+README (though `install.yaml` still ships `wt-up` and `wt-wp`), and no
+`sunrise.php` generation exists anywhere in the repo — do not plan to remove
+things that are already gone. The add-on itself is one repo, installed in one
+project, and worth archiving rather than deleting: it is the record of what was
+tried.
 
 ---
 
