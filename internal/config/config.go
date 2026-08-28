@@ -406,6 +406,7 @@ type ddevConfig struct {
 	ProjectTLD          string   `yaml:"project_tld"`
 	AdditionalHostnames []string `yaml:"additional_hostnames"`
 	AdditionalFQDNs     []string `yaml:"additional_fqdns"`
+	UploadDirs          []string `yaml:"upload_dirs"`
 }
 
 func loadDDEV(dir string) (*ddevConfig, string, error) {
@@ -455,6 +456,7 @@ func loadDDEV(dir string) (*ddevConfig, string, error) {
 		}
 		d.AdditionalHostnames = appendUnique(d.AdditionalHostnames, o.AdditionalHostnames)
 		d.AdditionalFQDNs = appendUnique(d.AdditionalFQDNs, o.AdditionalFQDNs)
+		d.UploadDirs = appendUnique(d.UploadDirs, o.UploadDirs)
 	}
 
 	if d.Name == "" {
@@ -502,6 +504,20 @@ func DDEVProject(dir string) (name string, hosts []string, tld string, err error
 		return "", nil, "", err
 	}
 	return d.Name, ddevHostnames(d), projectTLD(d), nil
+}
+
+// DDEVUploadDirs is the project's upload_dirs, which is DDEV's own answer to
+// "which directories hold content rather than code". A worktree sharing a
+// database has to share those too — the rows saying which image belongs to
+// which post live in the shared database, so an empty uploads directory means
+// every media request 302s away and any plugin reading a file server-side is
+// fatal.
+func DDEVUploadDirs(dir string) []string {
+	d, _, err := loadDDEV(dir)
+	if err != nil || d == nil {
+		return nil
+	}
+	return d.UploadDirs
 }
 
 // sitesFromDDEV builds the ordered list of local hosts for free: `name` plus
