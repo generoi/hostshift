@@ -119,10 +119,23 @@ UPDATE wp_2_options    SET option_value='https://$CANON_B' WHERE option_name IN 
 UPDATE wp_sitemeta     SET meta_value='https://$CANON_A/' WHERE meta_key='siteurl';
 SQL
 
+  say "building the image the add-on references"
+  # Always built from this checkout, never pulled. The add-on's compose service
+  # names ghcr.io/generoi/hostshift:latest, so without this the suite would
+  # exercise whatever was last published rather than the code under test — which
+  # is the opposite of what a CI run is for. It also means the script works
+  # before anything has ever been published.
+  docker build -q -t ghcr.io/generoi/hostshift:latest "$REPO" >/dev/null
+
   say "installing the hostshift add-on"
-  cp "$REPO/ddev/docker-compose.hostshift.yaml" "$ROOT/.ddev/"
-  sed -e "s|www.example.com|$CANON_A|" -e "s|www.example-blog2.com|$CANON_B|" \
-    "$REPO/ddev/docker-compose.hostshift-loopback.yaml" > "$ROOT/.ddev/docker-compose.hostshift-loopback.yaml"
+  # Through `ddev add-on get`, not by copying the files. Exercising install.yaml
+  # is the reason this script exists — both add-on bugs the M6 audit found were
+  # in the install path, and copying the compose files by hand walks straight
+  # past it.
+  (cd "$ROOT" && ddev add-on get "$REPO/ddev" >/dev/null)
+  sed -i.bak -e "s|www.example.com|$CANON_A|" -e "s|www.example-blog2.com|$CANON_B|" \
+    "$ROOT/.ddev/docker-compose.hostshift-loopback.yaml"
+  rm -f "$ROOT/.ddev/docker-compose.hostshift-loopback.yaml.bak"
 
   cat > "$ROOT/hostshift.yaml" <<YAML
 version: 1
