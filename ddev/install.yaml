@@ -35,11 +35,10 @@ post_install_actions:
     echo
     echo "    ddev hostshift init"
     echo
-    echo "It works out the slug from the git branch, writes the variant"
-    echo "hostnames into .ddev/config.hostshift.local.yaml so mkcert covers them,"
-    echo "and merges HOSTSHIFT_SLUG/VARIANTS/WEB_HOSTS into .ddev/.env. Then"
-    echo "'ddev restart'. Pass --dry-run first to see what it would write, or"
-    echo "--slug to choose the name yourself."
+    echo "It works out the slug from the git branch and merges"
+    echo "HOSTSHIFT_SLUG/VARIANTS/WEB_HOSTS into .ddev/.env — the only file it"
+    echo "writes. Then 'ddev restart'. Pass --dry-run first to see what it would"
+    echo "write, or --slug to choose the name yourself."
     echo
     echo "Two things it cannot do for you:"
     echo

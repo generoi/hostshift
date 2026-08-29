@@ -14,23 +14,23 @@
 # hostnames at this service rather than at `web` needs nothing more than naming
 # them here (PLAN §5.6).
 #
-# The variant hostnames must also be in the project's additional_hostnames, or
-# the mkcert certificate carries no SAN for them and the browser gets a TLS
-# interstitial instead of a site. A three-label variant host is not covered by
-# the *.ddev.site wildcard, so it needs registering regardless of hostshift.
+# VIRTUAL_HOST is the whole registration. DDEV builds the mkcert SAN list from
+# the project's hostnames *plus every VIRTUAL_HOST entry across all compose
+# services* (pkg/ddevapp/traefik.go, detectAppRouting), so naming the variants
+# here both routes them and gets them a certificate. Measured on v1.25.2 with no
+# hostshift config file on disk: the served cert carried a SAN for a three-label
+# variant host that was never registered anywhere, verified against the mkcert
+# root. Nothing needs writing into additional_hostnames.
 #
 # Substitutions DDEV performs: $DDEV_SITENAME, $DDEV_APPROOT, $DDEV_TLD.
 # HOSTSHIFT_VARIANTS and HOSTSHIFT_SLUG come from the project's .ddev/.env.
 
 services:
-  # The variant hostnames have to be in additional_hostnames so that DDEV
-  # registers them and mkcert issues a certificate covering them — but DDEV puts
-  # *every* additional hostname on web's VIRTUAL_HOST, so web and hostshift both
-  # claim them and the router sends them to web. WordPress then sees the variant
-  # host, fails to match wp_blogs.domain, and redirects to wp-signup.php.
-  #
-  # So web's list is narrowed back to the canonical hostnames. Everything not
-  # named here keeps going to web; only the variants reach hostshift.
+  # DDEV puts *every* hostname the project registers on web's VIRTUAL_HOST. A
+  # worktree inherits the tracked config.yaml's additional_hostnames, so web
+  # claims the canonical hostnames of the checkout this worktree came from —
+  # which the parent project is already serving. Narrowing web's list back to
+  # its own hostnames is what stops the two projects fighting over them.
   #
   # The default is every hostname the project has, which is what DDEV would have
   # done on its own. Without it, installing the add-on and not yet configuring it
@@ -55,6 +55,13 @@ services:
       - http://web:80
       - --slug
       - ${HOSTSHIFT_SLUG:-wt}
+      # The canonical hostnames live in the checkout this worktree branched
+      # from, which is not mounted here and cannot be. `ddev hostshift init`
+      # resolves them on the host and passes them through. Empty is no map, and
+      # then -C /project applies — which is right when the project has a
+      # hostshift.yaml, since that file *is* mounted.
+      - --map
+      - ${HOSTSHIFT_MAP:-}
     labels:
       com.ddev.site-name: ${DDEV_SITENAME}
       com.ddev.approot: ${DDEV_APPROOT}
