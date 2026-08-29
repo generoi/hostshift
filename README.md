@@ -204,7 +204,12 @@ One gitignored file comes out of it, and nothing else:
 HOSTSHIFT_SLUG=wt-a
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
+HOSTSHIFT_MAP=https://acme.ddev.site=https://wt-a--acme.ddev.site
 ```
+
+`HOSTSHIFT_MAP` is the map itself, resolved here and handed to the proxy. The
+compose service mounts only this worktree, so the canonical hostnames — which
+live in the parent checkout — cannot be worked out inside the container.
 
 Nothing registers `wt-a--acme.ddev.site` anywhere, and nothing needs to. The
 compose service puts `HOSTSHIFT_VARIANTS` into its `VIRTUAL_HOST`, which is what
@@ -287,7 +292,12 @@ hostshift: now run `ddev restart`
 HOSTSHIFT_SLUG=wt-a
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site,wt-a--shop.acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
+HOSTSHIFT_MAP=
 ```
+
+`HOSTSHIFT_MAP` is empty here because `hostshift.yaml` is mounted into the
+container and the proxy reads it directly — which it must, since a flat
+canonical=variant list cannot carry the aliases.
 
 Both variants reach the browser through `VIRTUAL_HOST` alone — no second file,
 and no hostname registered anywhere.
