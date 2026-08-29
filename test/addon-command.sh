@@ -240,7 +240,7 @@ echo "== check"
 # test/integration-ddev.sh, where there is a container to ask.
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 out="$(cd "$wt" && "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check says so when nothing is running" "not running" "$out"
+contains "check says so when there is no proxy container" "no proxy container" "$out"
 if (cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1); then
   fail "and exits non-zero" "exited 0"
 else

@@ -159,7 +159,7 @@ if [ "$cmd" = "copy-db" ]; then
 
   # Sharing the parent's database and copying it are different decisions, and
   # doing both means importing a database into itself.
-  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.*.yaml 2>/dev/null; then
+  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.*.yaml .ddev/docker-compose.*.yaml .ddev/.env 2>/dev/null; then
     echo "hostshift: this worktree is configured to *use* $from's database" >&2
     echo "  (DATABASE_URL points at ddev-$from-db). Copying it into itself is not" >&2
     echo "  what you want — remove that override and \`ddev restart\` first." >&2
@@ -184,7 +184,7 @@ if [ "$cmd" = "copy-db" ]; then
   echo "hostshift: copying the database from $from" >&2
   ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
     --no-tablespaces -h ddev-$from-db -udb -pdb db | mysql -h db -udb -pdb db" || {
-    echo "hostshift: the copy failed. Is $from running? \`ddev start -p $from\`" >&2
+    echo "hostshift: the copy failed. Is $from running? \`ddev start $from\`" >&2
     exit 1; }
   echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
   echo "  hostshift maps — nothing else to do." >&2
@@ -398,11 +398,26 @@ if [ "$cmd" = "check" ]; then
   # worktree to name itself, so a correctly configured worktree was told its
   # proxy was not running, on every single `ddev start`.
   name="${DDEV_SITENAME:-$(basename "$(pwd -P)")}"
-  running="$(docker inspect "ddev-$name-hostshift" \
-    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-    | sed -n '/^VIRTUAL_HOST=/{s///p;q;}' || true)"
+  # .State.Running as well as the env: docker keeps Config.Env for a container
+  # that has exited, and the compose service is `restart: "no"`, so a proxy that
+  # crashed stays down — and reporting its *configured* hostnames as served
+  # certified a total outage as healthy while every variant 502'd.
+  state="$(docker inspect "ddev-$name-hostshift" \
+    --format '{{.State.Running}}{{"\n"}}{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+  alive="$(printf '%s' "$state" | sed -n '1p')"
+  running="$(printf '%s' "$state" | sed -n '/^VIRTUAL_HOST=/{s///p;q;}')"
+  if [ -z "$alive" ]; then
+    echo "hostshift: no proxy container. \`ddev restart\` to serve $variants" >&2
+    exit 2
+  fi
+  if [ "$alive" != "true" ]; then
+    echo "hostshift: the proxy container has exited, so every variant 502s." >&2
+    echo "  \`ddev logs -s hostshift\` for why, then \`ddev restart\`." >&2
+    exit 2
+  fi
   if [ -z "$running" ]; then
-    echo "hostshift: not running. \`ddev restart\` to serve $variants" >&2
+    echo "hostshift: the proxy is running but answers on nothing —" >&2
+    echo "  its VIRTUAL_HOST is empty. \`ddev hostshift init && ddev restart\`." >&2
     exit 2
   fi
   if [ "$running" != "$variants" ]; then
