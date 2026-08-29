@@ -74,6 +74,19 @@ fi
 # careful parts get lost.
 hosts="$(hostshift hosts)"
 
+# In the checkout a worktree branches *from*, there is no canonical/variant
+# distinction to make: its own hostnames are the ones the database holds. Running
+# init here points web at nothing and hands the variants to a proxy nobody routes
+# to — and worse, whichever of the parent and its worktree starts second loses
+# the variant hostnames to the other.
+if [ ! -f .git ] || [ -n "${HOSTSHIFT_ALLOW_PARENT:-}" ]; then
+  if [ -z "${HOSTSHIFT_ALLOW_PARENT:-}" ]; then
+    echo "hostshift: warning: this is not a linked worktree, so its own hostnames are" >&2
+    echo "  the ones the database holds and there is nothing to map. Run this in a" >&2
+    echo "  worktree, or set HOSTSHIFT_ALLOW_PARENT=1 if you meant it." >&2
+  fi
+fi
+
 # And what the checkout this worktree came from answers to.
 #
 # Those hostnames are the ones the *database* holds. `db:pull` search-replaced
@@ -87,9 +100,25 @@ hosts="$(hostshift hosts)"
 parent=""
 parent_hosts=""
 unreadable_parent=""
+linked=""
 common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
-if [ -n "$common" ] && [ "$common" != "$gitdir" ]; then
+
+# A linked worktree has a .git *file* pointing into the parent's .git directory,
+# where a normal checkout has a .git directory. That is the reliable signal:
+# when the parent has been moved or deleted `git rev-parse --git-common-dir`
+# *fails* rather than naming an unreadable path, so testing its output alone
+# read as "not a worktree at all" and skipped the parent path in silence — the
+# map then had the worktree's own hostname as canonical, and because
+# parent_hosts was empty the narrowing subtracted nothing, so the worktree kept
+# claiming the parent's blog hostnames permanently rather than until a restart.
+[ -f .git ] && linked=1
+[ -n "$common" ] && [ "$common" != "$gitdir" ] && linked=1
+
+if [ -n "$linked" ] && [ -z "$common" ]; then
+  unreadable_parent="$(sed -n 's/^gitdir: //p' .git 2>/dev/null | sed 's|/\.git/worktrees/.*||')"
+  unreadable_parent="${unreadable_parent:-the checkout this worktree came from}"
+elif [ -n "$linked" ]; then
   dir="$(dirname "$common")"
   ph="$(hostshift hosts -C "$dir" 2>/dev/null || true)"
   case "$ph" in
@@ -129,9 +158,37 @@ if [ ! -f hostshift.yaml ] && [ -n "$parent_hosts" ]; then
 fi
 
 # The map is the binary's business; parse only what this needs from it.
-variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --json \
-  | sed -n 's|.*"variant": *"https\{0,1\}://\([^"]*\)".*|\1|p' | paste -sd, -)"
+variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --variant-hosts \
+  | paste -sd, -)"
 [ -n "$variants" ] || { echo "hostshift produced no map — run 'hostshift check'" >&2; exit 2; }
+
+# Nothing anywhere checks that two projects do not claim the same hostname —
+# DDEV validates hostname syntax per project and no more, and traefik resolves a
+# tie by rule length rather than complaining. Two branches whose slugs collide
+# therefore give two worktrees identical VIRTUAL_HOST entries, and one of them
+# silently serves the other's code at the URL its author is reviewing. The
+# 30-character truncation makes that likelier, not rarer: PROJ-123-fix-cart and
+# proj/123/fix-cart already collide, as does any pair sharing a 30-character
+# prefix. Checking is cheap — every configured project leaves its variants in
+# .ddev/.env — so check.
+here="$(pwd -P)"
+for other in ../*/.ddev/.env; do
+  [ -f "$other" ] || continue
+  odir="$(cd "$(dirname "$(dirname "$other")")" && pwd -P)"
+  [ "$odir" = "$here" ] && continue
+  ovar="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$other" | head -1)"
+  [ -n "$ovar" ] || continue
+  for v in $(printf '%s' "$variants" | tr ',' ' '); do
+    case ",$ovar," in *",$v,"*)
+      echo "hostshift: warning: $odir already claims $v." >&2
+      echo "  Two projects answering to one hostname is not an error anywhere in DDEV;" >&2
+      echo "  the router picks one and the other is silently unreachable. Pass --slug to" >&2
+      echo "  choose a different name." >&2
+      break 2 ;;
+    esac
+  done
+done
+
 
 # web keeps this project's own hostnames, minus the variants and minus the
 # parent's. DDEV puts every additional hostname on web's VIRTUAL_HOST, so
@@ -167,10 +224,15 @@ done <<<"$hosts"
 # reads it correctly.
 hsmap=""
 if [ ! -f hostshift.yaml ]; then
-  hsmap="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --json \
-    | python3 -c 'import json,sys; print(",".join(s["canonical"]+"="+s["variant"] for s in json.load(sys.stdin)))' \
-    2>/dev/null || true)"
+  hsmap="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs \
+    | paste -sd, - || true)"
   [ -n "$hsmap" ] || { echo "could not resolve a map to hand the proxy" >&2; exit 2; }
+  # The whole flag, not just its value: docker-compose's string command form
+  # drops an argument that expands to nothing, so an empty value means no --map
+  # at all. Passing `--map ""` instead made every project with a hostshift.yaml,
+  # and every project not yet configured, fail to start against a published
+  # image that predates the empty-value guard.
+  hsmap="--map $hsmap"
 fi
 
 # DDEV derives `name` from the directory but not additional_hostnames, so a
@@ -206,7 +268,7 @@ fi
 env_out="HOSTSHIFT_SLUG=$slug
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web
-HOSTSHIFT_MAP=$hsmap"
+HOSTSHIFT_MAP_ARG=$hsmap"
 
 if [ "$cmd" = "env" ]; then
   printf '%s\n' "$env_out"
@@ -228,8 +290,8 @@ fi
 # wp-cli.yml that already has a root `url:` gets it twice, which yaml.v3 rejects
 # outright as a duplicate key.
 if [ "$cmd" = "wp-cli" ]; then
-  canonical="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --json \
-    | sed -n 's|.*"canonical": *"\([^"]*\)".*|\1|p' | head -1)"
+  canonical="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs \
+    | head -1 | cut -d= -f1)"
   [ -n "$canonical" ] || { echo "no canonical origin in the map" >&2; exit 2; }
   echo "# generated by \`ddev hostshift wp-cli\` — do not commit"
   if [ -f wp-cli.yml ]; then

@@ -32,24 +32,27 @@ func TestAddonYAMLIsValid(t *testing.T) {
 // "*only* a compose service — no lib.sh, no generated files, no hooks, no
 // guard". §3 measured what happens when per-repo footprint is not held to — 42
 // repos carrying 14 different pinned SHAs of the same submodule.
-func TestAddonHasNoHooksOrScripts(t *testing.T) {
+func TestAddonStaysSmall(t *testing.T) {
 	entries, err := os.ReadDir("../../ddev")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The compose service, install.yaml, and the one command that scaffolds a
-	// project. §5.7 said "only a compose service — no lib.sh, no hooks, no
-	// guard", and that still holds for the request path: nothing here runs
-	// during a request, generates a guard, or wraps a task that should just
-	// work. What the command does is the setup the *binary* deliberately does
-	// not do, because scaffolding DDEV is opinionated and hostshift is not a
-	// DDEV tool.
+	// The compose service, install.yaml, one host command, and one config file
+	// carrying a post-start hook. §5.7 originally said "only a compose service
+	// — no lib.sh, no hooks, no guard"; the plan now says what this asserts.
+	//
+	// What survives of that constraint, and what this test is really for:
+	// nothing here runs during a *request*, nothing generates a guard, and
+	// nothing wraps a task that should just work. The hook prints the URLs
+	// being served and notices when .ddev/.env has gone stale — the only moment
+	// anything can notice, since the file is computed once on the host while
+	// the project name follows the directory.
 	for _, e := range entries {
 		if e.Name() == "commands" {
 			continue
 		}
 		if !strings.HasSuffix(e.Name(), ".yaml") {
-			t.Errorf("ddev/%s: the add-on is compose files, install.yaml and commands/", e.Name())
+			t.Errorf("ddev/%s: the add-on is yaml and commands/, nothing else", e.Name())
 		}
 	}
 	cmds, err := os.ReadDir("../../ddev/commands/host")
@@ -64,6 +67,9 @@ func TestAddonHasNoHooksOrScripts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The hook lives in config.hostshift.yaml, where DDEV reads hooks. A compose
+	// file is not that place, and additional_fqdns in particular is ruled out
+	// wherever it appears.
 	for _, banned := range []string{"hooks:", "post-start", "web_extra_hosts", "additional_fqdns"} {
 		if strings.Contains(string(b), banned) {
 			// additional_fqdns in particular: DDEV manages host-level hosts

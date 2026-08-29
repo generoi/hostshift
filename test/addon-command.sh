@@ -131,7 +131,7 @@ check "hostshift.yaml wins over the parent's hostnames" \
 # ...and then the container reads that file itself, since it is mounted and
 # carries aliases a canonical=variant list cannot express.
 contains "no map is handed over when hostshift.yaml is mounted" \
-  "HOSTSHIFT_MAP=" "$out"
+  "HOSTSHIFT_MAP_ARG=" "$out"
 rm "$wt/hostshift.yaml"
 
 # DDEV derives `name` from the directory but not additional_hostnames, so a
@@ -148,7 +148,39 @@ contains "an inherited hostname the parent also serves is called out" \
 # `-C /project` there built its map from the directory basename, literally
 # "project", and every request 421'd.
 contains "the resolved map is handed to the container" \
-  "HOSTSHIFT_MAP=https://acme.ddev.site=https://wt-a--acme.ddev.site" "$out"
+  "HOSTSHIFT_MAP_ARG=--map https://acme.ddev.site=https://wt-a--acme.ddev.site" "$out"
+
+# The parent moved or was deleted. `git rev-parse --git-common-dir` then *fails*
+# rather than naming an unreadable path, so testing its output alone read as
+# "not a worktree" — the map silently took the worktree's own hostname as
+# canonical, and the narrowing subtracted nothing, so the worktree kept the
+# parent's blog hostnames permanently rather than until a restart.
+mv "$main" "$main-moved"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "a parent that moved away is a warning, not a silent wrong map" \
+  "no DDEV" "$out"
+mv "$main-moved" "$main"
+
+# Two branches whose slugs collide give two projects identical VIRTUAL_HOST
+# entries; DDEV validates hostname syntax per project and no more, and traefik
+# resolves the tie by rule length rather than complaining.
+twin="$work/acme-wt-twin"
+git -C "$main" worktree add -q -b twin "$twin"
+mkdir -p "$twin/.ddev"; printf 'name: acme-wt-twin\n' > "$twin/.ddev/config.worktree.local.yaml"
+(cd "$wt" && "$cmd" init --slug clash >/dev/null 2>&1) || fail "init exited non-zero" ""
+out="$(cd "$twin" && "$cmd" env --slug clash 2>&1 || true)"
+contains "a slug another project already claims is a warning" "already claims" "$out"
+out="$(cd "$twin" && "$cmd" env --slug distinct 2>&1 || true)"
+case "$out" in *"already claims"*) fail "a distinct slug is not warned about" "$out" ;;
+                *) pass "a distinct slug is not warned about" ;; esac
+git -C "$main" worktree remove --force "$twin"
+# and put $wt back as the dry-run test below expects to find it
+rm -f "$wt/.ddev/.env"
+
+# The checkout a worktree branches from has no canonical/variant distinction to
+# make, and running init there makes it claim its own worktrees' hostnames.
+out="$(cd "$main" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "init in the parent checkout is warned about" "not a linked worktree" "$out"
 
 echo "== init"
 
