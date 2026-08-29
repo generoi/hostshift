@@ -131,7 +131,7 @@ check "hostshift.yaml wins over the parent's hostnames" \
 # ...and then the container reads that file itself, since it is mounted and
 # carries aliases a canonical=variant list cannot express.
 contains "no map is handed over when hostshift.yaml is mounted" \
-  "HOSTSHIFT_MAP_ARG=" "$out"
+  "HOSTSHIFT_MAP_ARGS=" "$out"
 rm "$wt/hostshift.yaml"
 
 # DDEV derives `name` from the directory but not additional_hostnames, so a
@@ -148,7 +148,7 @@ contains "an inherited hostname the parent also serves is called out" \
 # `-C /project` there built its map from the directory basename, literally
 # "project", and every request 421'd.
 contains "the resolved map is handed to the container" \
-  "HOSTSHIFT_MAP_ARG=--map https://acme.ddev.site=https://wt-a--acme.ddev.site" "$out"
+  "HOSTSHIFT_MAP_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site" "$out"
 
 # The parent moved or was deleted. `git rev-parse --git-common-dir` then *fails*
 # rather than naming an unreadable path, so testing its output alone read as
@@ -264,6 +264,40 @@ if (cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1); then
 else
   pass "check refuses when nothing is deployed"
 fi
+
+# The published image splits a comma-separated --map on its first `=`, so a
+# multisite map came out as one site with a corrupt variant host and every
+# variant 421'd. --from/--to is index-aligned and has always been understood.
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null || true)"
+contains "a multi-site map is passed as repeated --from/--to" \
+  "HOSTSHIFT_MAP_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site --from https://nat.acme.ddev.site --to https://wt-a--nat.acme.ddev.site" \
+  "$out"
+
+# The hook runs this; sourcing .ddev/.env made a project file into host code,
+# and broke outright on any value containing a space.
+hookbody="$(sed -n '/^hooks:/,$p' "$repo/ddev/config.hostshift.yaml")"
+case "$hookbody" in
+  *". ./.ddev/.env"*|*"source "*|*". .ddev/.env"*)
+    fail "the hook does not source .ddev/.env" "$hookbody" ;;
+  *) pass "the hook does not source .ddev/.env" ;;
+esac
+
+# A plain checkout with a hostshift.yaml is the other headline use — serving a
+# site at a hostname its database does not hold. Warning there is a false alarm.
+prod="$work/prodsite"; newproject "$prod" 'name: prodsite\ntype: php'
+printf 'sites:\n  - canonical: https://www.example.com\n    base: https://prodsite.ddev.site\n' > "$prod/hostshift.yaml"
+out="$(cd "$prod" && "$cmd" env --slug preview 2>&1 || true)"
+case "$out" in *"not a linked worktree"*) fail "a declared map is not a false alarm" "$out" ;;
+                *) pass "a declared map is not a false alarm" ;; esac
+
+# A submodule has a .git file too, and its "parent" is the superproject's
+# modules directory — not a checkout.
+sub="$work/host/vendor/sub"; mkdir -p "$sub/.ddev"
+printf 'name: sub\ntype: php\n' > "$sub/.ddev/config.yaml"
+printf 'gitdir: ../../.git/modules/vendor/sub\n' > "$sub/.git"
+out="$(cd "$sub" && "$cmd" env --slug sm 2>&1 || true)"
+case "$out" in *"but no DDEV"*) fail "a submodule is not mistaken for a worktree" "$out" ;;
+                *) pass "a submodule is not mistaken for a worktree" ;; esac
 
 echo "== wp-cli"
 

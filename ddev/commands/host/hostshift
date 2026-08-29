@@ -79,12 +79,11 @@ hosts="$(hostshift hosts)"
 # init here points web at nothing and hands the variants to a proxy nobody routes
 # to — and worse, whichever of the parent and its worktree starts second loses
 # the variant hostnames to the other.
-if [ ! -f .git ] || [ -n "${HOSTSHIFT_ALLOW_PARENT:-}" ]; then
-  if [ -z "${HOSTSHIFT_ALLOW_PARENT:-}" ]; then
-    echo "hostshift: warning: this is not a linked worktree, so its own hostnames are" >&2
-    echo "  the ones the database holds and there is nothing to map. Run this in a" >&2
-    echo "  worktree, or set HOSTSHIFT_ALLOW_PARENT=1 if you meant it." >&2
-  fi
+if [ ! -f .git ] && [ ! -f hostshift.yaml ]; then
+  echo "hostshift: warning: this is not a linked worktree and declares no" >&2
+  echo "  hostshift.yaml, so its own hostnames are the ones the database holds and" >&2
+  echo "  there is nothing to map. Run this in a worktree, or declare the hostnames" >&2
+  echo "  the database really holds in hostshift.yaml." >&2
 fi
 
 # And what the checkout this worktree came from answers to.
@@ -112,8 +111,11 @@ gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
 # map then had the worktree's own hostname as canonical, and because
 # parent_hosts was empty the narrowing subtracted nothing, so the worktree kept
 # claiming the parent's blog hostnames permanently rather than until a restart.
-[ -f .git ] && linked=1
-[ -n "$common" ] && [ "$common" != "$gitdir" ] && linked=1
+# A submodule has a .git file too, and its "parent" would be the superproject's
+# modules directory — not a checkout, and warning about it is a false alarm.
+# Only a linked worktree's gitdir points inside a .git/worktrees/ directory.
+grep -q '/worktrees/' .git 2>/dev/null && linked=1
+[ -n "$common" ] && [ "$common" != "$gitdir" ] && [ -d "$common" ] && linked=1
 
 if [ -n "$linked" ] && [ -z "$common" ]; then
   unreadable_parent="$(sed -n 's/^gitdir: //p' .git 2>/dev/null | sed 's|/\.git/worktrees/.*||')"
@@ -224,15 +226,23 @@ done <<<"$hosts"
 # reads it correctly.
 hsmap=""
 if [ ! -f hostshift.yaml ]; then
-  hsmap="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs \
-    | paste -sd, - || true)"
+  # Repeated --from/--to, not `--map c=v,c=v`. Comma-separated --map is a flag
+  # form this branch added, and the image is :latest: the published binary splits
+  # the whole string on its first `=`, so a two-site map came out as one site
+  # whose variant host was "wt-a--acme.ddev.site,https" and every variant 421'd —
+  # while `ddev start`, `ddev hostshift check` and `hostshift map` on the host all
+  # reported success. --from/--to is index-aligned and repeatable and always was,
+  # so it works against the image already published as well as a current one.
+  #
+  # The whole flag sequence, not just its value: docker-compose's string command
+  # form drops an argument that expands to nothing, so empty means no map flags
+  # at all — which is right when a hostshift.yaml is mounted.
+  hsmap=""
+  while IFS='=' read -r c v; do
+    [ -n "$c" ] || continue
+    hsmap="${hsmap:+$hsmap }--from $c --to $v"
+  done <<<"$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs)"
   [ -n "$hsmap" ] || { echo "could not resolve a map to hand the proxy" >&2; exit 2; }
-  # The whole flag, not just its value: docker-compose's string command form
-  # drops an argument that expands to nothing, so an empty value means no --map
-  # at all. Passing `--map ""` instead made every project with a hostshift.yaml,
-  # and every project not yet configured, fail to start against a published
-  # image that predates the empty-value guard.
-  hsmap="--map $hsmap"
 fi
 
 # DDEV derives `name` from the directory but not additional_hostnames, so a
@@ -265,6 +275,11 @@ $h
   fi
 fi
 
+env_out="HOSTSHIFT_SLUG=$slug
+HOSTSHIFT_VARIANTS=$variants
+HOSTSHIFT_WEB_HOSTS=$web
+HOSTSHIFT_MAP_ARGS=$hsmap"
+
 # `hostshift check` on its own is the wrong question in a worktree, and answers
 # it confidently: run without --from it resolves layer 1 against *this* checkout,
 # reports the map injective and anchored, and exits 0 — for a map whose canonical
@@ -278,16 +293,23 @@ fi
 if [ "$cmd" = "check" ]; then
   hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
   if [ -f .ddev/.env ]; then
-    deployed="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' .ddev/.env | head -1)"
-    if [ "$deployed" != "$variants" ]; then
-      echo "hostshift: .ddev/.env is out of date — it was written for" >&2
-      echo "  ${deployed:-nothing}" >&2
+    # The whole block, not one variable of it. A renamed worktree drifts only in
+    # HOSTSHIFT_WEB_HOSTS, a parent that gains a blog only in HOSTSHIFT_VARIANTS,
+    # and a hostshift.yaml appearing only in HOSTSHIFT_MAP_ARG — where the
+    # deployed flat map goes on winning over the file, so its aliases silently
+    # never rewrite. Comparing one variable caught one of the three.
+    deployed="$(grep '^HOSTSHIFT_' .ddev/.env || true)"
+    if [ "$deployed" != "$env_out" ]; then
+      echo "hostshift: .ddev/.env is out of date. It says" >&2
+      printf '  %s\n' ${deployed:-nothing} >&2
       echo "  and this project now resolves to" >&2
-      echo "  $variants" >&2
+      printf '  %s\n' $env_out >&2
       echo "  Run \`ddev hostshift init && ddev restart\`." >&2
       exit 2
     fi
-    echo "hostshift: .ddev/.env matches; $variants is what ddev restart would serve" >&2
+    printf '\n  hostshift is serving:\n' >&2
+    printf '    https://%s\n' $(printf '%s' "$variants" | tr ',' ' ') >&2
+    printf '\n' >&2
   else
     echo "hostshift: nothing deployed yet — run \`ddev hostshift init\`" >&2
     exit 2
@@ -295,10 +317,6 @@ if [ "$cmd" = "check" ]; then
   exit 0
 fi
 
-env_out="HOSTSHIFT_SLUG=$slug
-HOSTSHIFT_VARIANTS=$variants
-HOSTSHIFT_WEB_HOSTS=$web
-HOSTSHIFT_MAP_ARG=$hsmap"
 
 if [ "$cmd" = "env" ]; then
   printf '%s\n' "$env_out"
@@ -377,8 +395,8 @@ touch .ddev/.env
 tmp="$(mktemp)"
 grep -v '^HOSTSHIFT_' .ddev/.env > "$tmp" || true
 printf '%s\n' "$env_out" >> "$tmp"
-cat "$tmp" > .ddev/.env
-rm -f "$tmp"
+chmod 644 "$tmp"
+mv "$tmp" .ddev/.env
 
 # An earlier version of this command wrote that file. Left behind it is still
 # read as DDEV config, so it still feeds its own variants back in.

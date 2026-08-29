@@ -47,15 +47,18 @@ services:
     restart: "no"
     # String form, not a list, and deliberately: compose splits it after
     # interpolation, so an argument that expands to nothing disappears entirely
-    # rather than becoming an empty string. HOSTSHIFT_MAP_ARG is the whole flag
-    # — `--map c=v,c=v` or nothing at all.
+    # rather than becoming an empty string. HOSTSHIFT_MAP_ARGS is the whole flag
+    # sequence — repeated `--from`/`--to`, or nothing at all.
     #
     # That matters because the image is `:latest` and this file is not versioned
-    # with it. Passing `--map ""` needed a binary new enough to treat an empty
-    # value as no value; against the published image it was a hard startup
-    # failure, on every project not yet configured *and* on every project with a
-    # hostshift.yaml, whose map arg is empty by design. Anything added here must
-    # keep working against the image already published, or be released first.
+    # with it, and it has now bitten twice. Passing `--map ""` needed a binary new
+    # enough to treat an empty value as no value. Passing `--map c=v,c=v` needed
+    # one new enough to split on commas — the published binary split on the first
+    # `=` instead, so a multisite map became one site with a corrupt variant host
+    # and every variant 421'd, with `ddev start` and `check` both reporting
+    # success. Hence repeated `--from`/`--to`, which has worked since the first
+    # release. **Anything added here must work against the image already
+    # published, or be released before this file asks for it.**
     #
     # The canonical hostnames live in the checkout this worktree branched from,
     # which is not mounted here and cannot be, so `ddev hostshift init` resolves
@@ -63,7 +66,7 @@ services:
     # applies — right when the project has a hostshift.yaml, since that file
     # *is* mounted.
     command: proxy -C /project --listen 0.0.0.0:8080 --upstream http://web:80
-      --slug ${HOSTSHIFT_SLUG:-wt} ${HOSTSHIFT_MAP_ARG:-}
+      --slug ${HOSTSHIFT_SLUG:-wt} ${HOSTSHIFT_MAP_ARGS:-}
     labels:
       com.ddev.site-name: ${DDEV_SITENAME}
       com.ddev.approot: ${DDEV_APPROOT}
