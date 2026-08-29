@@ -96,7 +96,16 @@ if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
     # refuse during a rebase, a bisect or a checked-out tag — the hook runs it on
     # every start, and refusing means the staleness check silently stops running
     # for the duration.
+    # Two shapes to recover from, and reading only the first is why this has
+    # shipped broken twice: HOSTSHIFT_ARGS is `--slug X` only when a
+    # hostshift.yaml is present. On the README's headline path it is
+    # `--from … --to …`, and the deployed slug is the prefix of the first
+    # variant — wt-a--acme.ddev.site — which is present in both shapes.
     slug="$(sed -n '/^HOSTSHIFT_ARGS=--slug /{s///p;q;}' .ddev/.env 2>/dev/null)"
+    if [ -z "$slug" ]; then
+      slug="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' .ddev/.env 2>/dev/null \
+        | cut -d, -f1 | sed -n 's/--.*//p')"
+    fi
     slug="${slug:-wt}"
   fi
   [ -n "$branch" ] || [ -n "$slug" ] || { echo "no git branch here — pass --slug" >&2; exit 2; }
@@ -215,7 +224,7 @@ if [ "$cmd" = "copy-db" ]; then
   if [ -z "$force" ]; then
     tables="$(ddev exec -s web bash -c \
       "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
-      2>/dev/null | tail -1 | tr -dc '0-9')"
+      2>/dev/null | tail -1 | tr -dc '0-9' || true)"
     if [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null; then
       echo "hostshift: this worktree's database already has $tables table(s)." >&2
       echo "  Copying from $from replaces them, and there is no undo." >&2
@@ -518,7 +527,7 @@ if [ "$cmd" = "check" ]; then
 fi
 
 
-if [ "$cmd" = "init" ] && [ -n "$unreadable_parent" ]; then
+if [ "$cmd" = "init" ] && [ -n "$unreadable_parent" ] && [ ! -f hostshift.yaml ]; then
   echo "hostshift: refusing to write a map built from this worktree's own" >&2
   echo "  hostnames. $unreadable_parent could not be read, so the canonical side" >&2
   echo "  would be the hostname this worktree is *served at* — nothing would be" >&2

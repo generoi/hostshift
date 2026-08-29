@@ -65,7 +65,11 @@ contains "branch becomes a hostname label" "feature-abc-123--slug.ddev.site" "$o
 if out="$(cd "$d" && LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 "$cmd" env 2>&1)"; then
   # A hostname, not the variable name — "HOSTSHIFT_VARIANTS=" is a prefix of
   # every possible value, so it could not fail.
-  contains "a non-ASCII branch still derives a slug" "--slug.ddev.site" "$out"
+  # Equality on the line: "--slug.ddev.site" was a *suffix* of every possible
+  # variant here, because the fixture project is called "slug".
+  check "a non-ASCII branch still derives a slug" \
+    "HOSTSHIFT_VARIANTS=feature-k-ytt-liittym--slug.ddev.site,feature-k-ytt-liittym--blog.ddev.site" \
+    "$(printf '%s\n' "$out" | sed -n 's/^\(HOSTSHIFT_VARIANTS=.*\)$/\1/p')"
 else
   fail "a non-ASCII branch still derives a slug" "exited non-zero: $out"
 fi
@@ -133,8 +137,11 @@ esac
 printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n' > "$wt/hostshift.yaml"
 out="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null || true)"
 # By name, not by line number — the block gains and loses variables.
-contains "hostshift.yaml wins over the parent's hostnames" \
-  "HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site" "$out"
+# Equality: the expected string was a *prefix* of the broken output too, so
+# dropping the guard that makes hostshift.yaml win still passed.
+check "hostshift.yaml wins over the parent's hostnames" \
+  "HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site" \
+  "$(printf '%s\n' "$out" | sed -n '/^HOSTSHIFT_VARIANTS=/p')"
 # ...and then the container reads that file itself, since it is mounted and
 # carries aliases a canonical=variant list cannot express.
 contains "a mounted hostshift.yaml is resolved with a slug, not a map" \
@@ -230,6 +237,20 @@ rm -f "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 check ".env is 0644 when init creates it" "-rw-r--r--" \
   "$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
+
+# A detached HEAD — a rebase, a bisect, a checked-out tag — is ordinary, and the
+# post-start hook runs `check` on every start. This path has shipped broken
+# twice and had no coverage in any suite.
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+was="$(git -C "$wt" symbolic-ref --short HEAD)"
+(cd "$wt" && git checkout -q --detach HEAD)
+out="$(cd "$wt" && "$cmd" check 2>&1 || true)"
+case "$out" in
+  *"no git branch here"*|*"has no letters or digits"*|*"is out of date"*)
+    fail "a detached HEAD does not break check" "$out" ;;
+  *) pass "a detached HEAD does not break check" ;;
+esac
+git -C "$wt" checkout -q "$was"
 
 echo "== check"
 
