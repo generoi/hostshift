@@ -16,8 +16,10 @@
 #
 # `ddev hostshift check` already answers the question, reads the file by parsing
 # rather than sourcing, and cannot disagree with itself the way two separate
-# staleness checks did. `|| true` because a stale configuration is worth saying
-# out loud but is not a reason to fail the start.
+# staleness checks did. No `|| true`: DDEV does not fail `ddev start` on a failing
+# `exec-host` anyway — measured, it prints `Task failed:` and still reports
+# success — so all the guard did was suppress the one line that made a stale
+# configuration visible above the rest of the start output.
 hooks:
   post-start:
-    - exec-host: .ddev/commands/host/hostshift check || true
+    - exec-host: .ddev/commands/host/hostshift check
