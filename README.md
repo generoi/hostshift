@@ -142,7 +142,11 @@ submodule.
 
 The command is the opinionated half, and it is opinionated on purpose: it works
 the slug out from the git branch, decides which hostnames `web` keeps, and
-writes the one gitignored file a worktree needs. The hook prints the hostnames
+writes the one gitignored file a worktree needs. It also owns `check`, for the
+same reason — `hostshift check` in a worktree resolves *that* checkout's
+hostnames rather than the ones its database holds, and calls the resulting map
+valid, so the DDEV-shaped question has to be asked by the thing that knows what
+a worktree is. The hook prints the hostnames
 being served on every `ddev start`, and says so when that file has gone stale —
 which it does on its own, since the project name follows the directory while the
 file does not. Its tests are `test/addon-command.sh`.

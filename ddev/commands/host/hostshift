@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ## Description: configure hostshift for this DDEV project
-## Usage: hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]
+## Usage: hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]
 ## Example: "ddev hostshift init"
 ##
 ## Scaffolding a DDEV project is opinionated work, and this is where it is
@@ -31,16 +31,16 @@ while [ $# -gt 0 ]; do
     # Silently discarding an unknown flag is how `--dry-run` came to write the
     # files it was passed to prevent.
     *) echo "unknown argument: $1" >&2
-       echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]" >&2
+       echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]" >&2
        exit 2 ;;
   esac
 done
 
 case "$cmd" in
-  init|env|wp-cli) ;;
+  init|check|env|wp-cli) ;;
   -h|--help|help)
-    echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]"; exit 0 ;;
-  *) echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]" >&2; exit 2 ;;
+    echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]"; exit 0 ;;
+  *) echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]" >&2; exit 2 ;;
 esac
 
 command -v hostshift >/dev/null || {
@@ -263,6 +263,36 @@ $h
     echo "  project name from the directory but not the additional hostnames. Until" >&2
     echo "  \`ddev restart\`, those serve this worktree rather than $(basename "$parent")." >&2
   fi
+fi
+
+# `hostshift check` on its own is the wrong question in a worktree, and answers
+# it confidently: run without --from it resolves layer 1 against *this* checkout,
+# reports the map injective and anchored, and exits 0 — for a map whose canonical
+# hostname appears nowhere in the database and which the proxy never sees. It is
+# also what the README, this add-on's own post-install text and the proxy's 421
+# body all tell you to run.
+#
+# So the DDEV-shaped question is asked here, where knowing what a worktree is is
+# allowed: check the map that would be deployed, and whether what *is* deployed
+# still matches it.
+if [ "$cmd" = "check" ]; then
+  hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
+  if [ -f .ddev/.env ]; then
+    deployed="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' .ddev/.env | head -1)"
+    if [ "$deployed" != "$variants" ]; then
+      echo "hostshift: .ddev/.env is out of date — it was written for" >&2
+      echo "  ${deployed:-nothing}" >&2
+      echo "  and this project now resolves to" >&2
+      echo "  $variants" >&2
+      echo "  Run \`ddev hostshift init && ddev restart\`." >&2
+      exit 2
+    fi
+    echo "hostshift: .ddev/.env matches; $variants is what ddev restart would serve" >&2
+  else
+    echo "hostshift: nothing deployed yet — run \`ddev hostshift init\`" >&2
+    exit 2
+  fi
+  exit 0
 fi
 
 env_out="HOSTSHIFT_SLUG=$slug

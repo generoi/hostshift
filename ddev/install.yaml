@@ -53,8 +53,11 @@ post_install_actions:
     echo "    live production. That file has no generated-file marker, so your"
     echo "    edit survives the next 'ddev add-on get'."
     echo
-    echo "'ddev hostshift init --dry-run' shows what it would write; 'hostshift"
-    echo "check' validates the map it resolved."
+    echo "'ddev hostshift init --dry-run' shows what it would write, and"
+    echo "'ddev hostshift check' says whether what is deployed is still current."
+    echo "Use those rather than 'hostshift check' directly: in a worktree the"
+    echo "bare command resolves this checkout's own hostnames, not the ones the"
+    echo "database holds, and reports that map as valid."
     echo
 
 removal_actions:
