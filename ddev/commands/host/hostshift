@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#ddev-generated
 ## Description: configure hostshift for this DDEV project
 ## Usage: hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run]
 ## Example: "ddev hostshift init"
@@ -9,6 +10,19 @@
 ## does not write .ddev/ files, guess slugs from branches, or decide which
 ## hostnames `web` should keep. A binary with a `ddev init` subcommand would be
 ## a tool for one shop; this command is the shop.
+##
+## #ddev-generated, and it has to be. Without that marker `ddev add-on get`
+## refuses to overwrite this file, so an upgrade installs a new compose file
+## beside the old command — and the two halves disagree about the variable names
+## they pass between them. Renaming HOSTSHIFT_SLUG/HOSTSHIFT_MAP_ARGS to
+## HOSTSHIFT_ARGS did exactly that: init wrote the old names, compose read the
+## new one, the proxy started with its inert default and every variant 421'd,
+## with `init`, `restart` and `check` all reporting success.
+##
+## The cost is that a local edit here is lost on the next `ddev add-on get`.
+## That is the right trade for a file whose whole job is to stay in step with the
+## compose file it ships beside. The loopback override is the opposite case and
+## deliberately carries no marker.
 ##
 ## Needs the hostshift binary on PATH. Everything generic comes from it — the
 ## map, the variants, the hostnames a checkout declares — and everything
@@ -62,7 +76,13 @@ command -v hostshift >/dev/null || {
 # during a rebase, is a refusal with no reason behind it.
 if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
   branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
-  [ -n "$branch" ] || { echo "no git branch here — pass --slug" >&2; exit 2; }
+  # Detached HEAD is ordinary — a rebase, a bisect, a checked-out tag — and it
+  # must not stop `check`, which the post-start hook runs on every start. The
+  # deployed slug is right there in .ddev/.env.
+  if [ -z "$branch" ] && [ "$cmd" = "check" ] && [ -f .ddev/.env ]; then
+    slug="$(sed -n '/^HOSTSHIFT_ARGS=--slug /{s///p;q;}' .ddev/.env)"
+  fi
+  [ -n "$branch" ] || [ -n "$slug" ] || { echo "no git branch here — pass --slug" >&2; exit 2; }
   slug="$(printf '%s' "$branch" \
     | LC_ALL=C tr '[:upper:]' '[:lower:]' \
     | LC_ALL=C sed -e 's/[^a-z0-9]\{1,\}/-/g' \
@@ -159,7 +179,7 @@ if [ "$cmd" = "copy-db" ]; then
 
   # Sharing the parent's database and copying it are different decisions, and
   # doing both means importing a database into itself.
-  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.*.yaml .ddev/docker-compose.*.yaml .ddev/.env 2>/dev/null; then
+  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml .ddev/.env 2>/dev/null; then
     echo "hostshift: this worktree is configured to *use* $from's database" >&2
     echo "  (DATABASE_URL points at ddev-$from-db). Copying it into itself is not" >&2
     echo "  what you want — remove that override and \`ddev restart\` first." >&2
@@ -341,7 +361,8 @@ fi
 # canonical side, the slug is the only way to derive the variant. Shipping both
 # meant one of them was always dead, and the multisite example showed an empty
 # HOSTSHIFT_MAP_ARGS= line that reads like a bug.
-env_out="HOSTSHIFT_ARGS=${hsmap:---slug $slug}
+args="${hsmap:---slug $slug}"
+env_out="HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web"
 
@@ -383,7 +404,14 @@ if [ "$cmd" = "check" ]; then
     printf '%s\n' "${deployed:-  nothing}" >&2
     echo "  and this project now resolves to" >&2
     printf '%s\n' "$env_out" >&2
-    echo "  Run \`ddev hostshift init && ddev restart\`." >&2
+    if [ -n "$unreadable_parent" ]; then
+      echo "  Not \`ddev hostshift init\` — the map above was built from this" >&2
+      echo "  worktree's own hostnames because $unreadable_parent could not be" >&2
+      echo "  read, and deploying it would rewrite nothing and take the parent's" >&2
+      echo "  hostnames with it. Fix that checkout first." >&2
+    else
+      echo "  Run \`ddev hostshift init && ddev restart\`." >&2
+    fi
     exit 2
   fi
 
@@ -403,8 +431,10 @@ if [ "$cmd" = "check" ]; then
   # crashed stays down — and reporting its *configured* hostnames as served
   # certified a total outage as healthy while every variant 502'd.
   state="$(docker inspect "ddev-$name-hostshift" \
-    --format '{{.State.Running}}{{"\n"}}{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+    --format '{{.State.Running}}{{"\n"}}{{range .Config.Cmd}}{{.}} {{end}}{{"\n"}}{{range .Config.Env}}{{println .}}{{end}}' \
+    2>/dev/null || true)"
   alive="$(printf '%s' "$state" | sed -n '1p')"
+  cmd_running="$(printf '%s' "$state" | sed -n '2p')"
   running="$(printf '%s' "$state" | sed -n '/^VIRTUAL_HOST=/{s///p;q;}')"
   if [ -z "$alive" ]; then
     echo "hostshift: no ddev-$name-hostshift container. \`ddev restart\` to serve" >&2
@@ -429,6 +459,23 @@ if [ "$cmd" = "check" ]; then
     echo "  Run \`ddev restart\`." >&2
     exit 2
   fi
+
+  # VIRTUAL_HOST says which hostnames reach the proxy. It says nothing about the
+  # map the proxy was started with — and a proxy that is running, routed, and
+  # 421ing every hostname it is routed for was reported as healthy. That is the
+  # failure this file has warned about twice (`--map ""`, then a comma-separated
+  # `--map`), and it is what an upgrade produces when the two halves of the
+  # add-on disagree about a variable name.
+  case " $cmd_running " in
+    *" $args "*) ;;
+    *) echo "hostshift: the proxy is running with a different map than .ddev/.env" >&2
+       echo "  says. It was started with:" >&2
+       echo "    $cmd_running" >&2
+       echo "  and .ddev/.env now asks for:" >&2
+       echo "    $args" >&2
+       echo "  Run \`ddev restart\`." >&2
+       exit 2 ;;
+  esac
 
   printf '\n  hostshift is serving:\n' >&2
   printf '    https://%s\n' $(printf '%s' "$variants" | tr ',' ' ') >&2

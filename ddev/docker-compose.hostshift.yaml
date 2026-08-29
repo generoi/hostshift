@@ -70,7 +70,7 @@ services:
     # applies — right when the project has a hostshift.yaml, since that file
     # *is* mounted.
     command: proxy -C /project --listen 0.0.0.0:8080 --upstream http://web:80
-      ${HOSTSHIFT_ARGS:---slug wt}
+      ${HOSTSHIFT_ARGS:-${HOSTSHIFT_MAP_ARGS:---slug ${HOSTSHIFT_SLUG:-wt}}}
     labels:
       com.ddev.site-name: ${DDEV_SITENAME}
       com.ddev.approot: ${DDEV_APPROOT}
