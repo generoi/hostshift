@@ -57,7 +57,10 @@ command -v hostshift >/dev/null || {
 # feature/käyttöliittymä, and en_US.UTF-8 is the macOS default in a Finnish
 # shop. The trim runs after the truncation as well as before it, or a slug cut
 # at 30 characters can end in a hyphen and derive "…abc---site.ddev.site".
-if [ -z "$slug" ]; then
+# copy-db maps nothing, so it needs no slug — and refusing to copy a database
+# because the branch name has no letters in it, or because HEAD is detached
+# during a rebase, is a refusal with no reason behind it.
+if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
   branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
   [ -n "$branch" ] || { echo "no git branch here — pass --slug" >&2; exit 2; }
   slug="$(printf '%s' "$branch" \
@@ -144,6 +147,48 @@ elif [ -n "$linked" ]; then
     "$hosts") : ;;
     *) parent="$dir"; parent_hosts="$ph" ;;
   esac
+fi
+
+if [ "$cmd" = "copy-db" ]; then
+  [ -n "$parent" ] || {
+    echo "hostshift: no parent checkout to copy from — this is not a linked worktree" >&2
+    echo "  of a different DDEV project. Use \`ddev import-db\` or a fresh pull." >&2
+    exit 2; }
+  from="$(basename "$parent")"
+  [ -f "$parent/.ddev/config.yaml" ] && n="$(sed -n 's/^name: *//p' "$parent/.ddev/config.yaml" | head -1)" && [ -n "$n" ] && from="$n"
+
+  # Sharing the parent's database and copying it are different decisions, and
+  # doing both means importing a database into itself.
+  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.*.yaml 2>/dev/null; then
+    echo "hostshift: this worktree is configured to *use* $from's database" >&2
+    echo "  (DATABASE_URL points at ddev-$from-db). Copying it into itself is not" >&2
+    echo "  what you want — remove that override and \`ddev restart\` first." >&2
+    exit 2
+  fi
+
+  # It overwrites. Refuse to do that silently to a database that has something
+  # in it — the caller may well have meant `ddev import-db`, or may be in the
+  # wrong directory, and there is no undo.
+  if [ -z "$force" ]; then
+    tables="$(ddev exec -s web bash -c \
+      "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
+      2>/dev/null | tr -dc '0-9')"
+    if [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null; then
+      echo "hostshift: this worktree's database already has $tables table(s)." >&2
+      echo "  Copying from $from replaces them, and there is no undo." >&2
+      echo "  Pass --force if that is what you want." >&2
+      exit 2
+    fi
+  fi
+
+  echo "hostshift: copying the database from $from" >&2
+  ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
+    --no-tablespaces -h ddev-$from-db -udb -pdb db | mysql -h db -udb -pdb db" || {
+    echo "hostshift: the copy failed. Is $from running? \`ddev start -p $from\`" >&2
+    exit 1; }
+  echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
+  echo "  hostshift maps — nothing else to do." >&2
+  exit 0
 fi
 
 # hostshift.yaml, where a project has one, is a deliberate statement about which
@@ -319,48 +364,6 @@ HOSTSHIFT_WEB_HOSTS=$web"
 #
 # It does not touch hostnames. Whatever is copied still holds the parent's, which
 # is exactly why hostshift is needed afterwards just as much as before.
-if [ "$cmd" = "copy-db" ]; then
-  [ -n "$parent" ] || {
-    echo "hostshift: no parent checkout to copy from — this is not a linked worktree" >&2
-    echo "  of a different DDEV project. Use \`ddev import-db\` or a fresh pull." >&2
-    exit 2; }
-  from="$(basename "$parent")"
-  [ -f "$parent/.ddev/config.yaml" ] && n="$(sed -n 's/^name: *//p' "$parent/.ddev/config.yaml" | head -1)" && [ -n "$n" ] && from="$n"
-
-  # Sharing the parent's database and copying it are different decisions, and
-  # doing both means importing a database into itself.
-  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.*.yaml 2>/dev/null; then
-    echo "hostshift: this worktree is configured to *use* $from's database" >&2
-    echo "  (DATABASE_URL points at ddev-$from-db). Copying it into itself is not" >&2
-    echo "  what you want — remove that override and \`ddev restart\` first." >&2
-    exit 2
-  fi
-
-  # It overwrites. Refuse to do that silently to a database that has something
-  # in it — the caller may well have meant `ddev import-db`, or may be in the
-  # wrong directory, and there is no undo.
-  if [ -z "$force" ]; then
-    tables="$(ddev exec -s web bash -c \
-      "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
-      2>/dev/null | tr -dc '0-9')"
-    if [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null; then
-      echo "hostshift: this worktree's database already has $tables table(s)." >&2
-      echo "  Copying from $from replaces them, and there is no undo." >&2
-      echo "  Pass --force if that is what you want." >&2
-      exit 2
-    fi
-  fi
-
-  echo "hostshift: copying the database from $from" >&2
-  ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
-    --no-tablespaces -h ddev-$from-db -udb -pdb db | mysql -h db -udb -pdb db" || {
-    echo "hostshift: the copy failed. Is $from running? \`ddev start -p $from\`" >&2
-    exit 1; }
-  echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
-  echo "  hostshift maps — nothing else to do." >&2
-  exit 0
-fi
-
 if [ "$cmd" = "check" ]; then
   hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
 
@@ -389,8 +392,12 @@ if [ "$cmd" = "check" ]; then
   # `init` without the `ddev restart` it just told you to run. It reported
   # success with every container stopped, and after a slug change while the old
   # slug was still being served. So ask the container.
-  name="$(basename "$(pwd -P)")"
-  [ -f .ddev/config.yaml ] && n="$(sed -n 's/^name: *//p' .ddev/config.yaml | head -1)" && [ -n "$n" ] && name="$n"
+  # DDEV_SITENAME is what DDEV itself calls this project, and it hands it to
+  # host commands. Re-deriving it here read .ddev/config.yaml only, while DDEV
+  # merges config.*.yaml — and config.*.local.yaml is the natural place for a
+  # worktree to name itself, so a correctly configured worktree was told its
+  # proxy was not running, on every single `ddev start`.
+  name="${DDEV_SITENAME:-$(basename "$(pwd -P)")}"
   running="$(docker inspect "ddev-$name-hostshift" \
     --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
     | sed -n '/^VIRTUAL_HOST=/{s///p;q;}' || true)"

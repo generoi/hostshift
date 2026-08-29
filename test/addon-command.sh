@@ -69,11 +69,15 @@ else
 fi
 
 # The truncation used to happen after the trim, so a slug cut at 30 characters
-# could end in a hyphen and derive "…abc---site.ddev.site".
+# could end in a hyphen and derive "…abc---site.ddev.site". Asserted on the
+# variant hostname: the earlier version read HOSTSHIFT_SLUG, which no longer
+# exists, so it compared an always-empty string and could not fail.
 (cd "$d" && git checkout -q -b abcdefghijklmnopqrstuvwxyzabc/x)
-out="$(cd "$d" && "$cmd" env 2>/dev/null | sed -n 's/^HOSTSHIFT_SLUG=//p' || true)"
-case "$out" in *-) fail "a truncated slug never ends in a hyphen" "slug=$out" ;;
-                *) pass "a truncated slug never ends in a hyphen" ;; esac
+out="$(cd "$d" && "$cmd" env 2>/dev/null | sed -n 's/^HOSTSHIFT_VARIANTS=//p' || true)"
+case "$out" in
+  ""|*"---"*) fail "a truncated slug never ends in a hyphen" "variants=${out:-none}" ;;
+  *) pass "a truncated slug never ends in a hyphen" ;;
+esac
 
 (cd "$d" && git checkout -q -b '___')
 if (cd "$d" && "$cmd" env >/dev/null 2>&1); then
