@@ -25,7 +25,21 @@ func TestLayeredReferencesAreDeclined(t *testing.T) {
 	c := origin.MustParse("https://www.example.fi")
 	v := origin.MustParse("https://wt-a--ex.ddev.site")
 	m, _ := origin.NewMap([]origin.Site{{Name: "s", Canonical: c, Variant: v}})
-	in := `<iframe srcdoc="&#6&#48;;p&#6&#50;;see https:&#47;&#47;www.example.fi/x&#6&#48;;/p&#6&#50;;&#6&#48;;script&#6&#50;;alert(1)&#6&#48;;/script&#6&#50;;"></iframe>`
+	// Every position of a reference that this decoder can supply: the body
+	// (&#6 + 0 + ;), the terminator (&#60 + ;), a named fragment (&lt + ;) and
+	// a hex one (&#x3c + ;).
+	for _, in := range []string{
+		`<iframe srcdoc="&#6&#48;;p&#6&#50;;see https:&#47;&#47;www.example.fi/x&#6&#48;;script&#6&#50;;alert(1)&#6&#48;;/script&#6&#50;;"></iframe>`,
+		`<iframe srcdoc="see https:&#47;&#47;www.example.fi/x &#60&#59;script&#62&#59;alert(1)&#60&#59;/script&#62&#59;"></iframe>`,
+		`<iframe srcdoc="see https:&#47;&#47;www.example.fi/x &lt&#59;script&gt&#59;alert(1)&lt&#59;/script&gt&#59;"></iframe>`,
+		`<iframe srcdoc="see https:&#47;&#47;www.example.fi/x &#x3c&#59;script&#x3e&#59;alert(1)&#x3c&#59;/script&#x3e&#59;"></iframe>`,
+	} {
+		checkNoNestedScript(t, m, in)
+	}
+}
+
+func checkNoNestedScript(t *testing.T, m *origin.Map, in string) {
+	t.Helper()
 	out, _ := io.ReadAll(NewResponseBody(strings.NewReader(in), m.Forward(), nil, Options{Stats: NewStats(false)}))
 	t.Logf("out: %s", out)
 	// what the browser sees when it parses the srcdoc document

@@ -52,25 +52,36 @@ var urlNamedRefs = map[string]byte{
 // structural guard, so the value looks stable. Adjacency is the actual
 // condition, so test that.
 func fusesWithPending(out []byte, c byte) bool {
-	if !isRefTail(c) {
+	// ';' and '#' matter as much as the body characters, and guarding only the
+	// body is how this shipped broken twice. A reference is '&', an optional
+	// '#' (and 'x' for hex), a body, and a ';' — so *every* one of those four
+	// positions can be the byte this decoder supplies to complete a fragment
+	// the decoder itself refused:
+	//
+	//	"&#60" is refused (it would be '<') and passes through literally,
+	//	then "&#59;" decodes to ';', and together they spell "&#60;".
+	//
+	// "&lt" + ";" and "&#x3c" + ";" are the same shape with a named and a hex
+	// fragment. Harmless in an href; a real '<' in srcdoc, which the browser
+	// decodes a second time.
+	if c != ';' && c != '#' && !isRefBody(c) {
 		return false
 	}
-	// Walk back over the characters a reference body may contain, looking for
-	// the '&' that would start one.
 	i := len(out)
-	for i > 0 && isRefTail(out[i-1]) {
+	for i > 0 && isRefBody(out[i-1]) {
 		i--
 	}
-	if i > 0 && (out[i-1] == '#' || out[i-1] == 'x' || out[i-1] == 'X') {
+	// The 'x' of a hex reference, then the '#', in that order.
+	if i > 0 && (out[i-1] == 'x' || out[i-1] == 'X') {
 		i--
-		for i > 0 && (out[i-1] == '#') {
-			i--
-		}
+	}
+	if i > 0 && out[i-1] == '#' {
+		i--
 	}
 	return i > 0 && out[i-1] == '&'
 }
 
-func isRefTail(c byte) bool {
+func isRefBody(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
