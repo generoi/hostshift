@@ -2,37 +2,22 @@
 # hostshift — say what is being served, and notice when it has gone stale.
 #
 # Installed by `ddev add-on get`, not written per worktree, so it carries none of
-# the regeneration hazards a generated config file would.
+# the regeneration hazards a generated config file would. It declares no
+# hostnames and nothing else DDEV merges into the project's configuration; it is
+# here for the hook alone.
 #
-# It declares no hostnames and nothing else DDEV merges into the project's
-# configuration; it is here for the hook alone. `hostshift:ignore` so that
-# hostshift's own DDEV reader skips it, since a tool must not read its own
-# output back as input.
+# The hook delegates rather than reimplementing. An earlier version sourced
+# `.ddev/.env` with `.` to read the variables itself, which was wrong twice: that
+# file is dotenv, where values are literal, and sourcing it makes them *code* on
+# the developer's machine — `APP_SECRET=$(...)` in a project file became host
+# execution on every `ddev start`. It also broke outright the moment a value
+# contained a space, which HOSTSHIFT_MAP_ARGS always does, so it failed with exit
+# 127 on exactly the zero-config path the README leads with.
 #
-# The staleness check is the point. `.ddev/.env` is computed once, on the host,
-# by `ddev hostshift init`, and three of its inputs change freely afterwards: the
-# worktree's directory name (which is the DDEV project name), the parent
-# checkout's hostname list, and whether a hostshift.yaml exists. Every one of
-# those changes leaves a configuration that `ddev start` reports as a success and
-# that serves the wrong thing — a renamed worktree 404s at the URL DDEV prints,
-# a parent that gains a blog leaves the new variant unrouted. Re-deriving on
-# every start is the only moment anything can notice.
+# `ddev hostshift check` already answers the question, reads the file by parsing
+# rather than sourcing, and cannot disagree with itself the way two separate
+# staleness checks did. `|| true` because a stale configuration is worth saying
+# out loud but is not a reason to fail the start.
 hooks:
   post-start:
-    - exec-host: |
-        set -eu
-        [ -f .ddev/.env ] || exit 0
-        command -v hostshift >/dev/null 2>&1 || exit 0
-        . ./.ddev/.env
-        # The project's own primary hostname must be one web still answers on.
-        # It is not, after a rename or a `git worktree move`: HOSTSHIFT_WEB_HOSTS
-        # is frozen at init time while the project name follows the directory,
-        # so the router has no route for the name ddev prints and every URL 404s.
-        case ",${HOSTSHIFT_WEB_HOSTS:-}," in
-          *",${DDEV_HOSTNAME%%,*},"*) ;;
-          *) printf '\n  hostshift: .ddev/.env is stale — it does not mention %s.\n' "${DDEV_HOSTNAME%%,*}" >&2
-             printf '  Run `ddev hostshift init && ddev restart`.\n\n' >&2 ;;
-        esac
-        printf '\n  hostshift is serving:\n'
-        printf '    https://%s\n' $(printf '%s' "${HOSTSHIFT_VARIANTS:-}" | tr ',' ' ')
-        printf '\n'
+    - exec-host: .ddev/commands/host/hostshift check || true
