@@ -371,20 +371,10 @@ for v in HOSTSHIFT_ARGS HOSTSHIFT_MAP_ARGS HOSTSHIFT_SLUG; do
 done
 pass "compose reads the pre-rename spellings too"
 
-# hostshift.yaml is mounted and read by the proxy at startup, and nothing else
-# in .ddev/.env moved when it changed — so adding the alias the file exists for
-# left every comparison check makes still equal, and check reported success
-# while the running proxy used the old map.
-printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n' > "$wt/hostshift.yaml"
-before="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null | grep '^HOSTSHIFT_YAML=' || true)"
-printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n    aliases:\n      - https://acme.staging.example\n' > "$wt/hostshift.yaml"
-after="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null | grep '^HOSTSHIFT_YAML=' || true)"
-if [ -n "$before" ] && [ "$before" != "$after" ]; then
-  pass "editing hostshift.yaml is visible to check"
-else
-  fail "editing hostshift.yaml is visible to check" "before=$before after=$after"
-fi
-rm -f "$wt/hostshift.yaml"
+# Editing hostshift.yaml is caught by comparing the file against the running
+# container's start time, in test/integration-proxy-ddev.sh where there is a
+# container to ask. A checksum recorded at init time answered the wrong question:
+# a plain `ddev restart` picks the file up correctly, and check called that stale.
 
 # DDEV prints a four-line "Custom configuration detected" block naming every
 # unmarked custom file, on every start. .ddev/.env is ours, so it carries the

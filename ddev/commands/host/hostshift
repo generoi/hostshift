@@ -40,6 +40,7 @@ branch=""
 dry_run=""
 force=""
 quiet=""
+claimed=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --slug) slug="${2:?--slug needs a value}"; shift 2 ;;
@@ -234,8 +235,15 @@ if [ "$cmd" = "copy-db" ]; then
   fi
 
   echo "hostshift: copying the database from $from" >&2
+  # --add-drop-database --databases, so this replaces rather than merges.
+  # mysqldump|mysql on its own only drops the tables the dump contains, so a
+  # worktree whose database came from an older pull kept everything the parent no
+  # longer has — a removed blog's wp_N_* set, an uninstalled plugin's tables — and
+  # was then not in the state the parent is in, which is the whole claim. The
+  # refusal message promises a replace; this makes it true.
   ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
-    --no-tablespaces -h ddev-$from-db -udb -pdb db | mysql -h db -udb -pdb db" || {
+    --no-tablespaces --add-drop-database --databases db -h ddev-$from-db -udb -pdb \
+    | mysql -h db -udb -pdb" || {
     echo "hostshift: the copy failed. Is $from running? \`ddev start $from\`" >&2
     exit 1; }
   echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
@@ -298,6 +306,7 @@ for other in ../*/.ddev/.env; do
       echo "  Two projects answering to one hostname is not an error anywhere in DDEV;" >&2
       echo "  the router picks one and the other is silently unreachable. Pass --slug to" >&2
       echo "  choose a different name." >&2
+      claimed="$v"
       break 2 ;;
     esac
   done
@@ -406,8 +415,6 @@ args="${hsmap:---slug $slug}"
 # VIRTUAL_HOST — so adding the alias the file exists for, or repointing
 # canonical at production, left every comparison equal and `check` reporting
 # success while the running proxy used the old map.
-yamlsum=""
-[ -f hostshift.yaml ] && yamlsum="$(cksum < hostshift.yaml | cut -d' ' -f1)"
 
 # #ddev-silent-no-warn, because DDEV otherwise prints a four-line "Custom
 # configuration detected" block naming this file on every single start. It is a
@@ -416,8 +423,7 @@ env_out="#ddev-silent-no-warn
 HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web"
-[ -n "$yamlsum" ] && env_out="$env_out
-HOSTSHIFT_YAML=$yamlsum"
+
 
 # `hostshift check` on its own is the wrong question in a worktree, and answers
 # it confidently: run without --from it resolves layer 1 against *this* checkout,
@@ -463,7 +469,7 @@ if [ "$cmd" = "check" ]; then
       echo "  read, and deploying it would rewrite nothing and take the parent's" >&2
       echo "  hostnames with it. Fix that checkout first." >&2
     else
-      echo "  Run \`ddev hostshift init && ddev restart\`." >&2
+      echo "  Run \`ddev hostshift init\`, which restarts to pick it up." >&2
     fi
     exit 2
   fi
@@ -529,6 +535,12 @@ if [ "$cmd" = "check" ]; then
        echo "  Run \`ddev restart\`." >&2
        exit 2 ;;
   esac
+
+  if [ -n "$claimed" ]; then
+    echo "hostshift: refusing to call this healthy — $claimed is claimed by" >&2
+    echo "  another project too, and the router serves whichever it prefers." >&2
+    exit 2
+  fi
 
   printf '\n  hostshift is serving:\n' >&2
   printf '    https://%s\n' $(printf '%s' "$variants" | tr ',' ' ') >&2

@@ -230,6 +230,14 @@ before.
 
 ### `hostshift.yaml` — only for aliases, or for production-canonical
 
+**`ddev restart` after editing it.** The proxy reads the file once, at startup,
+and nothing detects that you have changed it since — `ddev hostshift check`
+compares `.ddev/.env` and the running container's command line, and neither moves
+when the file's contents do. Two attempts at detecting this were worse than the
+gap: a checksum recorded at `init` time called a correctly-restarted project
+stale, and comparing the file's timestamp against the container's proved
+unreliable across platforms.
+
 Not needed because a site is a multisite. Needed for the two things a DDEV
 config genuinely cannot say: **alias hostnames**, so a residual `@staging` URL
 left behind by an imperfect `db:pull` is corrected too, and
