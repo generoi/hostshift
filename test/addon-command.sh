@@ -132,8 +132,9 @@ esac
 # holds; --from would override it.
 printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n' > "$wt/hostshift.yaml"
 out="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null || true)"
-check "hostshift.yaml wins over the parent's hostnames" \
-  "HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site" "$(printf '%s' "$out" | sed -n '2p')"
+# By name, not by line number — the block gains and loses variables.
+contains "hostshift.yaml wins over the parent's hostnames" \
+  "HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site" "$out"
 # ...and then the container reads that file itself, since it is mounted and
 # carries aliases a canonical=variant list cannot express.
 contains "a mounted hostshift.yaml is resolved with a slug, not a map" \
@@ -348,6 +349,21 @@ for v in HOSTSHIFT_ARGS HOSTSHIFT_MAP_ARGS HOSTSHIFT_SLUG; do
     || fail "compose still reads $v" "not referenced"
 done
 pass "compose reads the pre-rename spellings too"
+
+# hostshift.yaml is mounted and read by the proxy at startup, and nothing else
+# in .ddev/.env moved when it changed — so adding the alias the file exists for
+# left every comparison check makes still equal, and check reported success
+# while the running proxy used the old map.
+printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n' > "$wt/hostshift.yaml"
+before="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null | grep '^HOSTSHIFT_YAML=' || true)"
+printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n    aliases:\n      - https://acme.staging.example\n' > "$wt/hostshift.yaml"
+after="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null | grep '^HOSTSHIFT_YAML=' || true)"
+if [ -n "$before" ] && [ "$before" != "$after" ]; then
+  pass "editing hostshift.yaml is visible to check"
+else
+  fail "editing hostshift.yaml is visible to check" "before=$before after=$after"
+fi
+rm -f "$wt/hostshift.yaml"
 
 echo "== wp-cli"
 

@@ -32,7 +32,53 @@ var urlNamedRefs = map[string]byte{
 // Position-preserving matters: this feeds a re-match whose only job is to catch
 // an origin the raw scan could not see, so everything it does not understand
 // has to survive untouched.
+// fusesWithPending reports whether appending a decoded byte to out would
+// complete a character reference out of a fragment the decoder did not consume.
+//
+// Excluding the structural characters stops this decoder *emitting* a '<'. It
+// does not stop it emitting a digit that fuses with an adjacent, unconsumed
+// fragment into a new complete reference: "&#6" is not a reference this decoder
+// accepts (6 is below the printable range), so it passes through literally —
+// and then decode("&#48;") appends '0', and the next literal byte is ';', and
+// together they spell "&#60;".
+//
+// In an href that is only a '<' inside a URL. In an attribute the browser
+// decodes a *second* time — srcdoc — it is a real one, and the same
+// alert(1) came back through:
+//
+//	srcdoc="&#6&#48;;script&#6&#50;;alert(1)…"  ->  "<script>alert(1)…"
+//
+// A fixed point does not catch this: the second decode is refused by the
+// structural guard, so the value looks stable. Adjacency is the actual
+// condition, so test that.
+func fusesWithPending(out []byte, c byte) bool {
+	if !isRefTail(c) {
+		return false
+	}
+	// Walk back over the characters a reference body may contain, looking for
+	// the '&' that would start one.
+	i := len(out)
+	for i > 0 && isRefTail(out[i-1]) {
+		i--
+	}
+	if i > 0 && (out[i-1] == '#' || out[i-1] == 'x' || out[i-1] == 'X') {
+		i--
+		for i > 0 && (out[i-1] == '#') {
+			i--
+		}
+	}
+	return i > 0 && out[i-1] == '&'
+}
+
+func isRefTail(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
 func decodeURLRefs(v []byte) ([]byte, bool) {
+	return decodeURLRefsOnce(v)
+}
+
+func decodeURLRefsOnce(v []byte) ([]byte, bool) {
 	if bytes.IndexByte(v, '&') < 0 {
 		return v, false
 	}
@@ -47,6 +93,11 @@ func decodeURLRefs(v []byte) ([]byte, bool) {
 			continue
 		}
 		out = append(out, v[prev:i]...)
+		// Decline the whole value rather than complete a reference out of a
+		// fragment we did not consume — see fusesWithPending.
+		if fusesWithPending(out, c) {
+			return v, false
+		}
 		out = append(out, c)
 		prev = i + n
 		i = prev - 1

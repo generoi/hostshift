@@ -1025,6 +1025,15 @@ added, include `text/javascript`: it is the IANA-preferred type and what nginx
 serves). That is where "most responses are never
 parsed" comes from, at zero buffering cost.
 
+**Layered character references are declined, not decoded.** A value where a
+reference fuses with an unconsumed fragment — `&#6` + `&#48;` + `;` spelling
+`&#60;` — is left exactly as it arrived, so an origin spelled that way is not
+rewritten and reaches the browser. That is a test 28 gap, and it is the
+deliberate side of a trade: decoding it built executable markup in any attribute
+the browser decodes a second time (`srcdoc`), on the developer's own host, from
+content that is inert on production. A leak is worse than nothing and better
+than an XSS.
+
 **`text/event-stream` is a known gap, and it is the one exclusion that can leak.**
 An SSE body carrying `data: https://www.herrfors.fi/x` reaches the browser
 verbatim — a dereferenceable production origin, which is what test 28 exists to
