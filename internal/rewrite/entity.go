@@ -9,17 +9,21 @@ import "bytes"
 // link on a page that had nothing wrong with it. Numeric references have no
 // such ambiguity and are decoded in full below.
 var urlNamedRefs = map[string]byte{
-	"sol":     '/',
-	"colon":   ':',
-	"period":  '.',
-	"quest":   '?',
-	"num":     '#',
-	"percnt":  '%',
-	"lowbar":  '_',
-	"hyphen":  '-',
-	"commat":  '@',
-	"NewLine": '\n',
+	"sol":    '/',
+	"colon":  ':',
+	"period": '.',
+	"quest":  '?',
+	"num":    '#',
+	"percnt": '%',
+	"lowbar": '_',
+	"hyphen": '-',
+	"commat": '@',
 }
+
+// NewLine is deliberately absent. It decodes to a raw 0x0A, which no origin
+// contains and which the printable-ASCII guard below would reject anyway — but
+// the named table is consulted first, so listing it here was a way past that
+// guard and into a spliced attribute value.
 
 // decodeURLRefs replaces the character references in v that could form part of
 // an origin, leaving every other byte exactly where it was. It returns v itself
@@ -95,9 +99,25 @@ func parseURLRef(b []byte) (byte, int) {
 	if j < len(b) && b[j] == ';' {
 		j++ // browsers accept a numeric reference without one
 	}
-	// Printable ASCII only. '&' is excluded because decoding it could splice a
-	// new reference together out of unrelated neighbouring text.
-	if val < 0x21 || val > 0x7e || val == '&' {
+	// Printable ASCII only, and never a character that is structural in the
+	// markup this value sits in.
+	//
+	// '&' is excluded because decoding it could splice a new reference together
+	// out of unrelated neighbouring text. The rest are excluded because the
+	// decoded text is spliced back *between the attribute's quotes* without
+	// being re-encoded, so decoding a quote, an angle bracket, '=' or '/' ends
+	// the attribute — or the tag — and everything after it becomes markup.
+	// href="…&#34;&#62;&#60;script&#62;alert(1)&#60;/script&#62;" came out as a
+	// real <script> element: content that is inert on production, made to
+	// execute on the developer's variant host, which is where their admin
+	// session lives.
+	//
+	// Nothing legitimate is lost. This exists to catch an origin hidden behind
+	// character references, and none of these can appear in one.
+	switch {
+	case val < 0x21 || val > 0x7e:
+		return 0, 0
+	case val == '&' || val == '"' || val == '\'' || val == '<' || val == '>' || val == '=' || val == '`':
 		return 0, 0
 	}
 	return byte(val), j
