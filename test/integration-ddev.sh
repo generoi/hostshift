@@ -245,6 +245,47 @@ contains "the variant serves the worktree from a mounted hostshift.yaml" "PROJEC
 contains "and reaches the app as the canonical hostname" "HOST=${tag}3.ddev.site" \
   "$(get https://wt-c--${tag}3.ddev.site/)"
 
+echo "== the real install path: ddev add-on get"
+
+# Nothing anywhere ran `ddev add-on get` — installaddon() above copies the files
+# by hand, and both suites say so in a comment. That is exactly why a pre-flight
+# in install.yaml shipped firing on 100% of installs: post_install_actions run
+# with cwd = <project>/.ddev, and nothing ever executed them.
+#
+# No containers here. What needs covering is install-time behaviour; that the
+# installed files then work is what every scenario above already asserts, and a
+# fourth project pair does not fit on a machine with a working fleet on it.
+m4="$work/${tag}4"
+newsite "$m4" parent4
+install_out="$(cd "$m4" && ddev add-on get "$repo/ddev" 2>&1)" \
+  || fail "ddev add-on get succeeds" "$install_out"
+projects+=("$m4")
+
+contains "the add-on installs the host command" "commands/host/hostshift" "$install_out"
+case "$install_out" in
+  *"predates this add-on"*)
+    fail "a fresh install is not told its command is stale" "$install_out" ;;
+  *) pass "a fresh install is not told its command is stale" ;;
+esac
+if head -5 "$m4/.ddev/commands/host/hostshift" | grep -q '#ddev-generated'; then
+  pass "the installed command carries the marker that lets it be upgraded"
+else
+  fail "the installed command carries the marker that lets it be upgraded" "no marker"
+fi
+# Re-installing over a marked command must be silent about staleness, and must
+# actually replace it.
+printf '# edited\n' >> "$m4/.ddev/commands/host/hostshift"
+again="$(cd "$m4" && ddev add-on get "$repo/ddev" 2>&1)" || true
+case "$again" in
+  *"predates this add-on"*) fail "re-installing over a marked command is silent" "$again" ;;
+  *) pass "re-installing over a marked command is silent" ;;
+esac
+if grep -q '^# edited' "$m4/.ddev/commands/host/hostshift"; then
+  fail "and replaces it" "the edit survived, so an upgrade would not land"
+else
+  pass "and replaces it"
+fi
+
 echo "== drift is noticed rather than served"
 
 sed -i.bak 's/^HOSTSHIFT_WEB_HOSTS=.*/HOSTSHIFT_WEB_HOSTS=renamed.ddev.site/' "$wt/.ddev/.env"
