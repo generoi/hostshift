@@ -85,6 +85,16 @@ jobs:
           HOSTSHIFT_IMAGE: hostshift:ci
         run: test/integration-ddev.sh
 
+      # The proxy's own behaviour through the real router: the request
+      # direction, which nothing tested before — a page can look perfect while
+      # the database quietly fills with worktree hostnames — plus redirects,
+      # cookies, Vary, validators, Range, and what is *running* rather than
+      # what is written.
+      - name: the proxy through the router
+        env:
+          HOSTSHIFT_IMAGE: hostshift:ci
+        run: test/integration-proxy-ddev.sh
+
       # The compose file is not versioned with the image it names, and asking the
       # published binary for a flag form it does not have has broken every
       # project twice now — once with `--map ""`, once with a comma-separated
@@ -97,8 +107,9 @@ jobs:
           set -eu
           published=ghcr.io/generoi/hostshift:latest
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          # The package is private, and a fork's token cannot read it. That is
-          # not skew, so do not fail the build for it — but say so, loudly enough
+          # The package is public since v0.1.0, so this should now always run.
+          # A pull can still fail on a fork PR or a registry outage, and that is
+          # not skew — do not fail the build for it, but say so loudly enough
           # that a real regression is never mistaken for this.
           if ! docker pull -q "$published"; then
             echo "::warning::cannot pull $published here; the compose file's flag" \
