@@ -28,6 +28,14 @@ test: test-addon
 test-addon:
 	GO=$(GO) bash test/addon-command.sh
 
+# The same command, but through real DDEV and a real router: what gets served,
+# rather than what gets written. Needs Docker and DDEV; skips cleanly without
+# them. Defaults to the published image, which is what `ddev add-on get` gives a
+# developer and where image skew shows up.
+.PHONY: test-integration
+test-integration:
+	GO=$(GO) bash test/integration-ddev.sh
+
 # The invariant that guards everything else (PLAN §5.2). If this goes red,
 # nothing downstream of it is trustworthy.
 .PHONY: identity

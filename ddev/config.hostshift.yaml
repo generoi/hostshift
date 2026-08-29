@@ -1,0 +1,25 @@
+#ddev-generated
+# hostshift — say what is being served, and notice when it has gone stale.
+#
+# Installed by `ddev add-on get`, not written per worktree, so it carries none of
+# the regeneration hazards a generated config file would. It declares no
+# hostnames and nothing else DDEV merges into the project's configuration; it is
+# here for the hook alone.
+#
+# The hook delegates rather than reimplementing. An earlier version sourced
+# `.ddev/.env` with `.` to read the variables itself, which was wrong twice: that
+# file is dotenv, where values are literal, and sourcing it makes them *code* on
+# the developer's machine — `APP_SECRET=$(...)` in a project file became host
+# execution on every `ddev start`. It also broke outright the moment a value
+# contained a space, which HOSTSHIFT_MAP_ARGS always does, so it failed with exit
+# 127 on exactly the zero-config path the README leads with.
+#
+# `ddev hostshift check` already answers the question, reads the file by parsing
+# rather than sourcing, and cannot disagree with itself the way two separate
+# staleness checks did. No `|| true`: DDEV does not fail `ddev start` on a failing
+# `exec-host` anyway — measured, it prints `Task failed:` and still reports
+# success — so all the guard did was suppress the one line that made a stale
+# configuration visible above the rest of the start output.
+hooks:
+  post-start:
+    - exec-host: .ddev/commands/host/hostshift check

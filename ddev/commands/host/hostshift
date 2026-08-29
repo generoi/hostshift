@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ## Description: configure hostshift for this DDEV project
-## Usage: hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]
+## Usage: hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]
 ## Example: "ddev hostshift init"
 ##
 ## Scaffolding a DDEV project is opinionated work, and this is where it is
@@ -31,16 +31,16 @@ while [ $# -gt 0 ]; do
     # Silently discarding an unknown flag is how `--dry-run` came to write the
     # files it was passed to prevent.
     *) echo "unknown argument: $1" >&2
-       echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]" >&2
+       echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]" >&2
        exit 2 ;;
   esac
 done
 
 case "$cmd" in
-  init|env|wp-cli) ;;
+  init|check|env|wp-cli) ;;
   -h|--help|help)
-    echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]"; exit 0 ;;
-  *) echo "usage: ddev hostshift [init|env|wp-cli] [--slug NAME] [--dry-run]" >&2; exit 2 ;;
+    echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]"; exit 0 ;;
+  *) echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]" >&2; exit 2 ;;
 esac
 
 command -v hostshift >/dev/null || {
@@ -69,10 +69,31 @@ if [ -z "$slug" ]; then
   echo "hostshift: slug \"$slug\", from the git branch $branch" >&2
 fi
 
+case "$slug" in
+  *[!a-z0-9-]*|-*|*-)
+    echo "hostshift: slug \"$slug\" is not a hostname label — use lowercase letters," >&2
+    echo "  digits and hyphens, not starting or ending with one. It becomes part of a" >&2
+    echo "  hostname and of the proxy's command line, where a space, quote, \$, ; or ," >&2
+    echo "  silently truncates or corrupts the map." >&2
+    exit 2 ;;
+esac
+
 # What this project answers to.  `hostshift hosts` reads the DDEV config with
 # its config.*.yaml override merging — parsing that here would be the place the
 # careful parts get lost.
 hosts="$(hostshift hosts)"
+
+# In the checkout a worktree branches *from*, there is no canonical/variant
+# distinction to make: its own hostnames are the ones the database holds. Running
+# init here points web at nothing and hands the variants to a proxy nobody routes
+# to — and worse, whichever of the parent and its worktree starts second loses
+# the variant hostnames to the other.
+if [ ! -f .git ] && [ ! -f hostshift.yaml ]; then
+  echo "hostshift: warning: this is not a linked worktree and declares no" >&2
+  echo "  hostshift.yaml, so its own hostnames are the ones the database holds and" >&2
+  echo "  there is nothing to map. Run this in a worktree, or declare the hostnames" >&2
+  echo "  the database really holds in hostshift.yaml." >&2
+fi
 
 # And what the checkout this worktree came from answers to.
 #
@@ -86,24 +107,58 @@ hosts="$(hostshift hosts)"
 # hostnames are the canonical side.
 parent=""
 parent_hosts=""
+unreadable_parent=""
+linked=""
 common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 gitdir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
-if [ -n "$common" ] && [ "$common" != "$gitdir" ]; then
-  parent="$(dirname "$common")"
-  parent_hosts="$(hostshift hosts -C "$parent" 2>/dev/null || true)"
-  # A worktree of a repo that pins `name:` in tracked config.yaml is the same
-  # DDEV project as its parent, sharing its containers and its hostnames. There
-  # is nothing to derive from elsewhere and nothing to subtract.
-  if [ "$parent_hosts" = "$hosts" ]; then
-    parent=""
-    parent_hosts=""
-  fi
+
+# A linked worktree has a .git *file* pointing into the parent's .git directory,
+# where a normal checkout has a .git directory. That is the reliable signal:
+# when the parent has been moved or deleted `git rev-parse --git-common-dir`
+# *fails* rather than naming an unreadable path, so testing its output alone
+# read as "not a worktree at all" and skipped the parent path in silence — the
+# map then had the worktree's own hostname as canonical, and because
+# parent_hosts was empty the narrowing subtracted nothing, so the worktree kept
+# claiming the parent's blog hostnames permanently rather than until a restart.
+# A submodule has a .git file too, and its "parent" would be the superproject's
+# modules directory — not a checkout, and warning about it is a false alarm.
+# Only a linked worktree's gitdir points inside a .git/worktrees/ directory.
+grep -q '/worktrees/' .git 2>/dev/null && linked=1
+[ -n "$common" ] && [ "$common" != "$gitdir" ] && [ -d "$common" ] && linked=1
+
+if [ -n "$linked" ] && [ -z "$common" ]; then
+  unreadable_parent="$(sed -n 's/^gitdir: //p' .git 2>/dev/null | sed 's|/\.git/worktrees/.*||')"
+  unreadable_parent="${unreadable_parent:-the checkout this worktree came from}"
+elif [ -n "$linked" ]; then
+  dir="$(dirname "$common")"
+  ph="$(hostshift hosts -C "$dir" 2>/dev/null || true)"
+  case "$ph" in
+    # Nothing readable there. Distinct from the case below, and the two must not
+    # be confused: this one is a problem and that one is not.
+    "") unreadable_parent="$dir" ;;
+    # A repo that pins `name:` in its tracked config.yaml gives every worktree
+    # the *same* DDEV project — same containers, same hostnames. There is nothing
+    # to derive from elsewhere and nothing to subtract.
+    "$hosts") : ;;
+    *) parent="$dir"; parent_hosts="$ph" ;;
+  esac
 fi
 
 # hostshift.yaml, where a project has one, is a deliberate statement about which
-# hostnames the database holds — a multisite's canonical hostnames are not
-# derivable from any DDEV config. Passing --from would override it.
+# hostnames the database holds — usually because it names alias hostnames from
+# other environments, or production ones the database was never search-replaced
+# away from. Passing --from would override it.
 map_args=()
+if [ ! -f hostshift.yaml ] && [ -n "$unreadable_parent" ]; then
+  # A linked worktree whose parent declares nothing readable. Falling through
+  # silently is the failure this whole path exists to prevent: the map gets built
+  # against the hostname the worktree is *served at*, every page loads, every
+  # link stays wrong, and `check` calls it injective and anchored.
+  echo "hostshift: warning: this is a worktree of $unreadable_parent, but no DDEV" >&2
+  echo "  config could be read there, so the map falls back to this project's own" >&2
+  echo "  hostnames. If the database came from that checkout it holds *its*" >&2
+  echo "  hostnames, and nothing will be rewritten. Declare them in hostshift.yaml." >&2
+fi
 if [ ! -f hostshift.yaml ] && [ -n "$parent_hosts" ]; then
   # Said out loud, because "map from --from/--to" does not tell anyone which
   # checkout those origins came from, and that is the one thing worth knowing.
@@ -114,9 +169,41 @@ if [ ! -f hostshift.yaml ] && [ -n "$parent_hosts" ]; then
 fi
 
 # The map is the binary's business; parse only what this needs from it.
-variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --json \
-  | sed -n 's|.*"variant": *"https\{0,1\}://\([^"]*\)".*|\1|p' | paste -sd, -)"
+variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --variant-hosts \
+  | paste -sd, -)"
 [ -n "$variants" ] || { echo "hostshift produced no map — run 'hostshift check'" >&2; exit 2; }
+
+# Nothing anywhere checks that two projects do not claim the same hostname —
+# DDEV validates hostname syntax per project and no more, and traefik resolves a
+# tie by rule length rather than complaining. Two branches whose slugs collide
+# therefore give two worktrees identical VIRTUAL_HOST entries, and one of them
+# silently serves the other's code at the URL its author is reviewing. The
+# 30-character truncation makes that likelier, not rarer: PROJ-123-fix-cart and
+# proj/123/fix-cart already collide, as does any pair sharing a 30-character
+# prefix. Checking is cheap — every configured project leaves its variants in
+# .ddev/.env — so check.
+here="$(pwd -P)"
+for other in ../*/.ddev/.env; do
+  [ -f "$other" ] || continue
+  odir="$(cd "$(dirname "$(dirname "$other")")" && pwd -P)"
+  [ "$odir" = "$here" ] && continue
+  # No `| head -1`: this script runs under `set -o pipefail`, and a head that
+  # exits after one line SIGPIPEs whatever is still writing, failing the whole
+  # pipeline. It is timing-dependent, so it passes on a fast small write and
+  # fails on a slow one — sed that stops at the first match instead.
+  ovar="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' "$other")"
+  [ -n "$ovar" ] || continue
+  for v in $(printf '%s' "$variants" | tr ',' ' '); do
+    case ",$ovar," in *",$v,"*)
+      echo "hostshift: warning: $odir already claims $v." >&2
+      echo "  Two projects answering to one hostname is not an error anywhere in DDEV;" >&2
+      echo "  the router picks one and the other is silently unreachable. Pass --slug to" >&2
+      echo "  choose a different name." >&2
+      break 2 ;;
+    esac
+  done
+done
+
 
 # web keeps this project's own hostnames, minus the variants and minus the
 # parent's. DDEV puts every additional hostname on web's VIRTUAL_HOST, so
@@ -135,9 +222,114 @@ $h
   web="${web:+$web,}$h"
 done <<<"$hosts"
 
+# The map the proxy cannot work out for itself.
+#
+# The compose service mounts ${DDEV_APPROOT}:/project — this worktree, and only
+# this worktree. The checkout it branched from is not in the container and never
+# will be, so the canonical hostnames, which live over there, are unknowable
+# inside it. `proxy -C /project` on a repo with no hostshift.yaml therefore built
+# its map from the worktree's own DDEV config, where a missing `name:` defaults
+# to the *directory basename* — which inside the container is literally
+# "project". The proxy came up mapping https://project.ddev.site, the router sent
+# it wt-a--transformerco.ddev.site, and every request 421'd.
+#
+# So it is resolved here, on the host, where the parent checkout is readable, and
+# handed over. Only when there is no hostshift.yaml: that file *is* mounted, it
+# carries aliases a canonical=variant list cannot express, and the container
+# reads it correctly.
+hsmap=""
+if [ ! -f hostshift.yaml ]; then
+  # Repeated --from/--to, not `--map c=v,c=v`. Comma-separated --map is a flag
+  # form this branch added, and the image is :latest: the published binary splits
+  # the whole string on its first `=`, so a two-site map came out as one site
+  # whose variant host was "wt-a--acme.ddev.site,https" and every variant 421'd —
+  # while `ddev start`, `ddev hostshift check` and `hostshift map` on the host all
+  # reported success. --from/--to is index-aligned and repeatable and always was,
+  # so it works against the image already published as well as a current one.
+  #
+  # The whole flag sequence, not just its value: docker-compose's string command
+  # form drops an argument that expands to nothing, so empty means no map flags
+  # at all — which is right when a hostshift.yaml is mounted.
+  hsmap=""
+  while IFS='=' read -r c v; do
+    [ -n "$c" ] || continue
+    hsmap="${hsmap:+$hsmap }--from $c --to $v"
+  done <<<"$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs)"
+  [ -n "$hsmap" ] || { echo "could not resolve a map to hand the proxy" >&2; exit 2; }
+fi
+
+# DDEV derives `name` from the directory but not additional_hostnames, so a
+# worktree inherits the parent's extra hostnames verbatim and registers them as
+# its own. traefik has no cross-project uniqueness check — DDEV's own
+# ValidateConfig only checks hostname *syntax* — and it resolves the tie by rule
+# length. A worktree's directory name is the parent's plus a suffix, so its rule
+# is always the longer one: the worktree wins every shared hostname, every time,
+# and `ddev start` says nothing.
+#
+# HOSTSHIFT_WEB_HOSTS below hands them back at the next restart. The window
+# between the worktree's first `ddev start` and that restart is real, though, and
+# during it the *parent's* blog is served by the worktree. This is the one moment
+# anyone can act on it. Upstream: ddev/ddev#5486, reopened for git worktrees.
+if [ -n "$parent_hosts" ]; then
+  shared=""
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    case "
+$parent_hosts
+" in *"
+$h
+"*) shared="${shared:+$shared, }$h" ;; esac
+  done <<<"$hosts"
+  if [ -n "$shared" ]; then
+    echo "hostshift: note: this worktree also registered $shared," >&2
+    echo "  inherited verbatim from the tracked .ddev/config.yaml — DDEV derives the" >&2
+    echo "  project name from the directory but not the additional hostnames. Until" >&2
+    echo "  \`ddev restart\`, those serve this worktree rather than $(basename "$parent")." >&2
+  fi
+fi
+
 env_out="HOSTSHIFT_SLUG=$slug
 HOSTSHIFT_VARIANTS=$variants
-HOSTSHIFT_WEB_HOSTS=$web"
+HOSTSHIFT_WEB_HOSTS=$web
+HOSTSHIFT_MAP_ARGS=$hsmap"
+
+# `hostshift check` on its own is the wrong question in a worktree, and answers
+# it confidently: run without --from it resolves layer 1 against *this* checkout,
+# reports the map injective and anchored, and exits 0 — for a map whose canonical
+# hostname appears nowhere in the database and which the proxy never sees. It is
+# also what the README, this add-on's own post-install text and the proxy's 421
+# body all tell you to run.
+#
+# So the DDEV-shaped question is asked here, where knowing what a worktree is is
+# allowed: check the map that would be deployed, and whether what *is* deployed
+# still matches it.
+if [ "$cmd" = "check" ]; then
+  hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
+  if [ -f .ddev/.env ]; then
+    # The whole block, not one variable of it. A renamed worktree drifts only in
+    # HOSTSHIFT_WEB_HOSTS, a parent that gains a blog only in HOSTSHIFT_VARIANTS,
+    # and a hostshift.yaml appearing only in HOSTSHIFT_MAP_ARG — where the
+    # deployed flat map goes on winning over the file, so its aliases silently
+    # never rewrite. Comparing one variable caught one of the three.
+    deployed="$(grep '^HOSTSHIFT_' .ddev/.env || true)"
+    if [ "$deployed" != "$env_out" ]; then
+      echo "hostshift: .ddev/.env is out of date. It says" >&2
+      printf '%s\n' "${deployed:-  nothing}" >&2
+      echo "  and this project now resolves to" >&2
+      printf '%s\n' "$env_out" >&2
+      echo "  Run \`ddev hostshift init && ddev restart\`." >&2
+      exit 2
+    fi
+    printf '\n  hostshift is configured to serve:\n' >&2
+    printf '    https://%s\n' $(printf '%s' "$variants" | tr ',' ' ') >&2
+    printf '\n' >&2
+  else
+    echo "hostshift: nothing deployed yet — run \`ddev hostshift init\`" >&2
+    exit 2
+  fi
+  exit 0
+fi
+
 
 if [ "$cmd" = "env" ]; then
   printf '%s\n' "$env_out"
@@ -159,8 +351,11 @@ fi
 # wp-cli.yml that already has a root `url:` gets it twice, which yaml.v3 rejects
 # outright as a duplicate key.
 if [ "$cmd" = "wp-cli" ]; then
-  canonical="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --json \
-    | sed -n 's|.*"canonical": *"\([^"]*\)".*|\1|p' | head -1)"
+  # Likewise no `| head -1 | cut`: hostshift would be killed by SIGPIPE mid-write
+  # and pipefail would take the exit code, so `wp-cli` failed with "no canonical
+  # origin in the map" on Linux and passed on macOS.
+  canonical="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs \
+    | sed -n '1s/=.*//p')"
   [ -n "$canonical" ] || { echo "no canonical origin in the map" >&2; exit 2; }
   echo "# generated by \`ddev hostshift wp-cli\` — do not commit"
   if [ -f wp-cli.yml ]; then
@@ -171,44 +366,39 @@ if [ "$cmd" = "wp-cli" ]; then
   exit 0
 fi
 
-# Registering the variants is what puts them in the mkcert certificate's SAN: a
-# three-label host is not covered by the *.ddev.site wildcard, so without this
-# the browser gets a TLS interstitial rather than a site. config.*.local.yaml is
-# in DDEV's own .ddev/.gitignore.
+# One file, not two. Registering the variants in additional_hostnames was
+# believed to be what put them in the mkcert certificate's SAN — and it is not.
+# DDEV builds that SAN list from the project's hostnames *plus every
+# VIRTUAL_HOST entry across all compose services* (pkg/ddevapp/traefik.go,
+# detectAppRouting: "There can possibly be VIRTUAL_HOST entries which are not
+# configured hostnames"), unchanged from v1.23 to v1.25. The compose service
+# already puts HOSTSHIFT_VARIANTS in VIRTUAL_HOST, so the certificate already
+# covers them. Measured on v1.25.2 with no config.hostshift.local.yaml on disk
+# at all: the served cert carried DNS:wt-a--shop.acme.ddev.site — three labels,
+# never registered — and openssl verified it against the mkcert root, return
+# code 0.
 #
-# additional_hostnames are relative to the project TLD and additional_fqdns are
-# not, and writing an FQDN under the wrong key makes DDEV register
-# acme.test.example.com.ddev.site — no SAN for the real host, which is the
-# interstitial this file exists to prevent.
+# The two inputs do different jobs, which the old comment conflated:
+# additional_hostnames drives /etc/hosts, the cert SANs and `ddev describe`;
+# VIRTUAL_HOST drives the traefik routers *and* the cert SANs. So VIRTUAL_HOST
+# is a strict superset of what this needs, and the generated file was redundant.
 #
-# hostshift:ignore, because this file is a config.*.yaml and hostshift reads
-# those: without the marker its variants come back as canonical hosts on the
-# next run, get variants of their own, and the list grows without bound.
-tld="$(printf '%s\n' "$hosts" | head -1 | cut -d. -f2-)"
-tld="${tld:-ddev.site}"
-short=""
-fqdns=""
-for h in $(printf '%s\n%s' "$hosts" "$(printf '%s' "$variants" | tr ',' '\n')" | sed '/^$/d' | sort -u); do
-  case "$h" in
-    *".$tld") short="$short  - ${h%".$tld"}
-" ;;
-    *) fqdns="$fqdns  - $h
-" ;;
-  esac
-done
-
-config_out="# generated by \`ddev hostshift init\` — delete it to undo, rerun to update.
-# hostshift:ignore — hostshift must not read its own output back as input.
-"
-[ -n "$short" ] && config_out="${config_out}additional_hostnames:
-$short"
-[ -n "$fqdns" ] && config_out="${config_out}additional_fqdns:
-$fqdns"
-
+# Not writing it is worth more than the file it saves. It was a
+# .ddev/config.*.yaml, so hostshift read it back as input on the next run — the
+# variants returned as canonical hosts, got variants of their own, and
+# additional_hostnames grew without bound. That whole hazard, and the marker
+# that suppressed it, existed only because of this file.
+#
+# Caveat, untested: on a custom project_tld that does not resolve publicly,
+# additional_hostnames is still what drives /etc/hosts, and a VIRTUAL_HOST-only
+# name would get a certificate but no hosts entry. Every project in the fleet is
+# on ddev.site, whose wildcard resolves at any depth.
+stale=".ddev/config.hostshift.local.yaml"
 if [ -n "$dry_run" ]; then
-  echo "# .ddev/.env" ; printf '%s\n\n' "$env_out"
-  echo "# .ddev/config.hostshift.local.yaml" ; printf '%s' "$config_out"
-  echo
+  echo "# .ddev/.env" ; printf '%s\n' "$env_out"
+  if [ -f "$stale" ] && grep -q 'generated by' "$stale" 2>/dev/null; then
+    echo "# would delete $stale, which is no longer needed"
+  fi
   hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
   echo "hostshift: --dry-run, nothing written" >&2
   exit 0
@@ -218,14 +408,27 @@ fi
 # else already. Written in place rather than moved over, or the destination
 # inherits mktemp's 0600 and its creator's group.
 touch .ddev/.env
-tmp="$(mktemp)"
-grep -v '^HOSTSHIFT_' .ddev/.env > "$tmp" || true
-printf '%s\n' "$env_out" >> "$tmp"
-cat "$tmp" > .ddev/.env
-rm -f "$tmp"
+# In .ddev/ so the mv is a rename on one filesystem rather than a copy+unlink
+# across two, which is not atomic — a concurrent compose read must never catch
+# this half-written and see an empty VIRTUAL_HOST.
+tmp="$(mktemp .ddev/.env.XXXXXX)"
+# cp -p first, then truncate: that gives the temp file the mode the real one
+# already had, and redirection keeps it. .ddev/.env is where DDEV documents
+# putting project env vars, credentials included, so a developer who chmod 600'd
+# it meant it — an earlier version reset it to 0644 on every init. (`chmod
+# --reference` would be simpler and is GNU-only; `stat -f` means two different
+# things on the two stats and silently succeeds on both.)
+cp -p .ddev/.env "$tmp"
+{ grep -v '^HOSTSHIFT_' .ddev/.env || true; printf '%s\n' "$env_out"; } > "$tmp"
+mv "$tmp" .ddev/.env
 
-printf '%s' "$config_out" > .ddev/config.hostshift.local.yaml
+# An earlier version of this command wrote that file. Left behind it is still
+# read as DDEV config, so it still feeds its own variants back in.
+if [ -f "$stale" ] && grep -q 'generated by' "$stale" 2>/dev/null; then
+  rm -f "$stale"
+  echo "hostshift: removed $stale — DDEV takes the certificate from VIRTUAL_HOST" >&2
+fi
 
-echo "hostshift: wrote .ddev/.env and .ddev/config.hostshift.local.yaml" >&2
+echo "hostshift: wrote .ddev/.env" >&2
 hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
 echo "hostshift: now run \`ddev restart\`" >&2

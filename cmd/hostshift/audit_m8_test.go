@@ -63,3 +63,34 @@ func TestCheckRejectsAnUnusableUpstream(t *testing.T) {
 		t.Errorf("stderr = %q", errOut)
 	}
 }
+
+// TestEmptyMapFlagIsNoMap. A caller assembling a command line from a template —
+// the add-on's docker-compose `command:` list — cannot leave a flag out
+// conditionally, so `--map ""` has to mean "nothing to give you" and fall
+// through to the project's own config, not fail.
+func TestEmptyMapFlagIsNoMap(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: site\n")
+	code, _, errOut := run(t, "", cmdMap, "-C", dir, "--slug", "wt-a", "--map", "")
+	if code != exitOK {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if !strings.Contains(errOut, "DDEV defaults") {
+		t.Errorf("an empty --map did not fall through to the project config: %q", errOut)
+	}
+}
+
+// TestMapFlagTakesSeveralPairsInOneValue. Same reason: one compose variable
+// cannot expand into several arguments, and a whole map has to fit in one.
+func TestMapFlagTakesSeveralPairsInOneValue(t *testing.T) {
+	code, out, errOut := run(t, "", cmdMap, "--json", "--map",
+		"https://a.example=https://wt--a.example,https://b.example=https://wt--b.example")
+	if code != exitOK {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	for _, want := range []string{"https://a.example", "https://wt--a.example", "https://b.example", "https://wt--b.example"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("map is missing %s:\n%s", want, out)
+		}
+	}
+}

@@ -19,6 +19,7 @@ pre_install_actions:
     fi
 
 project_files:
+  - config.hostshift.yaml
   - docker-compose.hostshift.yaml
   - docker-compose.hostshift-loopback.yaml
   - commands/host/hostshift
@@ -35,11 +36,10 @@ post_install_actions:
     echo
     echo "    ddev hostshift init"
     echo
-    echo "It works out the slug from the git branch, writes the variant"
-    echo "hostnames into .ddev/config.hostshift.local.yaml so mkcert covers them,"
-    echo "and merges HOSTSHIFT_SLUG/VARIANTS/WEB_HOSTS into .ddev/.env. Then"
-    echo "'ddev restart'. Pass --dry-run first to see what it would write, or"
-    echo "--slug to choose the name yourself."
+    echo "It works out the slug from the git branch and merges the HOSTSHIFT_*"
+    echo "variables into .ddev/.env — the only file it writes. Then"
+    echo "'ddev restart', which prints the URLs it is serving. Pass --dry-run"
+    echo "first to see what it would write, or --slug to name it yourself."
     echo
     echo "Two things it cannot do for you:"
     echo
@@ -53,8 +53,11 @@ post_install_actions:
     echo "    live production. That file has no generated-file marker, so your"
     echo "    edit survives the next 'ddev add-on get'."
     echo
-    echo "'ddev hostshift init --dry-run' shows what it would write; 'hostshift"
-    echo "check' validates the map it resolved."
+    echo "'ddev hostshift init --dry-run' shows what it would write, and"
+    echo "'ddev hostshift check' says whether what is deployed is still current."
+    echo "Use those rather than 'hostshift check' directly: in a worktree the"
+    echo "bare command resolves this checkout's own hostnames, not the ones the"
+    echo "database holds, and reports that map as valid."
     echo
 
 removal_actions:
