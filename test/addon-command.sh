@@ -47,7 +47,9 @@ newproject() {
   # Tracked, because that is what makes a worktree inherit it — and what makes
   # a worktree that wants containers of its own override `name` elsewhere.
   git -C "$1" add .ddev/config.yaml
-  git -C "$1" -c user.email=t@t -c user.name=t commit -q -m init
+  # gpgsign off: these are throwaway fixtures, and a developer whose global
+  # config signs commits should not have the suite fail on a locked agent.
+  git -C "$1" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m init
 }
 
 echo "== slug derivation"
@@ -105,13 +107,80 @@ out="$(cd "$same" && "$cmd" env --slug wt-b 2>/dev/null || true)"
 contains "a same-project worktree keeps its hostnames on web" \
   "HOSTSHIFT_WEB_HOSTS=pinned.ddev.site,nat.pinned.ddev.site" "$out"
 
+# Falling back silently is the failure this path exists to prevent: the map gets
+# built against the hostname the worktree is served at, and nothing is rewritten.
+mv "$main/.ddev/config.yaml" "$main/.ddev/hidden.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "an unreadable parent is a warning, not a silent wrong map" \
+  "no DDEV" "$out"
+mv "$main/.ddev/hidden.yaml" "$main/.ddev/config.yaml"
+
+# ...but a same-project worktree is not that case, and must not be warned about.
+out="$(cd "$same" && "$cmd" env --slug wt-b 2>&1 || true)"
+case "$out" in
+  *"no DDEV"*) fail "a same-project worktree is not warned about" "$out" ;;
+  *) pass "a same-project worktree is not warned about" ;;
+esac
+
 # hostshift.yaml is a deliberate statement about which hostnames the database
 # holds; --from would override it.
 printf 'sites:\n  - canonical: https://acme.fi\n    base: https://acme.ddev.site\n' > "$wt/hostshift.yaml"
 out="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null || true)"
 check "hostshift.yaml wins over the parent's hostnames" \
   "HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site" "$(printf '%s' "$out" | sed -n '2p')"
+# ...and then the container reads that file itself, since it is mounted and
+# carries aliases a canonical=variant list cannot express.
+contains "no map is handed over when hostshift.yaml is mounted" \
+  "HOSTSHIFT_MAP_ARGS=" "$out"
 rm "$wt/hostshift.yaml"
+
+# DDEV derives `name` from the directory but not additional_hostnames, so a
+# worktree registers the parent's extra hostnames as its own — and traefik,
+# which has no cross-project uniqueness check, resolves the tie by rule length,
+# which a worktree's longer directory name always wins. `ddev start` says
+# nothing about it.
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "an inherited hostname the parent also serves is called out" \
+  "also registered nat.acme.ddev.site" "$out"
+
+# The map the proxy cannot work out for itself: the compose service mounts only
+# this worktree, so the parent's hostnames are unknowable inside the container —
+# `-C /project` there built its map from the directory basename, literally
+# "project", and every request 421'd.
+contains "the resolved map is handed to the container" \
+  "HOSTSHIFT_MAP_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site" "$out"
+
+# The parent moved or was deleted. `git rev-parse --git-common-dir` then *fails*
+# rather than naming an unreadable path, so testing its output alone read as
+# "not a worktree" — the map silently took the worktree's own hostname as
+# canonical, and the narrowing subtracted nothing, so the worktree kept the
+# parent's blog hostnames permanently rather than until a restart.
+mv "$main" "$main-moved"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "a parent that moved away is a warning, not a silent wrong map" \
+  "no DDEV" "$out"
+mv "$main-moved" "$main"
+
+# Two branches whose slugs collide give two projects identical VIRTUAL_HOST
+# entries; DDEV validates hostname syntax per project and no more, and traefik
+# resolves the tie by rule length rather than complaining.
+twin="$work/acme-wt-twin"
+git -C "$main" worktree add -q -b twin "$twin"
+mkdir -p "$twin/.ddev"; printf 'name: acme-wt-twin\n' > "$twin/.ddev/config.worktree.local.yaml"
+(cd "$wt" && "$cmd" init --slug clash >/dev/null 2>&1) || fail "init exited non-zero" ""
+out="$(cd "$twin" && "$cmd" env --slug clash 2>&1 || true)"
+contains "a slug another project already claims is a warning" "already claims" "$out"
+out="$(cd "$twin" && "$cmd" env --slug distinct 2>&1 || true)"
+case "$out" in *"already claims"*) fail "a distinct slug is not warned about" "$out" ;;
+                *) pass "a distinct slug is not warned about" ;; esac
+git -C "$main" worktree remove --force "$twin"
+# and put $wt back as the dry-run test below expects to find it
+rm -f "$wt/.ddev/.env"
+
+# The checkout a worktree branches from has no canonical/variant distinction to
+# make, and running init there makes it claim its own worktrees' hostnames.
+out="$(cd "$main" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "init in the parent checkout is warned about" "not a linked worktree" "$out"
 
 echo "== init"
 
@@ -124,14 +193,40 @@ fi
 contains "--dry-run shows what it would write" "HOSTSHIFT_SLUG=wt-a" "$out"
 
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
-first="$(cat "$wt/.ddev/config.hostshift.local.yaml")"
-contains "the generated file opts out of being read back" "hostshift:ignore" "$first"
+if [ -e "$wt/.ddev/config.hostshift.local.yaml" ]; then
+  fail "init writes no DDEV config file" "it wrote one"
+else
+  pass "init writes no DDEV config file"
+fi
 
-# Three runs used to take additional_hostnames from 4 entries to 16 and produce
-# third--my-slug--feature-cool-thing--acme.ddev.site.
+# An earlier version wrote .ddev/config.hostshift.local.yaml to register the
+# variants. It was never needed — DDEV takes the cert SANs from VIRTUAL_HOST too
+# — and left behind it is still read as DDEV config, so it feeds its own variants
+# back in as canonical hosts.
+printf '# generated by `ddev hostshift init`\nadditional_hostnames:\n  - wt-a--acme\n' \
+  > "$wt/.ddev/config.hostshift.local.yaml"
+out="$(cd "$wt" && "$cmd" init --slug wt-a 2>&1 || true)"
+if [ -e "$wt/.ddev/config.hostshift.local.yaml" ]; then
+  fail "a stale generated file is removed" "still there"
+else
+  pass "a stale generated file is removed"
+fi
+contains "and removing it is said out loud" "removed .ddev/config.hostshift.local.yaml" "$out"
+
+# A config.*.yaml this command did not write is none of its business.
+printf 'additional_hostnames:\n  - mine\n' > "$wt/.ddev/config.hostshift.local.yaml"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+if [ -e "$wt/.ddev/config.hostshift.local.yaml" ]; then
+  pass "a file without the marker is left alone"
+else
+  fail "a file without the marker is left alone" "deleted it"
+fi
+rm -f "$wt/.ddev/config.hostshift.local.yaml"
+
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
-check "init is idempotent" "$first" "$(cat "$wt/.ddev/config.hostshift.local.yaml")"
+first="$(cat "$wt/.ddev/.env")"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+check "init is idempotent" "$first" "$(cat "$wt/.ddev/.env")"
 
 out="$(cd "$wt" && "$cmd" env --slug other 2>/dev/null || true)"
 contains "a second slug does not compound with the first" \
@@ -140,22 +235,78 @@ contains "a second slug does not compound with the first" \
 printf 'UNRELATED=keep\n' > "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 contains ".env keeps keys that are not ours" "UNRELATED=keep" "$(cat "$wt/.ddev/.env")"
-perms="$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
-check ".env stays world-readable" "-rw-r--r--" "$perms"
+# Not "stays 0644" — that pinned a bug. .ddev/.env is where DDEV documents
+# putting project env vars, credentials included, so init must keep whatever
+# mode the file already had rather than widening it.
+chmod 600 "$wt/.ddev/.env"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+check ".env keeps the mode it had" "-rw-------" \
+  "$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
+rm -f "$wt/.ddev/.env"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+check ".env is 0644 when init creates it" "-rw-r--r--" \
+  "$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
 
-# additional_fqdns are already qualified; writing them under
-# additional_hostnames makes DDEV register acme.test.example.com.ddev.site and
-# issue no SAN for the real host.
-fq="$work/fq"; newproject "$fq" 'name: fq\nadditional_fqdns:\n  - fq.test.example.com'
-(cd "$fq" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero (fqdn)" ""
-gen="$(sed -n '/^additional_hostnames:/,$p' "$fq/.ddev/config.hostshift.local.yaml")"
-check "each hostname is written under the key DDEV reads it with" \
-"additional_hostnames:
-  - fq
-  - wt-a--fq
-additional_fqdns:
-  - fq.test.example.com
-  - wt-a--fq.test.example.com" "$gen"
+echo "== check"
+
+# `hostshift check` on its own is worthless in a worktree: run without --from it
+# resolves layer 1 against the worktree's own config, calls the map injective and
+# anchored, and exits 0 — for a map the proxy never sees. It is also what the
+# README and the 421 body tell you to run.
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+(cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1) && pass "check passes a current worktree" \
+  || fail "check passes a current worktree" "non-zero"
+
+sed -i.bak 's/^HOSTSHIFT_VARIANTS=.*/HOSTSHIFT_VARIANTS=stale--acme.ddev.site/' "$wt/.ddev/.env"
+rm -f "$wt/.ddev/.env.bak"
+if (cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1); then
+  fail "check catches a .ddev/.env written for another slug" "exited 0"
+else
+  pass "check catches a .ddev/.env written for another slug"
+fi
+contains "and says what to run" "ddev hostshift init" \
+  "$(cd "$wt" && "$cmd" check --slug wt-a 2>&1 || true)"
+
+rm -f "$wt/.ddev/.env"
+if (cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1); then
+  fail "check refuses when nothing is deployed" "exited 0"
+else
+  pass "check refuses when nothing is deployed"
+fi
+
+# The published image splits a comma-separated --map on its first `=`, so a
+# multisite map came out as one site with a corrupt variant host and every
+# variant 421'd. --from/--to is index-aligned and has always been understood.
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>/dev/null || true)"
+contains "a multi-site map is passed as repeated --from/--to" \
+  "HOSTSHIFT_MAP_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site --from https://nat.acme.ddev.site --to https://wt-a--nat.acme.ddev.site" \
+  "$out"
+
+# The hook runs this; sourcing .ddev/.env made a project file into host code,
+# and broke outright on any value containing a space.
+hookbody="$(sed -n '/^hooks:/,$p' "$repo/ddev/config.hostshift.yaml")"
+case "$hookbody" in
+  *". ./.ddev/.env"*|*"source "*|*". .ddev/.env"*)
+    fail "the hook does not source .ddev/.env" "$hookbody" ;;
+  *) pass "the hook does not source .ddev/.env" ;;
+esac
+
+# A plain checkout with a hostshift.yaml is the other headline use — serving a
+# site at a hostname its database does not hold. Warning there is a false alarm.
+prod="$work/prodsite"; newproject "$prod" 'name: prodsite\ntype: php'
+printf 'sites:\n  - canonical: https://www.example.com\n    base: https://prodsite.ddev.site\n' > "$prod/hostshift.yaml"
+out="$(cd "$prod" && "$cmd" env --slug preview 2>&1 || true)"
+case "$out" in *"not a linked worktree"*) fail "a declared map is not a false alarm" "$out" ;;
+                *) pass "a declared map is not a false alarm" ;; esac
+
+# A submodule has a .git file too, and its "parent" is the superproject's
+# modules directory — not a checkout.
+sub="$work/host/vendor/sub"; mkdir -p "$sub/.ddev"
+printf 'name: sub\ntype: php\n' > "$sub/.ddev/config.yaml"
+printf 'gitdir: ../../.git/modules/vendor/sub\n' > "$sub/.git"
+out="$(cd "$sub" && "$cmd" env --slug sm 2>&1 || true)"
+case "$out" in *"but no DDEV"*) fail "a submodule is not mistaken for a worktree" "$out" ;;
+                *) pass "a submodule is not mistaken for a worktree" ;; esac
 
 echo "== wp-cli"
 
@@ -187,6 +338,19 @@ contains "--slug with no value says so" "--slug needs a value" \
   "$(cd "$wt" && "$cmd" env --slug 2>&1 || true)"
 contains "an unknown subcommand prints usage" "usage: ddev hostshift" \
   "$(cd "$wt" && "$cmd" nonsense 2>&1 || true)"
+
+# A slug reaches HOSTSHIFT_VARIANTS and the proxy's command line, and both go
+# through compose's shell-word splitting: a `;` truncated the map silently, a `$`
+# interpolated to nothing, a `"` killed the start with an error naming neither
+# hostshift nor the file, and a `,` corrupted the comma-delimited variant list.
+for bad in 'a;b' 'a$b' 'a,b' 'a b' '-lead' 'trail-'; do
+  if (cd "$wt" && "$cmd" env --slug "$bad" >/dev/null 2>&1); then
+    fail "a slug that is not a hostname label is refused" "accepted $bad"
+  fi
+done
+pass "a slug that is not a hostname label is refused"
+contains "and says why" "silently truncates or corrupts the map" \
+  "$(cd "$wt" && "$cmd" env --slug 'a;b' 2>&1 || true)"
 
 # `ddev` may be run from anywhere inside the project.
 mkdir -p "$wt/web/app"

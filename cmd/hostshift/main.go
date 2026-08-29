@@ -134,20 +134,40 @@ func describe(fs *flag.FlagSet, args []string, what string) (helped bool) {
 // repeatable collects a flag that may be given more than once.
 type repeatable []string
 
-func (r *repeatable) String() string     { return strings.Join(*r, ",") }
-func (r *repeatable) Set(v string) error { *r = append(*r, v); return nil }
+func (r *repeatable) String() string { return strings.Join(*r, ",") }
+
+// An empty value is no value. A caller assembling a command line from a
+// template — a compose file, a CI job — cannot leave a flag out conditionally,
+// so `--from ""` has to mean "I have nothing to give you" rather than fail.
+func (r *repeatable) Set(v string) error {
+	if v == "" {
+		return nil
+	}
+	*r = append(*r, v)
+	return nil
+}
 
 // pairFlag accepts --map canonical=variant, the spelling PLAN §5.3 uses.
 type pairFlag struct{ from, to *repeatable }
 
 func (p pairFlag) String() string { return "" }
+
+// Repeatable, and also comma-separated in one value — because the caller that
+// most needs to pass a whole map is a docker-compose `command:` list, which
+// cannot expand one variable into several arguments. A hostname cannot contain
+// a comma, so the separator is unambiguous. Empty is no map, per repeatable.Set.
 func (p pairFlag) Set(v string) error {
-	c, variant, ok := strings.Cut(v, "=")
-	if !ok {
-		return errors.New(`want canonical=variant, e.g. --map https://a=https://b`)
+	if v == "" {
+		return nil
 	}
-	*p.from = append(*p.from, c)
-	*p.to = append(*p.to, variant)
+	for _, pair := range strings.Split(v, ",") {
+		c, variant, ok := strings.Cut(pair, "=")
+		if !ok {
+			return errors.New(`want canonical=variant, e.g. --map https://a=https://b`)
+		}
+		*p.from = append(*p.from, c)
+		*p.to = append(*p.to, variant)
+	}
 	return nil
 }
 
@@ -365,6 +385,8 @@ func cmdMap(args []string) (int, error) {
 	var c common
 	c.register(fs)
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
+	pairs := fs.Bool("pairs", false, "emit canonical=variant, one per line, for --map")
+	hosts := fs.Bool("variant-hosts", false, "emit the variant hostnames, one per line")
 	if describe(fs, args, "print the resolved map, and where it came from") {
 		return exitOK, nil
 	}
@@ -374,6 +396,21 @@ func cmdMap(args []string) (int, error) {
 	res, err := c.load()
 	if err != nil {
 		return exitConfig, err
+	}
+	// Flat output, because the only consumer that needs the whole map is shell,
+	// and shell should not be parsing JSON. It was: the add-on shelled out to
+	// python3 to read --json, an undeclared dependency whose absence produced
+	// "could not resolve a map to hand the proxy" and named neither python3 nor
+	// the cause. Printing its own map flat is as generic as printing it as JSON.
+	if *pairs || *hosts {
+		for _, s := range res.Map.Sites {
+			if *pairs {
+				fmt.Printf("%s=%s\n", s.Canonical.String(), s.Variant.String())
+			} else {
+				fmt.Println(s.Variant.Host)
+			}
+		}
+		return exitOK, nil
 	}
 	if *asJSON {
 		type site struct {

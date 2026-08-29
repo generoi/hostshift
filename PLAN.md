@@ -1353,8 +1353,16 @@ is unreachable from the DDEV router. When run as a bare binary, bind `127.0.0.1`
 Never publish the port.
 
 Distribution: static binary, distroless image, and a DDEV add-on that is a
-compose service, the loopback override, and **one host command**. No `lib.sh`,
-no hooks, no guard — nothing runs during a request.
+compose service, the loopback override, **one host command** and **one
+post-start hook**. No `lib.sh`, no guard, and nothing that runs during a request.
+
+The hook is not scaffolding and does not write: it prints the hostnames being
+served, and says so when `.ddev/.env` has gone stale. That check has to happen
+at start or not at all — the file is computed once on the host by `ddev hostshift
+init`, while three of its inputs go on changing: the worktree's directory name,
+which is the DDEV project name; the parent checkout's hostname list; and whether
+a `hostshift.yaml` exists. Each of those leaves a configuration `ddev start`
+reports as a success and which serves the wrong thing.
 
 The command exists because the binary refuses to. Deriving a slug from a git
 branch, deciding which hostnames `web` should keep, writing `.ddev/.env` and the
