@@ -135,15 +135,17 @@ production origin reaches the browser"; `--strict-origins` returns 404 instead.
 
 ## The DDEV add-on
 
-Two compose files, an `install.yaml`, and one host command. No `lib.sh`, no
-hooks, no guard — §3 measured what happens when per-repo footprint is not held
+Two compose files, an `install.yaml`, one host command and one post-start hook.
+No `lib.sh`, no guard, and nothing that runs during a request — §3 measured what happens when per-repo footprint is not held
 to, and the answer was 42 repos carrying 14 different pinned SHAs of the same
 submodule.
 
 The command is the opinionated half, and it is opinionated on purpose: it works
 the slug out from the git branch, decides which hostnames `web` keeps, and
-writes the one gitignored file a worktree needs. Its tests are
-`test/addon-command.sh`.
+writes the one gitignored file a worktree needs. The hook prints the hostnames
+being served on every `ddev start`, and says so when that file has gone stale —
+which it does on its own, since the project name follows the directory while the
+file does not. Its tests are `test/addon-command.sh`.
 
 ```
 ddev add-on get generoi/hostshift
@@ -204,10 +206,10 @@ One gitignored file comes out of it, and nothing else:
 HOSTSHIFT_SLUG=wt-a
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
-HOSTSHIFT_MAP=https://acme.ddev.site=https://wt-a--acme.ddev.site
+HOSTSHIFT_MAP_ARG=--map https://acme.ddev.site=https://wt-a--acme.ddev.site
 ```
 
-`HOSTSHIFT_MAP` is the map itself, resolved here and handed to the proxy. The
+`HOSTSHIFT_MAP_ARG` is the map itself, resolved here and handed to the proxy. The
 compose service mounts only this worktree, so the canonical hostnames — which
 live in the parent checkout — cannot be worked out inside the container.
 
@@ -219,7 +221,8 @@ with no hostshift config file on disk at all: the served certificate carried
 `DNS:wt-a--shop.acme.ddev.site`, three labels and never registered, and verified
 against the mkcert root.
 
-`ddev restart`, and `https://wt-a--acme.ddev.site` serves the worktree while
+`ddev restart` — which prints the URL back to you — and
+`https://wt-a--acme.ddev.site` serves the worktree while
 `https://acme.ddev.site` goes on serving the parent checkout.
 `HOSTSHIFT_WEB_HOSTS` is what keeps the two apart: `web` answers on the
 worktree's own hostname, and only the variant reaches hostshift.
@@ -292,10 +295,10 @@ hostshift: now run `ddev restart`
 HOSTSHIFT_SLUG=wt-a
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site,wt-a--shop.acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
-HOSTSHIFT_MAP=
+HOSTSHIFT_MAP_ARG=
 ```
 
-`HOSTSHIFT_MAP` is empty here because `hostshift.yaml` is mounted into the
+`HOSTSHIFT_MAP_ARG` is empty here because `hostshift.yaml` is mounted into the
 container and the proxy reads it directly — which it must, since a flat
 canonical=variant list cannot carry the aliases.
 
