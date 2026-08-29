@@ -64,6 +64,9 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -88,16 +91,27 @@ jobs:
       # `--map`. Both were invisible because CI only ever ran its own build. So
       # assert the published image understands the exact shape the add-on emits.
       - name: the published image still understands what the add-on emits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eux
+          set -eu
           published=ghcr.io/generoi/hostshift:latest
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # The package is private, and a fork's token cannot read it. That is
+          # not skew, so do not fail the build for it — but say so, loudly enough
+          # that a real regression is never mistaken for this.
+          if ! docker pull -q "$published"; then
+            echo "::warning::cannot pull $published here; the compose file's flag" \
+                 "contract against the published image was NOT verified in this run"
+            exit 0
+          fi
           # A two-site map, the shape that 421'd everything when it was commas.
           docker run --rm "$published" map \
             --from https://a.example --to https://wt--a.example \
             --from https://b.example --to https://wt--b.example \
             | tee /dev/stderr | grep -q 'https://wt--b.example'
-          # And no map flags at all, which is what a project with a
-          # hostshift.yaml passes; it must not be a startup failure.
+          # And with no map flags at all, which is what a project with a
+          # hostshift.yaml passes.
           docker run --rm "$published" map --help >/dev/null
 
   # The acceptance suite against a WordPress that this job builds from nothing.
