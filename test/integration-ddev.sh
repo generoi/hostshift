@@ -26,6 +26,10 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Per-run project names. Hardcoded ones meant a run colliding with a previous
+# one's leftovers reported `ok` for assertions satisfied by *those* containers,
+# while neither project under test had started at all.
+tag="it$$"
 GO="${GO:-go}"
 IMAGE="${HOSTSHIFT_IMAGE:-ghcr.io/generoi/hostshift:latest}"
 work="${HOSTSHIFT_TEST_ROOT:-$(mktemp -d)}/integration"
@@ -38,8 +42,11 @@ contains() { case "$3" in *"$2"*) pass "$1" ;; *) fail "$1" "want to contain: $2
 
 projects=()
 cleanup() {
+  # By name, not by directory. `ddev delete` run from an approot that no longer
+  # exists cannot find the project, and `rm -rf "$work"` below destroys the only
+  # handle — leaving a registered project nothing can remove.
   for p in ${projects[@]+"${projects[@]}"}; do
-    (cd "$p" 2>/dev/null && ddev delete --omit-snapshot -y >/dev/null 2>&1) || true
+    ddev delete --omit-snapshot -y "$(basename "$p")" >/dev/null 2>&1 || true
   done
   rm -rf "$work"
 }
@@ -85,10 +92,10 @@ get() { curl -sk --max-time 20 "$1" 2>&1; }
 
 echo "== a single-site worktree, zero committed config  (image: $IMAGE)"
 
-main="$work/hsit"
+main="$work/${tag}"
 newsite "$main" parent
-git -C "$main" worktree add -q -b wt-a "$work/hsit-wt-a"
-wt="$work/hsit-wt-a"
+git -C "$main" worktree add -q -b wt-a "$work/${tag}-wt-a"
+wt="$work/${tag}-wt-a"
 printf '<?php echo "PROJECT=worktree HOST=", $_SERVER["HTTP_HOST"], "\\n";' > "$wt/web/index.php"
 installaddon "$wt"
 
@@ -100,7 +107,7 @@ start_out="$(cd "$wt" && ddev start -y 2>&1)" || fail "the worktree starts" "$st
 
 # The hook ran, and did not blow up. Exit 127 here was invisible to every other
 # test in the repo.
-contains "the post-start hook prints the URLs it serves" "hostshift is serving" "$start_out"
+contains "the post-start hook prints the URLs it serves" "hostshift is configured to serve" "$start_out"
 case "$start_out" in
   *"Task failed"*|*"exit status 127"*|*"No such file or directory"*)
     fail "the post-start hook does not fail the start" "$start_out" ;;
@@ -108,16 +115,16 @@ case "$start_out" in
 esac
 
 contains "the variant serves the worktree" "PROJECT=worktree" \
-  "$(get https://wt-a--hsit.ddev.site/)"
-contains "and it reaches the app as the canonical hostname" "HOST=hsit.ddev.site" \
-  "$(get https://wt-a--hsit.ddev.site/)"
+  "$(get https://wt-a--${tag}.ddev.site/)"
+contains "and it reaches the app as the canonical hostname" "HOST=${tag}.ddev.site" \
+  "$(get https://wt-a--${tag}.ddev.site/)"
 contains "the canonical hostname still serves the parent" "PROJECT=parent" \
-  "$(get https://hsit.ddev.site/)"
+  "$(get https://${tag}.ddev.site/)"
 contains "the worktree's own hostname still serves the worktree" "PROJECT=worktree" \
-  "$(get https://hsit-wt-a.ddev.site/)"
+  "$(get https://${tag}-wt-a.ddev.site/)"
 
 # Mailpit rides web's VIRTUAL_HOST, which the add-on narrows.
-code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://hsit-wt-a.ddev.site:8026/ 2>/dev/null || true)"
+code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://${tag}-wt-a.ddev.site:8026/ 2>/dev/null || true)"
 [ "$code" = "200" ] && pass "mailpit still routes" || fail "mailpit still routes" "http $code"
 
 out="$(cd "$wt" && ddev hostshift check 2>&1)" && pass "check passes a live worktree" \
@@ -125,10 +132,10 @@ out="$(cd "$wt" && ddev hostshift check 2>&1)" && pass "check passes a live work
 
 echo "== a multisite worktree — two canonical hostnames, two variants"
 
-m2="$work/hsit2"
-newsite "$m2" parent2 shop.hsit2
-git -C "$m2" worktree add -q -b wt-b "$work/hsit2-wt-b"
-wt2="$work/hsit2-wt-b"
+m2="$work/${tag}2"
+newsite "$m2" parent2 "shop.$tag"2
+git -C "$m2" worktree add -q -b wt-b "$work/${tag}2-wt-b"
+wt2="$work/${tag}2-wt-b"
 printf '<?php echo "PROJECT=worktree2 HOST=", $_SERVER["HTTP_HOST"], "\\n";' > "$wt2/web/index.php"
 installaddon "$wt2"
 projects+=("$m2" "$wt2")
@@ -140,13 +147,53 @@ projects+=("$m2" "$wt2")
 # The case a comma-separated --map broke against the published image: both
 # variants 421'd while everything reported success.
 contains "the first variant serves the worktree" "PROJECT=worktree2" \
-  "$(get https://wt-b--hsit2.ddev.site/)"
-contains "and reaches the app as its canonical hostname" "HOST=hsit2.ddev.site" \
-  "$(get https://wt-b--hsit2.ddev.site/)"
+  "$(get https://wt-b--${tag}2.ddev.site/)"
+contains "and reaches the app as its canonical hostname" "HOST=${tag}2.ddev.site" \
+  "$(get https://wt-b--${tag}2.ddev.site/)"
 contains "the second variant serves the worktree" "PROJECT=worktree2" \
-  "$(get https://wt-b--shop.hsit2.ddev.site/)"
-contains "and reaches the app as *its* canonical hostname" "HOST=shop.hsit2.ddev.site" \
-  "$(get https://wt-b--shop.hsit2.ddev.site/)"
+  "$(get https://wt-b--shop.${tag}2.ddev.site/)"
+contains "and reaches the app as *its* canonical hostname" "HOST=shop.${tag}2.ddev.site" \
+  "$(get https://wt-b--shop.${tag}2.ddev.site/)"
+
+# The whole reason the compose file narrows web's VIRTUAL_HOST. A worktree
+# inherits additional_hostnames verbatim and traefik prefers the longer rule, so
+# without the narrowing the worktree serves the parent's blog — silently, to
+# whoever else is working on it. Nothing asserted this.
+contains "and the parent keeps its own blog hostname" "PROJECT=parent2" \
+  "$(get https://shop.${tag}2.ddev.site/)"
+
+echo "== a worktree with a committed hostshift.yaml — the container resolves its own map"
+
+# The one per-project shape neither this suite nor CI exercised. Both scenarios
+# above have no hostshift.yaml, so the *host* resolves the map and hands it over
+# as --from/--to and the container never opens .ddev/config.yaml. With the file
+# present the map args are empty by design and the container reads it itself —
+# which is the multisite worked example, and acmecorp' exact configuration.
+m3="$work/${tag}3"
+newsite "$m3" parent3
+git -C "$m3" worktree add -q -b wt-c "$work/${tag}3-wt-c"
+wt3="$work/${tag}3-wt-c"
+printf '<?php echo "PROJECT=worktree3 HOST=", $_SERVER["HTTP_HOST"], "\\n";' > "$wt3/web/index.php"
+cat > "$wt3/hostshift.yaml" <<YAML
+sites:
+  - name: main
+    canonical: https://${tag}3.ddev.site
+    aliases:
+      - https://${tag}3.staging.example
+YAML
+installaddon "$wt3"
+projects+=("$m3" "$wt3")
+
+(cd "$m3" && ddev start -y >/dev/null 2>&1) || fail "the hostshift.yaml parent starts" ""
+(cd "$wt3" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds with a hostshift.yaml" ""
+out3="$(cd "$wt3" && ddev start -y 2>&1)" || fail "the hostshift.yaml worktree starts" "$out3"
+
+contains "the map args are empty, so the container reads the mounted file" \
+  "HOSTSHIFT_MAP_ARGS=" "$(cat "$wt3/.ddev/.env")"
+contains "the variant serves the worktree from a mounted hostshift.yaml" "PROJECT=worktree3" \
+  "$(get https://wt-c--${tag}3.ddev.site/)"
+contains "and reaches the app as the canonical hostname" "HOST=${tag}3.ddev.site" \
+  "$(get https://wt-c--${tag}3.ddev.site/)"
 
 echo "== drift is noticed rather than served"
 

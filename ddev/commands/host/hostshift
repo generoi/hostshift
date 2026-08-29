@@ -69,6 +69,15 @@ if [ -z "$slug" ]; then
   echo "hostshift: slug \"$slug\", from the git branch $branch" >&2
 fi
 
+case "$slug" in
+  *[!a-z0-9-]*|-*|*-)
+    echo "hostshift: slug \"$slug\" is not a hostname label — use lowercase letters," >&2
+    echo "  digits and hyphens, not starting or ending with one. It becomes part of a" >&2
+    echo "  hostname and of the proxy's command line, where a space, quote, \$, ; or ," >&2
+    echo "  silently truncates or corrupts the map." >&2
+    exit 2 ;;
+esac
+
 # What this project answers to.  `hostshift hosts` reads the DDEV config with
 # its config.*.yaml override merging — parsing that here would be the place the
 # careful parts get lost.
@@ -305,13 +314,13 @@ if [ "$cmd" = "check" ]; then
     deployed="$(grep '^HOSTSHIFT_' .ddev/.env || true)"
     if [ "$deployed" != "$env_out" ]; then
       echo "hostshift: .ddev/.env is out of date. It says" >&2
-      printf '  %s\n' ${deployed:-nothing} >&2
+      printf '%s\n' "${deployed:-  nothing}" >&2
       echo "  and this project now resolves to" >&2
-      printf '  %s\n' $env_out >&2
+      printf '%s\n' "$env_out" >&2
       echo "  Run \`ddev hostshift init && ddev restart\`." >&2
       exit 2
     fi
-    printf '\n  hostshift is serving:\n' >&2
+    printf '\n  hostshift is configured to serve:\n' >&2
     printf '    https://%s\n' $(printf '%s' "$variants" | tr ',' ' ') >&2
     printf '\n' >&2
   else
@@ -399,10 +408,18 @@ fi
 # else already. Written in place rather than moved over, or the destination
 # inherits mktemp's 0600 and its creator's group.
 touch .ddev/.env
-tmp="$(mktemp)"
-grep -v '^HOSTSHIFT_' .ddev/.env > "$tmp" || true
-printf '%s\n' "$env_out" >> "$tmp"
-chmod 644 "$tmp"
+# In .ddev/ so the mv is a rename on one filesystem rather than a copy+unlink
+# across two, which is not atomic — a concurrent compose read must never catch
+# this half-written and see an empty VIRTUAL_HOST.
+tmp="$(mktemp .ddev/.env.XXXXXX)"
+# cp -p first, then truncate: that gives the temp file the mode the real one
+# already had, and redirection keeps it. .ddev/.env is where DDEV documents
+# putting project env vars, credentials included, so a developer who chmod 600'd
+# it meant it — an earlier version reset it to 0644 on every init. (`chmod
+# --reference` would be simpler and is GNU-only; `stat -f` means two different
+# things on the two stats and silently succeeds on both.)
+cp -p .ddev/.env "$tmp"
+{ grep -v '^HOSTSHIFT_' .ddev/.env || true; printf '%s\n' "$env_out"; } > "$tmp"
 mv "$tmp" .ddev/.env
 
 # An earlier version of this command wrote that file. Left behind it is still

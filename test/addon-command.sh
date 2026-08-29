@@ -235,8 +235,17 @@ contains "a second slug does not compound with the first" \
 printf 'UNRELATED=keep\n' > "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 contains ".env keeps keys that are not ours" "UNRELATED=keep" "$(cat "$wt/.ddev/.env")"
-perms="$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
-check ".env stays world-readable" "-rw-r--r--" "$perms"
+# Not "stays 0644" — that pinned a bug. .ddev/.env is where DDEV documents
+# putting project env vars, credentials included, so init must keep whatever
+# mode the file already had rather than widening it.
+chmod 600 "$wt/.ddev/.env"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+check ".env keeps the mode it had" "-rw-------" \
+  "$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
+rm -f "$wt/.ddev/.env"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+check ".env is 0644 when init creates it" "-rw-r--r--" \
+  "$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
 
 echo "== check"
 
@@ -329,6 +338,19 @@ contains "--slug with no value says so" "--slug needs a value" \
   "$(cd "$wt" && "$cmd" env --slug 2>&1 || true)"
 contains "an unknown subcommand prints usage" "usage: ddev hostshift" \
   "$(cd "$wt" && "$cmd" nonsense 2>&1 || true)"
+
+# A slug reaches HOSTSHIFT_VARIANTS and the proxy's command line, and both go
+# through compose's shell-word splitting: a `;` truncated the map silently, a `$`
+# interpolated to nothing, a `"` killed the start with an error naming neither
+# hostshift nor the file, and a `,` corrupted the comma-delimited variant list.
+for bad in 'a;b' 'a$b' 'a,b' 'a b' '-lead' 'trail-'; do
+  if (cd "$wt" && "$cmd" env --slug "$bad" >/dev/null 2>&1); then
+    fail "a slug that is not a hostname label is refused" "accepted $bad"
+  fi
+done
+pass "a slug that is not a hostname label is refused"
+contains "and says why" "silently truncates or corrupts the map" \
+  "$(cd "$wt" && "$cmd" env --slug 'a;b' 2>&1 || true)"
 
 # `ddev` may be run from anywhere inside the project.
 mkdir -p "$wt/web/app"
