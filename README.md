@@ -192,17 +192,41 @@ In a worktree, run `ddev hostshift check` rather than the bare one. The bare
 command resolves *this* checkout's hostnames — not the ones the database holds
 — and reports that map as valid.
 
+## The database — required, and hostshift does not choose it
+
+**DDEV gives a new worktree an empty database of its own**, so the first thing
+you see after `ddev restart` is the CMS installer. hostshift maps hostnames and
+takes no part in this; pick one of two:
+
+**Share the parent's.** Right for previewing a branch. One gitignored file in
+the worktree, then `ddev restart`:
+
+```yaml
+# .ddev/config.worktree.local.yaml
+web_environment:
+  - DATABASE_URL=mysql://db:db@ddev-acme-db:3306/db
+```
+
+Every DDEV container is already on `ddev_default`, so the parent's database
+container resolves by name with nothing else configured. Note that a shared
+database is shared: previewing is safe, but activating a plugin, running a
+migration or uploading media writes to the real thing.
+
+**Or give it one of its own**, which a branch that has to write needs. The
+fastest source is the parent, and it is the state you are already working
+against:
+
+```console
+$ ddev hostshift copy-db
+```
+
+That streams the parent's database straight in — no dump on disk, no production
+round trip. It refuses to overwrite a database that already has tables unless
+you pass `--force`. It does not touch hostnames: the copy still holds the
+parent's, which is exactly why hostshift is needed afterwards just as much as
+before.
+
 ## What is optional
-
-### `ddev hostshift copy-db` — only if the worktree must write
-
-Sharing the parent's database is the default and is usually right. A worktree
-that has to *write* — activate a plugin, run a migration, upload media — wants
-one of its own, and the fastest source is the parent: every DDEV container is
-on `ddev_default`, so `ddev hostshift copy-db` streams the parent's database into
-this worktree's without a dump on disk or a production round trip. It does not
-touch hostnames — the copy still holds the parent's, which is exactly why
-hostshift is needed afterwards just as much as before.
 
 ### `hostshift.yaml` — only for aliases, or for production-canonical
 
