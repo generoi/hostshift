@@ -210,10 +210,10 @@ One gitignored file comes out of it, and nothing else:
 HOSTSHIFT_SLUG=wt-a
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
-HOSTSHIFT_MAP_ARG=--map https://acme.ddev.site=https://wt-a--acme.ddev.site
+HOSTSHIFT_MAP_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site
 ```
 
-`HOSTSHIFT_MAP_ARG` is the map itself, resolved here and handed to the proxy. The
+`HOSTSHIFT_MAP_ARGS` is the map itself, resolved here and handed to the proxy. The
 compose service mounts only this worktree, so the canonical hostnames — which
 live in the parent checkout — cannot be worked out inside the container.
 
@@ -299,10 +299,10 @@ hostshift: now run `ddev restart`
 HOSTSHIFT_SLUG=wt-a
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site,wt-a--shop.acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
-HOSTSHIFT_MAP_ARG=
+HOSTSHIFT_MAP_ARGS=
 ```
 
-`HOSTSHIFT_MAP_ARG` is empty here because `hostshift.yaml` is mounted into the
+`HOSTSHIFT_MAP_ARGS` is empty here because `hostshift.yaml` is mounted into the
 container and the proxy reads it directly — which it must, since a flat
 canonical=variant list cannot carry the aliases.
 
