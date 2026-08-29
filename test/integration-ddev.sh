@@ -107,7 +107,13 @@ start_out="$(cd "$wt" && ddev start -y 2>&1)" || fail "the worktree starts" "$st
 
 # The hook ran, and did not blow up. Exit 127 here was invisible to every other
 # test in the repo.
-contains "the post-start hook prints the URLs it serves" "hostshift is configured to serve" "$start_out"
+#
+# The hostname, not the sentence around it. Matching a fixed phrase went red the
+# day `check`'s wording changed from "is configured to serve" to "is serving" —
+# a rename that broke nothing — while a hook printing the *wrong* hostname, or
+# the parent's, would have passed it. What the hook is for is telling you which
+# URL this checkout answers on.
+contains "the post-start hook prints the URL it serves" "https://wt-a--${tag}.ddev.site" "$start_out"
 case "$start_out" in
   *"Task failed"*|*"exit status 127"*|*"No such file or directory"*)
     fail "the post-start hook does not fail the start" "$start_out" ;;
@@ -129,6 +135,39 @@ code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://${tag}-wt-
 
 out="$(cd "$wt" && ddev hostshift check 2>&1)" && pass "check passes a live worktree" \
   || fail "check passes a live worktree" "$out"
+
+echo "== copy-db"
+
+# The only subcommand that destroys something. It streams the parent's database
+# over the compose network into this worktree's, and there is no undo — so the
+# thing worth testing is not that the copy works but that it refuses when it
+# would overwrite. Both halves are new and neither had any coverage.
+sql() { (cd "$1" && ddev exec -s web bash -c "mysql -h db -udb -pdb -N -B -e \"$2\" db" 2>/dev/null) || true; }
+sql "$main" "create table hs_probe (id int); insert into hs_probe values (42);" >/dev/null
+
+out="$(cd "$wt" && ddev hostshift copy-db 2>&1)" || fail "copy-db copies the parent's database" "$out"
+contains "copy-db copies the parent's database" "42" "$(sql "$wt" "select id from hs_probe")"
+
+# Running it twice is the accident: the second run silently replaced whatever
+# the first one's work had put there.
+if (cd "$wt" && ddev hostshift copy-db >/dev/null 2>&1); then
+  fail "copy-db refuses a database that already has tables" "exited 0"
+else
+  pass "copy-db refuses a database that already has tables"
+fi
+contains "and says how to mean it" "--force" \
+  "$(cd "$wt" && ddev hostshift copy-db 2>&1 || true)"
+out="$(cd "$wt" && ddev hostshift copy-db --force 2>&1)" \
+  && pass "and --force goes through" || fail "and --force goes through" "$out"
+
+# In the parent there is no other checkout to copy from, and the parent's own
+# database is the one every worktree is sharing. Copying it into itself is the
+# one thing that cannot be recovered from.
+if (cd "$main" && ddev hostshift copy-db >/dev/null 2>&1); then
+  fail "copy-db refuses to run outside a worktree" "exited 0"
+else
+  pass "copy-db refuses to run outside a worktree"
+fi
 
 echo "== a multisite worktree — two canonical hostnames, two variants"
 
@@ -188,8 +227,19 @@ projects+=("$m3" "$wt3")
 (cd "$wt3" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds with a hostshift.yaml" ""
 out3="$(cd "$wt3" && ddev start -y 2>&1)" || fail "the hostshift.yaml worktree starts" "$out3"
 
-contains "the map args are empty, so the container reads the mounted file" \
-  "HOSTSHIFT_MAP_ARGS=" "$(cat "$wt3/.ddev/.env")"
+# The whole line, compared for equality. `contains "HOSTSHIFT_MAP_ARGS="` was
+# satisfied by every possible value of that variable — it is a prefix of all of
+# them — so the one assertion guarding "no flat map is handed over when a
+# hostshift.yaml is mounted" could not fail, and did not notice when the
+# variable was renamed out of existence. What must be true is that the proxy
+# gets a slug and nothing else: a `--from/--to` pair here beats the mounted
+# file, and the file's aliases then silently never rewrite.
+args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt3/.ddev/.env")"
+[ "$args" = "--slug wt-c" ] \
+  && pass "no flat map is handed over, so the container reads the mounted file" \
+  || fail "no flat map is handed over, so the container reads the mounted file" \
+       "want: --slug wt-c
+     got:  $args"
 contains "the variant serves the worktree from a mounted hostshift.yaml" "PROJECT=worktree3" \
   "$(get https://wt-c--${tag}3.ddev.site/)"
 contains "and reaches the app as the canonical hostname" "HOST=${tag}3.ddev.site" \
