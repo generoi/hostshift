@@ -63,7 +63,9 @@ contains "branch becomes a hostname label" "feature-abc-123--slug.ddev.site" "$o
 # and en_US.UTF-8 is the macOS default.
 (cd "$d" && git checkout -q -b 'feature/käyttöliittymä')
 if out="$(cd "$d" && LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 "$cmd" env 2>&1)"; then
-  contains "a non-ASCII branch still derives a slug" "HOSTSHIFT_VARIANTS=" "$out"
+  # A hostname, not the variable name — "HOSTSHIFT_VARIANTS=" is a prefix of
+  # every possible value, so it could not fail.
+  contains "a non-ASCII branch still derives a slug" "--slug.ddev.site" "$out"
 else
   fail "a non-ASCII branch still derives a slug" "exited non-zero: $out"
 fi
@@ -328,6 +330,25 @@ else
   pass "no message suggests a flag ddev does not have"
 fi
 
+# The host command must carry #ddev-generated or `ddev add-on get` refuses to
+# overwrite it — so an upgrade installs a new compose file beside the old
+# command, and the two halves disagree about the variable names they pass
+# between them. That is a fleet-wide 421 with init, restart and check all
+# reporting success.
+if head -5 "$repo/ddev/commands/host/hostshift" | grep -q '#ddev-generated'; then
+  pass "the host command can be upgraded by ddev add-on get"
+else
+  fail "the host command can be upgraded by ddev add-on get" "no #ddev-generated marker"
+fi
+
+# And the compose file must still read what a .ddev/.env written before the
+# rename says, because that file outlives the upgrade that renames it.
+for v in HOSTSHIFT_ARGS HOSTSHIFT_MAP_ARGS HOSTSHIFT_SLUG; do
+  grep -q "$v" "$repo/ddev/docker-compose.hostshift.yaml" \
+    || fail "compose still reads $v" "not referenced"
+done
+pass "compose reads the pre-rename spellings too"
+
 echo "== wp-cli"
 
 # A wp-cli.yml with no trailing newline glued url: onto its last line.
@@ -363,12 +384,14 @@ contains "an unknown subcommand prints usage" "usage: ddev hostshift" \
 # through compose's shell-word splitting: a `;` truncated the map silently, a `$`
 # interpolated to nothing, a `"` killed the start with an error naming neither
 # hostshift nor the file, and a `,` corrupted the comma-delimited variant list.
+bad_ok=1
 for bad in 'a;b' 'a$b' 'a,b' 'a b' '-lead' 'trail-'; do
   if (cd "$wt" && "$cmd" env --slug "$bad" >/dev/null 2>&1); then
     fail "a slug that is not a hostname label is refused" "accepted $bad"
+    bad_ok=""
   fi
 done
-pass "a slug that is not a hostname label is refused"
+[ -n "$bad_ok" ] && pass "a slug that is not a hostname label is refused"
 contains "and says why" "silently truncates or corrupts the map" \
   "$(cd "$wt" && "$cmd" env --slug 'a;b' 2>&1 || true)"
 
