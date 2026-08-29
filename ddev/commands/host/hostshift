@@ -407,7 +407,8 @@ if [ "$cmd" = "check" ]; then
   alive="$(printf '%s' "$state" | sed -n '1p')"
   running="$(printf '%s' "$state" | sed -n '/^VIRTUAL_HOST=/{s///p;q;}')"
   if [ -z "$alive" ]; then
-    echo "hostshift: no proxy container. \`ddev restart\` to serve $variants" >&2
+    echo "hostshift: no ddev-$name-hostshift container. \`ddev restart\` to serve" >&2
+    echo "  $variants" >&2
     exit 2
   fi
   if [ "$alive" != "true" ]; then
