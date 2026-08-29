@@ -20,6 +20,11 @@
 # `exec-host` anyway — measured, it prints `Task failed:` and still reports
 # success — so all the guard did was suppress the one line that made a stale
 # configuration visible above the rest of the start output.
+#
+# --quiet so that a project which has the add-on installed but has never been
+# configured says nothing at all. It has nothing to check, and nine lines of
+# advice plus a `Task failed` on a project with nothing wrong with it is how an
+# add-on stops being inert until it is configured.
 hooks:
   post-start:
-    - exec-host: .ddev/commands/host/hostshift check
+    - exec-host: .ddev/commands/host/hostshift check --quiet

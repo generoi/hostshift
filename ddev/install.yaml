@@ -25,6 +25,28 @@ project_files:
   - commands/host/hostshift
 
 post_install_actions:
+  # DDEV tests #ddev-generated on the file *already on disk*, not on the one it
+  # is installing. Every project that installed before the marker was added
+  # therefore keeps its old command while the compose file and the hook beside
+  # it are refreshed — and the three files pass state between them, so they
+  # disagree. `ddev add-on get` prints one NOT-overwriting line among many and
+  # exits 0, which is not enough to notice.
+  #
+  # This is the only moment anything can say so.
+  - |
+    #ddev-nodisplay
+    if ! head -5 .ddev/commands/host/hostshift 2>/dev/null | grep -q '#ddev-generated'; then
+      echo
+      echo "hostshift: .ddev/commands/host/hostshift predates this add-on and was NOT"
+      echo "  updated — DDEV will not overwrite a file without a #ddev-generated marker,"
+      echo "  and older versions of that file had none. The compose file beside it *was*"
+      echo "  updated, and the two pass variables between them, so leaving it will start"
+      echo "  the proxy with no map and 421 every hostname."
+      echo
+      echo "  Delete it and install again:"
+      echo "      rm .ddev/commands/host/hostshift && ddev add-on get generoi/hostshift"
+      echo
+    fi
   - |
     #ddev-nodisplay
     # One command, because both files it writes are derived from the same map

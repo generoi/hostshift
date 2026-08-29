@@ -385,7 +385,12 @@ echo "== what is running, not what is written"
 # the commonest failure there is — `init` without the `ddev restart` it just told
 # you to run. Passing --slug keeps the file half current, so only the container
 # comparison can catch this.
-(cd "$wt" && ddev hostshift init --slug wt-z >/dev/null 2>&1) || true
+# Invoked directly rather than through `ddev`, so DDEV_APPROOT is unset and init
+# does not restart — which is the only way to produce this state now that it
+# does. That auto-restart is the real fix for "init without restart"; this
+# assertion still has to prove the container comparison catches the state if it
+# ever arises another way.
+(cd "$wt" && ./.ddev/commands/host/hostshift init --slug wt-z >/dev/null 2>&1) || true
 if (cd "$wt" && ddev hostshift check --slug wt-z >/dev/null 2>&1); then
   fail "check catches a slug the running proxy does not answer on" "exited 0"
 else

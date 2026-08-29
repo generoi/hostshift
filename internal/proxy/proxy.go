@@ -75,6 +75,22 @@ var originHeaders = []string{
 	// scanned the HTML body, and the shell suite checks headers by name, so
 	// neither could see it.
 	"X-Pingback",
+
+	// Reporting endpoints. CSP itself is rewritten, so a policy naming
+	// `report-to csp` survives while the endpoint it points at does not — and
+	// the browser then POSTs violation reports to live production.
+	"Report-To",
+	"Reporting-Endpoints",
+
+	// Origin allowlists. A stale entry does not leak so much as silently switch
+	// a feature off on the variant, which is worse to diagnose than a leak.
+	"Timing-Allow-Origin",
+	"Permissions-Policy",
+
+	// Source maps: a dereferenceable production URL the browser fetches on its
+	// own as soon as devtools is open.
+	"SourceMap",
+	"X-SourceMap",
 }
 
 // requestOriginHeaders carry origins on the way in and must be mapped back to
