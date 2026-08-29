@@ -35,13 +35,17 @@ post_install_actions:
   # This is the only moment anything can say so.
   - |
     #ddev-nodisplay
-    if ! head -5 .ddev/commands/host/hostshift 2>/dev/null | grep -q '#ddev-generated'; then
+    # post_install_actions run with cwd = <project>/.ddev, not the project root.
+    # Pathing this as .ddev/commands/... made the test fail always, so the warning
+    # fired on every install including the first.
+    if ! head -5 commands/host/hostshift 2>/dev/null | grep -q '#ddev-generated'; then
       echo
       echo "hostshift: .ddev/commands/host/hostshift predates this add-on and was NOT"
       echo "  updated — DDEV will not overwrite a file without a #ddev-generated marker,"
       echo "  and older versions of that file had none. The compose file beside it *was*"
-      echo "  updated, and the two pass variables between them, so leaving it will start"
-      echo "  the proxy with no map and 421 every hostname."
+      echo "  updated, and the two pass variables between them — the compose file still"
+      echo "  reads the old names for one release, so this works for now and stops"
+      echo "  working when that goes."
       echo
       echo "  Delete it and install again:"
       echo "      rm .ddev/commands/host/hostshift && ddev add-on get generoi/hostshift"
