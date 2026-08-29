@@ -1,3 +1,4 @@
+#ddev-silent-no-warn
 # hostshift — container-scoped loopback containment (PLAN §4.4).
 #
 # This file carries no generated-file marker, deliberately. It has to be edited —

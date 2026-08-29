@@ -386,6 +386,26 @@ else
 fi
 rm -f "$wt/hostshift.yaml"
 
+# DDEV prints a four-line "Custom configuration detected" block naming every
+# unmarked custom file, on every start. .ddev/.env is ours, so it carries the
+# marker DDEV's own message tells you to add — and init must keep exactly one of
+# them however many times it runs.
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+check "one silence marker in .ddev/.env, however often init runs" "1" \
+  "$(grep -c '^#ddev-silent-no-warn' "$wt/.ddev/.env")"
+contains "and the loopback file carries one too" "#ddev-silent-no-warn" \
+  "$(head -1 "$repo/ddev/docker-compose.hostshift-loopback.yaml")"
+
+# A temp file left in .ddev/ is read by DDEV as a per-service env file, and
+# .ddev/.env is where DDEV documents putting credentials. One was found on this
+# machine — a verbatim copy of a project's .env.
+if ls "$wt"/.ddev/.env.* >/dev/null 2>&1; then
+  fail "init leaves no copy of .ddev/.env behind" "$(ls "$wt"/.ddev/.env.*)"
+else
+  pass "init leaves no copy of .ddev/.env behind"
+fi
+
 echo "== wp-cli"
 
 # A wp-cli.yml with no trailing newline glued url: onto its last line.

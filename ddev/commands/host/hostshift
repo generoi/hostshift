@@ -369,7 +369,12 @@ fi
 # between the worktree's first `ddev start` and that restart is real, though, and
 # during it the *parent's* blog is served by the worktree. This is the one moment
 # anyone can act on it. Upstream: ddev/ddev#5486, reopened for git worktrees.
-if [ -n "$parent_hosts" ]; then
+# Not on `check`. The note is a static intersection of the two projects'
+# declared hostnames, so it was true when init said it and false ever after —
+# and the post-start hook printed it on every start, including the restart that
+# had just handed those hostnames back to the parent. Four lines of "until
+# `ddev restart`, those serve this worktree" from the hook of that very restart.
+if [ -n "$parent_hosts" ] && [ "$cmd" != "check" ]; then
   shared=""
   while IFS= read -r h; do
     [ -n "$h" ] || continue
@@ -404,10 +409,15 @@ args="${hsmap:---slug $slug}"
 yamlsum=""
 [ -f hostshift.yaml ] && yamlsum="$(cksum < hostshift.yaml | cut -d' ' -f1)"
 
-env_out="HOSTSHIFT_ARGS=$args
-HOSTSHIFT_YAML=$yamlsum
+# #ddev-silent-no-warn, because DDEV otherwise prints a four-line "Custom
+# configuration detected" block naming this file on every single start. It is a
+# legal dotenv comment and DDEV documents the marker in that very message.
+env_out="#ddev-silent-no-warn
+HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web"
+[ -n "$yamlsum" ] && env_out="$env_out
+HOSTSHIFT_YAML=$yamlsum"
 
 # `hostshift check` on its own is the wrong question in a worktree, and answers
 # it confidently: run without --from it resolves layer 1 against *this* checkout,
@@ -441,7 +451,7 @@ if [ "$cmd" = "check" ]; then
   # in HOSTSHIFT_VARIANTS, and a hostshift.yaml appearing only in HOSTSHIFT_ARGS
   # — where the deployed flat map goes on beating the file, so its aliases
   # silently never rewrite.
-  deployed="$(grep '^HOSTSHIFT_' .ddev/.env || true)"
+  deployed="$(grep -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true)"
   if [ "$deployed" != "$env_out" ]; then
     echo "hostshift: .ddev/.env is out of date. It says" >&2
     printf '%s\n' "${deployed:-  nothing}" >&2
@@ -613,12 +623,14 @@ touch .ddev/.env
 # across two, which is not atomic — a concurrent compose read must never catch
 # this half-written and see an empty VIRTUAL_HOST.
 tmp="$(mktemp .ddev/.env.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT
 # cp -p first, then truncate: that gives the temp file the mode the real one
 # already had, and redirection keeps it. .ddev/.env is where DDEV documents
 # putting project env vars, credentials included, so a developer who chmod 600'd
 # it meant it.
 cp -p .ddev/.env "$tmp"
-{ grep -v '^HOSTSHIFT_' .ddev/.env || true; printf '%s\n' "$env_out"; } > "$tmp"
+{ grep -v -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true
+  printf '%s\n' "$env_out"; } > "$tmp"
 mv "$tmp" .ddev/.env
 
 echo "hostshift: wrote .ddev/.env" >&2

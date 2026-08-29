@@ -76,15 +76,15 @@ Install the add-on once per project:
 ddev add-on get generoi/hostshift
 ```
 
-Then, in the worktree, always these two:
+Then, in the worktree, one command:
 
 ```
 ddev hostshift init
-ddev restart
 ```
 
-`init` writes exactly one file, `.ddev/.env`, and nothing else. `restart` picks
-it up and prints the URLs. That is the whole required path.
+It writes exactly one file, `.ddev/.env`, and nothing else — then restarts the
+project to pick it up, and prints the URLs it is serving. That is the whole
+required path.
 
 ### Worked example
 
@@ -102,7 +102,7 @@ hostshift: canonical hostnames from /Users/you/Projects/acme, whose database thi
 hostshift: wrote .ddev/.env
 map from --from/--to
 site1  https://acme.ddev.site  ->  https://wt-a--acme.ddev.site
-hostshift: now run `ddev restart`
+hostshift: restarting to pick it up
 ```
 
 Nothing was committed and no map was declared. The hostnames the database holds
