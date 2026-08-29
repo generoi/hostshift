@@ -238,6 +238,33 @@ contains ".env keeps keys that are not ours" "UNRELATED=keep" "$(cat "$wt/.ddev/
 perms="$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
 check ".env stays world-readable" "-rw-r--r--" "$perms"
 
+echo "== check"
+
+# `hostshift check` on its own is worthless in a worktree: run without --from it
+# resolves layer 1 against the worktree's own config, calls the map injective and
+# anchored, and exits 0 — for a map the proxy never sees. It is also what the
+# README and the 421 body tell you to run.
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+(cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1) && pass "check passes a current worktree" \
+  || fail "check passes a current worktree" "non-zero"
+
+sed -i.bak 's/^HOSTSHIFT_VARIANTS=.*/HOSTSHIFT_VARIANTS=stale--acme.ddev.site/' "$wt/.ddev/.env"
+rm -f "$wt/.ddev/.env.bak"
+if (cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1); then
+  fail "check catches a .ddev/.env written for another slug" "exited 0"
+else
+  pass "check catches a .ddev/.env written for another slug"
+fi
+contains "and says what to run" "ddev hostshift init" \
+  "$(cd "$wt" && "$cmd" check --slug wt-a 2>&1 || true)"
+
+rm -f "$wt/.ddev/.env"
+if (cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1); then
+  fail "check refuses when nothing is deployed" "exited 0"
+else
+  pass "check refuses when nothing is deployed"
+fi
+
 echo "== wp-cli"
 
 # A wp-cli.yml with no trailing newline glued url: onto its last line.
