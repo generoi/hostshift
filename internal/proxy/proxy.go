@@ -67,6 +67,14 @@ var originHeaders = []string{
 	"Content-Security-Policy",
 	"Content-Security-Policy-Report-Only",
 	"Access-Control-Allow-Origin",
+
+	// WordPress core sends X-Pingback: <site_url>/xmlrpc.php on every singular
+	// view, so a production origin reached the browser on most pages — a test 28
+	// leak, and pointing at a *write* endpoint, which is the hazard §4.4 weighs
+	// the self-redirect carve-out against. Test 28's Go implementation only ever
+	// scanned the HTML body, and the shell suite checks headers by name, so
+	// neither could see it.
+	"X-Pingback",
 }
 
 // requestOriginHeaders carry origins on the way in and must be mapped back to
@@ -608,7 +616,13 @@ const (
 func bodyKind(ct string) bodyClass {
 	mt := strings.ToLower(mediaType(ct))
 	switch {
-	case mt == "application/json", strings.HasSuffix(mt, "+json"):
+	// text/json alongside the registered spellings, or the two directions
+	// disagree about the same body: the response side already treats it as JSON
+	// (rewritableJSON), while the "text/" prefix below sent the *request* down
+	// the flat path — which rewrites JSON *keys*, gives --explain no RFC 6901
+	// path, and half-rewrites a malformed body. Those are the three reasons the
+	// flat path is not used for JSON in the first place.
+	case mt == "application/json", mt == "text/json", strings.HasSuffix(mt, "+json"):
 		return bodyJSON
 	case mt == "application/x-www-form-urlencoded",
 		strings.HasPrefix(mt, "text/"):
