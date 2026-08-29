@@ -53,6 +53,53 @@ jobs:
       # Dockerfile still builds on every PR, which is where it would break.
       - run: docker build -t hostshift:ci .
 
+  # DDEV end to end: a parent checkout, a git worktree, the add-on, the router.
+  #
+  # This is the layer three defects walked straight through in one day, each of
+  # them green in every other suite: a post-start hook that exited 127 on every
+  # start because nothing ran the hook body, a `--map` form the *published* image
+  # parses as one pair because nothing ran the published image, and a `check`
+  # that certified both as correct. It asserts what DDEV serves, not what the
+  # host command writes.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - uses: ddev/github-action-setup-ddev@v1
+        with:
+          autostart: false
+
+      - name: build the image this PR would ship
+        run: docker build -t hostshift:ci .
+
+      - name: worktrees end to end
+        env:
+          HOSTSHIFT_IMAGE: hostshift:ci
+        run: test/integration-ddev.sh
+
+      # The compose file is not versioned with the image it names, and asking the
+      # published binary for a flag form it does not have has broken every
+      # project twice now — once with `--map ""`, once with a comma-separated
+      # `--map`. Both were invisible because CI only ever ran its own build. So
+      # assert the published image understands the exact shape the add-on emits.
+      - name: the published image still understands what the add-on emits
+        run: |
+          set -eux
+          published=ghcr.io/generoi/hostshift:latest
+          # A two-site map, the shape that 421'd everything when it was commas.
+          docker run --rm "$published" map \
+            --from https://a.example --to https://wt--a.example \
+            --from https://b.example --to https://wt--b.example \
+            | tee /dev/stderr | grep -q 'https://wt--b.example'
+          # And no map flags at all, which is what a project with a
+          # hostshift.yaml passes; it must not be a startup failure.
+          docker run --rm "$published" map --help >/dev/null
+
   # The acceptance suite against a WordPress that this job builds from nothing.
   #
   # internal/e2e can be pointed at any project, but it skips unless the variant

@@ -142,7 +142,10 @@ submodule.
 
 The command is the opinionated half, and it is opinionated on purpose: it works
 the slug out from the git branch, decides which hostnames `web` keeps, and
-writes the one gitignored file a worktree needs. It also owns `check`, for the
+writes the one gitignored file a worktree needs. `test/integration-ddev.sh`
+drives all of it through real DDEV — a parent checkout, a worktree, the router —
+and asserts what gets *served*, which is the layer three defects walked through
+in a day while every other suite stayed green. It also owns `check`, for the
 same reason — `hostshift check` in a worktree resolves *that* checkout's
 hostnames rather than the ones its database holds, and calls the resulting map
 valid, so the DDEV-shaped question has to be asked by the thing that knows what
@@ -382,9 +385,21 @@ change means something re-serialised.
 
 ```
 go test ./...                       hermetic; no Docker, no network
+make test-addon                     the add-on command; needs neither Docker nor DDEV
+make test-integration               worktrees through real DDEV and a real router
 test/bootstrap-ddev.sh up           build a WordPress multisite from nothing and run the live suite
 test/bootstrap-ddev.sh down         delete it
 ```
+
+`test/integration-ddev.sh` is the one that asserts what is *served* rather than
+what is written: it creates a parent checkout and a `git worktree`, installs the
+add-on, starts both, and checks that the variant hostname reaches the app as the
+*canonical* one while the parent keeps its own. It defaults to the **published**
+image, because that is what `ddev add-on get` gives a developer, and two
+outages so far came from the compose file asking that image for a flag it did
+not have. It exists because three defects shipped in one day with every other
+suite green — a `post-start` hook that exited 127 on every start, a `--map` form
+the published binary parsed as one pair, and a `check` that called both correct.
 
 `internal/e2e` drives hostshift against a real DDEV project and is skipped unless
 `HOSTSHIFT_E2E_VARIANT` is set, so `go test ./...` stays hermetic. It covers what
