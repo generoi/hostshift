@@ -240,7 +240,7 @@ echo "== check"
 # test/integration-ddev.sh, where there is a container to ask.
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 out="$(cd "$wt" && "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check says so when there is no proxy container" "no proxy container" "$out"
+contains "check says so when there is no proxy container" "no ddev-acme-wt-a-hostshift container" "$out"
 if (cd "$wt" && "$cmd" check --slug wt-a >/dev/null 2>&1); then
   fail "and exits non-zero" "exited 0"
 else
@@ -299,6 +299,34 @@ printf 'gitdir: ../../.git/modules/vendor/sub\n' > "$sub/.git"
 out="$(cd "$sub" && "$cmd" env --slug sm 2>&1 || true)"
 case "$out" in *"but no DDEV"*) fail "a submodule is not mistaken for a worktree" "$out" ;;
                 *) pass "a submodule is not mistaken for a worktree" ;; esac
+
+# The container check asks docker about a name, and deriving that name by hand
+# got it wrong: it read .ddev/config.yaml only, while DDEV merges config.*.yaml
+# and a worktree of a `name:`-pinned repo must override `name` in exactly such a
+# file. 62 of 66 fleet repos pin it, so the pilots' own shape — no `name:` — is
+# the one that hides this.
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+out="$(cd "$wt" && DDEV_SITENAME=pinned-wt-a "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check asks docker about the name DDEV uses, not one it re-derives" \
+  "ddev-pinned-wt-a-hostshift" "$out"
+
+# copy-db refuses when the worktree is configured to *use* the parent's
+# database. Sharing is as often set in a compose override as in config.*.yaml.
+mkdir -p "$wt/.ddev"
+printf 'services:\n  web:\n    environment:\n      - DATABASE_URL=mysql://db:db@ddev-acme-db:3306/db\n' \
+  > "$wt/.ddev/docker-compose.sharedb.yaml"
+out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
+contains "copy-db sees sharing configured in a compose override" \
+  "configured to *use*" "$out"
+rm -f "$wt/.ddev/docker-compose.sharedb.yaml"
+
+# Every command this prints must be one DDEV actually accepts. `ddev start -p X`
+# is not — it fails with "unknown shorthand flag".
+if grep -n 'ddev start -p' "$repo/ddev/commands/host/hostshift"; then
+  fail "no message suggests a flag ddev does not have" "ddev start -p"
+else
+  pass "no message suggests a flag ddev does not have"
+fi
 
 echo "== wp-cli"
 
