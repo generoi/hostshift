@@ -191,6 +191,18 @@ git -C "$main" worktree remove --force "$twin"
 # and put $wt back as the dry-run test below expects to find it
 rm -f "$wt/.ddev/.env"
 
+# A parent that has adopted a committed hostshift.yaml, and a worktree whose
+# branch predates it. `hostshift hosts -C <dir>` reads only DDEV config, so the
+# declaration is invisible from here — and the map then names the parent's
+# ddev.site hostnames, which is the wrong side: the shared database holds the
+# canonical ones, nothing is rewritten, and every link points at the live site.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
+  > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "a parent's hostshift.yaml a worktree cannot see is called out" \
+  "declares the hostnames its database" "$out"
+rm -f "$main/hostshift.yaml"
+
 # The checkout a worktree branches from has no canonical/variant distinction to
 # make, and running init there makes it claim its own worktrees' hostnames.
 out="$(cd "$main" && "$cmd" env --slug wt-a 2>&1 || true)"
@@ -273,7 +285,7 @@ cp "$work/parent-config.bak" "$main/.ddev/config.yaml"
 # colliding name the collision warning told you to move off.
 rm -f "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug picked >/dev/null 2>&1) || fail "init exited non-zero" ""
-contains "an explicit slug is recorded" "HOSTSHIFT_SLUG=picked" "$(cat "$wt/.ddev/.env")"
+contains "an explicit slug is recorded" "HOSTSHIFT_SLUG_CHOSEN=picked" "$(cat "$wt/.ddev/.env")"
 out="$(cd "$wt" && "$cmd" env 2>&1 || true)"
 contains "and a later run with no --slug keeps it" \
   "HOSTSHIFT_VARIANTS=picked--acme.ddev.site" "$out"
@@ -486,6 +498,43 @@ case "$out" in
   *) pass "an override renamed aside does not block the copy" ;;
 esac
 rm -f "$wt/.ddev/.env.web.disabled"
+
+# Compose writes environment entries as `- "KEY=value"` in its own docs, and
+# every quoted spelling walked past the guard.
+for form in '      - "DB_HOST=ddev-acme-db"' "      - 'DB_HOST=ddev-acme-db'" '      "DB_HOST": ddev-acme-db'; do
+  printf 'services:\n  web:\n    environment:\n%s\n' "$form" > "$wt/.ddev/docker-compose.q.yaml"
+  out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
+  case "$out" in
+    *"configured to *use*"*) pass "copy-db sees a quoted compose entry:$form" ;;
+    *) fail "copy-db sees a quoted compose entry:$form" "$out" ;;
+  esac
+done
+rm -f "$wt/.ddev/docker-compose.q.yaml"
+
+# A sibling project whose .ddev/.env cannot be read is not this project's
+# problem. It was: the only sed in the file reading a foreign file had no
+# `|| true`, so under `set -e` a failed command substitution took out init,
+# check, env, loopback and wp-cli at once — including the check the post-start
+# hook runs on every start.
+sib="$(dirname "$wt")/zz-unreadable-sibling"
+mkdir -p "$sib/.ddev"
+printf 'HOSTSHIFT_VARIANTS=zz--acme.ddev.site\n' > "$sib/.ddev/.env"
+chmod 000 "$sib/.ddev/.env"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+chmod 600 "$sib/.ddev/.env"; rm -rf "$sib"
+case "$out" in
+  *"Permission denied"*|"") fail "an unreadable sibling .ddev/.env is survivable" "$out" ;;
+  *HOSTSHIFT_VARIANTS=*) pass "an unreadable sibling .ddev/.env is survivable" ;;
+  *) fail "an unreadable sibling .ddev/.env is survivable" "$out" ;;
+esac
+
+# `--slug ""` was refused and `--slug=` was not, so the empty value pinned the
+# branch-derived name as though it had been chosen.
+if (cd "$wt" && "$cmd" env --slug= >/dev/null 2>&1); then
+  fail "--slug= is refused like --slug ''" "exited 0"
+else
+  pass "--slug= is refused like --slug ''"
+fi
 
 # Nothing shared: copy-db must get past the guard. A guard that refuses
 # everything passes both tests above and is useless.

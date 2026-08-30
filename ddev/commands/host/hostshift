@@ -35,6 +35,29 @@ set -euo pipefail
 [ -n "${DDEV_APPROOT:-}" ] && cd "$DDEV_APPROOT"
 
 cmd="${1:-init}"; shift || true
+# Every flag, because --slug-from-branch is the documented way back from a
+# pinned slug and appeared in neither the usage line nor --help — its only
+# mention anywhere was one line init prints, which is also the only mention of
+# the pinning itself.
+usage() {
+  cat <<'USAGE'
+usage: ddev hostshift <command> [flags]
+
+  init                write .ddev/.env and restart to pick it up
+  check               is what is deployed still what this checkout resolves to?
+  copy-db             replace this worktree's database with the parent's
+  loopback            pin the canonical hostnames to 127.0.0.1 inside web
+  env                 print what init would write
+  wp-cli              write wp-cli.local.yml
+
+  --slug NAME         name this worktree's hostnames; recorded, and it sticks
+  --slug-from-branch  forget a recorded slug and follow the branch again
+  --dry-run, -n       say what would happen, write nothing
+  --force             copy-db: overwrite a database that has tables
+  --quiet, -q         say nothing when there is nothing to check
+USAGE
+}
+
 slug=""
 slug_explicit=""
 forget_slug=""
@@ -46,7 +69,14 @@ claimed=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --slug) slug="${2:?--slug needs a value}"; slug_explicit=1; shift 2 ;;
-    --slug=*) slug="${1#*=}"; slug_explicit=1; shift ;;
+    # Both spellings agree. `--slug ""` was refused and `--slug=` was not, so
+    # the empty value left slug_explicit set, the branch derivation filled the
+    # slug in, and a *branch-derived* name was written to .ddev/.env as a chosen
+    # one — pinning the naming forever, with nothing said and --slug-from-branch
+    # the only way back.
+    --slug=*) slug="${1#*=}"
+       [ -n "$slug" ] || { echo "--slug needs a value" >&2; exit 2; }
+       slug_explicit=1; shift ;;
     # The way back. A recorded slug outranks the branch — that is the point of
     # recording it — so without this the only way to return to branch-derived
     # naming is to hand-edit .ddev/.env.
@@ -57,16 +87,15 @@ while [ $# -gt 0 ]; do
     # Silently discarding an unknown flag is how `--dry-run` came to write the
     # files it was passed to prevent.
     *) echo "unknown argument: $1" >&2
-       echo "usage: ddev hostshift [init|check|copy-db|loopback|env|wp-cli] [--slug NAME]" >&2
+       usage >&2
        exit 2 ;;
   esac
 done
 
 case "$cmd" in
   init|check|copy-db|loopback|env|wp-cli) ;;
-  -h|--help|help)
-    echo "usage: ddev hostshift [init|check|copy-db|loopback|env|wp-cli] [--slug NAME]"; exit 0 ;;
-  *) echo "usage: ddev hostshift [init|check|copy-db|loopback|env|wp-cli] [--slug NAME]" >&2; exit 2 ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
 esac
 
 # The post-start hook runs `check` on every start. Between `ddev add-on get` and
@@ -130,7 +159,15 @@ command -v hostshift >/dev/null || {
 # the branch and called a correct deployment stale forever, and `init` run as the
 # advice said reverted the choice.
 if [ -z "$slug" ] && [ -z "$forget_slug" ] && [ "$cmd" != "copy-db" ]; then
-  slug="$(sed -n '/^HOSTSHIFT_SLUG=/{s///p;q;}' .ddev/.env 2>/dev/null || true)"
+  # HOSTSHIFT_SLUG_CHOSEN, not HOSTSHIFT_SLUG. v0.1.0's init wrote
+  # `HOSTSHIFT_SLUG=$slug` *unconditionally* — for a slug derived from the
+  # branch exactly as for one that was passed — so reading that name as a
+  # deliberate choice pinned the naming on every project that ever ran v0.1.0,
+  # which by this add-on's own history is where the longest-running pilots are.
+  # It then announced "keeping the slug you chose" for a name nobody chose, on a
+  # branch that may no longer exist. A name v0.1.0 never wrote cannot be
+  # misread.
+  slug="$(sed -n '/^HOSTSHIFT_SLUG_CHOSEN=/{s///p;q;}' .ddev/.env 2>/dev/null || true)"
   if [ -n "$slug" ]; then
     slug_explicit=1
     # Said out loud on init, because init is where a developer would expect a
@@ -280,9 +317,15 @@ fi
 # reason — a config.yaml edited on Windows leaves \r on the value.
 ddev_name() {
   [ -f "$1" ] || return 0
-  sed -n 's/^name:[[:space:]]*//p' "$1" | sed -n 1p | tr -d '\r' \
-    | sed -e 's/[[:space:]]*#.*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" \
-    | sed 's/[[:space:]]*$//'
+  v="$(sed -n 's/^name:[[:space:]]*//p' "$1" | sed -n 1p | tr -d '\r')"
+  # A quote delimits the value, so a '#' inside one is not a comment. Stripping
+  # comments first turned `name: "a#b"` into `"a`; stripping them after
+  # unquoting turned it into `a`. Only the unquoted form has a comment to strip.
+  case "$v" in
+    '"'*) printf '%s\n' "$v" | sed 's/^"\([^"]*\)".*$/\1/' ;;
+    "'"*) printf '%s\n' "$v" | sed "s/^'\([^']*\)'.*\$/\1/" ;;
+    *)    printf '%s\n' "$v" | sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' ;;
+  esac
 }
 
 if [ "$cmd" = "copy-db" ]; then
@@ -343,7 +386,13 @@ if [ "$cmd" = "copy-db" ]; then
     # A shell assignment, a dotenv line, a YAML mapping value or a compose list
     # item — all of them are NAME, a separator, then the value. What none of them
     # is, is a comment.
-    assignment="^[[:space:]]*-?[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[:=][^#]*ddev-$fromre-db"
+    # The optional quote is not decoration. Compose's own documentation writes
+    # environment entries as `- "KEY=value"`, and requiring [A-Za-z_] straight
+    # after the `- ` meant every quoted spelling walked past the guard: the dump
+    # then goes into this worktree's idle db container while the application
+    # keeps reading the parent's, and copy-db prints "copied" and exits 0.
+    q='["'"'"']?'
+    assignment="^[[:space:]]*-?[[:space:]]*$q(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*$q[[:space:]]*[:=][^#]*ddev-$fromre-db"
     if [ -n "$asked" ]; then
       # The container already answered for its own environment; .env is the one
       # thing it could not see.
@@ -421,6 +470,28 @@ fi
 # other environments, or production ones the database was never search-replaced
 # away from. Passing --from would override it.
 map_args=()
+# The parent declares canonical hostnames this worktree cannot see.
+#
+# `hostshift hosts -C <dir>` reads the parent's *DDEV* config and nothing else,
+# so a parent that has adopted a committed hostshift.yaml — the README's
+# production-canonical path — is invisible from a worktree whose branch predates
+# that commit. The map then rewrote the parent's ddev.site hostnames, which is
+# the wrong side entirely: the shared database holds the canonical names, so
+# nothing is rewritten and every link on the preview points at the client's live
+# site, while `check` reports the map injective and anchored.
+#
+# Adopting production-canonical is exactly the moment worktrees exist on older
+# branches, so this is the common case rather than the odd one.
+parent_declares=""
+if [ ! -f hostshift.yaml ] && [ -n "$parent" ] && [ -f "$parent/hostshift.yaml" ]; then
+  parent_declares="$parent/hostshift.yaml"
+  echo "hostshift: warning: $parent_declares declares the hostnames its database" >&2
+  echo "  holds, and this worktree's branch predates it — so the map below was" >&2
+  echo "  built from that checkout's DDEV hostnames instead, and would rewrite" >&2
+  echo "  nothing. Every link would point at the canonical site." >&2
+  echo "  Merge the branch that adds hostshift.yaml, or copy it here." >&2
+fi
+
 if [ ! -f hostshift.yaml ] && [ -n "$unreadable_parent" ]; then
   # A linked worktree whose parent declares nothing readable. Falling through
   # silently is the failure this whole path exists to prevent: the map gets built
@@ -463,7 +534,14 @@ for other in ../*/.ddev/.env; do
   # exits after one line SIGPIPEs whatever is still writing, failing the whole
   # pipeline. It is timing-dependent, so it passes on a fast small write and
   # fails on a slow one — sed that stops at the first match instead.
-  ovar="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' "$other")"
+  # `|| true`, and stderr discarded: this is the one sed in the file reading a
+  # *foreign* file, and a sibling project whose .ddev/.env the current user
+  # cannot read — the file this codebase says holds credentials — made a failed
+  # command substitution abort everything under `set -e`. That took out init,
+  # check, env, loopback and wp-cli at once, including the check the post-start
+  # hook runs on every start, with a bare `sed: Permission denied` and no
+  # hostshift diagnostic. An unreadable sibling is not this project's problem.
+  ovar="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' "$other" 2>/dev/null || true)"
   [ -n "$ovar" ] || continue
   for v in $(printf '%s' "$variants" | tr ',' ' '); do
     case ",$ovar," in *",$v,"*)
@@ -623,7 +701,7 @@ args="${hsmap:---slug $slug}"
 # slug when run as printed, which in the case that motivates --slug at all is
 # back onto the colliding name the collision warning told you to move off.
 env_out="#ddev-silent-no-warn${slug_explicit:+
-HOSTSHIFT_SLUG=$slug}
+HOSTSHIFT_SLUG_CHOSEN=$slug}
 HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web"
@@ -739,6 +817,45 @@ if [ "$cmd" = "check" ]; then
        echo "  Run \`ddev restart\`." >&2
        exit 2 ;;
   esac
+
+  # Is every variant a name this machine will actually answer to?
+  #
+  # A production-canonical `hostshift.yaml` with no `base:` derives the variant
+  # from the *canonical*, so `canonical: https://www.example.com` becomes
+  # `local--www.example.com` — no DDEV TLD, no mkcert SAN, no DNS. Nothing
+  # rejected it and `check` printed "hostshift is serving" for a hostname that
+  # cannot resolve. Worse on a client domain with wildcard DNS, which is not
+  # rare: the name resolves to the *production server*, so the developer
+  # "reviewing their worktree" is looking at the live site, and loopback
+  # containment does not help — it pins the canonical names, not this one.
+  #
+  # DDEV registers hostnames under the project's own TLD, so a variant outside
+  # every one of this project's suffixes is a name DDEV never registered.
+  outside=""
+  for v in $(printf '%s' "$variants" | tr ',' ' '); do
+    ok=""
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      suffix=".${h#*.}"
+      case "$v" in *"$suffix") ok=1; break ;; esac
+    done <<<"$hosts"
+    [ -n "$ok" ] || outside="${outside:+$outside }$v"
+  done
+  if [ -n "$outside" ]; then
+    echo "hostshift: these variant hostnames are not under any domain this DDEV" >&2
+    echo "  project registers, so nothing local answers to them:" >&2
+    printf '    %s\n' $outside >&2
+    echo "  On a client domain with wildcard DNS they resolve to *production*." >&2
+    echo "  Declare \`base:\` on the site, pointing at this project's own" >&2
+    echo "  hostname, so the variant is derived from a name DDEV serves." >&2
+    exit 2
+  fi
+
+  if [ -n "$parent_declares" ]; then
+    echo "hostshift: refusing to call this healthy — see the warning above." >&2
+    echo "  The map does not name the hostnames the database holds." >&2
+    exit 2
+  fi
 
   if [ -n "$claimed" ]; then
     echo "hostshift: refusing to call this healthy — $claimed is claimed by" >&2

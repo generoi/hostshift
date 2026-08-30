@@ -1,50 +1,140 @@
 package rewrite
 
-import "bytes"
+import (
+	"bytes"
+	"strings"
+
+	"golang.org/x/net/idna"
+
+	"github.com/generoi/hostshift/internal/origin"
+)
 
 // The second gap between the matcher's model and the browser's: the matcher
 // models *bytes*, and the browser runs a URL parser over them first.
 //
 // §5.3's three encodings all assume the origin is a contiguous run reading
-// `scheme` `://` `host`. The WHATWG URL parser requires neither the run to be
-// contiguous nor the separator to be two forward slashes, and every shape below
-// was served unrewritten — and, worse, uncounted, so `--json` reported a clean
-// page and the straggler sweep saw nothing either:
+// `scheme` `://` `host`. The WHATWG URL parser requires none of that, and every
+// shape below resolves to https://www.example.fi/x in a browser — verified
+// against ada, the parser Chrome ships — while matching no pattern the scan can
+// see. Worse, it matched nothing the *census* could see either: `--json`
+// reported zero candidates and zero skips, and the straggler sweep runs through
+// the same matcher, so nothing anywhere said the page was worth a second look.
 //
-//	href="https://www.example.fi/x"    with a tab, LF or CR anywhere in it
-//	href="https:\\www.example.fi/x"
-//	href="https:///www.example.fi/x"   (or ////, /\, \/, //\ …)
-//	href="//www.example.fi/x"          with a tab, LF or CR in the host
-//	href="https://www.example&#9;.fi/x"
+//	https://www.example<TAB>.fi/x     tab, LF, CR anywhere, raw or as a reference
+//	https:\\www.example.fi/x          and /\, \/, ///, ////, //\ …
+//	http:www.example.fi/x             a *different* scheme needs no slashes at all
+//	<SPACE>https:\\www.example.fi/x   leading C0 and spaces are stripped first
+//	https://user@www.example.fi/x     userinfo pushes the host off the separator
+//	https://www.ex%61mple.fi/x        the host is percent-decoded before lookup
 //
-// Verified against the WHATWG parser: every one resolves to
-// https://www.example.fi/x. That is test 28 — a production origin the browser
-// dereferences — and it is reachable from any attacker-influenced content in the
-// database, pointing the developer's authenticated browser at the live site.
+// The first version of this file enumerated shapes and normalised them. That is
+// the wrong shape of solution — it closed the five cases it knew and left five
+// more, because a rule of the form "a run of two or more" is a guess at where
+// the authority begins. This one *locates* the authority the way the parser
+// locates it, then replaces the host and nothing else.
 //
-// Two mechanisms in the URL spec produce all of it:
+// Replacing only the host byte range matters. The value is not re-serialised, so
+// a query string, a fragment, an unusual separator and any whitespace outside
+// the host all survive exactly as written; the only bytes that change are the
+// ones naming the origin, which is the same contract as §5.2's ordinary splice.
+
+// hostReplacer maps a canonical host to the variant host that replaces it.
 //
-//   - Tab, LF and CR are removed from the whole URL before parsing. Nothing
-//     else is: a space, a form feed or a NBSP makes the URL fail to parse
-//     instead, so only these three are removed here.
-//   - After `scheme:`, the parser skips a run of any length of `/` and `\`
-//     before reading the authority ("special authority ignore slashes state").
-//     The same applies at the start of a scheme-relative reference.
+// Built from the matcher's pairs rather than from its patterns: this pass needs
+// a lookup keyed by the *parsed* host, which is a different question from the
+// anchored byte scan the patterns answer.
+type hostReplacer struct {
+	to map[string]origin.Origin
+	// schemes is the set of schemes the variants are served on. The document's
+	// own scheme decides whether a reference with a scheme and no slashes is an
+	// authority or a path, and the document is served at a variant origin.
+	schemes map[string]bool
+}
+
+func newHostReplacer(m *origin.Matcher) *hostReplacer {
+	h := &hostReplacer{to: map[string]origin.Origin{}, schemes: map[string]bool{}}
+	for _, p := range m.Pairs() {
+		if p.Identity() {
+			continue
+		}
+		h.to[p.Canonical.HostPort()] = p.Variant
+		h.schemes[p.Variant.Scheme] = true
+	}
+	return h
+}
+
+// sameSchemeAsDocument reports whether a reference written with this scheme is
+// resolved against a base of the same scheme, which is what decides whether
+// `https:host` is an authority or a relative path.
 //
-// So the value is normalised the way the parser would and re-matched, exactly
-// as decodeEntityLeak does for character references, and for the same reason:
-// pattern variants cannot close it, because the runs are unbounded. When the
-// normalised form carries an origin the raw form did not, it replaces the value
-// — which drops the obfuscation from the page, and is confined to values that
-// would otherwise leak, so it never runs on a page that is already correct.
+// When the map spans both schemes the answer is unknowable from here, and the
+// safe reading is "not the same" — that treats more references as authorities,
+// which can only ever rewrite an origin that is already in the map.
+func (h *hostReplacer) sameSchemeAsDocument(scheme string) bool {
+	return len(h.schemes) == 1 && h.schemes[scheme]
+}
+
+// key normalises a parsed host to the form the table is keyed on: lowercase,
+// no root dot, punycode.
+//
+// Punycode because §5.5 calls IDN "real for .fi client domains" and the pairs
+// are stored normalised, so a U-label in the document — hämeen.fi, or the same
+// host spelled with references — has to be folded before it can be looked up.
+func (h *hostReplacer) key(b []byte) string {
+	s := strings.TrimSuffix(strings.ToLower(string(b)), ".")
+	if a, err := idna.Punycode.ToASCII(s); err == nil {
+		return a
+	}
+	return s
+}
+
+func isURLStripped(c byte) bool { return c == '\t' || c == '\n' || c == '\r' }
+
+func isSlashish(c byte) bool { return c == '/' || c == '\\' }
+
+// normalised is v with the bytes the URL parser removes taken out, and a map
+// back to where each surviving byte came from.
+type normalised struct {
+	b   []byte
+	pos []int // pos[i] is the index in the original of b[i]
+}
+
+// stripForURL removes what the parser removes before it parses: leading and
+// trailing C0 controls and spaces, then tab, LF and CR wherever they appear.
+//
+// The character-reference spellings of those three go too. They are handled here
+// rather than in decodeURLRefs because that decoder must never *emit* a control
+// character — doing so was one of the XSS holes this file sits next to. Removing
+// one is not emitting one.
+func stripForURL(v []byte) normalised {
+	lo, hi := 0, len(v)
+	for lo < hi && v[lo] <= 0x20 {
+		lo++
+	}
+	for hi > lo && v[hi-1] <= 0x20 {
+		hi--
+	}
+	n := normalised{b: make([]byte, 0, hi-lo), pos: make([]int, 0, hi-lo)}
+	for i := lo; i < hi; {
+		if isURLStripped(v[i]) {
+			i++
+			continue
+		}
+		if v[i] == '&' {
+			if k := removableRef(v[i:]); k > 0 {
+				i += k
+				continue
+			}
+		}
+		n.b = append(n.b, v[i])
+		n.pos = append(n.pos, i)
+		i++
+	}
+	return n
+}
 
 // removableRef reports the length of a character reference at b that spells a
 // character the URL parser removes, or 0.
-//
-// These are handled here rather than in decodeURLRefs because that decoder must
-// never *emit* a control character — doing so was one of the XSS holes this file
-// sits next to. Removing one is not emitting one, so the same characters that
-// are unsafe to decode are safe to delete.
 func removableRef(b []byte) int {
 	if len(b) < 4 || b[0] != '&' {
 		return 0
@@ -65,8 +155,7 @@ func removableRef(b []byte) int {
 	if j < len(b) && (b[j] == 'x' || b[j] == 'X') {
 		base, j = 16, j+1
 	}
-	start := j
-	val := 0
+	start, val := j, 0
 	for j < len(b) {
 		d, ok := digitVal(b[j], base)
 		if !ok {
@@ -90,101 +179,19 @@ func removableRef(b []byte) int {
 	return 0
 }
 
-func isURLStripped(c byte) bool { return c == '\t' || c == '\n' || c == '\r' }
-
-func isSlashish(c byte) bool { return c == '/' || c == '\\' }
-
-// normaliseURL applies the two parser rules to v, returning the normalised
-// bytes and whether anything changed.
-func normaliseURL(v []byte) ([]byte, bool) {
-	// The ordinary case, and the one that must stay cheap: no removable
-	// character and no backslash means neither rule can fire. A lone extra '/'
-	// still has to be looked at, so the slash run is checked below rather than
-	// here.
-	fast := true
-	for _, c := range v {
-		if isURLStripped(c) || c == '\\' || c == '&' || c == '/' {
-			fast = false
-			break
-		}
-	}
-	if fast {
-		return v, false
-	}
-
-	// Rule one: delete tab, LF and CR, in raw and character-reference form.
-	stripped := make([]byte, 0, len(v))
-	changed := false
-	for i := 0; i < len(v); {
-		if isURLStripped(v[i]) {
-			i++
-			changed = true
-			continue
-		}
-		if v[i] == '&' {
-			if n := removableRef(v[i:]); n > 0 {
-				i += n
-				changed = true
-				continue
-			}
-		}
-		stripped = append(stripped, v[i])
-		i++
-	}
-
-	// Rule two: the authority separator. It is a run of '/' and '\' of length
-	// two or more, either at the very start of the value or immediately after
-	// `http:` / `https:`. Anywhere else a slash is a path and must not be
-	// touched — `/a//b` is a path with an empty segment, not an authority.
-	at := 0
-	if n := schemeLen(stripped); n > 0 {
-		at = n
-	} else if len(stripped) > 0 && isSlashish(stripped[0]) {
-		at = 0
-	} else {
-		return finish(v, stripped, changed)
-	}
-	end := at
-	for end < len(stripped) && isSlashish(stripped[end]) {
-		end++
-	}
-	if end-at < 2 {
-		// One slash is a path relative to the base, not an authority, and zero
-		// is not a separator at all.
-		return finish(v, stripped, changed)
-	}
-	if end-at != 2 || stripped[at] != '/' || stripped[at+1] != '/' {
-		out := make([]byte, 0, len(stripped))
-		out = append(out, stripped[:at]...)
-		out = append(out, '/', '/')
-		out = append(out, stripped[end:]...)
-		return out, true
-	}
-	return finish(v, stripped, changed)
-}
-
-func finish(v, stripped []byte, changed bool) ([]byte, bool) {
-	if !changed {
-		return v, false
-	}
-	return stripped, true
-}
-
-// schemeLen returns the length of a leading "http:" or "https:", or 0.
-//
-// Case-insensitive, because the URL parser lowercases the scheme, and only
-// these two because they are the only schemes hostshift maps.
-func schemeLen(b []byte) int {
-	for _, s := range [][]byte{[]byte("https:"), []byte("http:")} {
+// schemeLen returns the length of a leading "http:" or "https:", and which of
+// the two it was. Case-insensitive: the parser lowercases the scheme.
+func schemeLen(b []byte) (int, string) {
+	for _, s := range []string{"https:", "http:"} {
 		if len(b) >= len(s) && hasFoldPrefixASCII(b[:len(s)], s) {
-			return len(s)
+			return len(s), strings.TrimSuffix(s, ":")
 		}
 	}
-	return 0
+	return 0, ""
 }
 
-func hasFoldPrefixASCII(b, want []byte) bool {
-	for i := range want {
+func hasFoldPrefixASCII(b []byte, want string) bool {
+	for i := 0; i < len(want); i++ {
 		c := b[i]
 		if 'A' <= c && c <= 'Z' {
 			c += 'a' - 'A'
@@ -196,23 +203,129 @@ func hasFoldPrefixASCII(b, want []byte) bool {
 	return true
 }
 
-// normaliseURLLeak is the seam, alongside decodeEntityLeak and with the same
-// contract: it returns v untouched unless the normalised form carries an origin
-// that the value as written did not.
+// authorityStart returns where the authority begins in b, or -1.
+//
+// Two entries, straight out of the parser's state machine:
+//
+//   - A scheme. If it differs from the document's own scheme the parser goes to
+//     special-authority-slashes and then special-authority-ignore-slashes, which
+//     skips a run of '/' and '\' of *any* length, zero included — so
+//     `http:www.example.fi/x` on an https page is an authority. If it matches the
+//     document's scheme the parser goes to special-relative-or-authority, which
+//     needs two, and `https:www.example.fi/x` is then a path.
+//   - No scheme, and a run of two or more '/' and '\'.
+func (h *hostReplacer) authorityStart(b []byte) int {
+	if n, scheme := schemeLen(b); n > 0 {
+		i := n
+		for i < len(b) && isSlashish(b[i]) {
+			i++
+		}
+		if i-n >= 2 || !h.sameSchemeAsDocument(scheme) {
+			return i
+		}
+		return -1
+	}
+	i := 0
+	for i < len(b) && isSlashish(b[i]) {
+		i++
+	}
+	if i >= 2 {
+		return i
+	}
+	return -1
+}
+
+// hostRange returns the byte range of the host in b, starting at the authority.
+//
+// Userinfo is skipped: everything up to the *last* '@' before the authority
+// ends belongs to the credentials, so `https://user@host` names host and not
+// user. The authority ends at the first '/', '\', '?' or '#'; the host itself
+// also ends at ':', which begins the port.
+func hostRange(b []byte, at int) (start, end int, port string) {
+	end = len(b)
+	for i := at; i < len(b); i++ {
+		if b[i] == '/' || b[i] == '\\' || b[i] == '?' || b[i] == '#' {
+			end = i
+			break
+		}
+	}
+	start = at
+	if k := bytes.LastIndexByte(b[at:end], '@'); k >= 0 {
+		start = at + k + 1
+	}
+	if k := bytes.IndexByte(b[start:end], ':'); k >= 0 {
+		port = string(b[start+k+1 : end])
+		end = start + k
+	}
+	return start, end, port
+}
+
+// percentDecode decodes %XX in a host. The parser percent-decodes before
+// domain-to-ASCII, so `www.ex%61mple.fi` is `www.example.fi` — and delimAt
+// already reasons about a '%' on the right edge of a host without anything
+// having applied the same reasoning inside it.
+func percentDecode(b []byte) []byte {
+	if bytes.IndexByte(b, '%') < 0 {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if b[i] == '%' && i+2 < len(b) {
+			hi, ok1 := digitVal(b[i+1], 16)
+			lo, ok2 := digitVal(b[i+2], 16)
+			if ok1 && ok2 {
+				out = append(out, byte(hi*16+lo))
+				i += 2
+				continue
+			}
+		}
+		out = append(out, b[i])
+	}
+	return out
+}
+
+// normaliseURLLeak replaces the host in v when the URL parser would read one
+// that this map rewrites, and returns v untouched otherwise.
+//
+// Only the host's byte range changes. Everything else — the scheme as written,
+// the separator however it was spelled, userinfo, port, path, query, fragment —
+// is copied through, so this cannot damage a value it does not need to fix.
 func (w *HTML) normaliseURLLeak(base int, v []byte) []byte {
-	norm, ok := normaliseURL(v)
+	if w.hosts == nil || len(w.hosts.to) == 0 {
+		return v
+	}
+	n := stripForURL(v)
+	at := w.hosts.authorityStart(n.b)
+	if at < 0 || at >= len(n.b) {
+		return v
+	}
+	hs, he, port := hostRange(n.b, at)
+	if hs >= he {
+		return v
+	}
+	host := w.hosts.key(percentDecode(n.b[hs:he]))
+	to, ok := w.hosts.to[host]
+	if !ok && port != "" {
+		to, ok = w.hosts.to[host+":"+port]
+	}
 	if !ok {
 		return v
 	}
-	out, events := w.m.Rewrite(norm, SurfaceHTMLObfuscated, w.stats.Explain())
-	// Before the equality check, so a near-miss in the normalised form is
-	// counted as a skip rather than vanishing — see decodeEntityLeak.
-	w.stats.Record(SurfaceHTMLObfuscated, base, events)
-	if bytes.Equal(out, norm) {
-		// The normalised form holds no origin either. Leave the value exactly as
-		// its author wrote it — this pass exists to stop a leak, not to tidy
-		// anyone's markup.
-		return v
-	}
+
+	// Whatever the original spelled the host with — a tab, a reference, a
+	// percent escape — the replaced range covers all of it, because pos maps
+	// every surviving byte back and the removed ones lie between them.
+	from, until := n.pos[hs], n.pos[he-1]+1
+	out := make([]byte, 0, len(v)+len(to.Host))
+	out = append(out, v[:from]...)
+	out = append(out, to.Host...)
+	out = append(out, v[until:]...)
+
+	w.stats.Record(SurfaceHTMLObfuscated, base, []origin.Event{{
+		Offset:  base + from,
+		Surface: SurfaceHTMLObfuscated,
+		Action:  origin.ActionRewrote,
+		Text:    string(v[from:until]),
+	}})
 	return out
 }

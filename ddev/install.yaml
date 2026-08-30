@@ -44,6 +44,11 @@ pre_install_actions:
       echo '# hostshift (ddev add-on)'
       echo '.ddev/**/*hostshift*'
       echo '.ddev/.env'
+      # `ddev hostshift wp-cli` writes this, its own header says not to commit
+      # it, and the README calls it gitignored — and nothing ignored it. Under
+      # production-canonical it carries the *production* URL, so committing it
+      # points every teammate's `ddev wp` at the live site.
+      echo 'wp-cli.local.yml'
     } >> "$ex"
 
 project_files:
@@ -135,12 +140,28 @@ removal_actions:
     #
     # `git worktree list --porcelain` names every checkout, this one included;
     # the block stays while any *other* one still has the command installed.
+    # A path that is not there any more counts as still installed.
+    #
+    # `git worktree list` reports the *recorded* path, and a plain `mv` of a
+    # worktree directory leaves that stale — git marks the entry prunable and
+    # says nothing, while ddev and hostshift both go on working from the new
+    # location. Probing the stale path found no command, counted the worktree as
+    # gone, and stripped the block while it was still installed and running:
+    # .ddev/.env — DDEV's documented home for credentials — became committable
+    # by the next `git add -A`, which is the exact harm this guard exists to
+    # prevent. The same for a worktree on an unmounted volume, or one restored
+    # to a different path.
+    #
+    # So the asymmetry decides it: a stale ignore entry is harmless, and an
+    # un-ignored .ddev/.env is not. When the answer is unknowable, keep it.
     others=0
     here="$(git rev-parse --show-toplevel 2>/dev/null || true)"
     while read -r k v; do
       [ "$k" = "worktree" ] || continue
       [ "$v" = "$here" ] && continue
-      [ -f "$v/.ddev/commands/host/hostshift" ] && others=$((others + 1)) || true
+      if [ ! -d "$v" ] || [ -f "$v/.ddev/commands/host/hostshift" ]; then
+        others=$((others + 1))
+      fi
     done <<EOT
     $(git worktree list --porcelain 2>/dev/null || true)
     EOT
@@ -149,9 +170,16 @@ removal_actions:
       echo "installed, so .git/info/exclude keeps ignoring its files for them." >&2
       exit 0
     fi
+    # `|| true`: grep exits 1 when it selects *no* lines, which is exactly the
+    # case where info/exclude holds nothing but this block — the shape the
+    # install itself creates when the file did not exist before. `cat` then
+    # never ran, the block survived removal, and it went on ignoring .ddev/.env
+    # in a project that no longer has the add-on. `set -e` did not fire either,
+    # because grep is the non-final command of an && list.
     tmp="$(mktemp)"
-    grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' -e '.ddev/.env' \
-      "$ex" > "$tmp" && cat "$tmp" > "$ex"
+    grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' \
+      -e '.ddev/.env' -e 'wp-cli.local.yml' "$ex" > "$tmp" || true
+    cat "$tmp" > "$ex"
     rm -f "$tmp"
   - |
     #ddev-nodisplay
@@ -162,13 +190,17 @@ removal_actions:
     # inside web after the thing that needed it is gone. The HOSTSHIFT_ block in
     # .ddev/.env is inert once the compose service is gone, but it is still this
     # add-on's litter in the developer's project file.
+    # Paths relative to .ddev/, which is the cwd DDEV runs these actions in —
+    # documented at post_install_actions above, and got wrong here, which made
+    # this whole list dead on every removal. `..` is the project root.
     left=""
-    [ -f .ddev/docker-compose.hostshift-loopback.yaml ] && left="$left
+    [ -f docker-compose.hostshift-loopback.yaml ] && left="$left
       .ddev/docker-compose.hostshift-loopback.yaml — pins production hostnames to 127.0.0.1 in web"
-    grep -qs '^HOSTSHIFT_' .ddev/.env && left="$left
+    grep -qs '^HOSTSHIFT_' .env && left="$left
       the HOSTSHIFT_ lines in .ddev/.env"
-    [ -f wp-cli.local.yml ] && left="$left
-      wp-cli.local.yml"
+    [ -f ../wp-cli.local.yml ] && left="$left
+      wp-cli.local.yml — it carries the canonical URL \`ddev wp\` defaults to"
+    true
     if [ -n "$left" ]; then
       echo "hostshift removed. These are yours to delete:$left"
     else

@@ -41,6 +41,7 @@ type HTML struct {
 	maxPend int // high-water mark of the token buffer, for test 13
 	tail    io.Reader
 	attrs   []Attr // scratch for scanAttrsInto, reused across tags
+	hosts   *hostReplacer
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -155,6 +156,7 @@ func NewHTML(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) *HTML {
 	z := html.NewTokenizer(r)
 	z.SetMaxBuf(maxTok)
 	return &HTML{
+		hosts:  newHostReplacer(m),
 		z:      z,
 		m:      m,
 		stats:  st,
@@ -218,7 +220,7 @@ var singleURLAttrNames = [][]byte{
 	[]byte("href"), []byte("src"), []byte("action"), []byte("formaction"),
 	[]byte("cite"), []byte("poster"), []byte("data"), []byte("manifest"),
 	[]byte("longdesc"), []byte("background"), []byte("codebase"),
-	[]byte("profile"), []byte("itemid"),
+	[]byte("profile"), []byte("itemid"), []byte("xlink:href"),
 }
 
 func singleURLAttr(name []byte) bool {
@@ -259,15 +261,7 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	out, events := rw(v, surface, w.stats.Explain())
 	w.stats.Record(surface, base, events)
 	if surface == SurfaceHTMLAttr {
-		out = w.decodeEntityLeak(base, out)
-		// After the entity decode, because the two compose: a host may be
-		// spelled with references *and* carry a tab, and the reference form of
-		// the tab is removed here rather than decoded there — decodeURLRefs must
-		// never emit a control character, which is one of the XSS holes it was
-		// written to close. Removing one is not emitting one.
-		if singleURLAttr(name) {
-			out = w.normaliseURLLeak(base, out)
-		}
+		out = w.urlLeaks(base, out, singleURLAttr(name))
 	}
 	if w.dryRun {
 		return v
@@ -295,11 +289,31 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 //
 // Attribute values only: inside <script> and <style> the browser does not
 // decode references, so there is nothing there to decode.
-func (w *HTML) decodeEntityLeak(base int, v []byte) []byte {
-	dec, ok := decodeURLRefs(v)
-	if !ok {
+// urlLeaks runs both catchers, over one decode.
+//
+// They have to see the same bytes. decodeEntityLeak returned *v* — the value as
+// written — whenever the decoded form did not itself rewrite, so the URL pass
+// only ever saw the undecoded text, and every shape needing decode-then-parse
+// went out untouched: `https:&#47;&#47;www.example&#9;.fi/x` resolves to
+// production and was the exact case the comment here claimed was covered.
+func (w *HTML) urlLeaks(base int, v []byte, isURL bool) []byte {
+	dec, decoded := decodeURLRefs(v)
+	if decoded {
+		if out := w.decodeEntityLeak(base, v, dec); out != nil {
+			return out
+		}
+	}
+	if !isURL {
 		return v
 	}
+	// On the decoded form, so the two compose. When nothing decoded, dec is v.
+	if out := w.normaliseURLLeak(base, dec); !bytes.Equal(out, dec) {
+		return out
+	}
+	return v
+}
+
+func (w *HTML) decodeEntityLeak(base int, v, dec []byte) []byte {
 	out, events := w.m.Rewrite(dec, SurfaceHTMLEntity, w.stats.Explain())
 	// Recorded before the equality check, not after. Returning early skipped the
 	// *skips*, so a decoded value carrying an unanchored near-miss —
@@ -311,7 +325,7 @@ func (w *HTML) decodeEntityLeak(base int, v []byte) []byte {
 	// §5.3 does not model.
 	w.stats.Record(SurfaceHTMLEntity, base, events)
 	if bytes.Equal(out, dec) {
-		return v
+		return nil // nothing here; the caller tries the URL pass on dec
 	}
 	return out
 }

@@ -322,11 +322,20 @@ func TestParseURLRef(t *testing.T) {
 		{"&#47", "/", 4}, // browsers accept a numeric ref without the semicolon
 		{"&sol;", "/", 5},
 		{"&percnt;", "%", 8},
-		{"&copy;", "", 0},     // not URL structure: left alone
+		// Decoded, and correctly: a browser decodes a semicolon-terminated named
+		// reference too, and the value is only ever spliced back when an origin
+		// in it rewrote, so this is faithful rather than gratuitous. Non-ASCII
+		// named references are accepted because an IDN host is built from them
+		// — &auml;meen.fi is hämeen.fi — and §5.5 calls IDN real for .fi
+		// clients. The legacy *no-semicolon* form is what the short table exists
+		// to avoid, and it is still declined; see the `&copy=1` case below.
+		{"&copy;", "\u00a9", 6},
 		{"&#38;", "", 0},      // '&' excluded: decoding it could splice a new ref
 		{"&#x110000;", "", 0}, // out of range
 		{"&#;", "", 0},
-		{"&sol", "", 0}, // named refs require the semicolon
+		{"&sol", "", 0},  // named refs require the semicolon
+		{"&auml;", "ä", 6}, // an IDN host's letter
+		{"&notarealref;", "", 0},
 	} {
 		c2, n := parseURLRef([]byte(c.in))
 		got := ""

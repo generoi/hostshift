@@ -62,6 +62,36 @@ func TestObfuscatedOriginsAreRewritten(t *testing.T) {
 		{"LF as a named reference", `<a href="https://www.example&NewLine;.fi/x">`},
 		{"hex reference", `<a href="https://www.example&#x0A;.fi/x">`},
 		{"src, not only href", `<a src="https:\\www.example.fi/x">`},
+		// A scheme that differs from the document's needs no slashes at all: the
+		// parser goes to special-authority-ignore-slashes, which skips a run of
+		// length zero as happily as one of length three. The fleet's databases
+		// carry http:// spellings of https canonicals — M0 measured one host 165
+		// times over http and zero over https — so this is not an attacker shape.
+		{"a different scheme, no slashes", `<a href="http:www.example.fi/x">`},
+		{"a different scheme, one slash", `<a href="http:/www.example.fi/x">`},
+		{"a different scheme, uppercase", `<a href="HTTP:www.example.fi/x">`},
+		// Leading C0 and spaces are stripped before parsing, which moves the
+		// anchor every positional rule depends on.
+		{"a leading space", `<a href=" https:\\www.example.fi/x">`},
+		{"a leading C0 control", "<a href=\"\x01https:\\\\www.example.fi/x\">"},
+		// Userinfo pushes the host off the separator entirely.
+		{"userinfo", `<a href="https://user@www.example.fi/x">`},
+		{"empty userinfo", `<a href="https://@www.example.fi/x">`},
+		{"userinfo with a password", `<a href="https://u:p@www.example.fi/x">`},
+		{"scheme-relative userinfo", `<a href="//user@www.example.fi/x">`},
+		// The host is percent-decoded before domain-to-ASCII.
+		{"a percent-encoded host byte", `<a href="https://www.ex%61mple.fi/x">`},
+		{"a percent-encoded first byte", `<a href="https://%77ww.example.fi/x">`},
+		// The two passes have to compose: the entity decode used to return the
+		// value *as written* whenever the decoded form did not itself rewrite,
+		// so the URL pass never saw a decoded byte.
+		{"references then a tab", `<a href="https:&#47;&#47;www.example&#9;.fi/x">`},
+		{"references then extra slashes", `<a href="https:&#47;&#47;&#47;www.example.fi/x">`},
+		{"named reference slashes", `<a href="&sol;&sol;&sol;www.example.fi/x">`},
+		{"reference backslashes", `<a href="https:&bsol;&bsol;www.example.fi/x">`},
+		{"a reference scheme colon", `<a href="https&#58;\\www.example.fi/x">`},
+		// xlink:href is resolved and dereferenced for <image> and <use>.
+		{"xlink:href", `<svg><image xlink:href="https:\\www.example.fi/a.png"/></svg>`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			out := rewriteHTML(t, m, c.in, NewStats(false))
@@ -117,6 +147,21 @@ func TestNormalisationIsConfined(t *testing.T) {
 			"a value with nothing to rewrite keeps its tabs",
 			"<a href=\"/search?q=a\tb\">",
 			"q=a\tb",
+		},
+		{
+			// Same scheme as the document, fewer than two slashes: the parser
+			// reads this as a path, so it never reaches production and must not
+			// be touched.
+			"a same-scheme reference with no slashes is a path",
+			`<a href="https:www.example.fi/x">`,
+			`href="https:www.example.fi/x"`,
+		},
+		{
+			// Only the host's bytes change. The separator, userinfo, port, query
+			// and fragment are all copied through as written.
+			"everything but the host is preserved",
+			`<a href="https:\\user@www.example.fi/a b?q=1&r=2#f">`,
+			`href="https:\\user@wt-a--example.ddev.site/a b?q=1&r=2#f"`,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
