@@ -233,6 +233,25 @@ contains "a parent's hostshift.yaml a worktree cannot see is called out" \
   "declares the hostnames its database" "$out"
 rm -f "$main/hostshift.yaml"
 
+# A colliding project that is not a sibling directory.
+#
+# The scan read `../*/.ddev/.env` and nothing else, so two worktrees of one
+# parent in different directories — `git worktree add ~/worktrees/foo`, or two
+# developers with worktrees under their own homes — collided in silence: both
+# .ddev/.env files claiming the same variants, both projects up, and check in
+# each one printing "hostshift is serving" and exiting 0. A *dead* fake sibling
+# warned immediately, which is the wrong way round.
+far="$work/elsewhere/faraway"
+mkdir -p "$far/.ddev"
+printf 'HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site\n' > "$far/.ddev/.env"
+printf 'name: faraway\n' > "$far/.ddev/config.yaml"
+reg="$work/ddevglobal"
+mkdir -p "$reg"
+printf 'faraway:\n    approot: %s\n' "$far" > "$reg/project_list.yaml"
+out="$(cd "$wt" && DDEV_GLOBAL_CONFIG="$reg" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a colliding project that is not a sibling is found" "already claims" "$out"
+rm -rf "$work/elsewhere" "$reg"
+
 # The checkout a worktree branches from has no canonical/variant distinction to
 # make, and running init there makes it claim its own worktrees' hostnames.
 out="$(cd "$main" && "$cmd" env --slug wt-a 2>&1 || true)"
@@ -692,6 +711,41 @@ printf 'hostshift: map from /project/hostshift.yaml\nmain  https://old.example  
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "check catches a hostshift.yaml edited without a restart" \
   "running a different map" "$out"
+# check asks the database which hostnames it holds.
+#
+# Adopting production-canonical is a pincer that configuration alone cannot see:
+# a worktree whose branch predates the parent's hostshift.yaml has a map built
+# from DDEV hostnames, which is *correct* while the database still holds them and
+# both variants serve 200 — and check refused it on every start. Merge the file
+# as that warning says and check goes green while every URL 302s to wp-signup,
+# because the database has not moved. One query separates the two.
+fakedb="$work/fakedb"
+mkdir -p "$fakedb"
+cat > "$fakedb/ddev" <<'FAKEDDEV'
+#!/usr/bin/env bash
+# Only `ddev exec -s web bash -c <mysql...>` matters here.
+case "$*" in
+  *wp_options*) printf '%s
+' "${HS_FAKE_HOME:-}" ;;
+esac
+exit 0
+FAKEDDEV
+chmod +x "$fakedb/ddev"
+writefake
+# The database still holds a hostname the map does not name.
+out="$(cd "$wt" && HS_FAKE_HOME="https://www.somewhere-else.test" \
+  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check refuses when the database holds hostnames the map does not name" \
+  "the database says its home is" "$out"
+# ...and says nothing when it agrees.
+out="$(cd "$wt" && HS_FAKE_HOME="https://acme.ddev.site" \
+  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"the database says its home is"*) fail "and passes when the database agrees with the map" "$out" ;;
+  *) pass "and passes when the database agrees with the map" ;;
+esac
+unset HS_FAKE_DIR
+
 rm -f "$wt/hostshift.yaml"
 unset HS_FAKE_DIR
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true

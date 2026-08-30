@@ -451,6 +451,48 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			return nil
 		}
 
+	case rewritableText(ct):
+		// Buffered and swept like JSON, without a grammar.
+		//
+		// These were streaming through untouched, and one of them is the single
+		// most common admin action there is: wp-admin/async-upload.php sets
+		// `text/plain` before wp_send_json can set application/json, so every
+		// media upload handed the browser a canonical `url` and `link` while the
+		// listing endpoint beside it — application/json — was rewritten
+		// correctly. Feeds and sitemaps are the same shape. Under
+		// production-canonical that URL is the client's live site, and the
+		// developer's admin session fetches from it.
+		//
+		// Silent, too: --explain printed nothing at all for those responses, not
+		// even a skip.
+		body, over, err := readCapped(resp.Body, p.maxBody())
+		if err != nil {
+			return err
+		}
+		if over != nil {
+			p.log().Warn("body exceeds the size cap, passing through untouched",
+				"cap", p.maxBody(), "content-type", ct)
+			p.Stats.Record(rewrite.SurfaceText, 0, []origin.Event{{
+				Surface: rewrite.SurfaceText, Action: origin.ActionSkipped,
+				Reason: origin.ReasonSizeCap,
+			}})
+			resp.Body = readCloser{io.MultiReader(bytes.NewReader(body), over), resp.Body}
+			return nil
+		}
+		out, ev := p.Map.Forward().RewriteText(body, rewrite.SurfaceText, p.Stats.Explain())
+		p.Stats.Record(rewrite.SurfaceText, 0, ev)
+		out = rewrite.HostLeaks(p.Map.Forward(), out, false)
+		if !p.NoSweep {
+			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+		}
+		if p.DryRun {
+			out = body
+		}
+		resp.Body = readCloser{bytes.NewReader(out), resp.Body}
+		if bytes.Equal(out, body) && !changed {
+			return nil
+		}
+
 	default:
 		return nil
 	}
@@ -594,6 +636,25 @@ func (p *Proxy) isCanonicalDomain(d string) bool {
 // Tier 2: 88 CSS and 185 JS files in the fleet's themes, zero absolute URLs.
 func rewritableHTML(ct string) bool {
 	return strings.EqualFold(mediaType(ct), "text/html")
+}
+
+// rewritableText is the set that carries origins in no grammar the rewriter
+// models: plain text, and the XML family.
+//
+// text/plain because wp-admin/async-upload.php sends JSON under it — the one
+// endpoint every media upload goes through. The XML family because a feed and a
+// sitemap are full of absolute URLs, a browser renders both, and a reader
+// dereferences them. Excluded, deliberately and as §5.2 already decides: CSS and
+// JavaScript, where the fleet's themes have zero absolute URLs, and every binary
+// type, where the Content-Type answers the question for free.
+func rewritableText(ct string) bool {
+	mt := strings.ToLower(mediaType(ct))
+	switch mt {
+	case "text/plain", "text/xml", "application/xml",
+		"application/rss+xml", "application/atom+xml", "image/svg+xml":
+		return true
+	}
+	return strings.HasSuffix(mt, "+xml")
 }
 
 // rewritableJSON covers the REST API and everything modelled on it. JSON-LD

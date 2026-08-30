@@ -555,9 +555,33 @@ variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --var
 # prefix. Checking is cheap — every configured project leaves its variants in
 # .ddev/.env — so check.
 here="$(pwd -P)"
-for other in ../*/.ddev/.env; do
+
+# Every project DDEV knows about, not just the directories next door.
+#
+# `../*/.ddev/.env` sees a sibling and nothing else, so two worktrees of one
+# parent in different directories — `git worktree add ~/worktrees/foo`, or two
+# developers with worktrees under their own home directories — collided in total
+# silence: both `.ddev/.env` files carried the same HOSTSHIFT_VARIANTS, both
+# projects were up, and `check` in each printed "hostshift is serving" and exited
+# 0. Meanwhile a *dead* fake sibling — a bare directory with a .ddev/.env and no
+# containers — warned immediately. This is the one check whose job is to stop a
+# developer reviewing someone else's code at their own preview URL, and it was
+# blind to the arrangement where that most easily happens.
+#
+# ~/.ddev/project_list.yaml holds every project's approot. Siblings stay in the
+# list because a project that has never been started is not in the registry yet.
+scan_dirs="$(
+  {
+    for d in ../*/; do printf '%s\n' "${d%/}"; done
+    reg="${DDEV_GLOBAL_CONFIG:-$HOME/.ddev}/project_list.yaml"
+    [ -f "$reg" ] && sed -n 's/^[[:space:]]*approot:[[:space:]]*//p' "$reg"
+  } 2>/dev/null | LC_ALL=C sort -u
+)"
+
+for other_dir in $scan_dirs; do
+  other="$other_dir/.ddev/.env"
   [ -f "$other" ] || continue
-  odir="$(cd "$(dirname "$(dirname "$other")")" && pwd -P)"
+  odir="$(cd "$other_dir" 2>/dev/null && pwd -P)" || continue
   [ "$odir" = "$here" ] && continue
   # No `| head -1`: this script runs under `set -o pipefail`, and a head that
   # exits after one line SIGPIPEs whatever is still writing, failing the whole
@@ -1001,6 +1025,52 @@ if [ "$cmd" = "check" ]; then
     exit 2
   fi
 
+  # Ask the database which hostnames it actually holds.
+  #
+  # Everything above compares configuration against configuration, and adopting
+  # production-canonical is a pincer between two states configuration cannot
+  # tell apart. A worktree whose branch predates the parent's hostshift.yaml has
+  # a map built from DDEV hostnames — which is *correct* while the database still
+  # holds them, and both variants return 200 — and check refused it on every
+  # start, every statement in the warning false. Merge the file, as that warning
+  # says, and check reports "hostshift is serving" and exits 0 while both URLs
+  # 302 to wp-signup, because the database has not moved yet. The developer's
+  # only escape from a permanent red is the action that silently breaks the site.
+  #
+  # One query separates them, and the add-on already talks to this database in
+  # copy-db. Best-effort throughout: no container, no WordPress, an unusual table
+  # prefix or a stopped db all yield nothing, and nothing is not evidence.
+  dbhome="$(ddev exec -s web bash -c \
+    "mysql -h db -udb -pdb -N -B -e \"select option_value from wp_options where option_name='home' limit 1\" db" \
+    2>/dev/null | tail -1 | tr -d '\r' || true)"
+  dbhost=""
+  case "$dbhome" in
+    http://*|https://*) dbhost="$(printf '%s' "$dbhome" | sed -e 's|^https\{0,1\}://||' -e 's|[/:].*$||')" ;;
+  esac
+
+  if [ -n "$dbhost" ]; then
+    canon_hosts="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+      --canonical-hosts 2>/dev/null | sort -u || true)"
+    known=""
+    while IFS= read -r h; do
+      [ "$h" = "$dbhost" ] && { known=1; break; }
+    done <<<"$canon_hosts"
+    if [ -z "$known" ]; then
+      echo "hostshift: the database says its home is $dbhome, and this map does not" >&2
+      echo "  name that hostname — so nothing on the page would be rewritten and" >&2
+      echo "  every link would point at it. The map covers:" >&2
+      printf '    %s\n' $canon_hosts >&2
+      echo "  Either the database has not been moved to the hostnames" >&2
+      echo "  hostshift.yaml declares, or the map is built from the wrong" >&2
+      echo "  checkout. \`ddev hostshift wp-cli\` and a search-replace move it." >&2
+      exit 2
+    fi
+    # The database agrees with the deployed map, so the warning above — that this
+    # worktree's branch predates a hostshift.yaml — describes a state that has
+    # not arrived yet. Refusing here failed the hook on a site serving 200s.
+    parent_declares=""
+  fi
+
   if [ -n "$parent_declares" ]; then
     echo "hostshift: refusing to call this healthy — see the warning above." >&2
     echo "  The map does not name the hostnames the database holds." >&2
@@ -1068,6 +1138,34 @@ if [ "$cmd" = "check" ]; then
       echo "  Run \`ddev restart\`." >&2
       exit 2
     fi
+  fi
+
+  # One request, because everything above this line is inference.
+  #
+  # `check` inspects the container five ways — it exists, it is running, its
+  # VIRTUAL_HOST, its command line, the map it logged — and web's VIRTUAL_HOST
+  # besides, and then reports what is *configured* as though it were what is
+  # served. Two states measured green with the URL returning 502: a directory
+  # rename that left DDEV's old traefik routers behind pointing at a dead
+  # container, and two live projects claiming one hostname. A single request
+  # closes both.
+  #
+  # Only a hard routing failure is fatal. A 404, a 302 to wp-signup, a 401 — all
+  # mean the request reached an application, which is what this is asking. curl
+  # is not guaranteed present, so its absence is not an error either.
+  if command -v curl >/dev/null; then
+    probe="$(printf '%s' "$variants" | cut -d, -f1)"
+    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://$probe/" 2>/dev/null || true)"
+    case "$code" in
+      000|502|503|504)
+        echo "hostshift: everything is configured correctly, but https://$probe/" >&2
+        echo "  answers ${code:-nothing} — so something between the router and the" >&2
+        echo "  proxy is broken, not the configuration." >&2
+        echo "  A stale router from a renamed project does this, and so does" >&2
+        echo "  another project claiming the same hostname. \`ddev restart\`, and" >&2
+        echo "  if that does not clear it, \`ddev poweroff\` retires the routers." >&2
+        exit 2 ;;
+    esac
   fi
 
   printf '\n  hostshift is serving:\n' >&2
