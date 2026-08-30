@@ -168,12 +168,21 @@ func rewritablePart(headers []byte) bool {
 	}
 	if _, params, err := mime.ParseMediaType(strings.TrimSpace(disposition)); err == nil {
 		// Presence, not non-emptiness. filename="" still means a file part;
-		// testing the value let an empty file input through.
+		// testing the value let an empty file input through. ParseMediaType
+		// folds RFC 2231's filename*= into "filename" itself.
 		if _, isFile := params["filename"]; isFile {
 			return false
 		}
-	} else if strings.Contains(strings.ToLower(disposition), "filename=") {
-		return false
+	} else {
+		// The parse failed, so this is a hand-rolled scan over a disposition
+		// that is already malformed — which is exactly when it must be
+		// pessimistic. "filename=" alone missed RFC 2231's extended form,
+		// `filename*=UTF-8''photo.jpg`, so a file part with a malformed
+		// disposition had its bytes rewritten.
+		lower := strings.ToLower(disposition)
+		if strings.Contains(lower, "filename=") || strings.Contains(lower, "filename*=") {
+			return false
+		}
 	}
 	if ctype == "" {
 		return true

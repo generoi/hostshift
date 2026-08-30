@@ -36,6 +36,8 @@ set -euo pipefail
 
 cmd="${1:-init}"; shift || true
 slug=""
+slug_explicit=""
+forget_slug=""
 branch=""
 dry_run=""
 force=""
@@ -43,8 +45,12 @@ quiet=""
 claimed=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --slug) slug="${2:?--slug needs a value}"; shift 2 ;;
-    --slug=*) slug="${1#*=}"; shift ;;
+    --slug) slug="${2:?--slug needs a value}"; slug_explicit=1; shift 2 ;;
+    --slug=*) slug="${1#*=}"; slug_explicit=1; shift ;;
+    # The way back. A recorded slug outranks the branch — that is the point of
+    # recording it — so without this the only way to return to branch-derived
+    # naming is to hand-edit .ddev/.env.
+    --slug-from-branch) forget_slug=1; shift ;;
     --dry-run|-n) dry_run=1; shift ;;
     --quiet|-q) quiet=1; shift ;;
     --force) force=1; shift ;;
@@ -119,6 +125,22 @@ command -v hostshift >/dev/null || {
 # copy-db maps nothing, so it needs no slug — and refusing to copy a database
 # because the branch name has no letters in it, or because HEAD is detached
 # during a rebase, is a refusal with no reason behind it.
+# A slug recorded by `init --slug` outranks the branch, for every subcommand
+# that did not get one on the command line. Without this, `check` re-derived from
+# the branch and called a correct deployment stale forever, and `init` run as the
+# advice said reverted the choice.
+if [ -z "$slug" ] && [ -z "$forget_slug" ] && [ "$cmd" != "copy-db" ]; then
+  slug="$(sed -n '/^HOSTSHIFT_SLUG=/{s///p;q;}' .ddev/.env 2>/dev/null || true)"
+  if [ -n "$slug" ]; then
+    slug_explicit=1
+    # Said out loud on init, because init is where a developer would expect a
+    # bare invocation to re-derive, and silently keeping the old name is the
+    # kind of helpfulness that reads as a bug.
+    [ "$cmd" = "init" ] && echo "hostshift: keeping the slug you chose, $slug." \
+      "\`--slug NAME\` to change it, \`--slug-from-branch\` to go back to the branch." >&2
+  fi
+fi
+
 if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
   branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
   # Detached HEAD is ordinary — a rebase, a bisect, a checked-out tag — and it
@@ -248,13 +270,28 @@ elif [ -n "$linked" ]; then
   esac
 fi
 
+# ddev_name reads `name:` out of a DDEV config file, the way DDEV reads it.
+#
+# `sed -n 's/^name: *//p'` alone kept the quotes on `name: "acme"` and the
+# comment on `name: acme # local`, and a wrong project name is silent in both
+# places it is used: `docker inspect ddev-"acme"-web` finds nothing, which reads
+# as "the rival is not running" and lets a real hostname collision through, and
+# copy-db streams from a db container that does not exist. CRLF for the same
+# reason — a config.yaml edited on Windows leaves \r on the value.
+ddev_name() {
+  [ -f "$1" ] || return 0
+  sed -n 's/^name:[[:space:]]*//p' "$1" | sed -n 1p | tr -d '\r' \
+    | sed -e 's/[[:space:]]*#.*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" \
+    | sed 's/[[:space:]]*$//'
+}
+
 if [ "$cmd" = "copy-db" ]; then
   [ -n "$parent" ] || {
     echo "hostshift: no parent checkout to copy from — this is not a linked worktree" >&2
     echo "  of a different DDEV project. Use \`ddev import-db\` or a fresh pull." >&2
     exit 2; }
   from="$(basename "$parent")"
-  [ -f "$parent/.ddev/config.yaml" ] && n="$(sed -n 's/^name: *//p' "$parent/.ddev/config.yaml" | head -1)" && [ -n "$n" ] && from="$n"
+  n="$(ddev_name "$parent/.ddev/config.yaml")" && [ -n "$n" ] && from="$n"
 
   # Sharing the parent's database and copying it are different decisions, and
   # doing both is worse than pointless: the dump goes into this worktree's own
@@ -456,7 +493,7 @@ for other in ../*/.ddev/.env; do
       oname="$(basename "$odir")"
       for oc in "$odir/.ddev/config.yaml" "$odir"/.ddev/config.*.yaml; do
         [ -f "$oc" ] || continue
-        n="$(sed -n 's/^name: *//p' "$oc" | sed -n 1p)"
+        n="$(ddev_name "$oc")"
         [ -n "$n" ] && oname="$n"
       done
       if [ "$(docker inspect "ddev-$oname-web" --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
@@ -574,7 +611,19 @@ args="${hsmap:---slug $slug}"
 # #ddev-silent-no-warn, because DDEV otherwise prints a four-line "Custom
 # configuration detected" block naming this file on every single start. It is a
 # legal dotenv comment and DDEV documents the marker in that very message.
-env_out="#ddev-silent-no-warn
+# HOSTSHIFT_SLUG is written only when the slug was *chosen* rather than derived
+# from the branch, and it is what makes --slug stick.
+#
+# `check` re-derives the slug from the current branch, which is right for a slug
+# that came from a branch and wrong for one the developer picked: `init --slug
+# review-42` on branch `main` deployed correctly, served correctly, and then
+# failed the post-start hook on every single start, because check compared the
+# deployed `--slug review-42` against a freshly derived `--slug main`. Worse, the
+# advice it printed — `ddev hostshift init` — silently reverts to the branch
+# slug when run as printed, which in the case that motivates --slug at all is
+# back onto the colliding name the collision warning told you to move off.
+env_out="#ddev-silent-no-warn${slug_explicit:+
+HOSTSHIFT_SLUG=$slug}
 HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web"
@@ -783,7 +832,11 @@ if [ "$cmd" = "loopback" ]; then
     --canonical-hosts | sort -u)"
   # Off-box means "not one this DDEV project answers to". The project's own TLD
   # is the tail of its primary hostname, which `hostshift hosts` prints first.
-  tld="$(printf '%s\n' "$hosts" | head -1 | cut -d. -f2-)"
+  # sed, not `| head -1`: this script runs under `set -o pipefail`, and a head
+  # that exits after one line SIGPIPEs whatever is still writing. The same
+  # pattern is called out twice elsewhere in this file; $hosts is short enough
+  # that it has never fired, which is exactly why it would be a surprise.
+  tld="$(printf '%s\n' "$hosts" | sed -n 1p | cut -d. -f2-)"
   offbox="$(printf '%s\n' "$hosts_out" | grep -v "\.${tld:-ddev.site}\$" || true)"
   if [ -z "$offbox" ]; then
     echo "hostshift: every canonical hostname is a local DDEV one, so the" >&2

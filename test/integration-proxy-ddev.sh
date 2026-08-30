@@ -396,7 +396,11 @@ if (cd "$wt" && ddev hostshift check --slug wt-z >/dev/null 2>&1); then
 else
   pass "check catches a slug the running proxy does not answer on"
 fi
-(cd "$wt" && ddev hostshift init >/dev/null 2>&1) || true
+# --slug-from-branch, because a slug passed to `init` is now recorded and sticks:
+# a bare `init` that silently reverted it was failing the post-start hook forever
+# on every deliberately-slugged project, and telling the developer to run the
+# command that undid their choice.
+(cd "$wt" && ddev hostshift init --slug-from-branch >/dev/null 2>&1) || true
 
 # The compose service is `restart: "no"`, so a proxy that dies stays dead while
 # `ddev start` has already returned success — which is how an image that parses

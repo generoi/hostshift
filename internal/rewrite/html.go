@@ -301,10 +301,18 @@ func (w *HTML) decodeEntityLeak(base int, v []byte) []byte {
 		return v
 	}
 	out, events := w.m.Rewrite(dec, SurfaceHTMLEntity, w.stats.Explain())
+	// Recorded before the equality check, not after. Returning early skipped the
+	// *skips*, so a decoded value carrying an unanchored near-miss —
+	// `https:&#47;&#47;www.example.fi.evil/x` — counted zero candidates and zero
+	// skips, where the raw spelling of the same thing counts both. That is the
+	// state matcher.go's emit comment says was fixed: candidates == rewrites
+	// reads as "nothing was skipped", on the one surface where a non-zero count
+	// is documented as the signal that content is storing origins in a form
+	// §5.3 does not model.
+	w.stats.Record(SurfaceHTMLEntity, base, events)
 	if bytes.Equal(out, dec) {
 		return v
 	}
-	w.stats.Record(SurfaceHTMLEntity, base, events)
 	return out
 }
 

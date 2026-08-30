@@ -121,6 +121,34 @@ removal_actions:
     [ -n "$common" ] || exit 0
     ex="$common/info/exclude"
     [ -f "$ex" ] || exit 0
+    # Only when no other checkout of this repository still has the add-on.
+    #
+    # info/exclude is shared by the repository and all its linked worktrees —
+    # which is the property that makes one write cover them all on install, and
+    # exactly what made removal reach too far. Removing the add-on from one
+    # worktree un-ignored .ddev/config.hostshift.yaml, the host command and
+    # .ddev/.env in the *parent and every other worktree*, where it is still
+    # installed and running, with nothing printed. The next `git add -A` over
+    # there commits the add-on's files and .ddev/.env, which is where DDEV
+    # documents putting project env vars, credentials included. The install is
+    # idempotent-guarded, so it does not come back on its own either.
+    #
+    # `git worktree list --porcelain` names every checkout, this one included;
+    # the block stays while any *other* one still has the command installed.
+    others=0
+    here="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    while read -r k v; do
+      [ "$k" = "worktree" ] || continue
+      [ "$v" = "$here" ] && continue
+      [ -f "$v/.ddev/commands/host/hostshift" ] && others=$((others + 1)) || true
+    done <<EOT
+    $(git worktree list --porcelain 2>/dev/null || true)
+    EOT
+    if [ "$others" -gt 0 ]; then
+      echo "note: $others other checkout(s) of this repository still have hostshift" >&2
+      echo "installed, so .git/info/exclude keeps ignoring its files for them." >&2
+      exit 0
+    fi
     tmp="$(mktemp)"
     grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' -e '.ddev/.env' \
       "$ex" > "$tmp" && cat "$tmp" > "$ex"

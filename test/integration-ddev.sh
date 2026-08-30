@@ -340,6 +340,30 @@ else
   pass "but the repo's own hostshift.yaml still is not"
 fi
 rm -f "$m4/hostshift.yaml"
+
+# Removing the add-on from one worktree must not un-ignore it in the others.
+#
+# info/exclude is shared by the repository and all its linked worktrees, which
+# is the property that makes one write cover them all on install — and is
+# exactly what made removal reach too far. `ddev add-on remove` in a worktree
+# un-ignored the add-on's files and .ddev/.env in the parent and in every other
+# worktree, where it is still installed and running, and said nothing. The next
+# `git add -A` over there commits them, .ddev/.env included.
+rmwt="$work/${tag}-rmwt"
+git -C "$m4" worktree add -q -b "${tag}-rm" "$rmwt" >/dev/null 2>&1
+mkdir -p "$rmwt/.ddev"
+printf 'name: %s-rm\ntype: php\n' "$tag" > "$rmwt/.ddev/config.yaml"
+(cd "$rmwt" && ddev add-on get "$repo/ddev" >/dev/null 2>&1) || true
+projects+=("$rmwt")
+rm_out="$(cd "$rmwt" && ddev add-on remove hostshift 2>&1)" || true
+if git -C "$m4" check-ignore -q .ddev/.env; then
+  pass "removing it from one worktree leaves the others ignored"
+else
+  fail "removing it from one worktree leaves the others ignored" "$rm_out"
+fi
+git -C "$m4" worktree remove --force "$rmwt" >/dev/null 2>&1 || true
+git -C "$m4" branch -D "${tag}-rm" >/dev/null 2>&1 || true
+
 case "$install_out" in
   *"predates this add-on"*)
     fail "a fresh install is not told its command is stale" "$install_out" ;;

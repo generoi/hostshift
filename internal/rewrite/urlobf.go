@@ -205,12 +205,14 @@ func (w *HTML) normaliseURLLeak(base int, v []byte) []byte {
 		return v
 	}
 	out, events := w.m.Rewrite(norm, SurfaceHTMLObfuscated, w.stats.Explain())
+	// Before the equality check, so a near-miss in the normalised form is
+	// counted as a skip rather than vanishing — see decodeEntityLeak.
+	w.stats.Record(SurfaceHTMLObfuscated, base, events)
 	if bytes.Equal(out, norm) {
 		// The normalised form holds no origin either. Leave the value exactly as
 		// its author wrote it — this pass exists to stop a leak, not to tidy
 		// anyone's markup.
 		return v
 	}
-	w.stats.Record(SurfaceHTMLObfuscated, base, events)
 	return out
 }

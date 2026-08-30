@@ -262,6 +262,47 @@ contains "an unparseable parent config names the conflict markers" \
   "conflict markers" "$out"
 cp "$work/parent-config.bak" "$main/.ddev/config.yaml"
 
+# A slug the developer chose must survive `check` and a bare `init`.
+#
+# check re-derived the slug from the branch whenever there was one, so
+# `init --slug review-42` on branch `main` deployed correctly, served correctly,
+# and then failed the post-start hook on every start — comparing the deployed
+# `--slug review-42` against a freshly derived `--slug main`. The advice it
+# printed, `ddev hostshift init`, silently reverted the choice when run as
+# written, which in the case that motivates --slug at all lands back on the
+# colliding name the collision warning told you to move off.
+rm -f "$wt/.ddev/.env"
+(cd "$wt" && "$cmd" init --slug picked >/dev/null 2>&1) || fail "init exited non-zero" ""
+contains "an explicit slug is recorded" "HOSTSHIFT_SLUG=picked" "$(cat "$wt/.ddev/.env")"
+out="$(cd "$wt" && "$cmd" env 2>&1 || true)"
+contains "and a later run with no --slug keeps it" \
+  "HOSTSHIFT_VARIANTS=picked--acme.ddev.site" "$out"
+# No Docker here, so check gets as far as the missing container and stops. What
+# matters is that it does not get there via "out of date" — which is what it
+# said before, on a deployment that was correct.
+out="$(cd "$wt" && "$cmd" check 2>&1 || true)"
+case "$out" in
+  *"out of date"*) fail "and check does not call it stale" "$out" ;;
+  *) pass "and check does not call it stale" ;;
+esac
+
+# ...and there is a way back, or the only route to branch-derived naming is
+# hand-editing .ddev/.env.
+(cd "$wt" && "$cmd" init --slug-from-branch >/dev/null 2>&1) || fail "init exited non-zero" ""
+case "$(cat "$wt/.ddev/.env")" in
+  *HOSTSHIFT_SLUG=*) fail "--slug-from-branch forgets the recorded slug" "$(cat "$wt/.ddev/.env")" ;;
+  *) pass "--slug-from-branch forgets the recorded slug" ;;
+esac
+
+# ...while a slug that came from the branch still tracks the branch.
+out="$(cd "$wt" && "$cmd" env 2>&1 || true)"
+case "$out" in
+  *"picked--acme"*) fail "a branch-derived slug still follows the branch" "$out" ;;
+  *) pass "a branch-derived slug still follows the branch" ;;
+esac
+rm -f "$wt/.ddev/.env"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+
 out="$(cd "$wt" && "$cmd" env --slug other 2>/dev/null || true)"
 contains "a second slug does not compound with the first" \
   "HOSTSHIFT_VARIANTS=other--acme.ddev.site,other--nat.acme.ddev.site" "$out"
