@@ -117,14 +117,20 @@ The one file that comes out of it:
 
 ```sh
 # .ddev/.env
+#ddev-silent-no-warn
 HOSTSHIFT_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
 ```
 
-Ignore it in the project's own `.gitignore` — DDEV's generated
-`.ddev/.gitignore` does not cover `.env`. `init` merges into the file rather
-than truncating it, so anything else already in there survives.
+The first line is not a comment DDEV ignores: without it every `ddev start`
+prints a four-line "Custom configuration detected" block. `init` merges into
+the file rather than truncating it, so anything else already in there survives.
+
+You do not need to gitignore it. Installing the add-on adds its files to
+`.git/info/exclude`, which is per checkout and shared with linked worktrees, so
+the ignore travels with the machine rather than with the branch. Removing the
+add-on takes the entry back out.
 
 After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
 `https://acme.ddev.site` goes on serving the parent.

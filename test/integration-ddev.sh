@@ -136,6 +136,26 @@ code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://${tag}-wt-
 out="$(cd "$wt" && ddev hostshift check 2>&1)" && pass "check passes a live worktree" \
   || fail "check passes a live worktree" "$out"
 
+# ...and stops passing it the moment a sibling claims the same hostname. Two
+# projects on one hostname is an error nowhere in DDEV — traefik breaks the tie
+# by rule length and the loser is silently unreachable — so `check` refusing is
+# the only thing standing between a developer and reviewing the wrong branch's
+# code at the right URL. The scan reads `../*/.ddev/.env`, so a bare directory
+# is enough to stage it; no second DDEV project needed.
+rival="$work/${tag}-rival"
+mkdir -p "$rival/.ddev"
+printf 'HOSTSHIFT_VARIANTS=%s-wt-a.ddev.site\n' "$tag" > "$rival/.ddev/.env"
+if (cd "$wt" && ddev hostshift check >/dev/null 2>&1); then
+  fail "check refuses when another project claims the same hostname" \
+    "exit 0 — the collision was reported as healthy"
+else
+  pass "check refuses when another project claims the same hostname"
+fi
+rm -rf "$rival"
+(cd "$wt" && ddev hostshift check >/dev/null 2>&1) \
+  && pass "and passes again once the rival is gone" \
+  || fail "and passes again once the rival is gone" "$(cd "$wt" && ddev hostshift check 2>&1)"
+
 echo "== copy-db"
 
 # The only subcommand that destroys something. It streams the parent's database
@@ -144,9 +164,23 @@ echo "== copy-db"
 # would overwrite. Both halves are new and neither had any coverage.
 sql() { (cd "$1" && ddev exec -s web bash -c "mysql -h db -udb -pdb -N -B -e \"$2\" db" 2>/dev/null) || true; }
 sql "$main" "create table hs_probe (id int); insert into hs_probe values (42);" >/dev/null
+# A table only the worktree has, so the copy has something to drop. `mysqldump db
+# | mysql` drops only the tables the dump contains, so this survived — while the
+# refusal message promised a replace.
+sql "$wt" "create table hs_only_here (id int); insert into hs_only_here values (7);" >/dev/null
 
 out="$(cd "$wt" && ddev hostshift copy-db 2>&1)" || fail "copy-db copies the parent's database" "$out"
 contains "copy-db copies the parent's database" "42" "$(sql "$wt" "select id from hs_probe")"
+
+# Replace, not merge. `mysqldump db | mysql` drops only the tables the dump
+# contains, so a worktree from an older pull kept everything the parent no longer
+# has — and the refusal message promises a replace. The parent-side assertion
+# above passed before the fix too; this is the one that distinguishes them.
+if [ -n "$(sql "$wt" "select id from hs_only_here" 2>&1 | grep -x 7 || true)" ]; then
+  fail "and drops what only the worktree had" "hs_only_here survived, so it merged"
+else
+  pass "and drops what only the worktree had"
+fi
 
 # Running it twice is the accident: the second run silently replaced whatever
 # the first one's work had put there.
@@ -262,6 +296,20 @@ install_out="$(cd "$m4" && ddev add-on get "$repo/ddev" 2>&1)" \
 projects+=("$m4")
 
 contains "the add-on installs the host command" "commands/host/hostshift" "$install_out"
+
+# A .ddev project that is not a git checkout. DDEV runs install actions under
+# `set -eu -o pipefail`, and `git rev-parse` exits 128 outside a repository — so
+# an unguarded call aborted the install and left the project with nothing.
+nogit="$work/${tag}-nogit"
+mkdir -p "$nogit/.ddev"
+printf 'name: %s-nogit\ntype: php\n' "$tag" > "$nogit/.ddev/config.yaml"
+ng_out="$(cd "$nogit" && ddev add-on get "$repo/ddev" 2>&1)" || true
+projects+=("$nogit")
+if [ -f "$nogit/.ddev/commands/host/hostshift" ]; then
+  pass "and installs into a project that is not a git checkout"
+else
+  fail "and installs into a project that is not a git checkout" "$ng_out"
+fi
 
 # The files it installs are ignored in the *checkout*, not in a commit. A
 # .gitignore block is branch-scoped, so adopting hostshift leaves them untracked

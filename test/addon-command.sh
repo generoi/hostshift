@@ -233,6 +233,22 @@ chmod 600 "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 check ".env keeps the mode it had" "-rw-------" \
   "$(ls -l "$wt/.ddev/.env" | cut -c1-10)"
+
+# The write goes through a temp file in .ddev/ so the mv is an atomic rename.
+# That temp file is only safe because of the EXIT trap: without it, every failed
+# init leaves a `.ddev/.env.XXXXXX` behind — a file DDEV's own .ddev/.gitignore
+# does not cover, so it shows up as an untracked file in the developer's repo,
+# holding whatever credentials .env held. chmod 000 makes the `cp -p` fail,
+# which is the failure path.
+chmod 000 "$wt/.ddev/.env"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+chmod 600 "$wt/.ddev/.env"
+leftover="$(ls "$wt"/.ddev/.env.?????? 2>/dev/null || true)"
+if [ -n "$leftover" ]; then
+  fail "a failed init leaves no temp file behind" "$leftover"
+else
+  pass "a failed init leaves no temp file behind"
+fi
 rm -f "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 check ".env is 0644 when init creates it" "-rw-r--r--" \

@@ -31,7 +31,13 @@ pre_install_actions:
 # statement about its hostnames.
   - |
     #ddev-nodisplay
-    ex="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude"
+    # `|| true` inside the substitution: DDEV runs actions under `set -eu -o
+    # pipefail`, git rev-parse exits 128 outside a repository, and the assignment
+    # inherits that — which aborted the whole install and left the project with
+    # nothing, in any .ddev project that is not a git checkout.
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    [ -n "$common" ] || exit 0
+    ex="$common/info/exclude"
     [ -d "$(dirname "$ex")" ] || exit 0
     grep -qxF '# hostshift (ddev add-on)' "$ex" 2>/dev/null && exit 0
     {
@@ -111,7 +117,9 @@ post_install_actions:
 removal_actions:
   - |
     #ddev-nodisplay
-    ex="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude"
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    [ -n "$common" ] || exit 0
+    ex="$common/info/exclude"
     [ -f "$ex" ] || exit 0
     tmp="$(mktemp)"
     grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' -e '.ddev/.env' \

@@ -125,7 +125,11 @@ func (s *Sweep) flush(b []byte, limit int) int {
 	if len(b) == 0 {
 		return 0
 	}
-	out, consumed, events := s.m.RewritePrefix(b, limit, s.prev, SurfaceStraggler, true)
+	// s.stats.Explain(), not a bare true. Text is materialised for every
+	// ActionRewrote event regardless, which is all the WARN below reads, so
+	// forcing explain on bought nothing but a string per *skipped* candidate —
+	// and the sweep runs over every byte of every HTML body.
+	out, consumed, events := s.m.RewritePrefix(b, limit, s.prev, SurfaceStraggler, s.stats.Explain())
 	// Events arrive in increasing offset order, which is what the mapper's
 	// cursor needs, and each is mapped individually — the drift is not a
 	// constant per flush, it accumulates with every rewrite upstream. The
@@ -183,7 +187,7 @@ func SweepBytes(b []byte, m *origin.Matcher, st *Stats, log *slog.Logger) []byte
 	if log == nil {
 		log = slog.Default()
 	}
-	out, events := m.Rewrite(b, SurfaceStraggler, true)
+	out, events := m.Rewrite(b, SurfaceStraggler, st.Explain())
 	for _, e := range events {
 		if e.Action != origin.ActionRewrote {
 			continue
