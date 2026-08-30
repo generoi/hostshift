@@ -391,6 +391,7 @@ func cmdMap(args []string) (int, error) {
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
 	pairs := fs.Bool("pairs", false, "emit canonical=variant, one per line, for --map")
 	hosts := fs.Bool("variant-hosts", false, "emit the variant hostnames, one per line")
+	canon := fs.Bool("canonical-hosts", false, "emit every canonical-side hostname, aliases included, one per line")
 	if describe(fs, args, "print the resolved map, and where it came from") {
 		return exitOK, nil
 	}
@@ -406,6 +407,18 @@ func cmdMap(args []string) (int, error) {
 	// python3 to read --json, an undeclared dependency whose absence produced
 	// "could not resolve a map to hand the proxy" and named neither python3 nor
 	// the cause. Printing its own map flat is as generic as printing it as JSON.
+	// Every hostname the *content* may name, which is the canonical of each site
+	// plus its aliases. The variant side is what the browser uses; this side is
+	// what the application would reach out to, which is what loopback
+	// containment has to cover.
+	if *canon {
+		for _, s := range res.Map.Sites {
+			for _, o := range s.CanonicalSet() {
+				fmt.Println(o.Host)
+			}
+		}
+		return exitOK, nil
+	}
 	if *pairs || *hosts {
 		for _, s := range res.Map.Sites {
 			if *pairs {

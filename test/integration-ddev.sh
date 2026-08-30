@@ -262,6 +262,24 @@ install_out="$(cd "$m4" && ddev add-on get "$repo/ddev" 2>&1)" \
 projects+=("$m4")
 
 contains "the add-on installs the host command" "commands/host/hostshift" "$install_out"
+
+# The files it installs are ignored in the *checkout*, not in a commit. A
+# .gitignore block is branch-scoped, so adopting hostshift leaves them untracked
+# on every branch that predates the adoption — which is where `git add -A`
+# commits them.
+if [ -z "$(git -C "$m4" status --porcelain -- .ddev)" ]; then
+  pass "and nothing it installs shows up as untracked"
+else
+  fail "and nothing it installs shows up as untracked" "$(git -C "$m4" status --porcelain -- .ddev)"
+fi
+# The project's own committed statement about its hostnames is not ignored.
+printf 'sites:\n  - canonical: https://x.example\n' > "$m4/hostshift.yaml"
+if git -C "$m4" check-ignore -q hostshift.yaml; then
+  fail "but the repo's own hostshift.yaml still is not" "it is ignored"
+else
+  pass "but the repo's own hostshift.yaml still is not"
+fi
+rm -f "$m4/hostshift.yaml"
 case "$install_out" in
   *"predates this add-on"*)
     fail "a fresh install is not told its command is stale" "$install_out" ;;

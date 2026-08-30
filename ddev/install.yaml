@@ -18,6 +18,28 @@ pre_install_actions:
       echo "without it, but 'ddev hostshift' and 'hostshift map|check|diff' need it." >&2
     fi
 
+# Ignore what this add-on installs, in the checkout rather than in a commit.
+#
+# A .gitignore block is *branch*-scoped: adopt hostshift on one branch and every
+# pre-existing branch still shows the add-on's files as untracked, which is where
+# `git add -A` commits them. $GIT_COMMON_DIR/info/exclude is checkout-scoped,
+# which is the right scope for machine-local tool files, and it is shared by a
+# repository and all its linked worktrees — so one write covers them all, on
+# every branch, and the repo commits nothing.
+#
+# Deliberately not the root hostshift.yaml, which is a project's own committed
+# statement about its hostnames.
+  - |
+    #ddev-nodisplay
+    ex="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude"
+    [ -d "$(dirname "$ex")" ] || exit 0
+    grep -qxF '# hostshift (ddev add-on)' "$ex" 2>/dev/null && exit 0
+    {
+      echo '# hostshift (ddev add-on)'
+      echo '.ddev/**/*hostshift*'
+      echo '.ddev/.env'
+    } >> "$ex"
+
 project_files:
   - config.hostshift.yaml
   - docker-compose.hostshift.yaml
@@ -87,6 +109,14 @@ post_install_actions:
     echo
 
 removal_actions:
+  - |
+    #ddev-nodisplay
+    ex="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/info/exclude"
+    [ -f "$ex" ] || exit 0
+    tmp="$(mktemp)"
+    grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' -e '.ddev/.env' \
+      "$ex" > "$tmp" && cat "$tmp" > "$ex"
+    rm -f "$tmp"
   - |
     #ddev-nodisplay
     echo "hostshift removed. wp-cli.local.yml, if you generated one, is yours to delete."
