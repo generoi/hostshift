@@ -39,9 +39,31 @@ pre_install_actions:
     [ -n "$common" ] || exit 0
     ex="$common/info/exclude"
     [ -d "$(dirname "$ex")" ] || exit 0
-    grep -qxF '# hostshift (ddev add-on)' "$ex" 2>/dev/null && exit 0
+    # A delimited block, so removal can take back exactly what install put in.
+    #
+    # Removal used to `grep -vxF` each pattern, which deletes *every* matching
+    # line — including one the developer had written themselves. Both pilot
+    # repos had added `.ddev/.env` by hand before the add-on existed, so
+    # uninstalling took away their own rule and left the credentials file
+    # untracked and un-ignored: the exact exposure the block exists to prevent,
+    # in a single-checkout project with no worktrees in sight.
+    #
+    # The end marker also means a later version can add a pattern to the block
+    # rather than being frozen by the idempotency guard below.
+    if grep -qxF '# hostshift (ddev add-on) — begin' "$ex" 2>/dev/null; then
+      exit 0
+    fi
+    # An older, undelimited block from a previous version: take it out first, so
+    # this does not append a second copy beside it.
+    if grep -qxF '# hostshift (ddev add-on)' "$ex" 2>/dev/null; then
+      tmp="$(mktemp)"
+      grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' \
+        -e '.ddev/.env' -e 'wp-cli.local.yml' "$ex" > "$tmp" || true
+      cat "$tmp" > "$ex"
+      rm -f "$tmp"
+    fi
     {
-      echo '# hostshift (ddev add-on)'
+      echo '# hostshift (ddev add-on) — begin'
       echo '.ddev/**/*hostshift*'
       echo '.ddev/.env'
       # `ddev hostshift wp-cli` writes this, its own header says not to commit
@@ -49,6 +71,7 @@ pre_install_actions:
       # production-canonical it carries the *production* URL, so committing it
       # points every teammate's `ddev wp` at the live site.
       echo 'wp-cli.local.yml'
+      echo '# hostshift (ddev add-on) — end'
     } >> "$ex"
 
 project_files:
@@ -170,16 +193,34 @@ removal_actions:
       echo "installed, so .git/info/exclude keeps ignoring its files for them." >&2
       exit 0
     fi
-    # `|| true`: grep exits 1 when it selects *no* lines, which is exactly the
-    # case where info/exclude holds nothing but this block — the shape the
-    # install itself creates when the file did not exist before. `cat` then
-    # never ran, the block survived removal, and it went on ignoring .ddev/.env
-    # in a project that no longer has the add-on. `set -e` did not fire either,
-    # because grep is the non-final command of an && list.
+    # Delete the delimited range, not every line that looks like ours.
+    #
+    # `grep -vxF '.ddev/.env'` removed the developer's own rule too, and both
+    # pilot repos had written that line by hand before this add-on existed. sed
+    # between the markers takes back exactly what install appended.
+    #
+    # The awk fallback handles a block written by a version that had no end
+    # marker; there, matching the patterns is all there is to go on.
     tmp="$(mktemp)"
-    grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' \
-      -e '.ddev/.env' -e 'wp-cli.local.yml' "$ex" > "$tmp" || true
-    cat "$tmp" > "$ex"
+    ok=""
+    if grep -qxF '# hostshift (ddev add-on) — begin' "$ex"; then
+      sed '/^# hostshift (ddev add-on) — begin$/,/^# hostshift (ddev add-on) — end$/d' \
+        "$ex" > "$tmp" && ok=1
+    else
+      # grep exits 1 when it selects no lines, which is the shape the install
+      # creates when info/exclude did not exist before. That is a success with an
+      # empty result, not a failure.
+      grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' \
+        -e '.ddev/.env' -e 'wp-cli.local.yml' "$ex" > "$tmp"
+      [ $? -le 1 ] && ok=1
+    fi
+    # The *status*, not the size. An empty result is correct when the block was
+    # the whole file, so testing `-s "$tmp"` left the block behind in exactly
+    # that case — while a genuinely failed filter must not be allowed to blank
+    # the developer's other rules.
+    if [ -n "$ok" ]; then
+      cat "$tmp" > "$ex"
+    fi
     rm -f "$tmp"
   - |
     #ddev-nodisplay
@@ -201,8 +242,32 @@ removal_actions:
     [ -f ../wp-cli.local.yml ] && left="$left
       wp-cli.local.yml — it carries the canonical URL \`ddev wp\` defaults to"
     true
-    if [ -n "$left" ]; then
-      echo "hostshift removed. These are yours to delete:$left"
-    else
-      echo "hostshift removed."
+    # The hostnames go back to web, and that is not always harmless.
+    #
+    # docker-compose.hostshift.yaml is what narrowed web's VIRTUAL_HOST to this
+    # project's own hostnames. With it gone, a worktree's web re-registers every
+    # hostname it inherited verbatim from the tracked config.yaml — a multisite's
+    # blog hostnames included — and wins the router's tie against the parent, so
+    # the parent's second blog is served by the worktree's code and database.
+    # `init` prints a note about this hazard at the moment it *creates* it;
+    # removal is the moment that re-creates it and said nothing. The parent's own
+    # `check` cannot notice by construction: it scans siblings for variant
+    # collisions, never for web hostnames.
+    # `..` is the project root: these actions run with cwd <project>/.ddev, and
+    # a linked worktree's `.git` is a *file* there rather than a directory.
+    inherited=""
+    if [ -f ../.git ] && grep -qs '^HOSTSHIFT_WEB_HOSTS=.' .env; then
+      inherited=1
     fi
+
+    echo "hostshift removed."
+    if [ -n "$inherited" ]; then
+      echo "Note: this is a linked worktree, and the add-on was what kept the"
+      echo "hostnames it inherits from the parent's config.yaml off its web"
+      echo "container. They go back now, and the router prefers this project for"
+      echo "any it shares with the parent — so a hostname you expect to reach the"
+      echo "parent may reach this worktree instead. \`ddev stop\` here, or drop the"
+      echo "inherited hostnames from this worktree's DDEV config."
+    fi
+    [ -n "$left" ] && echo "These are yours to delete:$left"
+    true

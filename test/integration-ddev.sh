@@ -142,26 +142,27 @@ out="$(cd "$wt" && ddev hostshift check 2>&1)" && pass "check passes a live work
 # refusal is what stands between a developer and reviewing the wrong branch's
 # code at the right URL.
 #
-# The parent is already up, so it is the live rival: give it the worktree's
-# variant and it is genuinely contending for that hostname.
 variant="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env" | cut -d, -f1)"
-cp "$main/.ddev/.env" "$work/main-env.bak" 2>/dev/null || : > "$work/main-env.bak"
-printf 'HOSTSHIFT_VARIANTS=%s\n' "$variant" >> "$main/.ddev/.env"
-if (cd "$wt" && ddev hostshift check >/dev/null 2>&1); then
-  fail "check refuses when a running project claims the same hostname" \
-    "exit 0 — a live collision was reported as healthy"
-else
-  pass "check refuses when a running project claims the same hostname"
-fi
-cp "$work/main-env.bak" "$main/.ddev/.env"
 
-# But a directory left behind by a deleted worktree is not a claim. `git worktree
+# A directory left behind by a deleted worktree is not a claim. `git worktree
 # remove` refuses while untracked files are present, so the directory outliving
 # the project is the common case — and refusing there failed the post-start hook
 # on every start while routing was entirely correct.
 dead="$work/${tag}-dead"
 mkdir -p "$dead/.ddev"
 printf 'HOSTSHIFT_VARIANTS=%s\n' "$variant" > "$dead/.ddev/.env"
+# The parent is up but runs no proxy, so it is the same case: a .ddev/.env that
+# claims a variant nothing is serving. The variants live on the *hostshift*
+# container, so asking about web read every add-on-removed, crashed or
+# never-restarted sibling as a live claimant, and failed the post-start hook on
+# every start of a correct deployment.
+cp "$main/.ddev/.env" "$work/main-env.bak" 2>/dev/null || : > "$work/main-env.bak"
+printf 'HOSTSHIFT_VARIANTS=%s\n' "$variant" >> "$main/.ddev/.env"
+out="$(cd "$wt" && ddev hostshift check 2>&1)" \
+  && pass "a running project with no proxy of its own claims nothing" \
+  || fail "a running project with no proxy of its own claims nothing" "$out"
+cp "$work/main-env.bak" "$main/.ddev/.env"
+
 out="$(cd "$wt" && ddev hostshift check 2>&1)" \
   && pass "and a stopped project's leftover directory is a warning, not a failure" \
   || fail "and a stopped project's leftover directory is a warning, not a failure" "$out"

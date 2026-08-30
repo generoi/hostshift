@@ -374,6 +374,28 @@ projects+=("$wt2")
 (cd "$wt2" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds in the second worktree" ""
 out="$(cd "$wt2" && ddev start -y 2>&1)" || fail "the second worktree starts" "$out"
 
+# Both proxies are up, so this is a real collision rather than a leftover file:
+# point the second worktree's .ddev/.env at the first one's variant and it is
+# genuinely contending for that hostname. This is the assertion the liveness gate
+# exists for, and it needs two *running proxies* — which is why it lives here and
+# not in the suite where the only other project is a parent with no proxy.
+v1="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env" | cut -d, -f1)"
+cp "$wt2/.ddev/.env" "$work/wt2-env.bak"
+# Replaced, not appended: the scan reads the *first* HOSTSHIFT_VARIANTS line and
+# quits, so a second one below it is never seen and the rival claims nothing.
+sed -i.bak "s|^HOSTSHIFT_VARIANTS=.*|HOSTSHIFT_VARIANTS=$v1|" "$wt2/.ddev/.env"
+rm -f "$wt2/.ddev/.env.bak"
+if (cd "$wt" && ddev hostshift check >/dev/null 2>&1); then
+  fail "check refuses when a running proxy claims the same hostname" \
+    "exit 0 — a live collision was reported as healthy"
+else
+  pass "check refuses when a running proxy claims the same hostname"
+fi
+cp "$work/wt2-env.bak" "$wt2/.ddev/.env"
+(cd "$wt" && ddev hostshift check >/dev/null 2>&1) \
+  && pass "and passes again once the rival stops claiming it" \
+  || fail "and passes again once the rival stops claiming it" "$(cd "$wt" && ddev hostshift check 2>&1)"
+
 contains "the first worktree's variant still serves the first worktree" \
   "PROJECT=worktree HOST=$C" "$(get "https://$V/")"
 contains "the second worktree's variant serves the second worktree" \

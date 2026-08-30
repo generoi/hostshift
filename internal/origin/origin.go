@@ -79,16 +79,46 @@ func MustParse(s string) Origin {
 	return o
 }
 
+// hostFold is the browser's domain-to-ASCII: UTS46 mapping, then punycode.
+//
+// idna.Punycode punycodes and nothing else — no UTS46 mapping, no NFC, no
+// removal of ignorable code points — while the WHATWG parser runs domain-to-ASCII
+// with beStrict=false, which maps or deletes a large class of code points first.
+// Every spelling UTS46 folds onto a canonical host was therefore invisible: a
+// soft hyphen inside the host, fullwidth letters, U+3002/U+FF0E/U+FF61 as label
+// separators, a zero-width space, and — the one that turns up without an
+// attacker — NFD, which macOS filesystems and pasted content produce. All six
+// resolve to the canonical origin in a browser.
+//
+// idna.Lookup is not the answer either: it rejects hosts that are invalid for
+// resolution, and this is a comparison form, so it must fold rather than judge.
+// MapForLookup with StrictDomainName off maps without rejecting, and
+// Transitional(false) is what browsers do.
+var hostFold = idna.New(
+	idna.MapForLookup(),
+	idna.StrictDomainName(false),
+	idna.Transitional(false),
+)
+
 func normaliseHost(h string) (string, error) {
 	h = strings.ToLower(strings.TrimSuffix(h, "."))
-	// idna.Lookup rejects hosts that are invalid for resolution; ToASCII on the
-	// Punycode profile is the comparison form we want and leaves ASCII untouched.
-	a, err := idna.Punycode.ToASCII(h)
+	a, err := hostFold.ToASCII(h)
 	if err != nil {
+		// A host this cannot map is still a host someone declared. Fall back to
+		// the punycode-only form rather than refusing the configuration: being
+		// unable to fold an exotic spelling is a reason to compare it literally,
+		// not a reason to fail at startup.
+		if p, perr := idna.Punycode.ToASCII(h); perr == nil {
+			return p, nil
+		}
 		return "", fmt.Errorf("punycode %q: %w", h, err)
 	}
 	return a, nil
 }
+
+// HostFold exposes the browser's domain-to-ASCII for callers that parse a host
+// out of content rather than out of a configuration.
+func HostFold(h string) (string, error) { return hostFold.ToASCII(h) }
 
 // NormalisePort returns "" for a scheme's default port, so that
 // https://h and https://h:443 compare equal (PLAN §5.5).

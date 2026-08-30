@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"strings"
 
-	"golang.org/x/net/idna"
-
 	"github.com/generoi/hostshift/internal/origin"
 )
 
@@ -75,14 +73,16 @@ func (h *hostReplacer) sameSchemeAsDocument(scheme string) bool {
 }
 
 // key normalises a parsed host to the form the table is keyed on: lowercase,
-// no root dot, punycode.
+// no root dot, and the browser's domain-to-ASCII.
 //
-// Punycode because §5.5 calls IDN "real for .fi client domains" and the pairs
-// are stored normalised, so a U-label in the document — hämeen.fi, or the same
-// host spelled with references — has to be folded before it can be looked up.
+// origin.HostFold, not a bare punycode: the browser runs UTS46 mapping first, so
+// a soft hyphen in the host, fullwidth letters, U+3002 as a label separator or
+// an NFD spelling all name the canonical host to a browser while sharing no
+// bytes with it. §5.5 calls IDN real for .fi client domains, and NFD is what a
+// macOS filesystem or a paste produces without anyone trying.
 func (h *hostReplacer) key(b []byte) string {
 	s := strings.TrimSuffix(strings.ToLower(string(b)), ".")
-	if a, err := idna.Punycode.ToASCII(s); err == nil {
+	if a, err := origin.HostFold(s); err == nil {
 		return a
 	}
 	return s
@@ -316,15 +316,25 @@ func urlTokenStarts(v []byte) []int {
 	return out
 }
 
-// locateHost finds the host the URL parser would read starting at v, and the
-// origin it maps to.
-func (h *hostReplacer) locateHost(v []byte) (from, until int, to origin.Origin, ok bool) {
-	n := stripForURL(v)
-	at := h.authorityStart(n.b)
-	if at < 0 || at >= len(n.b) {
+// locateHostIn finds the host the URL parser would read starting at n.b[at],
+// and the origin it maps to. from/until are indices into the *original* value.
+//
+// It takes an already-stripped buffer rather than stripping one itself. Stripping
+// per candidate made the pass quadratic: stripForURL allocates a []byte and a
+// []int over the whole remainder, so a long value with many token starts cost
+// O(k·n) — measured at 55 seconds for a 320 KB attribute value, which
+// extrapolates to hours at the shipped 4 MiB token cap. That is the same bug
+// class scan.go documents having already fixed once.
+func (h *hostReplacer) locateHostIn(n normalised, at int) (from, until int, to origin.Origin, ok bool) {
+	rel := h.authorityStart(n.b[at:])
+	if rel < 0 {
 		return 0, 0, to, false
 	}
-	hs, he, port := hostRange(n.b, at)
+	start := at + rel
+	if start >= len(n.b) {
+		return 0, 0, to, false
+	}
+	hs, he, port := hostRange(n.b, start)
 	if hs >= he {
 		return 0, 0, to, false
 	}
@@ -342,6 +352,76 @@ func (h *hostReplacer) locateHost(v []byte) (from, until int, to origin.Origin, 
 	return n.pos[hs], n.pos[he-1] + 1, to, true
 }
 
+// foldedHostLeak catches a host that only *folds* onto a canonical one.
+//
+// The byte matcher compares bytes, so a host spelled with a soft hyphen, with
+// fullwidth letters, with U+3002 for the dots, or in NFD shares nothing with the
+// pattern it names — and unlike the shapes above, that is true on every surface,
+// not just in a URL attribute. A production origin in a text node, in an inline
+// script, in a stylesheet or in a comment is still a production origin the
+// browser will resolve when something reads it.
+//
+// So this runs over the whole value on every surface, and it is cheap because it
+// cannot fire without a non-ASCII byte: a host that is pure ASCII either matches
+// the pattern already or is not the canonical host at all. That one test skips
+// the entire pass on most documents, and on the rest the work is bounded by the
+// number of `//` runs.
+func (w *HTML) foldedHostLeak(surface string, base int, v []byte) []byte {
+	if w.hosts == nil || len(w.hosts.to) == 0 {
+		return v
+	}
+	nonASCII := false
+	for _, c := range v {
+		if c >= 0x80 {
+			nonASCII = true
+			break
+		}
+	}
+	if !nonASCII {
+		return v
+	}
+
+	n := stripForURL(v)
+	var out []byte
+	prev := 0
+	for i := 0; i+1 < len(n.b); i++ {
+		if !isSlashish(n.b[i]) || !isSlashish(n.b[i+1]) || n.pos[i] < prev {
+			continue
+		}
+		from, until, to, ok := w.hosts.locateHostIn(n, i)
+		if !ok {
+			continue
+		}
+		// Nothing to do when the bytes already say the variant, and nothing to
+		// do when the host is plain ASCII — that is the byte matcher's job, and
+		// it has already run.
+		if !bytes.Equal(v[from:until], []byte(to.Host)) && hasNonASCII(v[from:until]) {
+			out = append(out, v[prev:from]...)
+			out = append(out, to.Host...)
+			prev = until
+			w.stats.Record(surface, base, []origin.Event{{
+				Offset:  base + from,
+				Surface: surface,
+				Action:  origin.ActionRewrote,
+				Text:    string(v[from:until]),
+			}})
+		}
+	}
+	if out == nil {
+		return v
+	}
+	return append(out, v[prev:]...)
+}
+
+func hasNonASCII(b []byte) bool {
+	for _, c := range b {
+		if c >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
 // normaliseURLLeak replaces every host in v that the URL parser would read and
 // this map rewrites, and returns v untouched when there are none.
 //
@@ -353,17 +433,17 @@ func (w *HTML) normaliseURLLeak(base int, v []byte) []byte {
 	if w.hosts == nil || len(w.hosts.to) == 0 {
 		return v
 	}
+	n := stripForURL(v)
 	var out []byte
 	prev := 0
-	for _, off := range urlTokenStarts(v) {
-		if off < prev {
+	for _, off := range urlTokenStarts(n.b) {
+		if off < len(n.pos) && n.pos[off] < prev {
 			continue // inside a host already replaced
 		}
-		from, until, to, ok := w.hosts.locateHost(v[off:])
+		from, until, to, ok := w.hosts.locateHostIn(n, off)
 		if !ok {
 			continue
 		}
-		from, until = off+from, off+until
 		out = append(out, v[prev:from]...)
 		out = append(out, to.Host...)
 		prev = until

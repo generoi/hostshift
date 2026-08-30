@@ -228,6 +228,11 @@ var urlAttrNames = [][]byte{
 	// attribute's `url(…)`.
 	[]byte("srcset"), []byte("imagesrcset"), []byte("ping"),
 	[]byte("content"), []byte("style"),
+	// srcdoc holds a whole document whose base URL is the parent's, so every
+	// href inside it is navigable. data-src and data-srcset are what the fleet's
+	// lazyload and the WooCommerce gallery assign to src, which §5.2 already
+	// names as a real surface.
+	[]byte("srcdoc"), []byte("data-src"), []byte("data-srcset"),
 }
 
 func singleURLAttr(name []byte) bool {
@@ -270,6 +275,14 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	if surface == SurfaceHTMLAttr {
 		out = w.urlLeaks(base, out, singleURLAttr(name))
 	}
+	// Every surface, because a host that only folds onto a canonical one — a
+	// soft hyphen, fullwidth letters, U+3002 for the dots, NFD — shares no bytes
+	// with its pattern anywhere, not just in a URL attribute.
+	out = w.foldedHostLeak(surface, base, out)
+	// Every surface, because a host that only folds onto a canonical one — a
+	// soft hyphen, fullwidth letters, U+3002 for the dots, NFD — shares no bytes
+	// with its pattern anywhere, not just in a URL attribute.
+
 	if w.dryRun {
 		return v
 	}

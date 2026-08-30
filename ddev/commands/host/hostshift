@@ -574,7 +574,17 @@ for other in ../*/.ddev/.env; do
         n="$(ddev_name "$oc")"
         [ -n "$n" ] && oname="$n"
       done
-      if [ "$(docker inspect "ddev-$oname-web" --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
+      # The *hostshift* container, not web. The variant hostnames are served by
+      # the sibling's proxy, so a sibling whose project is up while its proxy is
+      # not claims nothing — and asking about web read every one of those as a
+      # live claimant: an add-on removed but its `.ddev/.env` left behind (which
+      # removal does by design, and says so), a proxy that crashed and stayed
+      # down because the compose service is `restart: "no"`, or a `.ddev/.env`
+      # written and never restarted into. `check` then failed on every start of
+      # a deployment that was entirely correct, and told the developer to rename
+      # a preview URL they may already have shared. This file handles exactly
+      # that crashed-proxy case for the *current* project two blocks down.
+      if [ "$(docker inspect "ddev-$oname-hostshift" --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
         claimed="$v"
         break 2
       fi
@@ -583,7 +593,7 @@ for other in ../*/.ddev/.env; do
       # check then printed "hostshift is serving" and exited 0 while traefik
       # routed that hostname elsewhere, which is the exact failure this block
       # exists to catch.
-      echo "  ($oname is not running, so nothing is serving it right now.)" >&2
+      echo "  ($oname's proxy is not running, so nothing is serving it right now.)" >&2
       break ;;
     esac
   done
@@ -829,16 +839,46 @@ if [ "$cmd" = "check" ]; then
   # "reviewing their worktree" is looking at the live site, and loopback
   # containment does not help — it pins the canonical names, not this one.
   #
-  # DDEV registers hostnames under the project's own TLD, so a variant outside
-  # every one of this project's suffixes is a name DDEV never registered.
+  # Ask the host file, not the shape of the name.
+  #
+  # A suffix test passes the very case it was written to stop. `hostshift hosts`
+  # includes additional_fqdns verbatim, so a project that points the production
+  # hostname at the box while adopting production-canonical — a natural move —
+  # contributes the suffix `.example.com`, and `local--www.example.com` then
+  # matches it. DDEV registers only the *exact* FQDN in /etc/hosts, so that name
+  # has no local entry at all and resolves through public DNS: under the wildcard
+  # records these domains often carry, straight to the production server, with
+  # the developer believing they are reviewing a worktree.
+  #
+  # $DDEV_TLD is the question, because it is what decides *how* a name resolves.
+  # DDEV sets it for every host command (ddev pkg/ddevapp/ddevapp.go).
+  #
+  # Names under the project TLD resolve by wildcard DNS — `*.ddev.site` is a real
+  # public record pointing at the loopback — so any name under it works without
+  # anything being registered anywhere, which is why variants normally need no
+  # setup at all. Names *outside* it resolve only if DDEV wrote them to
+  # /etc/hosts, and DDEV writes the exact FQDNs from additional_fqdns and nothing
+  # derived from them.
+  #
+  # That distinction is the whole bug in the previous suffix test: a project that
+  # points its production hostname at the box with additional_fqdns while
+  # adopting production-canonical contributed the suffix `.example.com`, so
+  # `local--www.example.com` matched and was accepted — a name with no local
+  # entry, which resolves through public DNS to the production server under the
+  # wildcard records these domains often carry.
+  tld="${DDEV_TLD:-ddev.site}"
   outside=""
   for v in $(printf '%s' "$variants" | tr ',' ' '); do
     ok=""
-    while IFS= read -r h; do
-      [ -n "$h" ] || continue
-      suffix=".${h#*.}"
-      case "$v" in *"$suffix") ok=1; break ;; esac
-    done <<<"$hosts"
+    case "$v" in *".$tld") ok=1 ;; esac
+    if [ -z "$ok" ]; then
+      while IFS= read -r h; do
+        [ "$h" = "$v" ] && { ok=1; break; }
+      done <<<"$hosts"
+    fi
+    if [ -z "$ok" ] && grep -qE "^[^#]*[[:space:]]$v([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+      ok=1
+    fi
     [ -n "$ok" ] || outside="${outside:+$outside }$v"
   done
   if [ -n "$outside" ]; then
@@ -1068,6 +1108,37 @@ hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
 # hand, init stays what it says on the tin: it writes a file.
 if [ -n "${DDEV_APPROOT:-}" ] && command -v ddev >/dev/null; then
   echo "hostshift: restarting to pick it up" >&2
-  exec ddev restart
+  # Not `exec`: that hands the exit status to `ddev restart`, and DDEV does not
+  # fail a restart on a failing `exec-host` hook — a fact config.hostshift.yaml
+  # documents at length, but only ever reasoned about for the hook itself. So
+  # `ddev hostshift init` printed the warning, printed `refusing to call this
+  # healthy`, printed `Task failed`, and exited **0** on a deployment whose map
+  # named the wrong hostnames entirely. PLAN §3's premise is unattended agents
+  # in worktrees, and an agent that checks $? was told everything was fine.
+  #
+  # So run the check again afterwards and answer with it. The hook has already
+  # printed the diagnosis by then, so this stays quiet and only sets the status.
+  ddev restart || exit $?
+  # `.ddev/commands/host/hostshift`, not "$0": we have already cd'd to
+  # $DDEV_APPROOT, so a relative $0 no longer resolves, and DDEV does not promise
+  # an absolute one.
+  self=".ddev/commands/host/hostshift"
+  [ -x "$self" ] || self="$0"
+  # ${slug_explicit:+…}, not ${slug:+…}. Passing --slug makes the sub-invocation
+  # treat the slug as *chosen*, so its expected .ddev/.env carries a
+  # HOSTSHIFT_SLUG_CHOSEN line that the file just written from a branch-derived
+  # slug does not — and it reported the project it had just configured as out of
+  # date. When the slug really was chosen the line is there and they agree; when
+  # it was not, the sub-invocation re-derives the same slug from the same branch.
+  if out="$(HOSTSHIFT_HOOK=1 "$self" check ${slug_explicit:+--slug "$slug"} 2>&1)"; then
+    exit 0
+  fi
+  # The post-start hook has usually printed this already, but not always — a
+  # `check` that fails for a reason the hook could not reach prints nothing
+  # otherwise, and exiting non-zero with no explanation is worse than repeating
+  # a few lines.
+  printf '%s\n' "$out" >&2
+  echo "hostshift: restarted, but the result is not healthy." >&2
+  exit 2
 fi
 echo "hostshift: now run \`ddev restart\`" >&2
