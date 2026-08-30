@@ -145,11 +145,20 @@ func NormalisePort(scheme, port string) string {
 }
 
 // HostPort renders host[:port], omitting a default port.
+//
+// An IPv6 literal gets its brackets back. url.Hostname() strips them, so an
+// origin parsed from `http://[::1]:8080` stored the host as `::1` and rendered
+// `http://::1:8080` — which ada rejects outright, so every rewritten link on the
+// page became unparseable while `check` called the map injective and anchored.
 func (o Origin) HostPort() string {
-	if o.Port == "" {
-		return o.Host
+	h := o.Host
+	if strings.ContainsRune(h, ':') {
+		h = "[" + h + "]"
 	}
-	return o.Host + ":" + o.Port
+	if o.Port == "" {
+		return h
+	}
+	return h + ":" + o.Port
 }
 
 // String renders scheme://host[:port].

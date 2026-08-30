@@ -2,6 +2,7 @@ package rewrite
 
 import (
 	"bytes"
+	"sort"
 	"strings"
 	"sync"
 
@@ -48,6 +49,19 @@ type hostReplacer struct {
 	// own scheme decides whether a reference with a scheme and no slashes is an
 	// authority or a path, and the document is served at a variant origin.
 	schemes map[string]bool
+	// schemeList is schemes in a fixed order, so nothing here depends on Go's
+	// randomised map iteration.
+	schemeList []string
+}
+
+// tableKey is how a parsed host is looked up: unbracketed, because that is what
+// hostReplacer.key produces and what origins store — HostPort() brackets an IPv6
+// literal for *rendering*, which is the opposite of what a lookup wants.
+func tableKey(o origin.Origin) string {
+	if o.Port == "" {
+		return o.Host
+	}
+	return o.Host + ":" + o.Port
 }
 
 func newHostReplacer(m *origin.Matcher) *hostReplacer {
@@ -56,9 +70,13 @@ func newHostReplacer(m *origin.Matcher) *hostReplacer {
 		if p.Identity() {
 			continue
 		}
-		h.to[p.Canonical.HostPort()] = p.Variant
+		h.to[tableKey(p.Canonical)] = p.Variant
 		h.schemes[p.Variant.Scheme] = true
 	}
+	for s := range h.schemes {
+		h.schemeList = append(h.schemeList, s)
+	}
+	sort.Strings(h.schemeList)
 	return h
 }
 
@@ -83,6 +101,11 @@ func (h *hostReplacer) sameSchemeAsDocument(scheme string) bool {
 // macOS filesystem or a paste produces without anyone trying.
 func (h *hostReplacer) key(b []byte) string {
 	s := strings.TrimSuffix(strings.ToLower(string(b)), ".")
+	// Origins store an IPv6 literal unbracketed — url.Hostname() strips them —
+	// so the lookup key has to match that.
+	if len(s) > 1 && s[0] == '[' && s[len(s)-1] == ']' {
+		return s[1 : len(s)-1]
+	}
 	if a, err := origin.HostFold(s); err == nil {
 		return a
 	}
@@ -106,7 +129,7 @@ func isAuthorityByte(c byte) bool {
 		return true
 	}
 	switch c {
-	case '-', '.', '_', '~', '%', '+', '@', ':':
+	case '-', '.', '_', '~', '%', '+', '@', ':', '[', ']':
 		return true
 	}
 	return false
@@ -321,8 +344,13 @@ func (h *hostReplacer) schemeAt(b []byte, at int) string {
 			return strings.TrimSuffix(s, ":")
 		}
 	}
-	for s := range h.schemes {
-		return s
+	// Sorted, not a map range: `for s := range h.schemes` picks by Go's
+	// randomised iteration order, so the same input in the same process produced
+	// two different outputs — 176 one way and 24 the other over 200 runs. A
+	// rewriter whose output depends on hash seeding undermines every
+	// byte-identity and corpus-diff claim in the project.
+	if len(h.schemeList) > 0 {
+		return h.schemeList[0]
 	}
 	return "https"
 }
@@ -354,7 +382,7 @@ func (h *hostReplacer) authorityStart(b []byte) int {
 // ends belongs to the credentials, so `https://user@host` names host and not
 // user. The authority ends at the first '/', '\', '?' or '#'; the host itself
 // also ends at ':', which begins the port.
-// maxHost bounds the authority scan. A DNS name is at most 253 octets, and
+// maxHost bounds the host. A DNS name is at most 253 octets, and
 // percent-encoding can only inflate that threefold, so nothing longer is a host
 // this map could ever contain.
 //
@@ -368,11 +396,8 @@ func (h *hostReplacer) authorityStart(b []byte) int {
 // fixed and this one was not.
 const maxHost = 253 * 3
 
-func hostRange(b []byte, at int) (start, end int, port string) {
+func hostRange(b []byte, at int) (start, hostEnd, end int, port string) {
 	end = len(b)
-	if lim := at + maxHost; lim < end {
-		end = lim
-	}
 	// Stop at anything that cannot be in an authority, not just at `/ \ ? #`.
 	//
 	// In an attribute the value *is* the URL, so the end of the buffer is the end
@@ -391,11 +416,35 @@ func hostRange(b []byte, at int) (start, end int, port string) {
 	if k := bytes.LastIndexByte(b[at:end], '@'); k >= 0 {
 		start = at + k + 1
 	}
+	// The cap belongs on the *host*, after userinfo is out of the way. Capping
+	// the whole authority put the userinfo search inside the window, so pushing
+	// the `@` past 759 bytes made the host vanish and the origin leak — silently,
+	// since the byte matcher needs `//` immediately before a host and could not
+	// see it either. A DNS name is 253 octets and percent-encoding inflates that
+	// threefold; nothing longer is a host this map contains. The scan itself is
+	// bounded by isAuthorityByte, and a candidate only starts after a
+	// non-authority byte, so the sum over candidates stays linear without it.
+	if end-start > maxHost {
+		return start, start, start, ""
+	}
+	hostEnd = end
+	// A bracketed IPv6 literal keeps its colons. Splitting at the first one put
+	// half the address in the "host" and the rest in the "port", so an IPv6
+	// variant could not be reversed at all.
+	if start < end && b[start] == '[' {
+		if k := bytes.IndexByte(b[start:end], ']'); k >= 0 {
+			hostEnd = start + k + 1
+			if hostEnd < end && b[hostEnd] == ':' {
+				port = string(b[hostEnd+1 : end])
+			}
+			return start, hostEnd, end, port
+		}
+	}
 	if k := bytes.IndexByte(b[start:end], ':'); k >= 0 {
 		port = string(b[start+k+1 : end])
-		end = start + k
+		hostEnd = start + k
 	}
-	return start, end, port
+	return start, hostEnd, end, port
 }
 
 // percentDecode decodes %XX in a host. The parser percent-decodes before
@@ -433,15 +482,24 @@ func percentDecode(b []byte) []byte {
 //
 // Only token boundaries, so a `//` inside a path or a query cannot be mistaken
 // for an authority.
+// tokenBoundary reports whether a URL could begin at v[i] — the start of the
+// value, or just after a byte that separates one token from the next.
+func tokenBoundary(v []byte, i int) bool {
+	if i == 0 {
+		return true
+	}
+	switch c := v[i-1]; {
+	case c <= 0x20, c == ',', c == '(', c == '=', c == '"', c == '\'', c == ';':
+		return true
+	}
+	return false
+}
+
 func urlTokenStarts(v []byte) []int {
 	var out []int
 	for i := 0; i < len(v); i++ {
-		if i > 0 {
-			switch c := v[i-1]; {
-			case c <= 0x20, c == ',', c == '(', c == '=', c == '"', c == '\'', c == ';':
-			default:
-				continue
-			}
+		if !tokenBoundary(v, i) {
+			continue
 		}
 		if n, _ := schemeLen(v[i:]); n > 0 {
 			out = append(out, i)
@@ -463,7 +521,7 @@ func urlTokenStarts(v []byte) []int {
 // O(k·n) — measured at 55 seconds for a 320 KB attribute value, which
 // extrapolates to hours at the shipped 4 MiB token cap. That is the same bug
 // class scan.go documents having already fixed once.
-func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, until int, to origin.Origin, ok bool) {
+func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, until int, repl string, ok bool) {
 	// The scheme decides which port is the default, so it has to be found
 	// wherever the caller entered. foldedHostLeak enters at the slash *run*, so
 	// looking only forwards saw no scheme and fell back to https — and
@@ -472,13 +530,13 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 	scheme := h.schemeAt(n.b, at)
 	rel := h.authorityStart(n.b[at:])
 	if rel < 0 {
-		return 0, 0, to, false
+		return 0, 0, "", false
 	}
 	start := at + rel
 	if start >= len(n.b) {
-		return 0, 0, to, false
+		return 0, 0, "", false
 	}
-	hs, he, port := hostRange(n.b, start)
+	hs, he, end, port := hostRange(n.b, start)
 	// A trailing dot is the host's root label inside a URL and a full stop in
 	// prose, and only the caller knows which surface it is on — the same
 	// distinction Matcher.RewriteText exists for. Absorbing it in a text node
@@ -487,18 +545,14 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 		he--
 	}
 	if hs >= he {
-		return 0, 0, to, false
+		return 0, 0, "", false
 	}
 	host := h.key(percentDecode(n.b[hs:he]))
-	// host:port first. Backwards, the bare-host pair won and an explicit
-	// :8080 origin was rewritten to the wrong variant — while the byte matcher,
-	// which disambiguates by port, got the same input right, so the two halves
-	// of the engine disagreed. §5.4 says matching is on exact origin equality,
-	// and :8080 is a different origin.
 	// host:port first, and the bare host only when the port is the scheme's
 	// default. §5.4 matches on exact origin equality, so `https://h:80` is a
 	// different origin from `https://h` and rewriting it was a false positive —
 	// one the byte matcher, which disambiguates by port, never made.
+	var to origin.Origin
 	if port != "" {
 		to, ok = h.to[host+":"+port]
 		if !ok && origin.NormalisePort(scheme, port) == "" {
@@ -508,12 +562,52 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 		to, ok = h.to[host]
 	}
 	if !ok {
-		return 0, 0, to, false
+		return 0, 0, "", false
 	}
 	// Whatever the original spelled the host with — a tab, a reference, a
 	// percent escape — the replaced range covers all of it, because pos maps
 	// every surviving byte back and the removed ones lie between them.
-	return n.pos[hs], n.end[he-1], to, true
+	from, until = n.pos[hs], n.end[he-1]
+
+	// The port, and the scheme, when the variant's differ from what is written.
+	//
+	// The splice used to emit to.Host alone, which is right only when the
+	// variant shares the canonical's scheme and has no port — the ddev case, and
+	// the only one anything tested. Anywhere else every obfuscated spelling came
+	// out on the wrong port and the wrong scheme while the plain spelling was
+	// correct, and the round trip then could not reverse it: the reverse table is
+	// keyed host:port, the request parsed a host with no port, and the *variant*
+	// hostname went upstream into the shared database.
+	//
+	// Widening the range to cover the scheme drops the obfuscated separator with
+	// it. That is a fair trade: what replaces it resolves to the same origin, and
+	// one fewer obfuscated URL on the page is not a loss.
+	needScheme := to.Scheme != scheme
+	hasPort := to.Port != "" || portOf(n.b, he, end) != ""
+	switch {
+	case needScheme:
+		// From the scheme through the port: the whole origin, written plainly.
+		return n.pos[at], authorityEnd(n, he, end), to.String(), true
+	case hasPort:
+		return from, authorityEnd(n, he, end), to.HostPort(), true
+	}
+	return from, until, to.Host, true
+}
+
+// authorityEnd is one past the port, or one past the host when there is none.
+func authorityEnd(n normalised, he, end int) int {
+	if end > he {
+		return n.end[end-1]
+	}
+	return n.end[he-1]
+}
+
+// portOf reports the port text between the host end and the authority end.
+func portOf(b []byte, he, end int) string {
+	if end > he && b[he] == ':' {
+		return string(b[he+1 : end])
+	}
+	return ""
 }
 
 // foldedHostLeak catches a host that only *folds* onto a canonical one.
@@ -563,11 +657,17 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 		for run < len(n.b) && isSlashish(n.b[run]) {
 			run++
 		}
-		if run-i < 2 || n.pos[i] < prev {
+		// The same left anchor urlTokenStarts applies. Without it this walked
+		// every `//` in the buffer, so `https://cdn.other/p//ｗｗｗ.example.fi/q`
+		// — where the run is a path separator, not an authority — had its path
+		// segment rewritten, while the plain ASCII spelling of the same URL was
+		// correctly left alone. The two spellings disagreeing is the model error;
+		// the oracle's second half calls it a false positive.
+		if run-i < 2 || n.pos[i] < prev || !tokenBoundary(n.b, i) {
 			i = run - 1
 			continue
 		}
-		from, until, to, ok := w.hosts.locateHostIn(n, i, value)
+		from, until, repl, ok := w.hosts.locateHostIn(n, i, value)
 		if !ok {
 			i = run - 1
 			continue
@@ -575,9 +675,9 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 		// Nothing to do when the bytes already say the variant, and nothing to
 		// do when the host is plain ASCII — that is the byte matcher's job, and
 		// it has already run.
-		if !bytes.Equal(v[from:until], []byte(to.Host)) && hasNonASCII(v[from:until]) {
+		if !bytes.Equal(v[from:until], []byte(repl)) && hasNonASCII(v[from:until]) {
 			out = append(out, v[prev:from]...)
-			out = append(out, to.Host...)
+			out = append(out, repl...)
 			prev = until
 			w.stats.Record(surface, base, []origin.Event{{
 				Offset:  base + from,
@@ -620,12 +720,12 @@ func (w *HTML) normaliseURLLeak(surface string, base int, v []byte, value bool) 
 		if off < len(n.pos) && n.pos[off] < prev {
 			continue // inside a host already replaced
 		}
-		from, until, to, ok := w.hosts.locateHostIn(n, off, value)
+		from, until, repl, ok := w.hosts.locateHostIn(n, off, value)
 		if !ok {
 			continue
 		}
 		out = append(out, v[prev:from]...)
-		out = append(out, to.Host...)
+		out = append(out, repl...)
 		prev = until
 		w.stats.Record(surface, base, []origin.Event{{
 			Offset:  base + from,
@@ -698,7 +798,7 @@ func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte)
 		if off < len(n.pos) && n.pos[off] < prev {
 			continue
 		}
-		from, until, to, ok := h.locateHostIn(n, off, value)
+		from, until, repl, ok := h.locateHostIn(n, off, value)
 		if !ok {
 			continue
 		}
@@ -706,7 +806,7 @@ func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte)
 			continue
 		}
 		out = append(out, v[prev:from]...)
-		out = append(out, to.Host...)
+		out = append(out, repl...)
 		prev = until
 	}
 	if out == nil {

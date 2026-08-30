@@ -55,13 +55,19 @@ func (e encoding) relSep() string {
 // hostPort renders host[:port] for this encoding. Only the port colon needs
 // encoding; hosts are ASCII after punycode.
 func (e encoding) hostPort(o Origin) string {
+	// Brackets for an IPv6 literal — url.Hostname() strips them on the way in,
+	// and without them the replacement is a URL ada refuses to parse at all.
+	h := o.Host
+	if strings.ContainsRune(h, ':') {
+		h = "[" + h + "]"
+	}
 	if o.Port == "" {
-		return o.Host
+		return h
 	}
 	if e == encPercent {
-		return o.Host + "%3A" + o.Port
+		return h + "%3A" + o.Port
 	}
-	return o.Host + ":" + o.Port
+	return h + ":" + o.Port
 }
 
 // pattern is one automaton entry: a left-anchored origin prefix plus a host.
@@ -235,9 +241,15 @@ func (m *Matcher) Identity() bool { return m.ident }
 // substring ban: it is that running this automaton over each *variant* origin
 // yields zero matches. That is what permits a variant host to contain a
 // canonical host, which the leftmost-label prefix scheme requires.
+type hostTarget struct {
+	to   Origin
+	name string
+}
+
 func (m *Matcher) Validate() error {
 	seen := map[Origin]string{}
 	rev := map[Origin]string{}
+	byHost := map[string]hostTarget{}
 	for _, p := range m.pairs {
 		if prev, dup := seen[p.Canonical]; dup {
 			return fmt.Errorf("origin: canonical %s declared by both %q and %q", p.Canonical, prev, p.Name)
@@ -252,6 +264,24 @@ func (m *Matcher) Validate() error {
 			return fmt.Errorf("origin: variant %s produced by both %q and %q — map is not injective", p.Variant, prev, p.Name)
 		}
 		rev[p.Variant] = p.Name
+
+		// One canonical *host* cannot map two ways.
+		//
+		// The scan deliberately ignores the scheme when choosing a pair, and the
+		// rewriter's host table is keyed on host:port with the scheme discarded,
+		// so a map declaring http://h → one and https://h → two is a
+		// configuration the engine cannot represent. It accepted it and reported
+		// "injective and anchored": the byte matcher then sent both spellings to
+		// whichever pair came first, and the locator sent them to whichever was
+		// written last — two blogs' content served from each other's worktree,
+		// with the two halves of the engine disagreeing about which.
+		if prev, dup := byHost[p.Canonical.HostPort()]; dup && prev.to != p.Variant {
+			return fmt.Errorf(
+				"origin: canonical host %s maps to both %s (%q) and %s (%q) — "+
+					"the scan does not distinguish schemes, so only one can win (PLAN §5.4)",
+				p.Canonical.HostPort(), prev.to, prev.name, p.Variant, p.Name)
+		}
+		byHost[p.Canonical.HostPort()] = hostTarget{to: p.Variant, name: p.Name}
 	}
 	if m.ident {
 		return nil // an identity map is trivially anchored against itself
