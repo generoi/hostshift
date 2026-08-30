@@ -155,4 +155,22 @@ removal_actions:
     rm -f "$tmp"
   - |
     #ddev-nodisplay
-    echo "hostshift removed. wp-cli.local.yml, if you generated one, is yours to delete."
+    # Everything DDEV does not take away itself. docker-compose.hostshift-loopback.yaml
+    # carries no #ddev-generated marker — deliberately, since `ddev hostshift
+    # loopback` writes it per project — so `add-on remove` leaves it, and a
+    # loopback file left behind goes on pinning production hostnames to 127.0.0.1
+    # inside web after the thing that needed it is gone. The HOSTSHIFT_ block in
+    # .ddev/.env is inert once the compose service is gone, but it is still this
+    # add-on's litter in the developer's project file.
+    left=""
+    [ -f .ddev/docker-compose.hostshift-loopback.yaml ] && left="$left
+      .ddev/docker-compose.hostshift-loopback.yaml — pins production hostnames to 127.0.0.1 in web"
+    grep -qs '^HOSTSHIFT_' .ddev/.env && left="$left
+      the HOSTSHIFT_ lines in .ddev/.env"
+    [ -f wp-cli.local.yml ] && left="$left
+      wp-cli.local.yml"
+    if [ -n "$left" ]; then
+      echo "hostshift removed. These are yours to delete:$left"
+    else
+      echo "hostshift removed."
+    fi

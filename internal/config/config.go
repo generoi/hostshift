@@ -363,28 +363,54 @@ func deriveVariant(explicit, base, canonical, pattern, slug, name string) (origi
 			name, slug, host, err)
 	}
 	if v.Host != strings.ToLower(host) || !validHostLabels(v.Host) {
+		// Name the actual problem. "use only letters, digits and hyphens" is
+		// unhelpful advice for a slug that is already only letters, digits and
+		// hyphens and is simply too long — and length is the reachable case,
+		// since the slug prefixes the leftmost label rather than replacing it.
+		hint := "slugs become hostname labels, so use only letters, digits and hyphens"
+		if l := longestLabel(strings.ToLower(host)); l > 63 {
+			hint = fmt.Sprintf(
+				"that host has a %d-character label and DNS allows 63 — "+
+					"the slug prefixes the leftmost label, so shorten the slug", l)
+		}
 		return origin.Origin{}, fmt.Errorf(
-			"site %q: --slug %q derives %q, which is not a usable hostname\n"+
-				"slugs become hostname labels, so use only letters, digits and hyphens",
-			name, slug, host)
+			"site %q: --slug %q derives %q, which is not a usable hostname\n%s",
+			name, slug, host, hint)
 	}
 	return v, nil
 }
 
-// validHostLabels checks each dot-separated label is non-empty and starts and
-// ends alphanumeric. A slug ending in "." derives "wt-a.--acmecorp.ddev.site",
-// whose second label starts with a hyphen — DNS-invalid, and it resolves or not
-// depending on the resolver rather than failing at startup where it belongs.
+// validHostLabels checks each dot-separated label is non-empty, no longer than
+// RFC 1035's 63 octets, and starts and ends alphanumeric.
+//
+// A slug ending in "." derives "wt-a.--acmecorp.ddev.site", whose second label
+// starts with a hyphen — DNS-invalid, and it resolves or not depending on the
+// resolver rather than failing at startup where it belongs. The length is the
+// same class: the variant prefixes the leftmost label, so a 30-character slug on
+// a 32-character label derives a 64-octet one. Nothing rejected it — the map
+// reported "injective and anchored" and exit 0 — and it fails later, as a
+// certificate mkcert will not issue a SAN for, which presents as a browser
+// warning rather than as a naming mistake.
 func validHostLabels(h string) bool {
 	alnum := func(c byte) bool {
 		return c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
 	}
 	for _, l := range strings.Split(h, ".") {
-		if l == "" || !alnum(l[0]) || !alnum(l[len(l)-1]) {
+		if l == "" || len(l) > 63 || !alnum(l[0]) || !alnum(l[len(l)-1]) {
 			return false
 		}
 	}
 	return true
+}
+
+func longestLabel(h string) int {
+	n := 0
+	for _, l := range strings.Split(h, ".") {
+		if len(l) > n {
+			n = len(l)
+		}
+	}
+	return n
 }
 
 func portSuffix(o origin.Origin) string {
