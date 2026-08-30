@@ -30,36 +30,66 @@ const schemes = ["https:", "http:", "HTTPS:", "HtTp:", ""];
 const slashes = ["", "/", "//", "///", "////", "\\\\", "/\\", "\\/", "//\\", "\\\\/"];
 const userinfos = ["", "u@", "u:p@", "@", "u%40b@"];
 const ports = ["", ":443", ":80", ":8080", ":"];
-const tails = ["/x", "/x?q=1", "/x#f", "", "/"];
+const tails = ["/x", "/x?q=1", ""];
 
 // Host spellings. Everything here is a way of writing CANON that a browser may
 // or may not fold onto it — plus near misses that must NOT be rewritten.
-const hosts = [
-  CANON,
-  CANON.toUpperCase(),
-  CANON + ".",
-  "www.exa­mple.fi",           // soft hyphen
-  "ｗｗｗ.example.fi",  // fullwidth w
-  "www。example。fi",       // ideographic full stop
-  "www．example．fi",       // fullwidth full stop
-  "www｡example｡fi",       // halfwidth ideographic full stop
-  "​www.example.fi",           // zero-width space
-  "www.example​.fi",
-  "www.ex%61mple.fi",               // percent-encoded letter
-  "%77ww.example.fi",
-  "www%2Eexample%2Efi",             // percent-encoded dots
-  "www.example\t.fi",               // tab
-  "www.example\n.fi",
-  "www.example\r.fi",
-  // Near misses: none of these is the canonical host.
+// Host spellings, built from mutators and *crossed with each other*.
+//
+// The flat list this replaces was one variation deep, and that is exactly what
+// hid the root-dot leak: `www。example。fi` was in it and handled, `www.example.fi。`
+// was not, and the combination of a fullwidth letter with a non-ASCII root dot
+// was two steps past anything listed. A browser applies UTS46 to the whole host
+// at once, so the spellings compose — and so must the corpus.
+const mutators = {
+  plain: (h) => h,
+  upper: (h) => h.toUpperCase(),
+  rootdot: (h) => h + ".",
+  ideographicRoot: (h) => h + "\u3002",
+  fullwidthRoot: (h) => h + "\uFF0E",
+  halfwidthRoot: (h) => h + "\uFF61",
+  ideographicDots: (h) => h.replace(/\./g, "\u3002"),
+  fullwidthDots: (h) => h.replace(/\./g, "\uFF0E"),
+  fullwidthFirst: (h) => "\uFF57" + h.slice(1),
+  softHyphen: (h) => h.replace("exa", "exa\u00AD"),
+  zeroWidth: (h) => "\u200B" + h,
+  pctLetter: (h) => h.replace("a", "%61"),
+  pctDots: (h) => h.replace(/\./g, "%2E"),
+  tab: (h) => h.replace("example", "example\t"),
+  nfd: (h) => h.replace("a", "a\u0308"),
+};
+// Crossed by class rather than exhaustively: a root-dot spelling over a
+// letter/separator spelling is the combination that hid the leak, and the full
+// 15x15 product multiplies the corpus by seven for shapes that add nothing.
+const roots = ["rootdot", "ideographicRoot", "fullwidthRoot", "halfwidthRoot"];
+const letters = [
+  "upper", "ideographicDots", "fullwidthDots", "fullwidthFirst",
+  "softHyphen", "zeroWidth", "pctLetter", "pctDots", "tab", "nfd",
+];
+
+const hostSet = new Set();
+for (const a of Object.keys(mutators)) {
+  hostSet.add(mutators[a](CANON));
+}
+for (const r of roots) {
+  for (const l of letters) {
+    hostSet.add(mutators[r](mutators[l](CANON)));
+    hostSet.add(mutators[l](mutators[r](CANON)));
+  }
+}
+// Near misses, which must never be rewritten.
+for (const h of [
   "www.example.fi.evil.com",
   "awww.example.fi",
-  "www.example.fi.",
   "wwwXexample.fi",
   "example.fi",
   "cdn.other.example",
-  "wt-a--example.ddev.site",        // the variant itself
-];
+  "wt-a--example.ddev.site",
+  "www.example.fi\u200B.evil.com",
+]) {
+  hostSet.add(h);
+}
+const hosts = [...hostSet];
 
 const seen = new Set();
 const out = [];

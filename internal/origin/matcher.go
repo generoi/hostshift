@@ -351,6 +351,16 @@ func isHostByte(c byte) bool {
 		return true
 	case c == '-' || c == '.' || c == '_':
 		return true
+	// Non-ASCII is a host byte, because an IDN label is made of it. Treating it
+	// as a terminator meant a canonical host followed by any non-ASCII character
+	// matched its ASCII prefix and was rewritten in place — and the whole host is
+	// then a *different* host: `https://www.example.fi—now` resolves to
+	// www.example.xn--finow-5u3b, not the canonical, so rewriting it changed a
+	// URL that never pointed at production, and `https://www.example.fi。:80`
+	// came out as a mangled `variant。:80`. Leaving them to the fold pass, which
+	// folds the whole host and checks the port, gets all of them right.
+	case c >= 0x80:
+		return true
 	}
 	return false
 }
