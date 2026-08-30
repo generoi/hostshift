@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -451,6 +452,16 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			return nil
 		}
 
+	case isAttachment(resp.Header):
+		// A download is a file the developer saves, not a page the browser
+		// renders, so the hostnames in it outlive this machine. `Tools → Export`
+		// returns text/xml with Content-Disposition: attachment, and every
+		// `<link>`, `<guid>` and `<wp:base_site_url>` in the WXR came back naming
+		// a worktree — a file that looks fine, imports fine, and points at a
+		// hostname that exists on one machine. The canonical origin is the right
+		// answer in an artifact meant to be carried somewhere else.
+		return nil
+
 	case rewritableText(ct):
 		// Buffered and swept like JSON, without a grammar.
 		//
@@ -643,6 +654,18 @@ func rewritableHTML(ct string) bool {
 	// references in attribute values exactly as HTML does, and §4.4 calls that
 	// surface safety-critical.
 	return mt == "text/html" || mt == "application/xhtml+xml"
+}
+
+// isAttachment reports whether the response is offered as a download.
+func isAttachment(h http.Header) bool {
+	d := h.Get("Content-Disposition")
+	if d == "" {
+		return false
+	}
+	if t, _, err := mime.ParseMediaType(d); err == nil {
+		return strings.EqualFold(t, "attachment")
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(d)), "attachment")
 }
 
 // rewritableText is the set that carries origins in no grammar the rewriter

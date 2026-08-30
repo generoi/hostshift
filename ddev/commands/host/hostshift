@@ -512,13 +512,29 @@ map_args=()
 # Adopting production-canonical is exactly the moment worktrees exist on older
 # branches, so this is the common case rather than the odd one.
 parent_declares=""
-if [ ! -f hostshift.yaml ] && [ -n "$parent" ] && [ -f "$parent/hostshift.yaml" ]; then
-  parent_declares="$parent/hostshift.yaml"
+parent_declares_msg=""
+parent_declares_warn() {
   echo "hostshift: warning: $parent_declares declares the hostnames its database" >&2
   echo "  holds, and this worktree's branch predates it — so the map below was" >&2
   echo "  built from that checkout's DDEV hostnames instead, and would rewrite" >&2
   echo "  nothing. Every link would point at the canonical site." >&2
   echo "  Merge the branch that adds hostshift.yaml, or copy it here." >&2
+}
+if [ ! -f hostshift.yaml ] && [ -n "$parent" ] && [ -f "$parent/hostshift.yaml" ]; then
+  parent_declares="$parent/hostshift.yaml"
+  # Held, not printed, when `check` is the one asking.
+  #
+  # The database is consulted much further down, and it is what decides whether
+  # this warning describes reality. Printing it up here meant a healthy worktree
+  # — 200s, every link rewritten, the database still holding DDEV hostnames —
+  # said "would rewrite nothing, every link would point at the canonical site"
+  # on every start, and recommended the one action this file's own comments call
+  # "the action that silently breaks the site" in that state.
+  if [ "$cmd" = "check" ]; then
+    parent_declares_msg=1
+  else
+    parent_declares_warn
+  fi
 fi
 
 if [ ! -f hostshift.yaml ] && [ -n "$unreadable_parent" ]; then
@@ -1053,8 +1069,23 @@ if [ "$cmd" = "check" ]; then
   # One query separates them, and the add-on already talks to this database in
   # copy-db. Best-effort throughout: no container, no WordPress, an unusual table
   # prefix or a stopped db all yield nothing, and nothing is not evidence.
+  # ${DB_HOST:-db} — the database the *application* reads, not the one beside it.
+  #
+  # `-h db` is the worktree's own container, and the README's headline answer to
+  # "the worktree has an empty database" is to share the parent's. On exactly
+  # that configuration the query hit an idle container holding a leftover
+  # install, so a site serving 200s with every link correctly rewritten was told
+  # its database names a hostname the map does not cover — refused on every
+  # start, every clause false. Worse, the remedy it printed is destructive there:
+  # `ddev wp` targets the parent, so the search-replace it recommends would
+  # rewrite the parent's real content to a throwaway worktree hostname.
+  #
+  # copy-db thirty lines up already asks the web container for DB_HOST for this
+  # exact reason. Running the query inside the container with its own environment
+  # inherits that knowledge instead of duplicating it.
   dbhome="$(ddev exec -s web bash -c \
-    "mysql -h db -udb -pdb -N -B -e \"select option_value from wp_options where option_name='home' limit 1\" db" \
+    "mysql -h \"\${DB_HOST:-db}\" -u\"\${DB_USER:-db}\" -p\"\${DB_PASSWORD:-db}\" -N -B \
+     -e \"select option_value from wp_options where option_name='home' limit 1\" \"\${DB_NAME:-db}\"" \
     2>/dev/null | tail -1 | tr -d '\r' || true)"
   dbhost=""
   case "$dbhome" in
@@ -1078,13 +1109,16 @@ if [ "$cmd" = "check" ]; then
       echo "  checkout. \`ddev hostshift wp-cli\` and a search-replace move it." >&2
       exit 2
     fi
-    # The database agrees with the deployed map, so the warning above — that this
-    # worktree's branch predates a hostshift.yaml — describes a state that has
-    # not arrived yet. Refusing here failed the hook on a site serving 200s.
+    # The database agrees with the deployed map, so the warning held above — that
+    # this worktree's branch predates a hostshift.yaml — describes a state that
+    # has not arrived yet. Refusing *or printing it* failed the hook, and told
+    # the developer to take the action that breaks the site.
     parent_declares=""
+    parent_declares_msg=""
   fi
 
   if [ -n "$parent_declares" ]; then
+    [ -n "$parent_declares_msg" ] && parent_declares_warn
     echo "hostshift: refusing to call this healthy — see the warning above." >&2
     echo "  The map does not name the hostnames the database holds." >&2
     exit 2
@@ -1173,22 +1207,41 @@ if [ "$cmd" = "check" ]; then
     # yet. A single request would turn that ordinary race into a refusal on a
     # perfectly good project, and a check that cries wolf on every cold start is
     # worse than the gap it closes.
+    # The router's port, and no proxy. DDEV supports a non-443 router port — the
+    # standard remedy when something else owns 443 — and exports it to host
+    # commands; without it the probe asked the wrong port and got nothing. An
+    # https_proxy in the shell had the same effect.
+    port=""
+    case "${DDEV_ROUTER_HTTPS_PORT:-443}" in 443|"") ;; *) port=":$DDEV_ROUTER_HTTPS_PORT" ;; esac
     code=""
+    rc=0
     for attempt in 1 2 3; do
-      code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://$probe/" 2>/dev/null || true)"
+      code="$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' \
+        --connect-timeout 3 --max-time 10 "https://$probe$port/" 2>/dev/null)" || rc=$?
       case "$code" in
-        000|502|503|504) [ "$attempt" = 3 ] || sleep 2 ;;
+        000|502) [ "$attempt" = 3 ] || sleep 2 ;;
         *) break ;;
       esac
     done
+    # 28 is curl's timeout. A slow homepage — a cold opcache on a bind mount,
+    # xdebug on, a heavy plugin set — is a site that answers, not a routing
+    # failure, and refusing there cost 35 seconds on every boot and then blamed
+    # the router. 503 and 504 are dropped for the same reason: maintenance-mode
+    # plugins and WordPress core itself send 503 while `.maintenance` exists, and
+    # an application that answers has answered.
+    if [ "$rc" = 28 ]; then
+      code="slow"
+    fi
     case "$code" in
-      000|502|503|504)
+      000|502)
         echo "hostshift: everything is configured correctly, but https://$probe/" >&2
         echo "  answers ${code:-nothing} — so something between the router and the" >&2
         echo "  proxy is broken, not the configuration." >&2
         echo "  A stale router from a renamed project does this, and so does" >&2
-        echo "  another project claiming the same hostname. \`ddev restart\`, and" >&2
-        echo "  if that does not clear it, \`ddev poweroff\` retires the routers." >&2
+        echo "  another project claiming the same hostname. Try \`ddev restart\`," >&2
+        echo "  then \`ddev stop && ddev start\` — which clears a stale router that" >&2
+        echo "  a restart does not — and only then \`ddev poweroff\`, which retires" >&2
+        echo "  every project's routers." >&2
         exit 2 ;;
     esac
   fi

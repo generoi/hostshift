@@ -115,6 +115,17 @@ func main() {
 // subcommand is for, and sends an explicitly requested help to stdout with exit
 // 0 rather than to stderr with exit 2. `hostshift check --help` printed nine
 // flags and not one word about what it checks.
+// rewritableText mirrors the proxy's set, so `rewrite --type` and the proxy
+// cannot disagree about the same bytes.
+func rewritableText(mt string) bool {
+	switch mt {
+	case "text/plain", "text/xml", "application/xml",
+		"application/rss+xml", "application/atom+xml", "image/svg+xml":
+		return true
+	}
+	return strings.HasSuffix(mt, "+xml")
+}
+
 func describe(fs *flag.FlagSet, args []string, what string) (helped bool) {
 	fs.Usage = func() {
 		w := fs.Output()
@@ -240,7 +251,7 @@ func cmdRewrite(args []string) (int, error) {
 
 	var src io.Reader = os.Stdin
 	switch {
-	case mt == "text/html":
+	case mt == "text/html" || mt == "application/xhtml+xml":
 		src = rewrite.NewResponseBody(os.Stdin, m, nil, rewrite.Options{
 			DryRun:  *dryRun,
 			NoSweep: *noSweep,
@@ -255,6 +266,29 @@ func cmdRewrite(args []string) (int, error) {
 		}
 		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 		out := rewrite.RewriteJSON(body, m, st, log, *explain)
+		if !*noSweep {
+			out = rewrite.SweepBytes(out, m, st, log)
+		}
+		if *dryRun {
+			out = body
+		}
+		src = bytes.NewReader(out)
+
+	case rewritableText(mt):
+		// The same set the proxy rewrites. `rewrite` is documented as "the same
+		// engine", and it was not: text/plain, XML, RSS and SVG streamed through
+		// byte-identical with no counters and nothing from --explain, while the
+		// proxy rewrote every one of them. A developer debugging why a feed or a
+		// sitemap looks wrong pipes it through here, sees an empty counter block,
+		// and concludes the engine cannot do it — at the moment it just learned.
+		body, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return exitRuntime, err
+		}
+		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		out, ev := m.RewriteText(body, rewrite.SurfaceText, *explain)
+		st.Record(rewrite.SurfaceText, 0, ev)
+		out = rewrite.HostLeaks(m, out, false)
 		if !*noSweep {
 			out = rewrite.SweepBytes(out, m, st, log)
 		}

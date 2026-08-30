@@ -161,3 +161,64 @@ func TestResponseContentTypes(t *testing.T) {
 		})
 	}
 }
+
+// A download is a file the developer saves, not a page the browser renders, so
+// the hostnames in it outlive this machine. `Tools → Export` returns text/xml
+// with Content-Disposition: attachment, and every <link>, <guid> and
+// <wp:base_site_url> in the WXR came back naming a worktree — a file that looks
+// fine, imports fine, and points at a hostname that exists on one machine.
+func TestDownloadsAreNotRewritten(t *testing.T) {
+	mp, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://acme.ddev.site"),
+		Variant:   origin.MustParse("https://wt-a--acme.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = `<rss><link>https://acme.ddev.site/post</link></rss>`
+
+	for _, c := range []struct {
+		name, disposition string
+		rewrite           bool
+	}{
+		{"an export", "attachment; filename=\"acme.WordPress.xml\"", false},
+		{"a bare attachment", "attachment", false},
+		{"an inline body", "inline", true},
+		{"no disposition at all", "", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/xml; charset=UTF-8")
+				if c.disposition != "" {
+					w.Header().Set("Content-Disposition", c.disposition)
+				}
+				w.Write([]byte(body))
+			}))
+			defer up.Close()
+			upURL, err := url.Parse(up.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := &Proxy{Map: mp, Upstream: upURL, Stats: rewrite.NewStats(false)}
+			srv := httptest.NewServer(p.Handler())
+			defer srv.Close()
+
+			req, _ := http.NewRequest("GET", srv.URL+"/export", nil)
+			req.Host = "wt-a--acme.ddev.site"
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			got, _ := io.ReadAll(resp.Body)
+
+			if c.rewrite && !strings.Contains(string(got), "wt-a--acme.ddev.site") {
+				t.Errorf("not rewritten:\n%s", got)
+			}
+			if !c.rewrite && string(got) != body {
+				t.Errorf("a download was rewritten, so it names a hostname that exists on one machine:\n%s", got)
+			}
+		})
+	}
+}
