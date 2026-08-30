@@ -570,15 +570,28 @@ here="$(pwd -P)"
 #
 # ~/.ddev/project_list.yaml holds every project's approot. Siblings stay in the
 # list because a project that has never been started is not in the registry yet.
+# `|| true` on the registry read, and newline-delimited iteration.
+#
+# `[ -f "$reg" ] && sed …` was the last command of the group, so a missing
+# project_list.yaml made the group exit 1, pipefail made the pipeline exit 1, the
+# assignment inherited it and `set -e` killed the script — no diagnostic, exit 1
+# rather than the documented 2, on a DDEV install that has never registered a
+# project. That is the same class the block below documents having already fixed
+# once. And `for x in $list` splits on spaces, so an approot under
+# `~/My Projects/` was invisible to the very check that exists for "two
+# developers with worktrees under their own home directories".
 scan_dirs="$(
   {
     for d in ../*/; do printf '%s\n' "${d%/}"; done
     reg="${DDEV_GLOBAL_CONFIG:-$HOME/.ddev}/project_list.yaml"
-    [ -f "$reg" ] && sed -n 's/^[[:space:]]*approot:[[:space:]]*//p' "$reg"
-  } 2>/dev/null | LC_ALL=C sort -u
+    if [ -f "$reg" ]; then
+      sed -n 's/^[[:space:]]*approot:[[:space:]]*//p' "$reg"
+    fi
+  } 2>/dev/null | LC_ALL=C sort -u || true
 )"
 
-for other_dir in $scan_dirs; do
+while IFS= read -r other_dir; do
+  [ -n "$other_dir" ] || continue
   other="$other_dir/.ddev/.env"
   [ -f "$other" ] || continue
   odir="$(cd "$other_dir" 2>/dev/null && pwd -P)" || continue
@@ -650,7 +663,7 @@ for other_dir in $scan_dirs; do
       break ;;
     esac
   done
-done
+done <<<"$scan_dirs"
 
 
 # web keeps this project's own hostnames, minus the variants and minus the

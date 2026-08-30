@@ -100,16 +100,22 @@ func (h *hostReplacer) sameSchemeAsDocument(scheme string) bool {
 // bytes with it. §5.5 calls IDN real for .fi client domains, and NFD is what a
 // macOS filesystem or a paste produces without anyone trying.
 func (h *hostReplacer) key(b []byte) string {
-	s := strings.TrimSuffix(strings.ToLower(string(b)), ".")
+	s := strings.ToLower(string(b))
 	// Origins store an IPv6 literal unbracketed — url.Hostname() strips them —
 	// so the lookup key has to match that.
 	if len(s) > 1 && s[0] == '[' && s[len(s)-1] == ']' {
 		return s[1 : len(s)-1]
 	}
 	if a, err := origin.HostFold(s); err == nil {
-		return a
+		s = a
 	}
-	return s
+	// After the fold, not before. UTS46 *produces* an ASCII root dot from
+	// U+3002, U+FF0E and U+FF61, so trimming first left `www。example。fi。`
+	// folding to `www.example.fi.` against a table keyed `www.example.fi` — a
+	// miss, and a dereferenceable production origin in a plain `<a href>` with
+	// no userinfo, no odd slashes and no encoding trick, on every surface and
+	// every content type.
+	return strings.TrimSuffix(s, ".")
 }
 
 func isURLStripped(c byte) bool { return c == '\t' || c == '\n' || c == '\r' }
@@ -339,8 +345,19 @@ func (h *hostReplacer) schemeAt(b []byte, at int) string {
 	if _, s := schemeLen(b[at:]); s != "" {
 		return s
 	}
+	// Back past the slash run, not just one byte. A candidate sits at the start
+	// of a run, and `https:///host`'s authority is three slashes from its
+	// scheme — looking only at the immediately preceding byte saw none, so the
+	// reference was resolved under the *variant's* scheme rather than its own
+	// written one. With an http variant that made `:80` a default port, and a
+	// URL naming a different origin was rewritten. Candidates are emitted only
+	// at run starts, so this terminates immediately.
+	j := at
+	for j > 0 && isSlashish(b[j-1]) {
+		j--
+	}
 	for _, s := range []string{"https:", "http:"} {
-		if at >= len(s) && hasFoldPrefixASCII(b[at-len(s):at], s) {
+		if j >= len(s) && hasFoldPrefixASCII(b[j-len(s):j], s) {
 			return strings.TrimSuffix(s, ":")
 		}
 	}
@@ -484,15 +501,25 @@ func percentDecode(b []byte) []byte {
 // for an authority.
 // tokenBoundary reports whether a URL could begin at v[i] — the start of the
 // value, or just after a byte that separates one token from the next.
+// tokenBoundary reports whether a URL could begin at v[i].
+//
+// Defined by what cannot precede one, not by a list of what can. The list was
+// space, comma, paren, equals, quote and semicolon — which is the same mistake
+// isHostByte's comment says it exists to avoid, "an allowlist of terminators …
+// guarantees a long tail of misses", made on the other side of the host. `>` was
+// not in it, and XML element content always begins right after `>`: the whole
+// obfuscated-URL family was invisible in a sitemap or a feed, on the very arm
+// that was added for them, while the same bytes one space later rewrote fine.
 func tokenBoundary(v []byte, i int) bool {
 	if i == 0 {
 		return true
 	}
-	switch c := v[i-1]; {
-	case c <= 0x20, c == ',', c == '(', c == '=', c == '"', c == '\'', c == ';':
-		return true
-	}
-	return false
+	c := v[i-1]
+	// Brackets are authority bytes because an IPv6 literal is written in them,
+	// but nothing continues *through* one — `]https://h` and `[https://h` both
+	// begin a URL — so they are boundaries here even though they are host bytes
+	// there.
+	return c == '[' || c == ']' || !isAuthorityByte(c)
 }
 
 func urlTokenStarts(v []byte) []int {
@@ -507,6 +534,14 @@ func urlTokenStarts(v []byte) []int {
 		}
 		if isSlashish(v[i]) {
 			out = append(out, i)
+			// Past the whole run. Every byte inside one used to be its own
+			// candidate, which is redundant — authorityStart walks the run from
+			// wherever it is asked, so they all reach the same authority — and it
+			// made schemeAt's backwards walk quadratic in the run's length: 4x
+			// the input cost 18x the time, caught by the scaling guard.
+			for i+1 < len(v) && isSlashish(v[i+1]) {
+				i++
+			}
 		}
 	}
 	return out
@@ -591,7 +626,10 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 	case hasPort:
 		return from, authorityEnd(n, he, end), to.HostPort(), true
 	}
-	return from, until, to.Host, true
+	// to.HostPort() rather than to.Host: it brackets an IPv6 literal, and the
+	// bare host produced `https://2001:db8::1/x`, which the parser rejects. The
+	// other two arms already went through String()/HostPort(); this one did not.
+	return from, until, to.HostPort(), true
 }
 
 // authorityEnd is one past the port, or one past the host when there is none.

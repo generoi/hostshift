@@ -635,7 +635,14 @@ func (p *Proxy) isCanonicalDomain(d string) bool {
 // it for free. text/css and application/javascript are deliberately excluded per
 // Tier 2: 88 CSS and 185 JS files in the fleet's themes, zero absolute URLs.
 func rewritableHTML(ct string) bool {
-	return strings.EqualFold(mediaType(ct), "text/html")
+	mt := strings.ToLower(mediaType(ct))
+	// application/xhtml+xml is HTML. rewritableText's `+xml` suffix swallowed it
+	// into the flat arm, which has no attribute-value decode at all — so
+	// `href="https:&#47;&#47;host"` went out untouched while the byte-identical
+	// body under text/html was rewritten. XML parses numeric character
+	// references in attribute values exactly as HTML does, and §4.4 calls that
+	// surface safety-critical.
+	return mt == "text/html" || mt == "application/xhtml+xml"
 }
 
 // rewritableText is the set that carries origins in no grammar the rewriter

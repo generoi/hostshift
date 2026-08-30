@@ -250,6 +250,34 @@ mkdir -p "$reg"
 printf 'faraway:\n    approot: %s\n' "$far" > "$reg/project_list.yaml"
 out="$(cd "$wt" && DDEV_GLOBAL_CONFIG="$reg" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a colliding project that is not a sibling is found" "already claims" "$out"
+
+# An approot with a space in it. `for x in $list` splits on it, so the check
+# that exists for "two developers with worktrees under their own home
+# directories" was blind to `~/My Projects/…`.
+spaced="$work/My Projects/faraway"
+mkdir -p "$spaced/.ddev"
+printf 'HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site\n' > "$spaced/.ddev/.env"
+printf 'name: spaced\n' > "$spaced/.ddev/config.yaml"
+printf 'spaced:\n    approot: %s\n' "$spaced" > "$reg/project_list.yaml"
+out="$(cd "$wt" && DDEV_GLOBAL_CONFIG="$reg" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "an approot containing a space is not skipped" "already claims" "$out"
+rm -rf "$work/My Projects"
+
+# A DDEV install that has never registered a project. The read used to abort the
+# whole script under `set -e`, with no diagnostic and exit 1 rather than 2.
+rm -f "$reg/project_list.yaml"
+# In an `if` condition, because this suite runs under `set -e` and the whole
+# point is a command that may exit non-zero.
+if out="$(cd "$wt" && DDEV_GLOBAL_CONFIG="$reg" "$cmd" check --slug wt-a 2>&1)"; then
+  rc=0
+else
+  rc=$?
+fi
+if [ "$rc" = 1 ] && [ -z "$out" ]; then
+  fail "a missing project_list.yaml is survivable" "exit 1, silent"
+else
+  pass "a missing project_list.yaml is survivable"
+fi
 rm -rf "$work/elsewhere" "$reg"
 
 # The checkout a worktree branches from has no canonical/variant distinction to

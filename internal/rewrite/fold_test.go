@@ -34,6 +34,14 @@ func TestFoldedHostsAreRewritten(t *testing.T) {
 		{"halfwidth ideographic full stop", "www｡example｡fi"},
 		{"zero-width space", "​www.example.fi"},
 		{"uppercase", "WWW.EXAMPLE.FI"},
+		// UTS46 *produces* an ASCII root dot from these, and the trim used to run
+		// before the fold — so the table, keyed without one, missed. A plain
+		// <a href> with no userinfo, no odd slashes and no encoding trick, on
+		// every surface and every content type.
+		{"ideographic full stop as the root dot", "www。example。fi。"},
+		{"fullwidth full stop as the root dot", "www．example．fi．"},
+		{"halfwidth ideographic root dot", "www｡example｡fi｡"},
+		{"a fullwidth letter and a non-ASCII root dot", "ｗww.example.fi。"},
 	} {
 		// Every surface, not only a URL attribute: a production origin in a text
 		// node, an inline script, a stylesheet or a comment is still one the

@@ -179,6 +179,30 @@ func TestRootDotIsPunctuationInProse(t *testing.T) {
 	}
 }
 
+// XML element content begins right after `>`, and the boundary test was an
+// allowlist that did not include it — so the whole obfuscated-URL family was
+// invisible in a sitemap or a feed, on the arm that was added for them, while
+// the same bytes one space later rewrote fine. A boundary is now anything that
+// cannot be in an authority, which is how the byte matcher has always defined
+// the other end of a host.
+func TestBoundariesAreNotAnAllowlist(t *testing.T) {
+	m := obfMatcher(t)
+	for _, prefix := range []string{"", " ", ">", "<", ")", "]", "&", "#", "|", "\t", "\n"} {
+		t.Run("prefix "+prefix, func(t *testing.T) {
+			in := prefix + `https:\\www.example.fi/x`
+			out := string(HostLeaks(m, []byte(in), false))
+			if strings.Contains(out, "www.example.fi") {
+				t.Errorf("a production origin survives after %q:\n%s", prefix, out)
+			}
+		})
+	}
+	// ...and a slash run inside a path is still not an authority.
+	in := `https://cdn.other.test/p//www.example.fi/q`
+	if out := string(HostLeaks(m, []byte(in), false)); out != in {
+		t.Errorf("a path segment was rewritten:\n got %s\nwant %s", out, in)
+	}
+}
+
 // The census has to see them too. A leak the counters call zero is a leak
 // nobody goes looking for, and --json reporting a clean page is what made this
 // survive three audit rounds.

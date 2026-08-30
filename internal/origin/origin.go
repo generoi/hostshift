@@ -111,7 +111,10 @@ var hostFold = idna.New(
 )
 
 func normaliseHost(h string) (string, error) {
-	h = strings.ToLower(strings.TrimSuffix(h, "."))
+	// Lowercased here, root dot trimmed *after* the fold: UTS46 produces an
+	// ASCII root dot from U+3002, U+FF0E and U+FF61, so trimming first left one
+	// behind on exactly the spellings the fold exists to catch.
+	h = strings.ToLower(h)
 	a, err := hostFold.ToASCII(h)
 	if err != nil {
 		// A host this cannot map is still a host someone declared. Fall back to
@@ -119,11 +122,11 @@ func normaliseHost(h string) (string, error) {
 		// unable to fold an exotic spelling is a reason to compare it literally,
 		// not a reason to fail at startup.
 		if p, perr := idna.Punycode.ToASCII(h); perr == nil {
-			return p, nil
+			return strings.TrimSuffix(p, "."), nil
 		}
 		return "", fmt.Errorf("punycode %q: %w", h, err)
 	}
-	return a, nil
+	return strings.TrimSuffix(a, "."), nil
 }
 
 // HostFold exposes the browser's domain-to-ASCII for callers that parse a host
