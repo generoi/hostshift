@@ -236,13 +236,10 @@ before.
 
 ### `hostshift.yaml` — only for aliases, or for production-canonical
 
-**`ddev restart` after editing it.** The proxy reads the file once, at startup,
-and nothing detects that you have changed it since — `ddev hostshift check`
-compares `.ddev/.env` and the running container's command line, and neither moves
-when the file's contents do. Two attempts at detecting this were worse than the
-gap: a checksum recorded at `init` time called a correctly-restarted project
-stale, and comparing the file's timestamp against the container's proved
-unreliable across platforms.
+**`ddev restart` after editing it.** The proxy reads the file once, at startup.
+`ddev hostshift check` catches it if you forget: the proxy prints its resolved
+map to stderr when it starts, so `check` compares that against what this
+checkout resolves to now and refuses to call a stale proxy healthy.
 
 Not needed because a site is a multisite. Needed for the two things a DDEV
 config genuinely cannot say: **alias hostnames**, so a residual `@staging` URL
@@ -331,7 +328,10 @@ Flags worth knowing:
   default; it exists for performance work where transfer size must resemble
   production.
 
-Exit codes: 0 success, 1 runtime error, 2 invalid configuration.
+Exit codes: 0 success, 1 runtime error, 2 invalid configuration. These are the
+binary's. DDEV collapses a host command's status to 1, so a script testing
+`ddev hostshift check` for `-eq 2` will never match — test for non-zero, or call
+`hostshift` directly.
 
 `hostshift diff -n 20` is the check that validates a deployment against
 reality: it crawls N pages canonically, fetches the same N through the proxy,

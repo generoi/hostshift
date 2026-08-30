@@ -136,25 +136,37 @@ code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://${tag}-wt-
 out="$(cd "$wt" && ddev hostshift check 2>&1)" && pass "check passes a live worktree" \
   || fail "check passes a live worktree" "$out"
 
-# ...and stops passing it the moment a sibling claims the same hostname. Two
-# projects on one hostname is an error nowhere in DDEV — traefik breaks the tie
-# by rule length and the loser is silently unreachable — so `check` refusing is
-# the only thing standing between a developer and reviewing the wrong branch's
-# code at the right URL. The scan reads `../*/.ddev/.env`, so a bare directory
-# is enough to stage it; no second DDEV project needed.
-rival="$work/${tag}-rival"
-mkdir -p "$rival/.ddev"
-printf 'HOSTSHIFT_VARIANTS=%s-wt-a.ddev.site\n' "$tag" > "$rival/.ddev/.env"
+# ...and stops passing it the moment a *running* sibling claims the same
+# hostname. Two projects on one hostname is an error nowhere in DDEV — traefik
+# breaks the tie by rule length and the loser is silently unreachable — so this
+# refusal is what stands between a developer and reviewing the wrong branch's
+# code at the right URL.
+#
+# The parent is already up, so it is the live rival: give it the worktree's
+# variant and it is genuinely contending for that hostname.
+variant="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env" | cut -d, -f1)"
+cp "$main/.ddev/.env" "$work/main-env.bak" 2>/dev/null || : > "$work/main-env.bak"
+printf 'HOSTSHIFT_VARIANTS=%s\n' "$variant" >> "$main/.ddev/.env"
 if (cd "$wt" && ddev hostshift check >/dev/null 2>&1); then
-  fail "check refuses when another project claims the same hostname" \
-    "exit 0 — the collision was reported as healthy"
+  fail "check refuses when a running project claims the same hostname" \
+    "exit 0 — a live collision was reported as healthy"
 else
-  pass "check refuses when another project claims the same hostname"
+  pass "check refuses when a running project claims the same hostname"
 fi
-rm -rf "$rival"
-(cd "$wt" && ddev hostshift check >/dev/null 2>&1) \
-  && pass "and passes again once the rival is gone" \
-  || fail "and passes again once the rival is gone" "$(cd "$wt" && ddev hostshift check 2>&1)"
+cp "$work/main-env.bak" "$main/.ddev/.env"
+
+# But a directory left behind by a deleted worktree is not a claim. `git worktree
+# remove` refuses while untracked files are present, so the directory outliving
+# the project is the common case — and refusing there failed the post-start hook
+# on every start while routing was entirely correct.
+dead="$work/${tag}-dead"
+mkdir -p "$dead/.ddev"
+printf 'HOSTSHIFT_VARIANTS=%s\n' "$variant" > "$dead/.ddev/.env"
+out="$(cd "$wt" && ddev hostshift check 2>&1)" \
+  && pass "and a stopped project's leftover directory is a warning, not a failure" \
+  || fail "and a stopped project's leftover directory is a warning, not a failure" "$out"
+contains "which still says what it found" "already claims" "$out"
+rm -rf "$dead"
 
 echo "== copy-db"
 

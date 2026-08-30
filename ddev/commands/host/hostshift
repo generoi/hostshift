@@ -67,7 +67,28 @@ esac
 # `ddev hostshift init` — and permanently, for anyone who installed the add-on
 # and never used it — there is nothing to check, and saying so in nine lines plus
 # a `Task failed` is how an add-on stops being inert until it is configured.
-if [ "$cmd" = "check" ] && [ -n "$quiet" ] && ! grep -qs '^HOSTSHIFT_' .ddev/.env 2>/dev/null; then
+#
+# $HOSTSHIFT_HOOK, not a flag, and that is not a style choice.
+# `config.hostshift.yaml` carries #ddev-generated so `ddev add-on get` replaces
+# it on upgrade. This file only gained that marker *after* v0.1.0, so DDEV
+# refuses to replace it — an upgraded project runs the new hook against the old
+# command, and the old parser exits 2 on any flag it does not know. Measured on a
+# real upgrade: `unknown argument: --quiet`, `Task failed`, `Successfully
+# started`. The proxy kept serving, so nothing looked wrong, and the post-start
+# check was dead from then on: every later drift — a renamed directory, a changed
+# branch, a stale .env, a crashed proxy, a hijacked hostname — went unreported on
+# exactly the projects that had been running longest.
+#
+# `bash -c` runs the hook line (ddev pkg/ddevapp/task.go, ExecHostTask.Execute),
+# so an environment prefix is a plain assignment there, and a parser that only
+# reads "$@" cannot trip over it. The rule the compose file states — anything
+# added must work against what is already deployed — covers the hook line too.
+#
+# Only this short-circuit is gated. `ddev hostshift check` typed by a person on a
+# project with no configuration is a question that deserves an answer, and it
+# still gets one.
+if [ "$cmd" = "check" ] && { [ -n "$quiet" ] || [ -n "${HOSTSHIFT_HOOK:-}" ]; } \
+   && ! grep -qs '^HOSTSHIFT_' .ddev/.env 2>/dev/null; then
   exit 0
 fi
 
@@ -193,7 +214,20 @@ elif [ -n "$linked" ]; then
   case "$ph" in
     # Nothing readable there. Distinct from the case below, and the two must not
     # be confused: this one is a problem and that one is not.
-    "") unreadable_parent="$dir" ;;
+    #
+    # A .ddev/config.yaml that is *present* but not parseable is the common
+    # shape, and mid-rebase it is the common cause: conflict markers make the
+    # YAML invalid, and "no DDEV config could be read there" then reads as
+    # "the parent has no DDEV project", which sends the reader looking in the
+    # wrong place entirely. Say which file, and what is in it.
+    "") unreadable_parent="$dir"
+        if [ -f "$dir/.ddev/config.yaml" ]; then
+          if grep -q '^<<<<<<< ' "$dir/.ddev/config.yaml" 2>/dev/null; then
+            unreadable_parent="$dir (its .ddev/config.yaml has unresolved conflict markers)"
+          else
+            unreadable_parent="$dir (its .ddev/config.yaml could not be parsed)"
+          fi
+        fi ;;
     # A repo that pins `name:` in its tracked config.yaml gives every worktree
     # the *same* DDEV project — same containers, same hostnames. There is nothing
     # to derive from elsewhere and nothing to subtract.
@@ -211,11 +245,41 @@ if [ "$cmd" = "copy-db" ]; then
   [ -f "$parent/.ddev/config.yaml" ] && n="$(sed -n 's/^name: *//p' "$parent/.ddev/config.yaml" | head -1)" && [ -n "$n" ] && from="$n"
 
   # Sharing the parent's database and copying it are different decisions, and
-  # doing both means importing a database into itself.
-  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml .ddev/.env 2>/dev/null; then
-    echo "hostshift: this worktree is configured to *use* $from's database" >&2
-    echo "  (DATABASE_URL points at ddev-$from-db). Copying it into itself is not" >&2
-    echo "  what you want — remove that override and \`ddev restart\` first." >&2
+  # doing both is worse than pointless: the dump goes into this worktree's own
+  # idle `db` container while the application goes on reading and writing the
+  # parent's — and copy-db says "copied", exit 0. The developer who ran it
+  # *specifically to stop writing to the parent* is told they succeeded, and
+  # carries on activating plugins and uploading media into the checkout they
+  # were protecting.
+  #
+  # Ask the container, not the files. This grepped four paths for the parent's
+  # db hostname and missed `.ddev/.env.web`, which is DDEV's own documented
+  # place for per-service environment — measured: DB_HOST=ddev-<parent>-db there,
+  # the worktree live on the parent's database, and copy-db reported success.
+  # `printenv` in the web container sees every mechanism that can set it,
+  # including ones DDEV has not invented yet, and it is what `check` already does
+  # for the same reason.
+  #
+  # Both, not either. The container is the truth when it is up, and it is down
+  # exactly when the files are all there is — a project stopped mid-configuration
+  # is the likeliest moment for someone to reach for copy-db. The file list gains
+  # `.ddev/.env.*`, which is where the miss was.
+  shared=""
+  dbenv="$(ddev exec -s web printenv DB_HOST DATABASE_URL DB_URL 2>/dev/null || true)"
+  case "$dbenv" in
+    *"ddev-$from-db"*) shared="$(printf '%s\n' "$dbenv" | grep -F "ddev-$from-db" || true)" ;;
+  esac
+  if [ -z "$shared" ]; then
+    shared="$(grep -rs 'ddev-'"$from"'-db' \
+      .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml \
+      .ddev/.env .ddev/.env.* 2>/dev/null || true)"
+  fi
+  if [ -n "$shared" ]; then
+    echo "hostshift: this worktree is configured to *use* $from's database:" >&2
+    printf '%s\n' "$shared" | sed 's/^/    /' >&2
+    echo "  Copying into it would write the dump to this worktree's own db" >&2
+    echo "  container, which nothing reads, and report success. Remove that" >&2
+    echo "  override and \`ddev restart\` first." >&2
     exit 2
   fi
 
@@ -244,7 +308,17 @@ if [ "$cmd" = "copy-db" ]; then
   ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
     --no-tablespaces --add-drop-database --databases db -h ddev-$from-db -udb -pdb \
     | mysql -h db -udb -pdb" || {
-    echo "hostshift: the copy failed. Is $from running? \`ddev start $from\`" >&2
+    # Not "the copy failed", full stop — that reads as "nothing happened", and
+    # it is only true if the dump never started. --add-drop-database puts
+    # `DROP DATABASE` at the top of the stream, so an interruption after that
+    # point — the laptop sleeping, the parent stopped mid-copy — leaves this
+    # database dropped and partially reloaded. Saying so is the difference
+    # between re-running the command and debugging a site that is now missing
+    # half its tables.
+    echo "hostshift: the copy failed." >&2
+    echo "  Is $from running? \`ddev start $from\`" >&2
+    echo "  This worktree's database may be half-replaced: the dump drops it" >&2
+    echo "  before reloading. Re-run with --force once $from is up." >&2
     exit 1; }
   echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
   echo "  hostshift maps — nothing else to do." >&2
@@ -306,7 +380,26 @@ for other in ../*/.ddev/.env; do
       echo "  Two projects answering to one hostname is not an error anywhere in DDEV;" >&2
       echo "  the router picks one and the other is silently unreachable. Pass --slug to" >&2
       echo "  choose a different name." >&2
-      claimed="$v"
+      # The warning is right either way; the *refusal* is not. A worktree that
+      # was `ddev delete`d but whose directory stayed still has its .ddev/.env,
+      # and `git worktree remove` refuses while untracked files are present, so
+      # the directory staying is the common case rather than the odd one. That
+      # made `check` exit 2 — failing the post-start hook on every single start —
+      # over a claim nothing was making, while routing was perfectly correct, and
+      # the advice to pass --slug was wrong for that case.
+      #
+      # So only a *live* claim is fatal. If the rival is not running there is
+      # nothing to lose a routing tie to today.
+      oname="$(basename "$odir")"
+      if [ -f "$odir/.ddev/config.yaml" ]; then
+        n="$(sed -n 's/^name: *//p' "$odir/.ddev/config.yaml" | sed -n 1p)"
+        [ -n "$n" ] && oname="$n"
+      fi
+      if [ "$(docker inspect "ddev-$oname-web" --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
+        claimed="$v"
+      else
+        echo "  ($oname is not running, so nothing is serving it right now.)" >&2
+      fi
       break 2 ;;
     esac
   done
@@ -533,6 +626,39 @@ if [ "$cmd" = "check" ]; then
     echo "hostshift: refusing to call this healthy — $claimed is claimed by" >&2
     echo "  another project too, and the router serves whichever it prefers." >&2
     exit 2
+  fi
+
+  # The map itself, not just the command line that asked for it.
+  #
+  # When the container resolves its own map from a mounted hostshift.yaml, the
+  # command line is `--slug X` and stays `--slug X` however the file changes — so
+  # editing hostshift.yaml and not restarting left `check` printing "hostshift is
+  # serving" while the new alias rewrote nothing. Two attempts at closing this
+  # were worse than the gap (a checksum at init time called a correctly restarted
+  # project stale; a file mtime against the container's was unreliable across
+  # platforms), and both were guessing at something the proxy states outright:
+  # it prints its resolved map to stderr at startup, and `docker logs` still has
+  # it. Comparing that against `hostshift map` here is exact, needs no recorded
+  # state, and both sides render through the same Map.String().
+  #
+  # Best-effort by design. A rotated or truncated log yields no pair lines and is
+  # not evidence of drift, so it says nothing rather than crying wolf.
+  running_map="$(docker logs "ddev-$name-hostshift" 2>&1 \
+    | sed -n 's/^\(.*[[:space:]]\)\{0,1\}\(https:\/\/[^[:space:]]*[[:space:]]*->[[:space:]]*https:\/\/[^[:space:]]*\)$/\2/p' \
+    | tr -s ' ' | sort -u || true)"
+  if [ -n "$running_map" ]; then
+    want_map="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" 2>/dev/null \
+      | sed -n 's/^\(.*[[:space:]]\)\{0,1\}\(https:\/\/[^[:space:]]*[[:space:]]*->[[:space:]]*https:\/\/[^[:space:]]*\)$/\2/p' \
+      | tr -s ' ' | sort -u || true)"
+    if [ -n "$want_map" ] && [ "$running_map" != "$want_map" ]; then
+      echo "hostshift: the proxy is running a different map than this checkout" >&2
+      echo "  now resolves to. It started with:" >&2
+      printf '%s\n' "$running_map" | sed 's/^/    /' >&2
+      echo "  and hostshift.yaml/DDEV config now give:" >&2
+      printf '%s\n' "$want_map" | sed 's/^/    /' >&2
+      echo "  Run \`ddev restart\`." >&2
+      exit 2
+    fi
   fi
 
   printf '\n  hostshift is serving:\n' >&2

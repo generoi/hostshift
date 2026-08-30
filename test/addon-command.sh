@@ -219,6 +219,49 @@ first="$(cat "$wt/.ddev/.env")"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
 check "init is idempotent" "$first" "$(cat "$wt/.ddev/.env")"
 
+# The hook line must parse under every released version of the command.
+#
+# config.hostshift.yaml carries #ddev-generated, so `ddev add-on get` replaces it
+# on upgrade. The command only gained that marker after v0.1.0, so DDEV refuses
+# to replace *that* — an upgraded project runs the new hook against the old
+# command. A flag the old parser does not know makes it exit 2, and since the
+# proxy goes on serving, the post-start check is then dead and silent: every
+# later drift goes unreported, on exactly the projects running longest.
+#
+# Run against the real released command out of the tag, not a stub of it, and
+# against every tag there is — a stub only proves what its author remembered.
+hook="$(sed -n 's/^ *- *exec-host: *//p' "$repo/ddev/config.hostshift.yaml")"
+[ -n "$hook" ] || fail "the post-start hook line could not be read" ""
+for tag in $(cd "$repo" && git tag -l 'v*'); do
+  old_cmd="$work/hostshift-$tag"
+  (cd "$repo" && git show "$tag:ddev/commands/host/hostshift") > "$old_cmd" 2>/dev/null || continue
+  chmod +x "$old_cmd"
+  # The hook names its path; point that at the old command and run the line the
+  # way DDEV does, `bash -c` from the approot (pkg/ddevapp/task.go, ExecHostTask).
+  mkdir -p "$wt/.ddev/commands/host"
+  cp "$old_cmd" "$wt/.ddev/commands/host/hostshift"
+  # `|| true`: the suite runs under `set -e`, and the whole point is to invoke a
+  # command that may fail. What is asserted is *why* it failed, not that it did.
+  out="$(cd "$wt" && bash -c "$hook" 2>&1 || true)"
+  rm -f "$wt/.ddev/commands/host/hostshift"
+  case "$out" in
+    *"unknown argument"*|*"usage:"*)
+      fail "the post-start hook parses under $tag's command" "$out" ;;
+    *) pass "the post-start hook parses under $tag's command" ;;
+  esac
+done
+
+# Mid-rebase, a parent's config.yaml has conflict markers and is not valid YAML.
+# The outcome is right — fall back to the worktree's own hostnames and warn — but
+# "no DDEV config could be read there" reads as "the parent has no DDEV project",
+# which sends the reader to look in the wrong place.
+cp "$main/.ddev/config.yaml" "$work/parent-config.bak"
+printf '<<<<<<< HEAD\nname: acme\n=======\nname: acme2\n>>>>>>> other\n' > "$main/.ddev/config.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "an unparseable parent config names the conflict markers" \
+  "conflict markers" "$out"
+cp "$work/parent-config.bak" "$main/.ddev/config.yaml"
+
 out="$(cd "$wt" && "$cmd" env --slug other 2>/dev/null || true)"
 contains "a second slug does not compound with the first" \
   "HOSTSHIFT_VARIANTS=other--acme.ddev.site,other--nat.acme.ddev.site" "$out"
@@ -359,6 +402,25 @@ out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
 contains "copy-db sees sharing configured in a compose override" \
   "configured to *use*" "$out"
 rm -f "$wt/.ddev/docker-compose.sharedb.yaml"
+
+# ...and in .ddev/.env.web, DDEV's own documented place for per-service
+# environment, which the file scan did not read. Measured live: DB_HOST set
+# there, the worktree serving off the parent's database, and copy-db reporting
+# "copied" into this worktree's idle db container — so the developer who ran it
+# specifically to stop writing to the parent was told they had.
+printf 'DB_HOST=ddev-acme-db\n' > "$wt/.ddev/.env.web"
+out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
+contains "copy-db sees sharing configured in .ddev/.env.web" \
+  "configured to *use*" "$out"
+rm -f "$wt/.ddev/.env.web"
+
+# Nothing shared: copy-db must get past the guard. A guard that refuses
+# everything passes both tests above and is useless.
+out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
+case "$out" in
+  *"configured to *use*"*) fail "and does not refuse when nothing is shared" "$out" ;;
+  *) pass "and does not refuse when nothing is shared" ;;
+esac
 
 # Every command this prints must be one DDEV actually accepts. `ddev start -p X`
 # is not — it fails with "unknown shorthand flag".
