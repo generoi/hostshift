@@ -333,7 +333,7 @@ func TestParseURLRef(t *testing.T) {
 		{"&#38;", "", 0},      // '&' excluded: decoding it could splice a new ref
 		{"&#x110000;", "", 0}, // out of range
 		{"&#;", "", 0},
-		{"&sol", "", 0},  // named refs require the semicolon
+		{"&sol", "", 0},    // named refs require the semicolon
 		{"&auml;", "ä", 6}, // an IDN host's letter
 		{"&notarealref;", "", 0},
 	} {

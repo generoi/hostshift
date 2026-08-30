@@ -42,7 +42,7 @@ const (
 	// storing origins in a form the byte model does not cover.
 	SurfaceHTMLObfuscated = "html-obfuscated"
 	SurfaceHeader         = "header"
-	SurfaceJSONString = "json-string"
+	SurfaceJSONString     = "json-string"
 	// SurfaceJSONEscape is a JSON string whose origin was only visible after
 	// the string was unquoted — a \uXXXX-escaped IDN host, an HTML character
 	// reference inside content.rendered, or double-escaped JSON-in-JSON. Like

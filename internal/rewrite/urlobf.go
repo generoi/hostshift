@@ -93,6 +93,25 @@ func isURLStripped(c byte) bool { return c == '\t' || c == '\n' || c == '\r' }
 
 func isSlashish(c byte) bool { return c == '/' || c == '\\' }
 
+// isAuthorityByte reports whether c can appear inside an authority — the host,
+// its userinfo, or its port. Deliberately generous: anything non-ASCII is a
+// possible IDN label, and `%` a possible escape. What it excludes is what ends
+// an authority in every context the rewriter sees one: a quote, a bracket,
+// whitespace, a comma, a semicolon.
+func isAuthorityByte(c byte) bool {
+	switch {
+	case c >= 0x80:
+		return true
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	switch c {
+	case '-', '.', '_', '~', '%', '+', '@', ':':
+		return true
+	}
+	return false
+}
+
 // normalised is v with the bytes the URL parser removes taken out, and a map
 // back to where each surviving byte came from.
 type normalised struct {
@@ -288,6 +307,26 @@ func hasFoldPrefixASCII(b []byte, want string) bool {
 //     document's scheme the parser goes to special-relative-or-authority, which
 //     needs two, and `https:www.example.fi/x` is then a path.
 //   - No scheme, and a run of two or more '/' and '\'.
+//
+// schemeAt names the scheme governing the authority at b[at], looking forwards
+// for one written there and backwards for one the caller entered past. With
+// neither, the reference is scheme-relative and resolves against the document,
+// which is served at a variant.
+func (h *hostReplacer) schemeAt(b []byte, at int) string {
+	if _, s := schemeLen(b[at:]); s != "" {
+		return s
+	}
+	for _, s := range []string{"https:", "http:"} {
+		if at >= len(s) && hasFoldPrefixASCII(b[at-len(s):at], s) {
+			return strings.TrimSuffix(s, ":")
+		}
+	}
+	for s := range h.schemes {
+		return s
+	}
+	return "https"
+}
+
 func (h *hostReplacer) authorityStart(b []byte) int {
 	if n, scheme := schemeLen(b); n > 0 {
 		i := n
@@ -334,8 +373,16 @@ func hostRange(b []byte, at int) (start, end int, port string) {
 	if lim := at + maxHost; lim < end {
 		end = lim
 	}
+	// Stop at anything that cannot be in an authority, not just at `/ \ ? #`.
+	//
+	// In an attribute the value *is* the URL, so the end of the buffer is the end
+	// of the authority. Everywhere else the URL is embedded and something follows
+	// it — `fetch("…")`, `url(…)`, prose — and taking those bytes into the host
+	// made the fold fail and the whole shape leak on exactly the surfaces §5.2
+	// calls Tier 1. The byte matcher never had this problem: delimAt knows a
+	// quote ends a host.
 	for i := at; i < end; i++ {
-		if b[i] == '/' || b[i] == '\\' || b[i] == '?' || b[i] == '#' {
+		if !isAuthorityByte(b[i]) {
 			end = i
 			break
 		}
@@ -417,6 +464,12 @@ func urlTokenStarts(v []byte) []int {
 // extrapolates to hours at the shipped 4 MiB token cap. That is the same bug
 // class scan.go documents having already fixed once.
 func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, until int, to origin.Origin, ok bool) {
+	// The scheme decides which port is the default, so it has to be found
+	// wherever the caller entered. foldedHostLeak enters at the slash *run*, so
+	// looking only forwards saw no scheme and fell back to https — and
+	// `http://h:443`, whose 443 is not http's default and so is a different
+	// origin, was rewritten.
+	scheme := h.schemeAt(n.b, at)
 	rel := h.authorityStart(n.b[at:])
 	if rel < 0 {
 		return 0, 0, to, false
@@ -442,10 +495,16 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 	// which disambiguates by port, got the same input right, so the two halves
 	// of the engine disagreed. §5.4 says matching is on exact origin equality,
 	// and :8080 is a different origin.
+	// host:port first, and the bare host only when the port is the scheme's
+	// default. §5.4 matches on exact origin equality, so `https://h:80` is a
+	// different origin from `https://h` and rewriting it was a false positive —
+	// one the byte matcher, which disambiguates by port, never made.
 	if port != "" {
 		to, ok = h.to[host+":"+port]
-	}
-	if !ok {
+		if !ok && origin.NormalisePort(scheme, port) == "" {
+			to, ok = h.to[host]
+		}
+	} else {
 		to, ok = h.to[host]
 	}
 	if !ok {
