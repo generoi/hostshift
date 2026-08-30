@@ -176,26 +176,26 @@ echo "== copy-db"
 # would overwrite. Both halves are new and neither had any coverage.
 sql() { (cd "$1" && ddev exec -s web bash -c "mysql -h db -udb -pdb -N -B -e \"$2\" db" 2>/dev/null) || true; }
 sql "$main" "create table hs_probe (id int); insert into hs_probe values (42);" >/dev/null
-# A table only the worktree has, so the copy has something to drop. `mysqldump db
-# | mysql` drops only the tables the dump contains, so this survived — while the
-# refusal message promised a replace.
-sql "$wt" "create table hs_only_here (id int); insert into hs_only_here values (7);" >/dev/null
-
 out="$(cd "$wt" && ddev hostshift copy-db 2>&1)" || fail "copy-db copies the parent's database" "$out"
 contains "copy-db copies the parent's database" "42" "$(sql "$wt" "select id from hs_probe")"
 
-# Replace, not merge. `mysqldump db | mysql` drops only the tables the dump
-# contains, so a worktree from an older pull kept everything the parent no longer
-# has — and the refusal message promises a replace. The parent-side assertion
-# above passed before the fix too; this is the one that distinguishes them.
+# Replace, not merge — and this is the assertion that distinguishes them. The one
+# above passed before the fix too. `mysqldump db | mysql` drops only the tables
+# the dump contains, so a worktree whose database came from an older pull kept
+# everything the parent no longer has, while the refusal message promised a
+# replace. Needs a table the *worktree* has and the parent does not; it goes in
+# after the first copy, so the copy above still runs against an empty database.
+sql "$wt" "create table hs_only_here (id int); insert into hs_only_here values (7);" >/dev/null
+out="$(cd "$wt" && ddev hostshift copy-db --force 2>&1)" \
+  || fail "and drops what only the worktree had" "$out"
 if [ -n "$(sql "$wt" "select id from hs_only_here" 2>&1 | grep -x 7 || true)" ]; then
   fail "and drops what only the worktree had" "hs_only_here survived, so it merged"
 else
   pass "and drops what only the worktree had"
 fi
 
-# Running it twice is the accident: the second run silently replaced whatever
-# the first one's work had put there.
+# Running it twice is the accident this refusal is for: the second run silently
+# replaced whatever the first one's work had put there.
 if (cd "$wt" && ddev hostshift copy-db >/dev/null 2>&1); then
   fail "copy-db refuses a database that already has tables" "exited 0"
 else
