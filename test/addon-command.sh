@@ -201,6 +201,26 @@ git -C "$main" worktree remove --force "$twin"
 # and put $wt back as the dry-run test below expects to find it
 rm -f "$wt/.ddev/.env"
 
+# Installed but not configured is inert — except in a worktree of a project that
+# declares additional_hostnames, where `ddev add-on get`'s own advice to run
+# `ddev restart` registers the parent's blog hostnames on this project's web and
+# the router prefers this one. The moment the add-on could say so is the moment
+# it created the hazard, and it said nothing.
+mv "$wt/.ddev/.env" "$work/env.hold" 2>/dev/null || true
+out="$(cd "$wt" && HOSTSHIFT_HOOK=1 "$cmd" check 2>&1 || true)"
+contains "an unconfigured worktree of a multi-hostname parent is warned" \
+  "not configured" "$out"
+# ...and a project whose parent declares nothing extra stays silent.
+cp "$main/.ddev/config.yaml" "$work/pcfg.hold"
+printf 'name: acme\n' > "$main/.ddev/config.yaml"
+out="$(cd "$wt" && HOSTSHIFT_HOOK=1 "$cmd" check 2>&1 || true)"
+case "$out" in
+  "") pass "and one whose parent declares nothing extra stays silent" ;;
+  *) fail "and one whose parent declares nothing extra stays silent" "$out" ;;
+esac
+cp "$work/pcfg.hold" "$main/.ddev/config.yaml"
+mv "$work/env.hold" "$wt/.ddev/.env" 2>/dev/null || true
+
 # A parent that has adopted a committed hostshift.yaml, and a worktree whose
 # branch predates it. `hostshift hosts -C <dir>` reads only DDEV config, so the
 # declaration is invisible from here — and the map then names the parent's

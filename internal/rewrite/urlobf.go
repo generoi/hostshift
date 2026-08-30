@@ -315,9 +315,26 @@ func (h *hostReplacer) authorityStart(b []byte) int {
 // ends belongs to the credentials, so `https://user@host` names host and not
 // user. The authority ends at the first '/', '\', '?' or '#'; the host itself
 // also ends at ':', which begins the port.
+// maxHost bounds the authority scan. A DNS name is at most 253 octets, and
+// percent-encoding can only inflate that threefold, so nothing longer is a host
+// this map could ever contain.
+//
+// Without the bound the scan ran to the end of the buffer whenever the region
+// held no delimiter — and `urlTokenStarts` offers a candidate at every `http:`,
+// which `authorityStart` accepts with zero slashes because the scheme differs
+// from the document's. A body of `"http: "` repeated was therefore k candidates
+// times O(n) each: 7 seconds at 192 KB, extrapolating to about four hours of
+// pinned CPU for one 8 MiB JSON request body, with no timeout on that path.
+// Third instance of the bug class scan.go documents; the other two callers were
+// fixed and this one was not.
+const maxHost = 253 * 3
+
 func hostRange(b []byte, at int) (start, end int, port string) {
 	end = len(b)
-	for i := at; i < len(b); i++ {
+	if lim := at + maxHost; lim < end {
+		end = lim
+	}
+	for i := at; i < end; i++ {
 		if b[i] == '/' || b[i] == '\\' || b[i] == '?' || b[i] == '#' {
 			end = i
 			break
@@ -645,4 +662,22 @@ func (w *HTML) cssEscapeLeak(v []byte) []byte {
 		return v
 	}
 	return w.hosts.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, true)
+}
+
+// HostLeaks applies the URL-parser locator and the IDNA fold to a standalone
+// buffer, for the proxy's request line, query, headers and non-HTML bodies.
+//
+// Those surfaces had the byte matcher alone, and the response side manufactures
+// exactly what the byte matcher cannot see: it splices only the matched host, so
+// `https:\\www.example.fi/a` goes to the browser as `https:\\wt-a--x.ddev.site/a`
+// — an obfuscated *variant*. The byte matcher's prefilter needs `//`, `\/` or
+// `%2F`, and that string has none, so a form post carrying it back went upstream
+// unreversed and the variant hostname was written into the shared database. That
+// is worse than a leak: §4.3's case for the whole design is that the database
+// stays byte-identical to production, shared by canonical, every worktree and CI.
+func HostLeaks(m *origin.Matcher, b []byte, value bool) []byte {
+	if m == nil || len(b) == 0 {
+		return b
+	}
+	return hostsFor(m).rewriteAll(b, value)
 }

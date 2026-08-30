@@ -206,43 +206,16 @@ var structuredAttrNames = [][]byte{
 	[]byte("srcset"), []byte("imagesrcset"), []byte("ping"), []byte("srcdoc"), []byte("content"),
 }
 
-// urlAttrNames are the attributes whose value carries a URL the browser resolves
-// through the URL parser — one URL, a list of them, or one embedded in a small
-// grammar.
+// Every attribute gets the locator, with no allow-list.
 //
-// An allow-list, not everything: the pass rewrites what the *parser* would read
-// as a host, and in a title or an alt an origin-shaped run of bytes is prose the
-// browser never dereferences. Leaving those alone is correct, not cautious.
-//
-// The list ones — srcset, imagesrcset, ping — used to be excluded because the
-// pass deleted whitespace, which is their separator. It no longer does: it
-// replaces the host's byte range and copies everything else, so a list is safe
-// as long as the locator is offered each entry. See urlTokenStarts.
-var urlAttrNames = [][]byte{
-	[]byte("href"), []byte("src"), []byte("action"), []byte("formaction"),
-	[]byte("cite"), []byte("poster"), []byte("data"), []byte("manifest"),
-	[]byte("longdesc"), []byte("background"), []byte("codebase"),
-	[]byte("profile"), []byte("itemid"), []byte("xlink:href"),
-	// Lists, and small grammars with a URL inside: srcset's `URL descriptor,
-	// …`, ping's space-separated list, a meta refresh's `0;url=…`, and a style
-	// attribute's `url(…)`.
-	[]byte("srcset"), []byte("imagesrcset"), []byte("ping"),
-	[]byte("content"), []byte("style"),
-	// srcdoc holds a whole document whose base URL is the parent's, so every
-	// href inside it is navigable. data-src and data-srcset are what the fleet's
-	// lazyload and the WooCommerce gallery assign to src, which §5.2 already
-	// names as a real surface.
-	[]byte("srcdoc"), []byte("data-src"), []byte("data-srcset"),
-}
-
-func singleURLAttr(name []byte) bool {
-	for _, s := range urlAttrNames {
-		if len(name) == len(s) && bytes.EqualFold(name, s) {
-			return true
-		}
-	}
-	return false
-}
+// The list existed because the pass used to normalise whole values, deleting
+// whitespace — which is content in a title and a separator in a srcset. It
+// stopped doing that: it replaces the matched host's byte range and copies
+// everything else. Keeping the list only produced a second class of missed
+// attribute, on exactly the surface §5.2 already names —
+// `data-large_image="https:\\www.example.fi/a.jpg"` came out byte-identical
+// while `foldedHostLeak` and `cssEscapeLeak`, which never had a list, rewrote
+// the same attribute. The WooCommerce gallery assigns that value to an img.src.
 
 // structuredAttr matches on the raw name bytes, case-insensitively. Lowercasing
 // every attribute name to a string first cost one allocation per attribute —
@@ -276,7 +249,7 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	// trailing dot is the host's root label, in prose it is a full stop.
 	value := surface == SurfaceHTMLAttr
 	if surface == SurfaceHTMLAttr {
-		out = w.urlLeaks(base, out, singleURLAttr(name))
+		out = w.urlLeaks(base, out)
 	} else {
 		// Every other surface gets the locator too. It ran on attributes alone,
 		// so every *ASCII* URL-parser shape — `https:\h`, `https:///h`,
@@ -334,19 +307,26 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 // only ever saw the undecoded text, and every shape needing decode-then-parse
 // went out untouched: `https:&#47;&#47;www.example&#9;.fi/x` resolves to
 // production and was the exact case the comment here claimed was covered.
-func (w *HTML) urlLeaks(base int, v []byte, isURL bool) []byte {
+func (w *HTML) urlLeaks(base int, v []byte) []byte {
 	dec, decoded := decodeURLRefs(v)
+	// cur is what the locator sees: the decoded form, or the decoded *and
+	// entity-rewritten* form when that pass fired. Returning early on the
+	// entity pass's success skipped the locator for the whole value, so a second
+	// origin in the same value went out untouched —
+	// `srcset="https:&#47;&#47;a/1 1x, https:\a/2 2x"` rewrote the first entry
+	// and left the second dereferencing production, while --json reported a
+	// successful rewrite on a value that still leaked.
+	cur := dec
 	if decoded {
 		if out := w.decodeEntityLeak(base, v, dec); out != nil {
-			return out
+			cur = out
 		}
 	}
-	if !isURL {
-		return v
-	}
-	// On the decoded form, so the two compose. When nothing decoded, dec is v.
-	if out := w.normaliseURLLeak(SurfaceHTMLObfuscated, base, dec, true); !bytes.Equal(out, dec) {
+	if out := w.normaliseURLLeak(SurfaceHTMLObfuscated, base, cur, true); !bytes.Equal(out, cur) {
 		return out
+	}
+	if !bytes.Equal(cur, dec) {
+		return cur
 	}
 	return v
 }

@@ -83,6 +83,16 @@ pre_install_actions:
       ' "$ex" > "$tmp" && cat "$tmp" > "$ex"
       rm -f "$tmp"
     fi
+    # A file that does not end in a newline gets one first. Appending to
+    # `…node_modules/` with no trailing newline welded the marker onto the
+    # developer's last rule — `node_modules/# hostshift (ddev add-on) — begin` —
+    # which stopped ignoring node_modules, defeated the idempotency guard (the
+    # welded line is not an exact match, so every later install appended another
+    # whole block), and made removal impossible, since none of its three paths
+    # can find a marker that is not on a line of its own.
+    if [ -s "$ex" ] && [ -n "$(tail -c 1 "$ex")" ]; then
+      echo "" >> "$ex"
+    fi
     {
       echo '# hostshift (ddev add-on) — begin'
       echo '.ddev/**/*hostshift*'
@@ -242,12 +252,18 @@ removal_actions:
         { drop = 0; print }
       ' "$ex" > "$tmp" && ok=1
     else
-      # grep exits 1 when it selects no lines, which is the shape the install
-      # creates when info/exclude did not exist before. That is a success with an
-      # empty result, not a failure.
-      grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' \
-        -e '.ddev/.env' -e 'wp-cli.local.yml' "$ex" > "$tmp"
-      [ $? -le 1 ] && ok=1
+      # The same contiguous-run rule as the migration, for a block written by a
+      # version that had no markers at all. Not `grep -vxF`: that removes every
+      # matching line anywhere in the file, which takes the developer's own
+      # `.ddev/.env` rule with it — and, as a bare statement returning 1 when it
+      # selects nothing, it aborted this whole action under `set -eu -o
+      # pipefail`, so the block survived, the temp file leaked, and the farewell
+      # action never ran. awk always exits 0 here.
+      awk '
+        $0 == "# hostshift (ddev add-on)" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && ok=1
     fi
     # The *status*, not the size. An empty result is correct when the block was
     # the whole file, so testing `-s "$tmp"` left the block behind in exactly

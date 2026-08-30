@@ -90,6 +90,7 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 		}
 
 		nv, ev := m.Rewrite(body[bodyStart:end], rewrite.SurfaceRequestBody, explain)
+		nv = rewrite.HostLeaks(m, nv, true)
 		st.Record(rewrite.SurfaceRequestBody, bodyStart, ev)
 		if bytes.Equal(nv, body[bodyStart:end]) {
 			continue
