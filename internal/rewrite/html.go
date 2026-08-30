@@ -204,6 +204,32 @@ var structuredAttrNames = [][]byte{
 	[]byte("srcset"), []byte("imagesrcset"), []byte("ping"), []byte("srcdoc"), []byte("content"),
 }
 
+// singleURLAttrNames are the attributes whose whole value is one URL, which the
+// browser resolves through the URL parser.
+//
+// Only these get normaliseURLLeak, and the restriction is not caution for its
+// own sake: that pass deletes tab, LF and CR, because the URL parser does. In a
+// title or an alt those are ordinary text, and in srcset, imagesrcset and ping
+// they are *separators* — a list of URLs delimited by whitespace, which deleting
+// the whitespace would run together. The remaining gap is therefore an
+// obfuscated origin inside a srcset entry; it is a background image rather than
+// a navigation target, and closing it means splitting the list first.
+var singleURLAttrNames = [][]byte{
+	[]byte("href"), []byte("src"), []byte("action"), []byte("formaction"),
+	[]byte("cite"), []byte("poster"), []byte("data"), []byte("manifest"),
+	[]byte("longdesc"), []byte("background"), []byte("codebase"),
+	[]byte("profile"), []byte("itemid"),
+}
+
+func singleURLAttr(name []byte) bool {
+	for _, s := range singleURLAttrNames {
+		if len(name) == len(s) && bytes.EqualFold(name, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // structuredAttr matches on the raw name bytes, case-insensitively. Lowercasing
 // every attribute name to a string first cost one allocation per attribute —
 // 37,280 of them across the corpus — for a check that five byte comparisons
@@ -234,6 +260,14 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	w.stats.Record(surface, base, events)
 	if surface == SurfaceHTMLAttr {
 		out = w.decodeEntityLeak(base, out)
+		// After the entity decode, because the two compose: a host may be
+		// spelled with references *and* carry a tab, and the reference form of
+		// the tab is removed here rather than decoded there — decodeURLRefs must
+		// never emit a control character, which is one of the XSS holes it was
+		// written to close. Removing one is not emitting one.
+		if singleURLAttr(name) {
+			out = w.normaliseURLLeak(base, out)
+		}
 	}
 	if w.dryRun {
 		return v

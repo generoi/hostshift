@@ -8,16 +8,25 @@ import "bytes"
 // so a query string carrying "&copy=1" would come back as "©=1" — a corrupted
 // link on a page that had nothing wrong with it. Numeric references have no
 // such ambiguity and are decoded in full below.
+//
+// Every entry is checked against html.UnescapeString by TestNamedRefsMatchHTML5.
+// "hyphen" was in this table decoding to '-', and it is not: HTML5 defines
+// &hyphen; as U+2010 HYPHEN, not U+002D. Because a decoded value is spliced back
+// whole whenever any origin inside it rewrote, that turned an inert link live —
+// `next=https://staging&hyphen;old.prod.fi/` resolves to a punycode host that
+// does not exist on production, and hostshift served `staging-old.prod.fi`,
+// which does. There is no named reference for U+002D; it is spelled &#45;.
 var urlNamedRefs = map[string]byte{
-	"sol":    '/',
-	"colon":  ':',
-	"period": '.',
-	"quest":  '?',
-	"num":    '#',
-	"percnt": '%',
-	"lowbar": '_',
-	"hyphen": '-',
-	"commat": '@',
+	"sol":      '/',
+	"bsol":     '\\', // the JSON separator's byte
+	"colon":    ':',
+	"period":   '.',
+	"quest":    '?',
+	"num":      '#',
+	"percnt":   '%',
+	"lowbar":   '_',
+	"UnderBar": '_', // a second spelling of the same character
+	"commat":   '@',
 }
 
 // NewLine is deliberately absent. It decodes to a raw 0x0A, which no origin

@@ -414,6 +414,38 @@ contains "copy-db sees sharing configured in .ddev/.env.web" \
   "configured to *use*" "$out"
 rm -f "$wt/.ddev/.env.web"
 
+# Bedrock keeps DB_HOST in the project root .env, not under .ddev/. Neither half
+# of the guard saw it: the file list stopped at .ddev/, and `printenv` in the web
+# container cannot see it either, because phpdotenv reads that file inside PHP.
+# It is the shape most likely in this fleet.
+printf 'DB_NAME=db\nDB_HOST=ddev-acme-db\nWP_ENV=development\n' > "$wt/.env"
+out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
+contains "copy-db sees sharing configured in the project root .env" \
+  "configured to *use*" "$out"
+rm -f "$wt/.env"
+
+# A comment is not a configuration. This refused, printed the `#` back, and
+# --force does not bypass this guard — so a stale note permanently blocked a
+# legitimate copy and the message told the developer to remove something they
+# already had.
+printf '# DB_HOST=ddev-acme-db   # disabled, we have our own db now\n' > "$wt/.ddev/.env.web"
+out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
+case "$out" in
+  *"configured to *use*"*) fail "a commented-out override does not block the copy" "$out" ;;
+  *) pass "a commented-out override does not block the copy" ;;
+esac
+rm -f "$wt/.ddev/.env.web"
+
+# Same for an override renamed aside to turn it off. DDEV's per-service form is
+# .ddev/.env.<service>, and a service name has no dot in it.
+printf 'DB_HOST=ddev-acme-db\n' > "$wt/.ddev/.env.web.disabled"
+out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"
+case "$out" in
+  *"configured to *use*"*) fail "an override renamed aside does not block the copy" "$out" ;;
+  *) pass "an override renamed aside does not block the copy" ;;
+esac
+rm -f "$wt/.ddev/.env.web.disabled"
+
 # Nothing shared: copy-db must get past the guard. A guard that refuses
 # everything passes both tests above and is useless.
 out="$(cd "$wt" && "$cmd" copy-db 2>&1 || true)"

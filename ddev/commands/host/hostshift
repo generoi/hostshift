@@ -87,9 +87,21 @@ esac
 # Only this short-circuit is gated. `ddev hostshift check` typed by a person on a
 # project with no configuration is a question that deserves an answer, and it
 # still gets one.
-if [ "$cmd" = "check" ] && { [ -n "$quiet" ] || [ -n "${HOSTSHIFT_HOOK:-}" ]; } \
-   && ! grep -qs '^HOSTSHIFT_' .ddev/.env 2>/dev/null; then
-  exit 0
+#
+# `[ ! -e ]` or readable-and-empty, not `grep -qs`. -s swallows the difference
+# between "no HOSTSHIFT_ line" and "cannot read the file", so a fully configured
+# project whose .ddev/.env had lost its read permission reported healthy on every
+# start — the one file the whole check is about, silently unread.
+if [ "$cmd" = "check" ] && { [ -n "$quiet" ] || [ -n "${HOSTSHIFT_HOOK:-}" ]; }; then
+  if [ ! -e .ddev/.env ]; then
+    exit 0
+  elif [ ! -r .ddev/.env ]; then
+    echo "hostshift: .ddev/.env exists but cannot be read, so nothing here can be" >&2
+    echo "  checked. \`chmod u+r .ddev/.env\`." >&2
+    exit 2
+  elif ! grep -q '^HOSTSHIFT_' .ddev/.env; then
+    exit 0
+  fi
 fi
 
 command -v hostshift >/dev/null || {
@@ -260,19 +272,61 @@ if [ "$cmd" = "copy-db" ]; then
   # including ones DDEV has not invented yet, and it is what `check` already does
   # for the same reason.
   #
-  # Both, not either. The container is the truth when it is up, and it is down
-  # exactly when the files are all there is — a project stopped mid-configuration
-  # is the likeliest moment for someone to reach for copy-db. The file list gains
-  # `.ddev/.env.*`, which is where the miss was.
+  # The container first, and its answer is final either way — including "no".
+  # Testing `[ -z "$shared" ]` could not tell "the container says it is not
+  # shared" from "there is no container to ask", so a running project that had
+  # been un-shared was still blocked by a file left lying around.
+  #
+  # The file scan is the fallback for when nothing is running, which is exactly
+  # when someone reaches for copy-db. It reads assignments, not any line that
+  # mentions the hostname: a commented-out `# DB_HOST=ddev-<parent>-db` blocked
+  # the copy and printed its own `#` back, with no way past — --force does not
+  # bypass this guard — so a stale note permanently refused a legitimate copy.
+  #
+  # The project's own .env is in the list because that is where Bedrock keeps
+  # DB_HOST. `printenv` in the web container cannot see it (phpdotenv reads it
+  # inside PHP), and the previous list stopped at .ddev/, so the one shape most
+  # likely in this fleet was missed by both halves of the guard.
   shared=""
+  asked=""
   dbenv="$(ddev exec -s web printenv DB_HOST DATABASE_URL DB_URL 2>/dev/null || true)"
+  [ -n "$dbenv" ] && asked=1
   case "$dbenv" in
     *"ddev-$from-db"*) shared="$(printf '%s\n' "$dbenv" | grep -F "ddev-$from-db" || true)" ;;
   esac
-  if [ -z "$shared" ]; then
-    shared="$(grep -rs 'ddev-'"$from"'-db' \
-      .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml \
-      .ddev/.env .ddev/.env.* 2>/dev/null || true)"
+  # ...but the container's environment cannot see a dotenv file the application
+  # reads for itself, so that one is checked either way.
+  if [ -z "$shared" ] && { [ -z "$asked" ] || [ -f .env ]; }; then
+    # An assignment: optional `export`, the name, `=`, and the parent's db host
+    # in the value. `# DB_HOST=...` does not match, and neither does prose.
+    # -E and no -r: a fixed file list, so a directory recursion is not wanted,
+    # and $from goes through sed first because a project name containing `.` or
+    # `+` would otherwise widen the pattern.
+    fromre="$(printf '%s' "$from" | sed 's/[][\.*^$(){}?+|]/\\&/g')"
+    # A shell assignment, a dotenv line, a YAML mapping value or a compose list
+    # item — all of them are NAME, a separator, then the value. What none of them
+    # is, is a comment.
+    assignment="^[[:space:]]*-?[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[:=][^#]*ddev-$fromre-db"
+    if [ -n "$asked" ]; then
+      # The container already answered for its own environment; .env is the one
+      # thing it could not see.
+      shared="$(grep -sEn "$assignment" .env 2>/dev/null || true)"
+    else
+      # DDEV's per-service form is .ddev/.env.<service>, and a service name has
+      # no dot in it. Taking the glob whole made `.ddev/.env.web.disabled` — a
+      # override renamed aside precisely to turn it off — refuse the copy, with
+      # no way past.
+      envfiles=""
+      for f in .ddev/.env.*; do
+        [ -f "$f" ] || continue
+        case "${f#.ddev/.env.}" in *.*) continue ;; esac
+        envfiles="$envfiles $f"
+      done
+      # shellcheck disable=SC2086
+      shared="$(grep -sEn "$assignment" \
+        .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml \
+        .ddev/.env $envfiles .env 2>/dev/null || true)"
+    fi
   fi
   if [ -n "$shared" ]; then
     echo "hostshift: this worktree is configured to *use* $from's database:" >&2
@@ -390,17 +444,32 @@ for other in ../*/.ddev/.env; do
       #
       # So only a *live* claim is fatal. If the rival is not running there is
       # nothing to lose a routing tie to today.
+      # Every config.*.yaml, in DDEV's own merge order, not config.yaml alone.
+      # config.yaml is *tracked*, so in a sibling worktree it holds the parent
+      # repo's pinned `name:` while the worktree's own name lives in a
+      # config.*.local.yaml — which is the shape this repo's test harness uses
+      # and the shape a worktree naturally takes. Reading config.yaml alone
+      # therefore asked docker about the *parent*, which is running by
+      # definition, so every stale sibling .ddev/.env was fatal again and the
+      # liveness gate was inert. That is the same mistake this file already
+      # fixed for the current project two blocks down.
       oname="$(basename "$odir")"
-      if [ -f "$odir/.ddev/config.yaml" ]; then
-        n="$(sed -n 's/^name: *//p' "$odir/.ddev/config.yaml" | sed -n 1p)"
+      for oc in "$odir/.ddev/config.yaml" "$odir"/.ddev/config.*.yaml; do
+        [ -f "$oc" ] || continue
+        n="$(sed -n 's/^name: *//p' "$oc" | sed -n 1p)"
         [ -n "$n" ] && oname="$n"
-      fi
+      done
       if [ "$(docker inspect "ddev-$oname-web" --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
         claimed="$v"
-      else
-        echo "  ($oname is not running, so nothing is serving it right now.)" >&2
+        break 2
       fi
-      break 2 ;;
+      # Not `break 2`. A dead sibling is not a claim, and stopping at the first
+      # one meant a *live* rival further down the list was never examined —
+      # check then printed "hostshift is serving" and exited 0 while traefik
+      # routed that hostname elsewhere, which is the exact failure this block
+      # exists to catch.
+      echo "  ($oname is not running, so nothing is serving it right now.)" >&2
+      break ;;
     esac
   done
 done
@@ -641,15 +710,39 @@ if [ "$cmd" = "check" ]; then
   # it. Comparing that against `hostshift map` here is exact, needs no recorded
   # state, and both sides render through the same Map.String().
   #
-  # Best-effort by design. A rotated or truncated log yields no pair lines and is
+  # Best-effort by design. A rotated or truncated log yields no map block and is
   # not evidence of drift, so it says nothing rather than crying wolf.
-  running_map="$(docker logs "ddev-$name-hostshift" 2>&1 \
-    | sed -n 's/^\(.*[[:space:]]\)\{0,1\}\(https:\/\/[^[:space:]]*[[:space:]]*->[[:space:]]*https:\/\/[^[:space:]]*\)$/\2/p' \
-    | tr -s ' ' | sort -u || true)"
+  #
+  # The block is delimited, not pattern-matched out of the whole log, and only
+  # the *last* block counts. Both matter:
+  #
+  #   * Every straggler WARN carries a `context=` attribute whose value is raw
+  #     page bytes. A page that merely mentions `https://old -> https://new`
+  #     within 64 bytes of a straggler injected a phantom pair, `check` exited 2
+  #     on every start, and the advice — `ddev restart` — could not help, because
+  #     the line stays in the log until the container is *recreated*.
+  #   * `docker logs` keeps output across a restart, and a hostshift.yaml edit
+  #     changes the map without changing the compose definition, so the container
+  #     is reused. Unioning the blocks compared the old map against the new one
+  #     and never agreed again. Reading the last block compares what is actually
+  #     running.
+  #
+  # `map from` opens the block and the version banner closes it; both are printed
+  # by the same function, adjacent, before the first request is served.
+  extract_map='
+    /^hostshift: map from /   { inblock = 1; delete m; n = 0; next }
+    inblock && /: listening on / { inblock = 0; next }
+    inblock                   { m[++n] = $0 }
+    END { for (i = 1; i <= n; i++) print m[i] }'
+  # Same normalisation both sides: drop the site-name column and collapse the
+  # alignment padding, which depends on the longest hostname in the map. No line
+  # to skip on the host side — `hostshift map` prints its `map from` header to
+  # stderr, so stdout is pair lines only, and dropping one ate a real pair.
+  norm_map() { awk '{ sub(/^[^ \t]+[ \t]+/, ""); gsub(/[ \t]+/, " "); print }' | LC_ALL=C sort -u; }
+  running_map="$(docker logs "ddev-$name-hostshift" 2>&1 | awk "$extract_map" | norm_map || true)"
   if [ -n "$running_map" ]; then
     want_map="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" 2>/dev/null \
-      | sed -n 's/^\(.*[[:space:]]\)\{0,1\}\(https:\/\/[^[:space:]]*[[:space:]]*->[[:space:]]*https:\/\/[^[:space:]]*\)$/\2/p' \
-      | tr -s ' ' | sort -u || true)"
+      | norm_map || true)"
     if [ -n "$want_map" ] && [ "$running_map" != "$want_map" ]; then
       echo "hostshift: the proxy is running a different map than this checkout" >&2
       echo "  now resolves to. It started with:" >&2

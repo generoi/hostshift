@@ -33,7 +33,15 @@ const (
 	// count is worth looking at: it means content is storing origins in a form
 	// §5.3's three encodings do not model.
 	SurfaceHTMLEntity = "html-entity"
-	SurfaceHeader     = "header"
+	// SurfaceHTMLObfuscated is an attribute value whose origin was only visible
+	// after the value was normalised the way the WHATWG URL parser normalises
+	// it: tab, LF and CR removed, and the run of '/' and '\' after the scheme
+	// collapsed. `https:\\h`, `https:///h` and a tab inside the host all
+	// dereference to production in a browser while matching none of §5.3's
+	// three encodings. Like html-entity, a non-zero count means content is
+	// storing origins in a form the byte model does not cover.
+	SurfaceHTMLObfuscated = "html-obfuscated"
+	SurfaceHeader         = "header"
 	SurfaceJSONString = "json-string"
 	// SurfaceJSONEscape is a JSON string whose origin was only visible after
 	// the string was unquoted — a \uXXXX-escaped IDN host, an HTML character
