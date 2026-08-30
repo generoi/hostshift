@@ -284,48 +284,98 @@ func percentDecode(b []byte) []byte {
 	return out
 }
 
-// normaliseURLLeak replaces the host in v when the URL parser would read one
-// that this map rewrites, and returns v untouched otherwise.
+// urlTokenStarts returns every offset in v where a URL could begin.
 //
-// Only the host's byte range changes. Everything else — the scheme as written,
-// the separator however it was spelled, userinfo, port, path, query, fragment —
-// is copied through, so this cannot damage a value it does not need to fix.
+// A value is not always one URL. srcset and imagesrcset are comma-separated
+// lists whose entries carry a descriptor, ping is a space-separated list, a meta
+// refresh spells it `0;url=…`, and a style attribute wraps it in `url(…)`. The
+// anchored matcher finds plain origins in all of those without knowing any of
+// their grammars — it just scans — and the same is true here as long as the
+// locator is offered each token rather than only the head of the value.
+//
+// Only token boundaries, so a `//` inside a path or a query cannot be mistaken
+// for an authority.
+func urlTokenStarts(v []byte) []int {
+	var out []int
+	for i := 0; i < len(v); i++ {
+		if i > 0 {
+			switch c := v[i-1]; {
+			case c <= 0x20, c == ',', c == '(', c == '=', c == '"', c == '\'', c == ';':
+			default:
+				continue
+			}
+		}
+		if n, _ := schemeLen(v[i:]); n > 0 {
+			out = append(out, i)
+			continue
+		}
+		if isSlashish(v[i]) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// locateHost finds the host the URL parser would read starting at v, and the
+// origin it maps to.
+func (h *hostReplacer) locateHost(v []byte) (from, until int, to origin.Origin, ok bool) {
+	n := stripForURL(v)
+	at := h.authorityStart(n.b)
+	if at < 0 || at >= len(n.b) {
+		return 0, 0, to, false
+	}
+	hs, he, port := hostRange(n.b, at)
+	if hs >= he {
+		return 0, 0, to, false
+	}
+	host := h.key(percentDecode(n.b[hs:he]))
+	to, ok = h.to[host]
+	if !ok && port != "" {
+		to, ok = h.to[host+":"+port]
+	}
+	if !ok {
+		return 0, 0, to, false
+	}
+	// Whatever the original spelled the host with — a tab, a reference, a
+	// percent escape — the replaced range covers all of it, because pos maps
+	// every surviving byte back and the removed ones lie between them.
+	return n.pos[hs], n.pos[he-1] + 1, to, true
+}
+
+// normaliseURLLeak replaces every host in v that the URL parser would read and
+// this map rewrites, and returns v untouched when there are none.
+//
+// Only the hosts' byte ranges change. Everything else — the scheme as written,
+// the separator however it was spelled, userinfo, port, path, query, fragment,
+// and every byte between the entries of a list — is copied through, so this
+// cannot damage a value it does not need to fix.
 func (w *HTML) normaliseURLLeak(base int, v []byte) []byte {
 	if w.hosts == nil || len(w.hosts.to) == 0 {
 		return v
 	}
-	n := stripForURL(v)
-	at := w.hosts.authorityStart(n.b)
-	if at < 0 || at >= len(n.b) {
+	var out []byte
+	prev := 0
+	for _, off := range urlTokenStarts(v) {
+		if off < prev {
+			continue // inside a host already replaced
+		}
+		from, until, to, ok := w.hosts.locateHost(v[off:])
+		if !ok {
+			continue
+		}
+		from, until = off+from, off+until
+		out = append(out, v[prev:from]...)
+		out = append(out, to.Host...)
+		prev = until
+		w.stats.Record(SurfaceHTMLObfuscated, base, []origin.Event{{
+			Offset:  base + from,
+			Surface: SurfaceHTMLObfuscated,
+			Action:  origin.ActionRewrote,
+			Text:    string(v[from:until]),
+		}})
+	}
+	if out == nil {
 		return v
 	}
-	hs, he, port := hostRange(n.b, at)
-	if hs >= he {
-		return v
-	}
-	host := w.hosts.key(percentDecode(n.b[hs:he]))
-	to, ok := w.hosts.to[host]
-	if !ok && port != "" {
-		to, ok = w.hosts.to[host+":"+port]
-	}
-	if !ok {
-		return v
-	}
-
-	// Whatever the original spelled the host with — a tab, a reference, a
-	// percent escape — the replaced range covers all of it, because pos maps
-	// every surviving byte back and the removed ones lie between them.
-	from, until := n.pos[hs], n.pos[he-1]+1
-	out := make([]byte, 0, len(v)+len(to.Host))
-	out = append(out, v[:from]...)
-	out = append(out, to.Host...)
-	out = append(out, v[until:]...)
-
-	w.stats.Record(SurfaceHTMLObfuscated, base, []origin.Event{{
-		Offset:  base + from,
-		Surface: SurfaceHTMLObfuscated,
-		Action:  origin.ActionRewrote,
-		Text:    string(v[from:until]),
-	}})
-	return out
+	return append(out, v[prev:]...)
 }

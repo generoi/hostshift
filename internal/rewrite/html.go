@@ -206,25 +206,32 @@ var structuredAttrNames = [][]byte{
 	[]byte("srcset"), []byte("imagesrcset"), []byte("ping"), []byte("srcdoc"), []byte("content"),
 }
 
-// singleURLAttrNames are the attributes whose whole value is one URL, which the
-// browser resolves through the URL parser.
+// urlAttrNames are the attributes whose value carries a URL the browser resolves
+// through the URL parser — one URL, a list of them, or one embedded in a small
+// grammar.
 //
-// Only these get normaliseURLLeak, and the restriction is not caution for its
-// own sake: that pass deletes tab, LF and CR, because the URL parser does. In a
-// title or an alt those are ordinary text, and in srcset, imagesrcset and ping
-// they are *separators* — a list of URLs delimited by whitespace, which deleting
-// the whitespace would run together. The remaining gap is therefore an
-// obfuscated origin inside a srcset entry; it is a background image rather than
-// a navigation target, and closing it means splitting the list first.
-var singleURLAttrNames = [][]byte{
+// An allow-list, not everything: the pass rewrites what the *parser* would read
+// as a host, and in a title or an alt an origin-shaped run of bytes is prose the
+// browser never dereferences. Leaving those alone is correct, not cautious.
+//
+// The list ones — srcset, imagesrcset, ping — used to be excluded because the
+// pass deleted whitespace, which is their separator. It no longer does: it
+// replaces the host's byte range and copies everything else, so a list is safe
+// as long as the locator is offered each entry. See urlTokenStarts.
+var urlAttrNames = [][]byte{
 	[]byte("href"), []byte("src"), []byte("action"), []byte("formaction"),
 	[]byte("cite"), []byte("poster"), []byte("data"), []byte("manifest"),
 	[]byte("longdesc"), []byte("background"), []byte("codebase"),
 	[]byte("profile"), []byte("itemid"), []byte("xlink:href"),
+	// Lists, and small grammars with a URL inside: srcset's `URL descriptor,
+	// …`, ping's space-separated list, a meta refresh's `0;url=…`, and a style
+	// attribute's `url(…)`.
+	[]byte("srcset"), []byte("imagesrcset"), []byte("ping"),
+	[]byte("content"), []byte("style"),
 }
 
 func singleURLAttr(name []byte) bool {
-	for _, s := range singleURLAttrNames {
+	for _, s := range urlAttrNames {
 		if len(name) == len(s) && bytes.EqualFold(name, s) {
 			return true
 		}

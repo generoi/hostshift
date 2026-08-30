@@ -92,6 +92,15 @@ func TestObfuscatedOriginsAreRewritten(t *testing.T) {
 		{"a reference scheme colon", `<a href="https&#58;\\www.example.fi/x">`},
 		// xlink:href is resolved and dereferenced for <image> and <use>.
 		{"xlink:href", `<svg><image xlink:href="https:\\www.example.fi/a.png"/></svg>`},
+		// A value is not always one URL. The plain spelling of every one of
+		// these is caught by the anchored matcher, which knows none of their
+		// grammars either — it just scans — so the obfuscated spelling has no
+		// business being the exception.
+		{"srcset entry", `<img srcset="https:\\www.example.fi/a.png 1x">`},
+		{"a later srcset entry", `<img srcset="/local.png 1x, https:\\www.example.fi/b.png 2x">`},
+		{"ping list", `<a ping="https:\\www.example.fi/p">x</a>`},
+		{"meta refresh", `<meta http-equiv="refresh" content="0;url=https:\\www.example.fi/">`},
+		{"css url() in a style attribute", `<div style="background:url(https:\\www.example.fi/x.png)">`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			out := rewriteHTML(t, m, c.in, NewStats(false))
@@ -127,6 +136,13 @@ func TestNormalisationIsConfined(t *testing.T) {
 			"srcset keeps its whitespace separators",
 			"<img srcset=\"https://www.example.fi/a.png 1x,\thttps://www.example.fi/b.png 2x\">",
 			"1x,\thttps://wt-a--example.ddev.site/b.png",
+		},
+		{
+			// The descriptors and the separator survive an obfuscated entry too:
+			// only the host's bytes are replaced.
+			"an obfuscated srcset keeps its descriptors",
+			`<img srcset="https:\\www.example.fi/a.png 1x, https:\\www.example.fi/b.png 2x">`,
+			`srcset="https:\\wt-a--example.ddev.site/a.png 1x, https:\\wt-a--example.ddev.site/b.png 2x"`,
 		},
 		{
 			"a title is text, not a URL",
