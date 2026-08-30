@@ -90,6 +90,25 @@ installaddon() {
 
 get() { curl -sk --max-time 20 "$1" 2>&1; }
 
+# ready waits for a URL to answer at all, before the assertions that care what it
+# answers.
+#
+# `ddev start` returns before traefik has finished reconfiguring, and a teardown
+# running beside it — another suite's, or an agent's — churns the router further.
+# The symptom is an empty body from one hostname while its neighbours are fine,
+# which reads exactly like a routing bug and cost two investigations to identify.
+#
+# This is a readiness wait, not a retry-until-green: it gives up after 30 seconds
+# and the assertions then run and fail as they would have, so a hostname that
+# genuinely never serves is still a failure with the same message.
+ready() {
+  for _ in $(seq 1 15); do
+    [ -n "$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null | grep -v '^000$')" ] && return 0
+    sleep 2
+  done
+  return 0
+}
+
 echo "== a single-site worktree, zero committed config  (image: $IMAGE)"
 
 main="$work/${tag}"
@@ -229,6 +248,11 @@ projects+=("$m2" "$wt2")
 (cd "$m2" && ddev start -y >/dev/null 2>&1) || fail "the multisite parent starts" ""
 (cd "$wt2" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds on a multisite" ""
 (cd "$wt2" && ddev start -y >/dev/null 2>&1) || fail "the multisite worktree starts" ""
+# Both blogs, because the second one is the one that has been seen empty while
+# the first was already answering.
+ready "https://wt-b--${tag}2.ddev.site/"
+ready "https://wt-b--shop.${tag}2.ddev.site/"
+ready "https://shop.${tag}2.ddev.site/"
 
 # The case a comma-separated --map broke against the published image: both
 # variants 421'd while everything reported success.
