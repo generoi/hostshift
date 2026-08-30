@@ -50,16 +50,37 @@ pre_install_actions:
     #
     # The end marker also means a later version can add a pattern to the block
     # rather than being frozen by the idempotency guard below.
+    # A complete block is left alone; a half-written one is repaired rather than
+    # frozen, since the idempotency guard would otherwise arm that trap forever.
     if grep -qxF '# hostshift (ddev add-on) — begin' "$ex" 2>/dev/null; then
-      exit 0
+      if grep -qxF '# hostshift (ddev add-on) — end' "$ex"; then
+        exit 0
+      fi
+      tmp="$(mktemp)"
+      awk '
+        $0 == "# hostshift (ddev add-on) — begin" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && cat "$tmp" > "$ex"
+      rm -f "$tmp"
     fi
     # An older, undelimited block from a previous version: take it out first, so
     # this does not append a second copy beside it.
+    #
+    # Only the *contiguous* run that follows the marker. `grep -vxF` removed
+    # every matching line anywhere in the file, so a developer's own
+    # `.ddev/.env` rule written above the block — the shape this file's comments
+    # say both pilot repos have — was deleted from their own section and
+    # absorbed into ours, and the next removal then took it away for good. That
+    # is the exposure the markers were introduced to prevent, reintroduced one
+    # release later through the migration.
     if grep -qxF '# hostshift (ddev add-on)' "$ex" 2>/dev/null; then
       tmp="$(mktemp)"
-      grep -vxF -e '# hostshift (ddev add-on)' -e '.ddev/**/*hostshift*' \
-        -e '.ddev/.env' -e 'wp-cli.local.yml' "$ex" > "$tmp" || true
-      cat "$tmp" > "$ex"
+      awk '
+        $0 == "# hostshift (ddev add-on)" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && cat "$tmp" > "$ex"
       rm -f "$tmp"
     fi
     {
@@ -203,9 +224,23 @@ removal_actions:
     # marker; there, matching the patterns is all there is to go on.
     tmp="$(mktemp)"
     ok=""
-    if grep -qxF '# hostshift (ddev add-on) — begin' "$ex"; then
+    # Both markers, or neither. `sed` with an unmatched end address deletes from
+    # the begin marker to end of file, so a block whose end marker had been
+    # hand-deleted emptied the developer's whole exclude file — silently, exit 0.
+    if grep -qxF '# hostshift (ddev add-on) — begin' "$ex" &&
+       grep -qxF '# hostshift (ddev add-on) — end' "$ex"; then
       sed '/^# hostshift (ddev add-on) — begin$/,/^# hostshift (ddev add-on) — end$/d' \
         "$ex" > "$tmp" && ok=1
+    elif grep -qxF '# hostshift (ddev add-on) — begin' "$ex"; then
+      # A begin marker with no end: take the marker and the contiguous run of
+      # our own patterns, and leave everything else alone. Deleting to end of
+      # file, which is what sed does with an unmatched end address, emptied the
+      # developer's whole exclude file.
+      awk '
+        $0 == "# hostshift (ddev add-on) — begin" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && ok=1
     else
       # grep exits 1 when it selects no lines, which is the shape the install
       # creates when info/exclude did not exist before. That is a success with an

@@ -153,9 +153,19 @@ rm "$wt/hostshift.yaml"
 # which has no cross-project uniqueness check, resolves the tie by rule length,
 # which a worktree's longer directory name always wins. `ddev start` says
 # nothing about it.
-out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+# `init --dry-run`, because the note is init's: it says those hostnames serve
+# this worktree "until `ddev restart`", which is true when init says it and
+# false ever after — so env, wp-cli and loopback printing it told a developer
+# with a healthy worktree that it was stealing a hostname it was not.
+out="$(cd "$wt" && "$cmd" init --dry-run --slug wt-a 2>&1 || true)"
 contains "an inherited hostname the parent also serves is called out" \
   "also registered nat.acme.ddev.site" "$out"
+# ...and not by the read-only subcommands, where it is false.
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"also registered"*) fail "and env does not repeat it" "$out" ;;
+  *) pass "and env does not repeat it" ;;
+esac
 
 # The map the proxy cannot work out for itself: the compose service mounts only
 # this worktree, so the parent's hostnames are unknowable inside the container —
@@ -242,7 +252,14 @@ check "init is idempotent" "$first" "$(cat "$wt/.ddev/.env")"
 #
 # Run against the real released command out of the tag, not a stub of it, and
 # against every tag there is — a stub only proves what its author remembered.
-hook="$(sed -n 's/^ *- *exec-host: *//p' "$repo/ddev/config.hostshift.yaml")"
+# The hook is a YAML block scalar now, so take the whole indented body rather
+# than one line after the key.
+hook="$(awk '
+  /^ *- *exec-host: *\|/ { inblock = 1; next }
+  inblock && /^        / { sub(/^        /, ""); print; next }
+  inblock { exit }
+' "$repo/ddev/config.hostshift.yaml")"
+[ -n "$hook" ] || hook="$(sed -n 's/^ *- *exec-host: *//p' "$repo/ddev/config.hostshift.yaml")"
 [ -n "$hook" ] || fail "the post-start hook line could not be read" ""
 for tag in $(cd "$repo" && git tag -l 'v*'); do
   old_cmd="$work/hostshift-$tag"
@@ -257,9 +274,16 @@ for tag in $(cd "$repo" && git tag -l 'v*'); do
   out="$(cd "$wt" && bash -c "$hook" 2>&1 || true)"
   rm -f "$wt/.ddev/commands/host/hostshift"
   case "$out" in
-    *"unknown argument"*|*"usage:"*)
+    *"unknown argument"*|*"usage: ddev hostshift <command>"*)
       fail "the post-start hook parses under $tag's command" "$out" ;;
     *) pass "the post-start hook parses under $tag's command" ;;
+  esac
+  # ...and it warns, on every start, that the old command is still in place —
+  # one line in an `add-on get` output is not enough, and DDEV itself tells
+  # developers to strip the marker that keeps the command replaceable.
+  case "$out" in
+    *"predates this add-on"*) pass "and says the command was not replaced" ;;
+    *) fail "and says the command was not replaced" "$out" ;;
   esac
 done
 

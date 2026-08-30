@@ -204,6 +204,18 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 	dec, _ = decodeURLRefs(dec)
 
 	out, _ := m.Rewrite(dec, SurfaceJSONEscape, false)
+	// The same two catchers the HTML surfaces get. Without them the REST body
+	// was the one surface with neither: `{"u":"https:\\h/x"}` and an NFD host in
+	// content.rendered both went out untouched while the identical bytes in the
+	// page were rewritten — which is the hazard this function's own header
+	// describes, "the page rewrites; the REST API does not, so Gutenberg and
+	// every JS fetch get production URLs". And because this is also the
+	// request-body path, a Gutenberg save wrote the unfolded host back into the
+	// database.
+	//
+	// value=true: a JSON string holding a URL is a value, so a trailing dot is
+	// the host's root label rather than a sentence's full stop.
+	out = hostsFor(m).rewriteAll(out, true)
 	if bytes.Equal(out, dec) {
 		return nil, false
 	}

@@ -272,13 +272,31 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	}
 	out, events := rw(v, surface, w.stats.Explain())
 	w.stats.Record(surface, base, events)
+	// `value` is the same distinction RewriteText draws above: in an attribute a
+	// trailing dot is the host's root label, in prose it is a full stop.
+	value := surface == SurfaceHTMLAttr
 	if surface == SurfaceHTMLAttr {
 		out = w.urlLeaks(base, out, singleURLAttr(name))
+	} else {
+		// Every other surface gets the locator too. It ran on attributes alone,
+		// so every *ASCII* URL-parser shape — `https:\h`, `https:///h`,
+		// `http:h`, a tab in the host, `u@h`, `%2e` for a dot — went out
+		// untouched in an inline script, an inline stylesheet, a text node and a
+		// comment, with the census reporting a clean page. §5.2 calls inline
+		// script and style Tier 1 and "where the CSS and JS URLs actually are",
+		// and `fetch("https://www%2eexample%2efi/a")` is a production request
+		// carrying the developer's session.
+		out = w.normaliseURLLeak(surface, base, out, false)
 	}
-	// Every surface, because a host that only folds onto a canonical one — a
-	// soft hyphen, fullwidth letters, U+3002 for the dots, NFD — shares no bytes
-	// with its pattern anywhere, not just in a URL attribute.
-	out = w.foldedHostLeak(surface, base, out)
+	// And a host that only folds onto a canonical one — a soft hyphen, fullwidth
+	// letters, U+3002 for the dots, NFD — shares no bytes with its pattern on any
+	// surface either.
+	out = w.foldedHostLeak(surface, base, out, value)
+	// CSS unescapes before the URL parser runs, so a style surface needs that
+	// view too — see stripForCSS.
+	if surface == SurfaceInlineStyle || (surface == SurfaceHTMLAttr && len(name) == 5 && bytes.EqualFold(name, []byte("style"))) {
+		out = w.cssEscapeLeak(out)
+	}
 	// Every surface, because a host that only folds onto a canonical one — a
 	// soft hyphen, fullwidth letters, U+3002 for the dots, NFD — shares no bytes
 	// with its pattern anywhere, not just in a URL attribute.
@@ -327,7 +345,7 @@ func (w *HTML) urlLeaks(base int, v []byte, isURL bool) []byte {
 		return v
 	}
 	// On the decoded form, so the two compose. When nothing decoded, dec is v.
-	if out := w.normaliseURLLeak(base, dec); !bytes.Equal(out, dec) {
+	if out := w.normaliseURLLeak(SurfaceHTMLObfuscated, base, dec, true); !bytes.Equal(out, dec) {
 		return out
 	}
 	return v

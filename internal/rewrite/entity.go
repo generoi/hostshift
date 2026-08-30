@@ -143,7 +143,13 @@ func parseURLRef(b []byte) (string, int) {
 	if b[1] != '#' {
 		// Named. Bounded lookahead: long enough for the accented letters an IDN
 		// host is built from as well as the punctuation table.
-		lim := min(len(b), 16)
+		// Long enough for the whole family. The cap used to be 16, which silently
+		// dropped four of the seven HTML5 names decoding to a character UTS46
+		// deletes inside a host: &NegativeThinSpace; &NegativeVeryThinSpace;
+		// &NegativeMediumSpace; and &NegativeThickSpace;, all U+200B, all live
+		// production links one character away from the &ZeroWidthSpace; spelling
+		// that is caught. The longest name in the HTML5 table is 32 characters.
+		lim := min(len(b), 34)
 		end := bytes.IndexByte(b[1:lim], ';')
 		if end < 0 {
 			return "", 0

@@ -94,9 +94,19 @@ func MustParse(s string) Origin {
 // resolution, and this is a comparison form, so it must fold rather than judge.
 // MapForLookup with StrictDomainName off maps without rejecting, and
 // Transitional(false) is what browsers do.
+//
+// CheckHyphens(false) because WHATWG's domain-to-ASCII sets it false explicitly,
+// and MapForLookup turns it on. With it on, x/net *errors* where the browser
+// succeeds — on any label with `--` in positions 3-4, or a leading or trailing
+// hyphen — and the fallback then compares the raw string, which shares no bytes
+// with anything. One such host in the map silently switched the whole fold off
+// for that host on every surface. `--` at 3-4 is not exotic: it is the shape the
+// add-on's own default slug produces, `wt--acme.ddev.site`, and a variant is the
+// canonical side of the request-direction matcher.
 var hostFold = idna.New(
 	idna.MapForLookup(),
 	idna.StrictDomainName(false),
+	idna.CheckHyphens(false),
 	idna.Transitional(false),
 )
 

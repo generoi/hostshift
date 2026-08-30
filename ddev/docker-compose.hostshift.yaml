@@ -40,7 +40,13 @@ services:
   # of hostshift yet. An add-on has to be inert until it is configured.
   web:
     environment:
-      VIRTUAL_HOST: ${HOSTSHIFT_WEB_HOSTS:-$DDEV_HOSTNAME}
+      # `-`, not `:-`. An *empty* HOSTSHIFT_WEB_HOSTS is a real answer — every
+      # hostname this worktree registers belongs to a variant or to the parent,
+      # so web should serve none of them — and `:-` treated it as unset and
+      # handed web the whole list back, inverting the narrowing exactly where it
+      # mattered most. Unset still means "the add-on has not configured this
+      # project", which is what the fallback is for.
+      VIRTUAL_HOST: ${HOSTSHIFT_WEB_HOSTS-$DDEV_HOSTNAME}
 
   hostshift:
     container_name: ddev-${DDEV_SITENAME}-hostshift

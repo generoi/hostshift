@@ -41,6 +41,29 @@
 # configured says nothing at all on start. It has nothing to check, and nine
 # lines of advice plus a `Task failed` on a project with nothing wrong with it is
 # how an add-on stops being inert until it is configured.
+# The version guard is not decoration.
+#
+# DDEV replaces *this* file on `ddev add-on get` because it carries
+# #ddev-generated, and refuses to replace the command because v0.1.0's copy does
+# not. So an upgraded project runs the new hook against the old logic — and the
+# old logic is missing every refusal added since: the parent-declares check, the
+# variant-resolvability check, the collision liveness gate, and the running-map
+# comparison. Measured on a real upgrade, a worktree whose map named the wrong
+# hostnames entirely printed "hostshift is configured to serve" and exited 0,
+# while both variants 302'd to wp-signup.php.
+#
+# install.yaml warns about this once, in the middle of a long `add-on get`
+# output, at a moment when nothing is yet broken. That is not enough, and DDEV
+# itself makes it worse: it prints "unexpected #ddev-generated … Remove
+# unexpected '#ddev-generated' comments" on every restart, so a developer
+# following DDEV's own advice arms the trap on a project that was fine. Nagging
+# on every start until the command is replaced is the proportionate answer.
 hooks:
   post-start:
-    - exec-host: HOSTSHIFT_HOOK=1 .ddev/commands/host/hostshift check
+    - exec-host: |
+        grep -q '#ddev-generated' .ddev/commands/host/hostshift 2>/dev/null || {
+          echo "hostshift: .ddev/commands/host/hostshift predates this add-on and was" >&2
+          echo "  NOT replaced on upgrade, so the checks added since are not running." >&2
+          echo "  rm .ddev/commands/host/hostshift && ddev add-on get generoi/hostshift" >&2
+        }
+        HOSTSHIFT_HOOK=1 .ddev/commands/host/hostshift check

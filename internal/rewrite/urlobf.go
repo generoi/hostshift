@@ -3,6 +3,7 @@ package rewrite
 import (
 	"bytes"
 	"strings"
+	"sync"
 
 	"github.com/generoi/hostshift/internal/origin"
 )
@@ -96,7 +97,8 @@ func isSlashish(c byte) bool { return c == '/' || c == '\\' }
 // back to where each surviving byte came from.
 type normalised struct {
 	b   []byte
-	pos []int // pos[i] is the index in the original of b[i]
+	pos []int // pos[i] is where b[i] came from in the original
+	end []int // end[i] is one past the *end* of what b[i] came from
 }
 
 // stripForURL removes what the parser removes before it parses: leading and
@@ -114,7 +116,7 @@ func stripForURL(v []byte) normalised {
 	for hi > lo && v[hi-1] <= 0x20 {
 		hi--
 	}
-	n := normalised{b: make([]byte, 0, hi-lo), pos: make([]int, 0, hi-lo)}
+	n := normalised{b: make([]byte, 0, hi-lo), pos: make([]int, 0, hi-lo), end: make([]int, 0, hi-lo)}
 	for i := lo; i < hi; {
 		if isURLStripped(v[i]) {
 			i++
@@ -128,7 +130,79 @@ func stripForURL(v []byte) normalised {
 		}
 		n.b = append(n.b, v[i])
 		n.pos = append(n.pos, i)
+		n.end = append(n.end, i+1)
 		i++
+	}
+	return n
+}
+
+// stripForCSS is stripForURL with CSS escapes decoded first.
+//
+// `https\3a\2f\2fwww.example.fi/x` is a CSS-level spelling of an absolute URL:
+// the CSS tokenizer unescapes it *before* anything sees a URL, so the locator —
+// which models the URL parser and nothing else — cannot reach it by
+// construction, and the byte matcher sees no `://` at all. Measured in Chrome,
+// both `cssText` and `getComputedStyle().backgroundImage` come back as
+// `url("https://www.example.fi/…")`, a live production fetch.
+//
+// One escape is a backslash, one to six hex digits, and an optional single
+// trailing whitespace which is part of the escape rather than of the value.
+func stripForCSS(v []byte) normalised {
+	if bytes.IndexByte(v, '\\') < 0 {
+		return stripForURL(v)
+	}
+	dec := make([]byte, 0, len(v))
+	pos := make([]int, 0, len(v))
+	end := make([]int, 0, len(v))
+	for i := 0; i < len(v); {
+		if v[i] != '\\' || i+1 >= len(v) {
+			dec = append(dec, v[i])
+			pos = append(pos, i)
+			end = append(end, i+1)
+			i++
+			continue
+		}
+		j, val, digits := i+1, 0, 0
+		for j < len(v) && digits < 6 {
+			d, ok := digitVal(v[j], 16)
+			if !ok {
+				break
+			}
+			val = val*16 + d
+			j++
+			digits++
+		}
+		if digits == 0 {
+			// An escaped literal: the next character stands for itself.
+			dec = append(dec, v[i+1])
+			pos = append(pos, i)
+			end = append(end, i+2)
+			i += 2
+			continue
+		}
+		if j < len(v) && (v[j] == ' ' || isURLStripped(v[j])) {
+			j++ // the one whitespace that terminates an escape
+		}
+		if val == 0 || val > 0x10FFFF {
+			val = 0xFFFD
+		}
+		for _, c := range []byte(string(rune(val))) {
+			dec = append(dec, c)
+			pos = append(pos, i)
+			end = append(end, j)
+		}
+		i = j
+	}
+	// Now the URL parser's own removals, over the decoded bytes, carrying the
+	// map through.
+	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
+	for i := 0; i < len(dec); i++ {
+		if isURLStripped(dec[i]) {
+			continue
+		}
+		n.b = append(n.b, dec[i])
+		n.pos = append(n.pos, pos[i])
+		n.end = append(n.end, end[i])
 	}
 	return n
 }
@@ -325,7 +399,7 @@ func urlTokenStarts(v []byte) []int {
 // O(k·n) — measured at 55 seconds for a 320 KB attribute value, which
 // extrapolates to hours at the shipped 4 MiB token cap. That is the same bug
 // class scan.go documents having already fixed once.
-func (h *hostReplacer) locateHostIn(n normalised, at int) (from, until int, to origin.Origin, ok bool) {
+func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, until int, to origin.Origin, ok bool) {
 	rel := h.authorityStart(n.b[at:])
 	if rel < 0 {
 		return 0, 0, to, false
@@ -335,13 +409,27 @@ func (h *hostReplacer) locateHostIn(n normalised, at int) (from, until int, to o
 		return 0, 0, to, false
 	}
 	hs, he, port := hostRange(n.b, start)
+	// A trailing dot is the host's root label inside a URL and a full stop in
+	// prose, and only the caller knows which surface it is on — the same
+	// distinction Matcher.RewriteText exists for. Absorbing it in a text node
+	// would eat the sentence's punctuation.
+	if !value && he > hs && n.b[he-1] == '.' {
+		he--
+	}
 	if hs >= he {
 		return 0, 0, to, false
 	}
 	host := h.key(percentDecode(n.b[hs:he]))
-	to, ok = h.to[host]
-	if !ok && port != "" {
+	// host:port first. Backwards, the bare-host pair won and an explicit
+	// :8080 origin was rewritten to the wrong variant — while the byte matcher,
+	// which disambiguates by port, got the same input right, so the two halves
+	// of the engine disagreed. §5.4 says matching is on exact origin equality,
+	// and :8080 is a different origin.
+	if port != "" {
 		to, ok = h.to[host+":"+port]
+	}
+	if !ok {
+		to, ok = h.to[host]
 	}
 	if !ok {
 		return 0, 0, to, false
@@ -349,7 +437,7 @@ func (h *hostReplacer) locateHostIn(n normalised, at int) (from, until int, to o
 	// Whatever the original spelled the host with — a tab, a reference, a
 	// percent escape — the replaced range covers all of it, because pos maps
 	// every surviving byte back and the removed ones lie between them.
-	return n.pos[hs], n.pos[he-1] + 1, to, true
+	return n.pos[hs], n.end[he-1], to, true
 }
 
 // foldedHostLeak catches a host that only *folds* onto a canonical one.
@@ -366,7 +454,7 @@ func (h *hostReplacer) locateHostIn(n normalised, at int) (from, until int, to o
 // the pattern already or is not the canonical host at all. That one test skips
 // the entire pass on most documents, and on the rest the work is bounded by the
 // number of `//` runs.
-func (w *HTML) foldedHostLeak(surface string, base int, v []byte) []byte {
+func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []byte {
 	if w.hosts == nil || len(w.hosts.to) == 0 {
 		return v
 	}
@@ -385,11 +473,27 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte) []byte {
 	var out []byte
 	prev := 0
 	for i := 0; i+1 < len(n.b); i++ {
-		if !isSlashish(n.b[i]) || !isSlashish(n.b[i+1]) || n.pos[i] < prev {
+		if !isSlashish(n.b[i]) {
 			continue
 		}
-		from, until, to, ok := w.hosts.locateHostIn(n, i)
+		// Jump to the end of the run rather than trying every offset inside it.
+		// authorityStart walks the run from wherever it is asked, so starting at
+		// each of its L bytes was L²/2 work — 20 seconds for a 400,000-byte run,
+		// extrapolating to about 38 minutes at the 4 MiB token cap. That is the
+		// bug locateHostIn's own comment says was already fixed once, live again
+		// in its other caller. One non-ASCII byte anywhere in the value is the
+		// only other trigger.
+		run := i
+		for run < len(n.b) && isSlashish(n.b[run]) {
+			run++
+		}
+		if run-i < 2 || n.pos[i] < prev {
+			i = run - 1
+			continue
+		}
+		from, until, to, ok := w.hosts.locateHostIn(n, i, value)
 		if !ok {
+			i = run - 1
 			continue
 		}
 		// Nothing to do when the bytes already say the variant, and nothing to
@@ -429,7 +533,7 @@ func hasNonASCII(b []byte) bool {
 // the separator however it was spelled, userinfo, port, path, query, fragment,
 // and every byte between the entries of a list — is copied through, so this
 // cannot damage a value it does not need to fix.
-func (w *HTML) normaliseURLLeak(base int, v []byte) []byte {
+func (w *HTML) normaliseURLLeak(surface string, base int, v []byte, value bool) []byte {
 	if w.hosts == nil || len(w.hosts.to) == 0 {
 		return v
 	}
@@ -440,16 +544,16 @@ func (w *HTML) normaliseURLLeak(base int, v []byte) []byte {
 		if off < len(n.pos) && n.pos[off] < prev {
 			continue // inside a host already replaced
 		}
-		from, until, to, ok := w.hosts.locateHostIn(n, off)
+		from, until, to, ok := w.hosts.locateHostIn(n, off, value)
 		if !ok {
 			continue
 		}
 		out = append(out, v[prev:from]...)
 		out = append(out, to.Host...)
 		prev = until
-		w.stats.Record(SurfaceHTMLObfuscated, base, []origin.Event{{
+		w.stats.Record(surface, base, []origin.Event{{
 			Offset:  base + from,
-			Surface: SurfaceHTMLObfuscated,
+			Surface: surface,
 			Action:  origin.ActionRewrote,
 			Text:    string(v[from:until]),
 		}})
@@ -458,4 +562,87 @@ func (w *HTML) normaliseURLLeak(base int, v []byte) []byte {
 		return v
 	}
 	return append(out, v[prev:]...)
+}
+
+// hostsFor gives a matcher its host table, built once and cached on the matcher
+// so the JSON path does not rebuild it per string.
+var hostsCache sync.Map // *origin.Matcher -> *hostReplacer
+
+func hostsFor(m *origin.Matcher) *hostReplacer {
+	if h, ok := hostsCache.Load(m); ok {
+		return h.(*hostReplacer)
+	}
+	h := newHostReplacer(m)
+	hostsCache.Store(m, h)
+	return h
+}
+
+// rewriteAll applies both catchers to a standalone buffer — the JSON path, which
+// has no HTML tokenizer around it. Counters are the caller's business; the
+// events this would emit duplicate the ones RewriteJSON already records.
+func (h *hostReplacer) rewriteAll(v []byte, value bool) []byte {
+	if h == nil || len(h.to) == 0 {
+		return v
+	}
+	v = h.spliceHosts(v, urlTokenStarts, value)
+	if hasNonASCII(v) {
+		v = h.spliceHosts(v, slashRunStarts, value)
+	}
+	return v
+}
+
+// slashRunStarts yields the first byte of each run of two or more slashes, which
+// is where a scheme-relative authority can begin.
+func slashRunStarts(b []byte) []int {
+	var out []int
+	for i := 0; i < len(b); i++ {
+		if !isSlashish(b[i]) {
+			continue
+		}
+		run := i
+		for run < len(b) && isSlashish(b[run]) {
+			run++
+		}
+		if run-i >= 2 {
+			out = append(out, i)
+		}
+		i = run - 1
+	}
+	return out
+}
+
+func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bool) []byte {
+	return h.spliceHostsIn(stripForURL(v), v, starts, value)
+}
+
+func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte) []int, value bool) []byte {
+	var out []byte
+	prev := 0
+	for _, off := range starts(n.b) {
+		if off < len(n.pos) && n.pos[off] < prev {
+			continue
+		}
+		from, until, to, ok := h.locateHostIn(n, off, value)
+		if !ok {
+			continue
+		}
+		if from < prev {
+			continue
+		}
+		out = append(out, v[prev:from]...)
+		out = append(out, to.Host...)
+		prev = until
+	}
+	if out == nil {
+		return v
+	}
+	return append(out, v[prev:]...)
+}
+
+// cssEscapeLeak is the CSS-tokenizer view of a style surface.
+func (w *HTML) cssEscapeLeak(v []byte) []byte {
+	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '\\') < 0 {
+		return v
+	}
+	return w.hosts.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, true)
 }

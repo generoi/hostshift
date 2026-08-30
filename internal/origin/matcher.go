@@ -341,6 +341,15 @@ func delimAt(b []byte, i int) bool {
 	if i >= len(b) {
 		return true
 	}
+	// '@' is not one. It is not a host byte, so it read as a delimiter and
+	// terminated the match — but in a URL '@' *starts* userinfo, so what
+	// precedes it is credentials and the real host comes after:
+	// https://www.example.fi@evil.com names evil.com, not the canonical, and
+	// rewriting it changed bytes on a value that never pointed at production.
+	// §4.4's delimiter list does not include it either.
+	if b[i] == '@' {
+		return false
+	}
 	if b[i] == '%' {
 		if c, ok := unhex(b, i+1); ok {
 			return !isHostByte(c)

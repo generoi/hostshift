@@ -114,6 +114,71 @@ func TestObfuscatedOriginsAreRewritten(t *testing.T) {
 	}
 }
 
+// The locator ran on attribute values only, so every *ASCII* URL-parser shape
+// went out untouched in an inline script, an inline stylesheet, a text node and
+// a comment — with the census reporting a clean page, which is the exact
+// property this file's header says was fixed one surface over.
+//
+// §5.2 calls inline script and style Tier 1 and "where the CSS and JS URLs
+// actually are", and `fetch("https://www%2eexample%2efi/a")` is a production
+// request carrying the developer's session.
+func TestObfuscatedOriginsOnEverySurface(t *testing.T) {
+	m := obfMatcher(t)
+	for _, shape := range []string{
+		`https:\\www.example.fi/x`,
+		`https:///www.example.fi/x`,
+		`http:www.example.fi/x`,
+		`https://u@www.example.fi/x`,
+		`https://www%2eexample%2efi/x`,
+		"https://www.example	.fi/x",
+	} {
+		for _, s := range []struct{ name, tmpl string }{
+			{"inline script", `<script>fetch("%s")</script>`},
+			{"inline style", `<style>a{background:url(%s)}</style>`},
+			{"text", `<p>%s</p>`},
+			{"comment", `<!-- %s -->`},
+		} {
+			t.Run(s.name+" "+shape, func(t *testing.T) {
+				in := strings.Replace(s.tmpl, "%s", shape, 1)
+				out := rewriteHTML(t, m, in, NewStats(false))
+				if strings.Contains(out, "www.example.fi") {
+					t.Errorf("a production origin reached the browser:\n%s", out)
+				}
+			})
+		}
+	}
+}
+
+// CSS unescapes before the URL parser runs, so `aff` is a spelling of
+// `://` that the locator cannot reach by construction and the byte matcher
+// cannot see at all. Measured in Chrome, both cssText and
+// getComputedStyle().backgroundImage resolve it to a live production fetch.
+func TestCSSEscapesAreRewritten(t *testing.T) {
+	m := obfMatcher(t)
+	for _, c := range []struct{ name, in string }{
+		{"style element", `<style>a{background:url("https\3a\2f\2fwww.example.fi/x")}</style>`},
+		{"style attribute", `<div style="background:url(https\3a\2f\2fwww.example.fi/y)">`},
+		{"escape with a terminating space", `<style>a{background:url(https\3a \2f \2f www.example.fi/z)}</style>`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := rewriteHTML(t, m, c.in, NewStats(false))
+			if strings.Contains(out, "www.example.fi") {
+				t.Errorf("a production origin reached the browser:\n%s", out)
+			}
+		})
+	}
+}
+
+// A trailing dot is the host's root label in a URL and a full stop in prose.
+// Absorbing it on a text surface ate the sentence's punctuation.
+func TestRootDotIsPunctuationInProse(t *testing.T) {
+	out := rewriteHTML(t, obfMatcher(t),
+		`<p>Visit https://www.example.fi. Then leave.</p>`, NewStats(false))
+	if !strings.Contains(out, "https://wt-a--example.ddev.site. Then") {
+		t.Errorf("the full stop did not survive:\n%s", out)
+	}
+}
+
 // The census has to see them too. A leak the counters call zero is a leak
 // nobody goes looking for, and --json reporting a clean page is what made this
 // survive three audit rounds.

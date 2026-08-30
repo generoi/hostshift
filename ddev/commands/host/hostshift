@@ -334,7 +334,16 @@ if [ "$cmd" = "copy-db" ]; then
     echo "  of a different DDEV project. Use \`ddev import-db\` or a fresh pull." >&2
     exit 2; }
   from="$(basename "$parent")"
-  n="$(ddev_name "$parent/.ddev/config.yaml")" && [ -n "$n" ] && from="$n"
+  # Every config.*.yaml, in DDEV's merge order — config.yaml alone is the same
+  # mistake the collision gate two blocks up was fixed for. A parent that names
+  # itself in a config.*.local.yaml made this grep for the wrong ddev-<name>-db
+  # and let a copy through that writes into an idle container while the
+  # application goes on reading the parent's.
+  for pc in "$parent/.ddev/config.yaml" $(LC_ALL=C printf '%s\n' "$parent"/.ddev/config.*.yaml | LC_ALL=C sort); do
+    [ -f "$pc" ] || continue
+    n="$(ddev_name "$pc")"
+    [ -n "$n" ] && from="$n"
+  done
 
   # Sharing the parent's database and copying it are different decisions, and
   # doing both is worse than pointless: the dump goes into this worktree's own
@@ -605,15 +614,32 @@ done
 # without narrowing it web and hostshift both claim the variants and the router
 # picks web — WordPress then sees a variant host, fails to match
 # wp_blogs.domain, and redirects to wp-signup.php.
+# This project's own primary hostname is never subtracted.
+#
+# A parent that lists the worktree's hostname in its own additional_hostnames —
+# which teams do commit, for the mkcert SANs or as a leftover — made the
+# subtraction remove *everything*, so HOSTSHIFT_WEB_HOSTS came out empty. The
+# compose file read it as `${HOSTSHIFT_WEB_HOSTS:-$DDEV_HOSTNAME}`, and `:-`
+# treats empty as unset, so web fell back to every hostname the worktree
+# registers — the exact inverse of narrowing, permanently, in the configuration
+# where the subtraction has the most to do. Both `init` and `check` reported
+# success, because check compares .ddev/.env against a recomputation of itself
+# and both said the same empty thing.
+#
+# A project must be reachable at its own name regardless of what the parent
+# claims, so that one is kept before the subtraction runs.
+own="$(printf '%s' "$hosts" | sed -n 1p)"
 web=""
 while IFS= read -r h; do
   [ -n "$h" ] || continue
   case ",$variants," in *",$h,"*) continue ;; esac
-  case "
+  if [ "$h" != "$own" ]; then
+    case "
 $parent_hosts
 " in *"
 $h
 "*) continue ;; esac
+  fi
   web="${web:+$web,}$h"
 done <<<"$hosts"
 
@@ -670,7 +696,14 @@ fi
 # and the post-start hook printed it on every start, including the restart that
 # had just handed those hostnames back to the parent. Four lines of "until
 # `ddev restart`, those serve this worktree" from the hook of that very restart.
-if [ -n "$parent_hosts" ] && [ "$cmd" != "check" ]; then
+# `init` only, not every subcommand that is not check.
+#
+# The note says those hostnames serve this worktree "until `ddev restart`",
+# which is true when init says it and false ever after — so `env`, `wp-cli` and
+# `loopback` printed it on an already-restarted, entirely healthy worktree,
+# telling the developer their worktree was stealing a hostname it was not and
+# pointing them at remedial action they should not take.
+if [ -n "$parent_hosts" ] && [ "$cmd" = "init" ]; then
   shared=""
   while IFS= read -r h; do
     [ -n "$h" ] || continue
@@ -749,7 +782,14 @@ if [ "$cmd" = "check" ]; then
   # in HOSTSHIFT_VARIANTS, and a hostshift.yaml appearing only in HOSTSHIFT_ARGS
   # — where the deployed flat map goes on beating the file, so its aliases
   # silently never rewrite.
-  deployed="$(grep -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true)"
+  # The same four keys `init` writes and strips, not `^HOSTSHIFT_`. The two
+  # disagreed: init left a v0.1.0 project's leftover HOSTSHIFT_SLUG= and
+  # HOSTSHIFT_MAP_ARGS= lines alone while check counted them, so check reported
+  # "out of date" forever on exactly the upgraded projects. It also swept up any
+  # variable of the developer's own sharing the prefix — and the compose file
+  # reads HOSTSHIFT_* names, so that is how someone arrives at one.
+  deployed="$(grep -e '^HOSTSHIFT_ARGS=' -e '^HOSTSHIFT_VARIANTS=' -e '^HOSTSHIFT_WEB_HOSTS=' \
+    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^#ddev-silent-no-warn' .ddev/.env | tr -d '\r' || true)"
   if [ "$deployed" != "$env_out" ]; then
     echo "hostshift: .ddev/.env is out of date. It says" >&2
     printf '%s\n' "${deployed:-  nothing}" >&2
@@ -1092,7 +1132,8 @@ trap 'rm -f "$tmp"' EXIT
 # putting project env vars, credentials included, so a developer who chmod 600'd
 # it meant it.
 cp -p .ddev/.env "$tmp"
-{ grep -v -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true
+{ grep -v -e '^HOSTSHIFT_ARGS=' -e '^HOSTSHIFT_VARIANTS=' -e '^HOSTSHIFT_WEB_HOSTS=' \
+    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^#ddev-silent-no-warn' .ddev/.env || true
   printf '%s\n' "$env_out"; } > "$tmp"
 mv "$tmp" .ddev/.env
 
