@@ -588,6 +588,114 @@ case "$out" in
   *) pass "and does not refuse when nothing is shared" ;;
 esac
 
+echo "== check, past the container gate"
+
+# Everything in `check` after the first `docker inspect` had never run.
+#
+# This suite has no Docker, so every inspect returned empty and check always
+# bailed at "no ddev-…-hostshift container" — which meant the map comparison, the
+# variant-resolvability test, the collision gate, the running-map diff against
+# `docker logs` and the web VIRTUAL_HOST check were all unexecuted, in a file
+# where four separate audit rounds have found bugs in exactly those blocks. A
+# fake `docker` that emits the shapes the real one does is enough to drive it to
+# the end.
+fakebin="$work/fakebin"
+mkdir -p "$fakebin"
+cat > "$fakebin/docker" <<'FAKE'
+#!/usr/bin/env bash
+# Reads its answers from files the test writes, so each case is explicit.
+case "$1" in
+  inspect)
+    name="$2"
+    case "$name" in
+      *-hostshift) cat "${HS_FAKE_DIR}/hostshift-state" 2>/dev/null || true ;;
+      *-web)       cat "${HS_FAKE_DIR}/web-env" 2>/dev/null || true ;;
+      *)           exit 1 ;;
+    esac ;;
+  logs) cat "${HS_FAKE_DIR}/logs" 2>/dev/null || true ;;
+esac
+exit 0
+FAKE
+chmod +x "$fakebin/docker"
+export HS_FAKE_DIR="$work/fake"
+mkdir -p "$HS_FAKE_DIR"
+
+# A healthy worktree: the proxy is up, answering on the variants, started with
+# the map .ddev/.env asks for, and web holds exactly the narrowed list.
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake() {
+  printf 'true
+proxy %s 
+VIRTUAL_HOST=%s
+' "$env_args" "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
+  printf 'VIRTUAL_HOST=%s
+' "$env_web" > "$HS_FAKE_DIR/web-env"
+  : > "$HS_FAKE_DIR/logs"
+}
+writefake
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" \
+  && pass "check reaches the end and reports what is served" \
+  || fail "check reaches the end and reports what is served" "$out"
+contains "and names the variants" "hostshift is serving" "$out"
+
+# A proxy started with a different map than the file now asks for — the shape
+# that shipped twice as a fleet-wide 421.
+writefake
+printf 'true
+proxy --slug something-else 
+VIRTUAL_HOST=%s
+' "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a proxy running a different map" "different map" "$out"
+
+# A proxy answering on hostnames the file no longer asks for.
+writefake
+printf 'true
+proxy %s 
+VIRTUAL_HOST=stale--acme.ddev.site
+' "$env_args" > "$HS_FAKE_DIR/hostshift-state"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a proxy answering on stale hostnames" "the running proxy answers on" "$out"
+
+# A crashed proxy: the container exists, the env is still there, it is not up.
+writefake
+printf 'false
+proxy %s 
+VIRTUAL_HOST=%s
+' "$env_args" "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a proxy that has exited" "has exited" "$out"
+
+# web serving more than the narrowed list — the inversion that made a worktree
+# steal the parent's blog, and which check could not see until it looked at web.
+writefake
+printf 'VIRTUAL_HOST=%s,b.acme.ddev.site
+' "$env_web" > "$HS_FAKE_DIR/web-env"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches web serving hostnames it should not" "web is serving a different set" "$out"
+
+# The running map differing from what hostshift.yaml now resolves to. Only
+# checked when a hostshift.yaml is present, since otherwise the command line is
+# the map and the comparison above already covered it.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
+  > "$wt/hostshift.yaml"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+printf 'hostshift: map from /project/hostshift.yaml\nmain  https://old.example  ->  https://wt-a--acme.ddev.site\nhostshift v1: listening on :80, upstream http://web\n' \
+  > "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a hostshift.yaml edited without a restart" \
+  "running a different map" "$out"
+rm -f "$wt/hostshift.yaml"
+unset HS_FAKE_DIR
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+
 # Every command this prints must be one DDEV actually accepts. `ddev start -p X`
 # is not — it fails with "unknown shorthand flag".
 if grep -n 'ddev start -p' "$repo/ddev/commands/host/hostshift"; then
