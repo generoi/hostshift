@@ -1155,7 +1155,19 @@ if [ "$cmd" = "check" ]; then
   # is not guaranteed present, so its absence is not an error either.
   if command -v curl >/dev/null; then
     probe="$(printf '%s' "$variants" | cut -d, -f1)"
-    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://$probe/" 2>/dev/null || true)"
+    # Retried, because this runs in the post-start hook — the instant after
+    # `ddev start` returns, when traefik may not have picked up the new router
+    # yet. A single request would turn that ordinary race into a refusal on a
+    # perfectly good project, and a check that cries wolf on every cold start is
+    # worse than the gap it closes.
+    code=""
+    for attempt in 1 2 3; do
+      code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://$probe/" 2>/dev/null || true)"
+      case "$code" in
+        000|502|503|504) [ "$attempt" = 3 ] || sleep 2 ;;
+        *) break ;;
+      esac
+    done
     case "$code" in
       000|502|503|504)
         echo "hostshift: everything is configured correctly, but https://$probe/" >&2

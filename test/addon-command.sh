@@ -711,6 +711,49 @@ printf 'hostshift: map from /project/hostshift.yaml\nmain  https://old.example  
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "check catches a hostshift.yaml edited without a restart" \
   "running a different map" "$out"
+# The HTTP probe: a hard routing failure is fatal, an application answering is
+# not, and a cold start is retried rather than refused.
+#
+# It runs inside the post-start hook, the instant after `ddev start` returns,
+# when traefik may not have picked up the new router yet — so a single request
+# would turn an ordinary race into a refusal on a good project.
+fakecurl="$work/fakecurl"
+mkdir -p "$fakecurl"
+cat > "$fakecurl/curl" <<'FAKECURL'
+#!/usr/bin/env bash
+# Emits the codes listed in $HS_CURL_CODES, one per call, last one repeating.
+f="${HS_CURL_STATE:-/tmp/hs-curl-n}"
+n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$f"
+set -- ${HS_CURL_CODES:-200}
+[ "$n" -le $# ] && eval "printf '%s' "\${$n}"" || eval "printf '%s' "\${$#}""
+exit 0
+FAKECURL
+chmod +x "$fakecurl/curl"
+export HS_CURL_STATE="$work/curl-n"
+
+writefake
+: > "$HS_CURL_STATE"
+out="$(cd "$wt" && HS_CURL_CODES="502 502 200" PATH="$fakecurl:$fakebin:$PATH" \
+  "$cmd" check --slug wt-a 2>&1)" \
+  && pass "a cold-start 502 is retried, not refused" \
+  || fail "a cold-start 502 is retried, not refused" "$out"
+
+: > "$HS_CURL_STATE"
+out="$(cd "$wt" && HS_CURL_CODES="502" PATH="$fakecurl:$fakebin:$PATH" \
+  "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a persistent 502 is refused" "so something between the router" "$out"
+
+# An application answering — a 404, a redirect to wp-signup, an auth challenge —
+# means the request got there, which is the question being asked.
+for code in 404 302 401 200; do
+  : > "$HS_CURL_STATE"
+  (cd "$wt" && HS_CURL_CODES="$code" PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1) \
+    && pass "http $code is an answer, not a routing failure" \
+    || fail "http $code is an answer, not a routing failure" "$code was refused"
+done
+unset HS_CURL_STATE
+
 # check asks the database which hostnames it holds.
 #
 # Adopting production-canonical is a pincer that configuration alone cannot see:
