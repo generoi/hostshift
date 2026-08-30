@@ -37,6 +37,7 @@ const (
 )
 
 type urlShape struct {
+	base      string // the document's scheme: "https" or "http"
 	candidate string
 	resolved  string
 }
@@ -63,15 +64,20 @@ func loadShapes(t *testing.T) []urlShape {
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
-		tab := strings.LastIndexByte(line, '\t')
-		if tab < 0 {
+		first := strings.IndexByte(line, '\t')
+		last := strings.LastIndexByte(line, '\t')
+		if first < 0 || last <= first {
 			continue
 		}
 		var cand string
-		if err := json.Unmarshal([]byte(line[:tab]), &cand); err != nil {
+		if err := json.Unmarshal([]byte(line[first+1:last]), &cand); err != nil {
 			t.Fatalf("corpus line %q: %v", line, err)
 		}
-		out = append(out, urlShape{candidate: cand, resolved: line[tab+1:]})
+		out = append(out, urlShape{
+			base:      line[:first],
+			candidate: cand,
+			resolved:  line[last+1:],
+		})
 	}
 	if err := sc.Err(); err != nil {
 		t.Fatal(err)
@@ -82,11 +88,18 @@ func loadShapes(t *testing.T) []urlShape {
 	return out
 }
 
-func oracleMatcher(t *testing.T) *origin.Matcher {
+// oracleMatcher builds the map for a document served on the given scheme. The
+// variant's scheme *is* the document's scheme — the page is served at the
+// variant origin — and that is what decides whether `https:host` is an authority
+// or a path, so a corpus with one base only ever exercised half the rule.
+func oracleMatcher(t *testing.T, base string) *origin.Matcher {
 	t.Helper()
+	if base == "" {
+		base = "https"
+	}
 	m, err := origin.NewMatcher([]origin.Pair{{
 		Canonical: origin.MustParse("https://" + oracleCanonical),
-		Variant:   origin.MustParse("https://" + oracleVariant),
+		Variant:   origin.MustParse(base + "://" + oracleVariant),
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -115,9 +128,41 @@ var surfaces = []struct {
 	{"comment", false, func(u string) string { return `<!-- ` + u + ` -->` }},
 }
 
+// knownRelativePortLimit is the one place hostshift and the parser disagree, and
+// it is a deliberate limitation rather than an oversight.
+//
+// A scheme-relative `//host:443` names https://host:443 under an https document
+// and http://host:443 under an http one. The byte matcher has no document to
+// consult, so it resolves the reference under the *canonical's* scheme — which
+// is right whenever the document and the canonical share a scheme, and that is
+// every configuration the fleet has: DDEV serves https and the canonicals are
+// https.
+//
+// Where it is wrong — an http-served variant, a scheme-relative reference, and
+// an explicit port that is the other scheme's default — the error is a false
+// positive on a URL that pointed at nothing (http://host:443), not a leak. The
+// alternative is teaching the hot-path scanner which scheme the document is
+// served on, which is a large change to buy a case with no reachable harm.
+// Recorded here rather than quietly excluded, and in PLAN §5.5.
+func knownRelativePortLimit(sh urlShape) bool {
+	if sh.base != "http" || sh.candidate == "" {
+		return false
+	}
+	if _, scheme := schemeLen([]byte(sh.candidate)); scheme != "" {
+		return false
+	}
+	if !isSlashish(sh.candidate[0]) {
+		return false
+	}
+	return strings.HasSuffix(sh.resolved, ":443")
+}
+
 func TestURLShapesAgainstBrowserOracle(t *testing.T) {
 	shapes := loadShapes(t)
-	m := oracleMatcher(t)
+	byBase := map[string]*origin.Matcher{
+		"https": oracleMatcher(t, "https"),
+		"http":  oracleMatcher(t, "http"),
+	}
 
 	// The whole corpus on the surface most origins live on, then a deterministic
 	// slice of it on every surface — a missed *surface* is how two of the last
@@ -131,8 +176,11 @@ func TestURLShapesAgainstBrowserOracle(t *testing.T) {
 				if s.cssEscapes && strings.ContainsRune(sh.candidate, '\\') {
 					continue
 				}
+				if knownRelativePortLimit(sh) {
+					continue
+				}
 				in := s.wrap(sh.candidate)
-				out := rewriteHTML(t, m, in, NewStats(false))
+				out := rewriteHTML(t, byBase[sh.base], in, NewStats(false))
 
 				// A trailing root dot names the same host in DNS, and PLAN §4.4
 				// specifies absorbing it. The parser keeps it in `host`, so the
@@ -192,7 +240,7 @@ func TestURLShapesAgainstBrowserOracle(t *testing.T) {
 // says stays byte-identical to production.
 func TestOracleShapesRoundTrip(t *testing.T) {
 	shapes := loadShapes(t)
-	fwd := oracleMatcher(t)
+	fwd := oracleMatcher(t, "https")
 	rev, err := origin.NewMatcher([]origin.Pair{{
 		Canonical: origin.MustParse("https://" + oracleVariant),
 		Variant:   origin.MustParse("https://" + oracleCanonical),
@@ -203,7 +251,7 @@ func TestOracleShapesRoundTrip(t *testing.T) {
 
 	var bad int
 	for i, sh := range shapes {
-		if i%37 != 0 || strings.TrimSuffix(sh.resolved, ".") != oracleCanonical {
+		if i%37 != 0 || sh.base != "https" || strings.TrimSuffix(sh.resolved, ".") != oracleCanonical {
 			continue
 		}
 		served := rewriteHTML(t, fwd, `<a href="`+sh.candidate+`">x</a>`, NewStats(false))

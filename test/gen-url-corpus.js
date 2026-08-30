@@ -12,10 +12,18 @@
 //
 //     node test/gen-url-corpus.js | gzip -9 > testdata/url-shapes.tsv.gz
 //
-// Columns: candidate, resolved host ("" when the parser rejects it). The
-// candidate is escaped with JSON.stringify so control characters survive a TSV.
+// Columns: base scheme, candidate, resolved host ("" when the parser rejects
+// it). The candidate is escaped with JSON.stringify so control characters
+// survive a TSV.
 
-const BASE = "https://wt-a--example.ddev.site/dir/page";
+// Two bases, because the parser's rule for `scheme:host` with fewer than two
+// slashes turns on whether the reference's scheme matches the *document's* — so
+// one base exercises only half of authorityStart, and the half it skips is the
+// one that leaked in round ten.
+const BASES = [
+  "https://wt-a--example.ddev.site/dir/page",
+  "http://wt-a--example.ddev.site/dir/page",
+];
 const CANON = "www.example.fi";
 
 const schemes = ["https:", "http:", "HTTPS:", "HtTp:", ""];
@@ -62,15 +70,21 @@ for (const scheme of schemes) {
         for (const port of ports) {
           for (const tail of tails) {
             const candidate = scheme + slash + user + host + port + tail;
-            if (seen.has(candidate)) continue;
-            seen.add(candidate);
-            let resolved = "";
-            try {
-              resolved = new URL(candidate, BASE).host;
-            } catch {
-              resolved = "";
+            for (const base of BASES) {
+              const key = base + "\u0000" + candidate;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              let resolved = "";
+              try {
+                resolved = new URL(candidate, base).host;
+              } catch {
+                resolved = "";
+              }
+              out.push(
+                new URL(base).protocol.replace(":", "") +
+                  "\t" + JSON.stringify(candidate) + "\t" + resolved,
+              );
             }
-            out.push(JSON.stringify(candidate) + "\t" + resolved);
           }
         }
       }
