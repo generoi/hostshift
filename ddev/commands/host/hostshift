@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
+#ddev-generated
 ## Description: configure hostshift for this DDEV project
-## Usage: hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]
+## Usage: hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--quiet]
 ## Example: "ddev hostshift init"
 ##
 ## Scaffolding a DDEV project is opinionated work, and this is where it is
@@ -9,6 +10,19 @@
 ## does not write .ddev/ files, guess slugs from branches, or decide which
 ## hostnames `web` should keep. A binary with a `ddev init` subcommand would be
 ## a tool for one shop; this command is the shop.
+##
+## #ddev-generated, and it has to be. Without that marker `ddev add-on get`
+## refuses to overwrite this file, so an upgrade installs a new compose file
+## beside the old command — and the two halves disagree about the variable names
+## they pass between them. Renaming HOSTSHIFT_SLUG/HOSTSHIFT_MAP_ARGS to
+## HOSTSHIFT_ARGS did exactly that: init wrote the old names, compose read the
+## new one, the proxy started with its inert default and every variant 421'd,
+## with `init`, `restart` and `check` all reporting success.
+##
+## The cost is that a local edit here is lost on the next `ddev add-on get`.
+## That is the right trade for a file whose whole job is to stay in step with the
+## compose file it ships beside. The loopback override is the opposite case and
+## deliberately carries no marker.
 ##
 ## Needs the hostshift binary on PATH. Everything generic comes from it — the
 ## map, the variants, the hostnames a checkout declares — and everything
@@ -22,26 +36,40 @@ set -euo pipefail
 
 cmd="${1:-init}"; shift || true
 slug=""
+branch=""
 dry_run=""
+force=""
+quiet=""
+claimed=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --slug) slug="${2:?--slug needs a value}"; shift 2 ;;
     --slug=*) slug="${1#*=}"; shift ;;
     --dry-run|-n) dry_run=1; shift ;;
+    --quiet|-q) quiet=1; shift ;;
+    --force) force=1; shift ;;
     # Silently discarding an unknown flag is how `--dry-run` came to write the
     # files it was passed to prevent.
     *) echo "unknown argument: $1" >&2
-       echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]" >&2
+       echo "usage: ddev hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--force|--quiet]" >&2
        exit 2 ;;
   esac
 done
 
 case "$cmd" in
-  init|check|env|wp-cli) ;;
+  init|check|copy-db|env|wp-cli) ;;
   -h|--help|help)
-    echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]"; exit 0 ;;
-  *) echo "usage: ddev hostshift [init|check|env|wp-cli] [--slug NAME] [--dry-run]" >&2; exit 2 ;;
+    echo "usage: ddev hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--force|--quiet]"; exit 0 ;;
+  *) echo "usage: ddev hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--force|--quiet]" >&2; exit 2 ;;
 esac
+
+# The post-start hook runs `check` on every start. Between `ddev add-on get` and
+# `ddev hostshift init` — and permanently, for anyone who installed the add-on
+# and never used it — there is nothing to check, and saying so in nine lines plus
+# a `Task failed` is how an add-on stops being inert until it is configured.
+if [ "$cmd" = "check" ] && [ -n "$quiet" ] && ! grep -qs '^HOSTSHIFT_' .ddev/.env 2>/dev/null; then
+  exit 0
+fi
 
 command -v hostshift >/dev/null || {
   echo "hostshift is not on PATH — https://github.com/generoi/hostshift" >&2; exit 1; }
@@ -55,9 +83,39 @@ command -v hostshift >/dev/null || {
 # feature/käyttöliittymä, and en_US.UTF-8 is the macOS default in a Finnish
 # shop. The trim runs after the truncation as well as before it, or a slug cut
 # at 30 characters can end in a hyphen and derive "…abc---site.ddev.site".
-if [ -z "$slug" ]; then
+# copy-db maps nothing, so it needs no slug — and refusing to copy a database
+# because the branch name has no letters in it, or because HEAD is detached
+# during a rebase, is a refusal with no reason behind it.
+if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
   branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
-  [ -n "$branch" ] || { echo "no git branch here — pass --slug" >&2; exit 2; }
+  # Detached HEAD is ordinary — a rebase, a bisect, a checked-out tag — and it
+  # must not stop `check`, which the post-start hook runs on every start. The
+  # deployed slug is right there in .ddev/.env.
+  if [ -z "$branch" ] && [ "$cmd" = "check" ]; then
+    # Any slug will do on the --from/--to path, where it is never read; on the
+    # --slug path the deployed one is in .ddev/.env. Either way `check` must not
+    # refuse during a rebase, a bisect or a checked-out tag — the hook runs it on
+    # every start, and refusing means the staleness check silently stops running
+    # for the duration.
+    # Two shapes to recover from, and reading only the first is why this has
+    # shipped broken twice: HOSTSHIFT_ARGS is `--slug X` only when a
+    # hostshift.yaml is present. On the README's headline path it is
+    # `--from … --to …`, and the deployed slug is the prefix of the first
+    # variant — wt-a--acme.ddev.site — which is present in both shapes.
+    slug="$(sed -n '/^HOSTSHIFT_ARGS=--slug /{s///p;q;}' .ddev/.env 2>/dev/null)"
+    if [ -z "$slug" ]; then
+      slug="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' .ddev/.env 2>/dev/null \
+        | cut -d, -f1 | sed -n 's/--.*//p')"
+    fi
+    slug="${slug:-wt}"
+  fi
+  [ -n "$branch" ] || [ -n "$slug" ] || { echo "no git branch here — pass --slug" >&2; exit 2; }
+fi
+
+# Derive from the branch only when nothing above supplied one — the recovered
+# slug used to be overwritten here two lines after it was found, which is why
+# the detached-HEAD fallback never worked.
+if [ -z "$slug" ] && [ -n "$branch" ]; then
   slug="$(printf '%s' "$branch" \
     | LC_ALL=C tr '[:upper:]' '[:lower:]' \
     | LC_ALL=C sed -e 's/[^a-z0-9]\{1,\}/-/g' \
@@ -144,6 +202,55 @@ elif [ -n "$linked" ]; then
   esac
 fi
 
+if [ "$cmd" = "copy-db" ]; then
+  [ -n "$parent" ] || {
+    echo "hostshift: no parent checkout to copy from — this is not a linked worktree" >&2
+    echo "  of a different DDEV project. Use \`ddev import-db\` or a fresh pull." >&2
+    exit 2; }
+  from="$(basename "$parent")"
+  [ -f "$parent/.ddev/config.yaml" ] && n="$(sed -n 's/^name: *//p' "$parent/.ddev/config.yaml" | head -1)" && [ -n "$n" ] && from="$n"
+
+  # Sharing the parent's database and copying it are different decisions, and
+  # doing both means importing a database into itself.
+  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml .ddev/.env 2>/dev/null; then
+    echo "hostshift: this worktree is configured to *use* $from's database" >&2
+    echo "  (DATABASE_URL points at ddev-$from-db). Copying it into itself is not" >&2
+    echo "  what you want — remove that override and \`ddev restart\` first." >&2
+    exit 2
+  fi
+
+  # It overwrites. Refuse to do that silently to a database that has something
+  # in it — the caller may well have meant `ddev import-db`, or may be in the
+  # wrong directory, and there is no undo.
+  if [ -z "$force" ]; then
+    tables="$(ddev exec -s web bash -c \
+      "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
+      2>/dev/null | tail -1 | tr -dc '0-9' || true)"
+    if [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null; then
+      echo "hostshift: this worktree's database already has $tables table(s)." >&2
+      echo "  Copying from $from replaces them, and there is no undo." >&2
+      echo "  Pass --force if that is what you want." >&2
+      exit 2
+    fi
+  fi
+
+  echo "hostshift: copying the database from $from" >&2
+  # --add-drop-database --databases, so this replaces rather than merges.
+  # mysqldump|mysql on its own only drops the tables the dump contains, so a
+  # worktree whose database came from an older pull kept everything the parent no
+  # longer has — a removed blog's wp_N_* set, an uninstalled plugin's tables — and
+  # was then not in the state the parent is in, which is the whole claim. The
+  # refusal message promises a replace; this makes it true.
+  ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
+    --no-tablespaces --add-drop-database --databases db -h ddev-$from-db -udb -pdb \
+    | mysql -h db -udb -pdb" || {
+    echo "hostshift: the copy failed. Is $from running? \`ddev start $from\`" >&2
+    exit 1; }
+  echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
+  echo "  hostshift maps — nothing else to do." >&2
+  exit 0
+fi
+
 # hostshift.yaml, where a project has one, is a deliberate statement about which
 # hostnames the database holds — usually because it names alias hostnames from
 # other environments, or production ones the database was never search-replaced
@@ -199,6 +306,7 @@ for other in ../*/.ddev/.env; do
       echo "  Two projects answering to one hostname is not an error anywhere in DDEV;" >&2
       echo "  the router picks one and the other is silently unreachable. Pass --slug to" >&2
       echo "  choose a different name." >&2
+      claimed="$v"
       break 2 ;;
     esac
   done
@@ -270,7 +378,12 @@ fi
 # between the worktree's first `ddev start` and that restart is real, though, and
 # during it the *parent's* blog is served by the worktree. This is the one moment
 # anyone can act on it. Upstream: ddev/ddev#5486, reopened for git worktrees.
-if [ -n "$parent_hosts" ]; then
+# Not on `check`. The note is a static intersection of the two projects'
+# declared hostnames, so it was true when init said it and false ever after —
+# and the post-start hook printed it on every start, including the restart that
+# had just handed those hostnames back to the parent. Four lines of "until
+# `ddev restart`, those serve this worktree" from the hook of that very restart.
+if [ -n "$parent_hosts" ] && [ "$cmd" != "check" ]; then
   shared=""
   while IFS= read -r h; do
     [ -n "$h" ] || continue
@@ -288,10 +401,29 @@ $h
   fi
 fi
 
-env_out="HOSTSHIFT_SLUG=$slug
+# One variable, not two. `--slug` and the map args are mutually exclusive by
+# construction: internal/config returns early on --from/--to, so the slug is
+# never read once a map is given — and when a mounted hostshift.yaml supplies the
+# canonical side, the slug is the only way to derive the variant. Shipping both
+# meant one of them was always dead, and the multisite example showed an empty
+# HOSTSHIFT_MAP_ARGS= line that reads like a bug.
+args="${hsmap:---slug $slug}"
+
+# A digest of hostshift.yaml, so that editing it is drift like any other.
+# The file is mounted and the proxy reads it once, at startup. Nothing else in
+# .ddev/.env moves when it changes — not the args, not the variants, not
+# VIRTUAL_HOST — so adding the alias the file exists for, or repointing
+# canonical at production, left every comparison equal and `check` reporting
+# success while the running proxy used the old map.
+
+# #ddev-silent-no-warn, because DDEV otherwise prints a four-line "Custom
+# configuration detected" block naming this file on every single start. It is a
+# legal dotenv comment and DDEV documents the marker in that very message.
+env_out="#ddev-silent-no-warn
+HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
-HOSTSHIFT_WEB_HOSTS=$web
-HOSTSHIFT_MAP_ARGS=$hsmap"
+HOSTSHIFT_WEB_HOSTS=$web"
+
 
 # `hostshift check` on its own is the wrong question in a worktree, and answers
 # it confidently: run without --from it resolves layer 1 against *this* checkout,
@@ -303,33 +435,129 @@ HOSTSHIFT_MAP_ARGS=$hsmap"
 # So the DDEV-shaped question is asked here, where knowing what a worktree is is
 # allowed: check the map that would be deployed, and whether what *is* deployed
 # still matches it.
+# A worktree that needs to *write* — activate a plugin, run a migration, upload
+# media — needs a database of its own rather than the parent's. The fastest
+# source is the parent itself: every DDEV container is on ddev_default, so the
+# worktree's web container can reach the parent's db container by name and stream
+# one into the other. No dump on disk, no compression, no production round trip,
+# and it is the state you are already working against.
+#
+# It does not touch hostnames. Whatever is copied still holds the parent's, which
+# is exactly why hostshift is needed afterwards just as much as before.
 if [ "$cmd" = "check" ]; then
   hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
-  if [ -f .ddev/.env ]; then
-    # The whole block, not one variable of it. A renamed worktree drifts only in
-    # HOSTSHIFT_WEB_HOSTS, a parent that gains a blog only in HOSTSHIFT_VARIANTS,
-    # and a hostshift.yaml appearing only in HOSTSHIFT_MAP_ARG — where the
-    # deployed flat map goes on winning over the file, so its aliases silently
-    # never rewrite. Comparing one variable caught one of the three.
-    deployed="$(grep '^HOSTSHIFT_' .ddev/.env || true)"
-    if [ "$deployed" != "$env_out" ]; then
-      echo "hostshift: .ddev/.env is out of date. It says" >&2
-      printf '%s\n' "${deployed:-  nothing}" >&2
-      echo "  and this project now resolves to" >&2
-      printf '%s\n' "$env_out" >&2
-      echo "  Run \`ddev hostshift init && ddev restart\`." >&2
-      exit 2
-    fi
-    printf '\n  hostshift is configured to serve:\n' >&2
-    printf '    https://%s\n' $(printf '%s' "$variants" | tr ',' ' ') >&2
-    printf '\n' >&2
-  else
+
+  if [ ! -f .ddev/.env ]; then
     echo "hostshift: nothing deployed yet — run \`ddev hostshift init\`" >&2
     exit 2
   fi
+
+  # Is the file current? The whole block, not one variable of it: a renamed
+  # worktree drifts only in HOSTSHIFT_WEB_HOSTS, a parent that gains a blog only
+  # in HOSTSHIFT_VARIANTS, and a hostshift.yaml appearing only in HOSTSHIFT_ARGS
+  # — where the deployed flat map goes on beating the file, so its aliases
+  # silently never rewrite.
+  deployed="$(grep -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true)"
+  if [ "$deployed" != "$env_out" ]; then
+    echo "hostshift: .ddev/.env is out of date. It says" >&2
+    printf '%s\n' "${deployed:-  nothing}" >&2
+    echo "  and this project now resolves to" >&2
+    printf '%s\n' "$env_out" >&2
+    if [ -n "$unreadable_parent" ]; then
+      echo "  Not \`ddev hostshift init\` — the map above was built from this" >&2
+      echo "  worktree's own hostnames because $unreadable_parent could not be" >&2
+      echo "  read, and deploying it would rewrite nothing and take the parent's" >&2
+      echo "  hostnames with it. Fix that checkout first." >&2
+    else
+      echo "  Run \`ddev hostshift init\`, which restarts to pick it up." >&2
+    fi
+    exit 2
+  fi
+
+  # And is the file what is *running*? Everything above compares the file to a
+  # recomputation of the file, which cannot see the commonest failure there is:
+  # `init` without the `ddev restart` it just told you to run. It reported
+  # success with every container stopped, and after a slug change while the old
+  # slug was still being served. So ask the container.
+  # DDEV_SITENAME is what DDEV itself calls this project, and it hands it to
+  # host commands. Re-deriving it here read .ddev/config.yaml only, while DDEV
+  # merges config.*.yaml — and config.*.local.yaml is the natural place for a
+  # worktree to name itself, so a correctly configured worktree was told its
+  # proxy was not running, on every single `ddev start`.
+  name="${DDEV_SITENAME:-$(basename "$(pwd -P)")}"
+  # .State.Running as well as the env: docker keeps Config.Env for a container
+  # that has exited, and the compose service is `restart: "no"`, so a proxy that
+  # crashed stays down — and reporting its *configured* hostnames as served
+  # certified a total outage as healthy while every variant 502'd.
+  state="$(docker inspect "ddev-$name-hostshift" \
+    --format '{{.State.Running}}{{"\n"}}{{range .Config.Cmd}}{{.}} {{end}}{{"\n"}}{{range .Config.Env}}{{println .}}{{end}}' \
+    2>/dev/null || true)"
+  alive="$(printf '%s' "$state" | sed -n '1p')"
+  cmd_running="$(printf '%s' "$state" | sed -n '2p')"
+  running="$(printf '%s' "$state" | sed -n '/^VIRTUAL_HOST=/{s///p;q;}')"
+  if [ -z "$alive" ]; then
+    echo "hostshift: no ddev-$name-hostshift container. \`ddev restart\` to serve" >&2
+    echo "  $variants" >&2
+    exit 2
+  fi
+  if [ "$alive" != "true" ]; then
+    echo "hostshift: the proxy container has exited, so every variant 502s." >&2
+    echo "  \`ddev logs -s hostshift\` for why, then \`ddev restart\`." >&2
+    exit 2
+  fi
+  if [ -z "$running" ]; then
+    echo "hostshift: the proxy is running but answers on nothing —" >&2
+    echo "  its VIRTUAL_HOST is empty. \`ddev hostshift init && ddev restart\`." >&2
+    exit 2
+  fi
+  if [ "$running" != "$variants" ]; then
+    echo "hostshift: the running proxy answers on" >&2
+    echo "  $running" >&2
+    echo "  but .ddev/.env now says" >&2
+    echo "  $variants" >&2
+    echo "  Run \`ddev restart\`." >&2
+    exit 2
+  fi
+
+  # VIRTUAL_HOST says which hostnames reach the proxy. It says nothing about the
+  # map the proxy was started with — and a proxy that is running, routed, and
+  # 421ing every hostname it is routed for was reported as healthy. That is the
+  # failure this file has warned about twice (`--map ""`, then a comma-separated
+  # `--map`), and it is what an upgrade produces when the two halves of the
+  # add-on disagree about a variable name.
+  case " $cmd_running " in
+    *" $args "*) ;;
+    *) echo "hostshift: the proxy is running with a different map than .ddev/.env" >&2
+       echo "  says. It was started with:" >&2
+       echo "    $cmd_running" >&2
+       echo "  and .ddev/.env now asks for:" >&2
+       echo "    $args" >&2
+       echo "  Run \`ddev restart\`." >&2
+       exit 2 ;;
+  esac
+
+  if [ -n "$claimed" ]; then
+    echo "hostshift: refusing to call this healthy — $claimed is claimed by" >&2
+    echo "  another project too, and the router serves whichever it prefers." >&2
+    exit 2
+  fi
+
+  printf '\n  hostshift is serving:\n' >&2
+  printf '    https://%s\n' $(printf '%s' "$variants" | tr ',' ' ') >&2
+  printf '\n' >&2
   exit 0
 fi
 
+
+if [ "$cmd" = "init" ] && [ -n "$unreadable_parent" ] && [ ! -f hostshift.yaml ]; then
+  echo "hostshift: refusing to write a map built from this worktree's own" >&2
+  echo "  hostnames. $unreadable_parent could not be read, so the canonical side" >&2
+  echo "  would be the hostname this worktree is *served at* — nothing would be" >&2
+  echo "  rewritten — and web would keep the parent's hostnames, which both" >&2
+  echo "  projects would then claim. Fix that checkout, or declare the hostnames" >&2
+  echo "  the database really holds in hostshift.yaml." >&2
+  exit 2
+fi
 
 if [ "$cmd" = "env" ]; then
   printf '%s\n' "$env_out"
@@ -393,42 +621,42 @@ fi
 # additional_hostnames is still what drives /etc/hosts, and a VIRTUAL_HOST-only
 # name would get a certificate but no hosts entry. Every project in the fleet is
 # on ddev.site, whose wildcard resolves at any depth.
-stale=".ddev/config.hostshift.local.yaml"
 if [ -n "$dry_run" ]; then
   echo "# .ddev/.env" ; printf '%s\n' "$env_out"
-  if [ -f "$stale" ] && grep -q 'generated by' "$stale" 2>/dev/null; then
-    echo "# would delete $stale, which is no longer needed"
-  fi
   hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
   echo "hostshift: --dry-run, nothing written" >&2
   exit 0
 fi
 
 # Merged, not truncated: .ddev/.env is a project file that may hold something
-# else already. Written in place rather than moved over, or the destination
-# inherits mktemp's 0600 and its creator's group.
+# else already.
 touch .ddev/.env
 # In .ddev/ so the mv is a rename on one filesystem rather than a copy+unlink
 # across two, which is not atomic — a concurrent compose read must never catch
 # this half-written and see an empty VIRTUAL_HOST.
 tmp="$(mktemp .ddev/.env.XXXXXX)"
+trap 'rm -f "$tmp"' EXIT
 # cp -p first, then truncate: that gives the temp file the mode the real one
 # already had, and redirection keeps it. .ddev/.env is where DDEV documents
 # putting project env vars, credentials included, so a developer who chmod 600'd
-# it meant it — an earlier version reset it to 0644 on every init. (`chmod
-# --reference` would be simpler and is GNU-only; `stat -f` means two different
-# things on the two stats and silently succeeds on both.)
+# it meant it.
 cp -p .ddev/.env "$tmp"
-{ grep -v '^HOSTSHIFT_' .ddev/.env || true; printf '%s\n' "$env_out"; } > "$tmp"
+{ grep -v -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true
+  printf '%s\n' "$env_out"; } > "$tmp"
 mv "$tmp" .ddev/.env
-
-# An earlier version of this command wrote that file. Left behind it is still
-# read as DDEV config, so it still feeds its own variants back in.
-if [ -f "$stale" ] && grep -q 'generated by' "$stale" 2>/dev/null; then
-  rm -f "$stale"
-  echo "hostshift: removed $stale — DDEV takes the certificate from VIRTUAL_HOST" >&2
-fi
 
 echo "hostshift: wrote .ddev/.env" >&2
 hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
+
+# And pick it up. init always leaves the project stale — that is what it is for —
+# so ending with the restart removes the step this file elsewhere calls the
+# commonest failure there is: init without the `ddev restart` it just told you to
+# run. env, wp-cli and --dry-run all exit above this line and never restart.
+# Only when actually invoked through `ddev hostshift` — DDEV sets DDEV_APPROOT
+# for a host command, and nothing else does. Run directly, from a test or by
+# hand, init stays what it says on the tin: it writes a file.
+if [ -n "${DDEV_APPROOT:-}" ] && command -v ddev >/dev/null; then
+  echo "hostshift: restarting to pick it up" >&2
+  exec ddev restart
+fi
 echo "hostshift: now run \`ddev restart\`" >&2

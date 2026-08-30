@@ -2,9 +2,10 @@
 # hostshift — the whole DDEV add-on.
 #
 # One compose service, and one host command beside it. No lib.sh, no hooks, no
-# guard; nothing runs during a request. What the command writes is two files
-# DDEV's own .ddev/.gitignore already covers, plus wp-cli.local.yml, which is
-# gitignored fleet-wide. PLAN §3's constraint is near-zero per-repo footprint,
+# guard; nothing runs during a request. The command writes one file,
+# .ddev/.env — which DDEV does *not* gitignore, contrary to what this comment
+# used to say: the generated .ddev/.gitignore on v1.25.2 has no .env rule, and
+# both pilot repos had to add one themselves. PLAN §3's constraint is near-zero per-repo footprint,
 # and 42 repos carrying 14 different pinned SHAs of .claude/agency is what
 # happens when that is not held to.
 #
@@ -23,7 +24,7 @@
 # root. Nothing needs writing into additional_hostnames.
 #
 # Substitutions DDEV performs: $DDEV_SITENAME, $DDEV_APPROOT, $DDEV_TLD.
-# HOSTSHIFT_VARIANTS and HOSTSHIFT_SLUG come from the project's .ddev/.env.
+# HOSTSHIFT_VARIANTS and HOSTSHIFT_ARGS come from the project's .ddev/.env.
 
 services:
   # DDEV puts *every* hostname the project registers on web's VIRTUAL_HOST. A
@@ -47,8 +48,11 @@ services:
     restart: "no"
     # String form, not a list, and deliberately: compose splits it after
     # interpolation, so an argument that expands to nothing disappears entirely
-    # rather than becoming an empty string. HOSTSHIFT_MAP_ARGS is the whole flag
-    # sequence — repeated `--from`/`--to`, or nothing at all.
+    # rather than becoming an empty string. HOSTSHIFT_ARGS is whatever the proxy
+    # needs to resolve its map: repeated `--from`/`--to` when the host worked it
+    # out, or `--slug X` when a mounted hostshift.yaml supplies the canonical
+    # side. The `:---slug wt` default keeps an installed-but-unconfigured add-on
+    # inert.
     #
     # That matters because the image is `:latest` and this file is not versioned
     # with it, and it has now bitten twice. Passing `--map ""` needed a binary new
@@ -66,14 +70,14 @@ services:
     # applies — right when the project has a hostshift.yaml, since that file
     # *is* mounted.
     command: proxy -C /project --listen 0.0.0.0:8080 --upstream http://web:80
-      --slug ${HOSTSHIFT_SLUG:-wt} ${HOSTSHIFT_MAP_ARGS:-}
+      ${HOSTSHIFT_ARGS:-${HOSTSHIFT_MAP_ARGS:---slug ${HOSTSHIFT_SLUG:-wt}}}
     labels:
       com.ddev.site-name: ${DDEV_SITENAME}
       com.ddev.approot: ${DDEV_APPROOT}
     environment:
       # The hostnames the router should send here. Everything else keeps going
       # to `web`, so the canonical site stays reachable alongside the variant.
-      VIRTUAL_HOST: ${HOSTSHIFT_VARIANTS}
+      VIRTUAL_HOST: ${HOSTSHIFT_VARIANTS:-}
       # external:internal. hostshift listens plain on 8080 and never terminates
       # TLS; DDEV's router does that, as it does for `web`.
       HTTP_EXPOSE: 80:8080

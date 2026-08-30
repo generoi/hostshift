@@ -1,189 +1,96 @@
 # hostshift
 
-Serve a CMS site from a hostname other than the one baked into its database,
-without rewriting the database.
+Rewrite origins in HTTP traffic, in both directions.
 
-A reverse proxy that maps origins in both directions: the browser talks to a
-variant hostname, the application sees the hostname its database was written
-for. Nothing in the database is ever rewritten.
+A site's content refers to one hostname; you want to reach it at another.
+hostshift maps between them: responses get the hostname the browser is on,
+requests get the hostname the content was written for. Nothing is rewritten at
+rest — the database is never touched.
 
-**What it is for: worktrees.** One project, one database, and a second hostname
-so a branch or an agent can be previewed without a database of its own —
-`acme.ddev.site` served also at `wt-a--acme.ddev.site`. Whatever pulls the
-database keeps its search-replace and the main site is unaffected; nothing about
-a normal pull changes.
+It is a filter and a reverse proxy, it knows nothing about any CMS, and it
+scaffolds nothing: no config files written, no slugs guessed, no directories
+created. An optional DDEV add-on sits on top and does the opinionated part.
 
-**Production-canonical is the same engine pointed further.** Declare production
-hostnames in `hostshift.yaml` and a pristine, unrewritten dump can be browsed
-directly. It is supported and piloted, opt-in per repo, and it is where the
-hazards live — see PLAN §4.4, particularly loopback containment, which only
-matters once `home_url()` is a hostname that resolves off the box.
+**You have this problem if** one database has to be browsed at more than one
+hostname — a git worktree previewing a branch beside the main checkout, or a
+production dump you want to open locally without search-replacing it first.
+**The one precondition hostshift cannot supply** is that the application derive
+its host from the request. Bedrock does; a site that pins `WP_HOME` to a
+constant cannot be proxied by hostshift or by anything else.
 
-[`PLAN.md`](PLAN.md) is the authoritative design and is not re-decided here.
-[`spike/`](spike/) is the working evidence behind the Go decision. Progress notes
-for completed milestones live in [`docs/`](docs/).
+## Install
 
-**Status: M6 done.** Piloted against two real client sites: a two-blog multisite
-running on a genuinely unrewritten production database — `wp_blogs.domain`
-holding production hostnames — and a five-blog one. Both corpus diffs green: 0
-leaks, 0 stragglers, every line count identical. `docs/m6-pilot.md` has the
-numbers and the four `PLAN.md` claims the pilot corrected.
-
-Not yet done at pilot time: installing the DDEV add-on into a project and
-starting it — the pilot drove `hostshift proxy` directly. Two adoption PRs now
-document that path, and CI's e2e job installs through the add-on.
-
-## Using it
+Binaries for linux and darwin, amd64 and arm64, are attached to each
+[release](https://github.com/generoi/hostshift/releases). Put one on `PATH` as
+`hostshift`. With Go:
 
 ```
-hostshift rewrite < in.html > out.html   the whole engine as a Unix filter
-hostshift proxy   --upstream http://web:80 --listen 0.0.0.0:8080 --slug wt-a
-hostshift map     print the resolved host map
-hostshift hosts   print the hostnames a project declares, one per line
-hostshift check   validate the map; exit 2 if it is not usable
-hostshift diff    crawl a site two ways and compare
+go install github.com/generoi/hostshift/cmd/hostshift@latest
 ```
 
-**It scaffolds nothing.** No config files written, no slug guessed from a
-branch, no knowledge of any CMS. It *reads* a DDEV project's declared hostnames
-as one source for the map, because that costs no opinion — anyone running DDEV
-gets a map for free and anyone else loses nothing — but setting a project up is
-opinionated work and lives in the add-on, as `ddev hostshift`. One day that is
-its own repo.
+The DDEV add-on runs the proxy from `ghcr.io/generoi/hostshift`, so the
+container half needs nothing installed. The binary on `PATH` is what
+`ddev hostshift` and `hostshift map|check|diff` use.
 
-### The map
+## The smallest thing that works
 
-Resolved from three layers, each overriding the last (§5.3). Discovery by probing
-is impossible and would be a silent no-op, so the map is always declared.
+No DDEV, no config file, no project. Give it a map and it runs anywhere:
 
-1. **DDEV defaults.** `.ddev/config.yaml`'s `name` and `additional_hostnames`
-   give the ordered list of local hosts for free. For a single-environment site
-   with no extra aliases this is enough on its own and no config file is needed
-   — with a `--slug`, which is what says *which* variant to derive.
-2. **`hostshift.yaml`.** Adds the production hostnames, alias hosts from other
-   environments, the variant pattern and the upstream.
-3. **Flags.** `--slug`, `--upstream`, `--from`/`--to`, `--map C=V`.
-
-```yaml
-version: 1
-upstream: http://web:80
-sites:
-  - name: main
-    canonical: https://www.example.com
-    base:      https://acme.ddev.site
-    aliases:   [https://acme.staging.example.net]
-  - name: shop
-    canonical: https://shop.example.com
-    base:      https://shop.acme.ddev.site
-```
-
-Variants are derived, not written out: `--slug wt-a` prefixes the leftmost label
-of each site's base host, giving `wt-a--acme.ddev.site` and
-`wt-a--shop.acme.ddev.site`. An explicit `variant:` overrides that.
-
-Listing the other environments as `aliases` is what lets a residual `@production`
-or `@staging` URL left behind by an imperfect `db:pull` be corrected too.
-
-### Flags worth knowing
-
-- `--dry-run` counts every rewrite it would make and changes nothing, so it is
-  safe to point at a live canonical checkout.
-- `--explain` traces every candidate that did *not* result in a rewrite, with the
-  reason — `not-a-url`, `host-not-in-map`, `unanchored`, `identity-map`,
-  `self-redirect`. Given how many silent-failure modes this design has, that
-  trace is the difference between a five-minute diagnosis and an afternoon.
-- `--strict-origins` turns off the self-redirect carve-out (see below).
-- `--compress` re-encodes responses per the client's `Accept-Encoding`. Off by
-  default: over loopback compression buys nothing, and it exists for performance
-  work where transfer size and `Content-Encoding` must resemble production.
-- stdout is data, stderr is diagnostics, in every subcommand. Exit codes are
-  0 success, 1 runtime error, 2 invalid configuration.
-
-`--type` selects the surface: `text/html` (the default) streams; `application/json`
-and `application/*+json` are buffered and get an RFC 6901 path in `--explain`:
-
-```
-$ hostshift rewrite --type application/json --explain \
-    --map https://c.example=https://v.example < rest.json > out.json
+```console
+$ printf '<a href="https://acme.ddev.site/x">x</a>\n' \
+    | hostshift rewrite --map https://acme.ddev.site=https://wt-a--acme.ddev.site
+<a href="https://wt-a--acme.ddev.site/x">x</a>
 rewrites by surface:
-  json-string              3
+  html-attr                1
 candidates by surface:
-  json-string              3
-explain (3 events):
-     9  rewrote  -  json-string /link                  https://c.example
-    63  rewrote  -  json-string /content/rendered      https://c.example
-   120  rewrote  -  json-string /_links/self/0/href    https://c.example
+  html-attr                1
 ```
 
-Everything else passes through byte-identical and never enters a rewriter.
+The rewritten bytes are on stdout, the counters on stderr — in every
+subcommand, so a rewrite can always be piped. `--quiet` drops the counters.
 
-The corpus diff (§7) collapses to one line:
+The same engine in front of an upstream:
 
-```bash
-curl -s https://canonical/page | hostshift rewrite --quiet -C . --slug wt-a \
-  | diff - <(curl -s https://variant/page)
+```console
+$ hostshift proxy --upstream http://127.0.0.1:8080 --listen 127.0.0.1:8081 \
+    --map https://acme.ddev.site=https://wt-a--acme.ddev.site
+hostshift: map from --from/--to
+site1  https://acme.ddev.site  ->  https://wt-a--acme.ddev.site
+hostshift: listening on 127.0.0.1:8081, upstream http://127.0.0.1:8080
 ```
 
-### The self-redirect carve-out
+Everything that is not an origin in the map passes through byte-identical and
+never enters a rewriter.
 
-53 of the fleet's 63 DDEV repos ship an nginx snippet that 302-redirects a
-missing `/app/uploads/` request to a hardcoded production origin. Rewriting that
-`Location` would send the browser back to the request it just made — an infinite
-redirect loop. hostshift detects it and passes the `Location` through unmodified,
-counted as `self-redirect`. That is the single enumerated exception to "no
-production origin reaches the browser"; `--strict-origins` returns 404 instead.
+## Worktrees under DDEV
 
-## The DDEV add-on
+The case the add-on exists for: one project, one database, and a second
+hostname, so a branch can be previewed without a database of its own.
+`acme.ddev.site` is served *also* at `wt-a--acme.ddev.site`, and the parent
+checkout goes on serving `acme.ddev.site` untouched. Whatever pulls the
+database keeps its search-replace; nothing about a normal pull changes.
 
-Two compose files, an `install.yaml`, one host command and one post-start hook.
-No `lib.sh`, no guard, and nothing that runs during a request — §3 measured what happens when per-repo footprint is not held
-to, and the answer was 42 repos carrying 14 different pinned SHAs of the same
-submodule.
-
-The command is the opinionated half, and it is opinionated on purpose: it works
-the slug out from the git branch, decides which hostnames `web` keeps, and
-writes the one gitignored file a worktree needs. `test/integration-ddev.sh`
-drives all of it through real DDEV — a parent checkout, a worktree, the router —
-and asserts what gets *served*, which is the layer three defects walked through
-in a day while every other suite stayed green. It also owns `check`, for the
-same reason — `hostshift check` in a worktree resolves *that* checkout's
-hostnames rather than the ones its database holds, and calls the resulting map
-valid, so the DDEV-shaped question has to be asked by the thing that knows what
-a worktree is. The hook prints the hostnames
-being served on every `ddev start`, and says so when that file has gone stale —
-which it does on its own, since the project name follows the directory while the
-file does not. Its tests are `test/addon-command.sh`.
+Install the add-on once per project:
 
 ```
 ddev add-on get generoi/hostshift
 ```
 
-Then, per project:
+Then, in the worktree, one command:
 
-1. **Declare the map** — `.ddev/config.yaml` alone is enough for a
-   single-environment site; `hostshift.yaml` for production-canonical.
-2. **`ddev hostshift init`** writes `HOSTSHIFT_SLUG`, `HOSTSHIFT_VARIANTS` and
-   `HOSTSHIFT_WEB_HOSTS` into `.ddev/.env`. That is the only file it writes: the
-   compose service puts `HOSTSHIFT_VARIANTS` into `VIRTUAL_HOST`, and DDEV
-   builds the mkcert SAN list from every service's `VIRTUAL_HOST` as well as the
-   project's registered hostnames, so nothing has to be registered separately.
-3. **`ddev hostshift wp-cli > wp-cli.local.yml`** if the database holds
-   production hostnames — without it every `ddev wp` on a multisite fails to
-   resolve a site.
-4. **List this site's production hostnames** in
-   `.ddev/docker-compose.hostshift-loopback.yaml`, or WordPress's internal
-   requests (wp-cron, Site Health) leave the machine for live production.
+```
+ddev hostshift init
+```
 
-Routing is DDEV's router's job and it already does it: the add-on names the
-variant hostnames in `VIRTUAL_HOST` and exposes 80/443 → 8080, the same
-mechanism the phpmyadmin add-on uses. Everything not named there keeps going to
-`web`, so the canonical site stays reachable alongside the variant.
+It writes exactly one file, `.ddev/.env`, and nothing else — then restarts the
+project to pick it up, and prints the URLs it is serving. That is the whole
+required path.
 
-### Worked example: a single WordPress site
+### Worked example
 
-One site, one hostname, and `.ddev/config.yaml` deliberately has no `name:` — so
-DDEV names each project after its own directory, and a worktree is automatically
-a DDEV project of its own with nothing configured.
+One site, one hostname, and `.ddev/config.yaml` deliberately has no `name:` —
+so DDEV names each project after its own directory, and a worktree becomes a
+DDEV project of its own with nothing configured.
 
 ```console
 $ git worktree add ../acme-wt-a -b wt-a
@@ -195,248 +102,257 @@ hostshift: canonical hostnames from /Users/you/Projects/acme, whose database thi
 hostshift: wrote .ddev/.env
 map from --from/--to
 site1  https://acme.ddev.site  ->  https://wt-a--acme.ddev.site
-hostshift: now run `ddev restart`
+hostshift: restarting to pick it up
 ```
 
-**Nothing is committed and no map is declared.** The hostnames the database holds
-are the *parent* checkout's — whatever pulled the database search-replaced to
-`acme.ddev.site`, not to the worktree's hostname — so the command reads them from
-there rather than from the project it is configuring. Getting this wrong is
-silent: a map built from the worktree's own config names `acme-wt-a.ddev.site`,
-which appears nowhere in the database, so every page loads and every link is
-still the parent's.
+Nothing was committed and no map was declared. The hostnames the database holds
+are the **parent checkout's** — whatever pulled it search-replaced to
+`acme.ddev.site`, not to the worktree's hostname — so the command reads them
+from there rather than from the project it is configuring. Getting this wrong
+is silent: a map built from the worktree's own config would name
+`acme-wt-a.ddev.site`, which appears nowhere in the database, so every page
+loads and every link is still the parent's.
 
-One gitignored file comes out of it, and nothing else:
+The one file that comes out of it:
 
 ```sh
 # .ddev/.env
-HOSTSHIFT_SLUG=wt-a
+HOSTSHIFT_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
-HOSTSHIFT_MAP_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site
 ```
 
-`HOSTSHIFT_MAP_ARGS` is the map itself, resolved here and handed to the proxy. The
-compose service mounts only this worktree, so the canonical hostnames — which
-live in the parent checkout — cannot be worked out inside the container.
+Ignore it in the project's own `.gitignore` — DDEV's generated
+`.ddev/.gitignore` does not cover `.env`. `init` merges into the file rather
+than truncating it, so anything else already in there survives.
 
-Nothing registers `wt-a--acme.ddev.site` anywhere, and nothing needs to. The
-compose service puts `HOSTSHIFT_VARIANTS` into its `VIRTUAL_HOST`, which is what
-traefik routes on — and DDEV feeds every service's `VIRTUAL_HOST` into the mkcert
-SAN list too, so the certificate covers it for free. Measured on DDEV v1.25.2
-with no hostshift config file on disk at all: the served certificate carried
-`DNS:wt-a--shop.acme.ddev.site`, three labels and never registered, and verified
-against the mkcert root.
+After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
+`https://acme.ddev.site` goes on serving the parent.
 
-`ddev restart` — which prints the URL back to you — and
-`https://wt-a--acme.ddev.site` serves the worktree while
-`https://acme.ddev.site` goes on serving the parent checkout.
-`HOSTSHIFT_WEB_HOSTS` is what keeps the two apart: `web` answers on the
-worktree's own hostname, and only the variant reaches hostshift.
+### What happens by itself
 
-### Worked example: a multisite
-
-Two blogs, so two hostnames in `wp_blogs.domain`. **This still needs no map
-file.** Whatever pulled the database search-replaced to the DDEV hostnames, and
-`.ddev/config.yaml` already declares every one of them:
-
-```yaml
-# .ddev/config.yaml, in the parent checkout
-additional_hostnames:
-  - shop.acme
-```
-
-so `ddev hostshift init` in a worktree derives both sites on its own, exactly as
-the single-site case does — `acme.ddev.site` and `shop.acme.ddev.site` mapping to
-`wt-a--acme.ddev.site` and `wt-a--shop.acme.ddev.site`.
-
-A `hostshift.yaml` is for the two things a DDEV config genuinely cannot say:
-**alias hostnames**, so a residual staging URL an imperfect pull left behind is
-corrected too, and **production-canonical**, where the database was never
-search-replaced at all and the canonical hostnames are the live ones.
-
-```yaml
-# hostshift.yaml, committed
-version: 1
-upstream: http://web:80
-
-sites:
-  - name: main
-    canonical: https://acme.ddev.site
-    base: https://acme.ddev.site
-    aliases:
-      - https://acme.staging.example.net
-
-  - name: shop
-    canonical: https://shop.acme.ddev.site
-    base: https://shop.acme.ddev.site
-    aliases:
-      - https://shop.acme.staging.example.net
-```
-
-`canonical` is what the database holds. `base` is what the variant is derived
-from, so `--slug wt-a` gives `wt-a--acme.ddev.site`. `aliases` are other
-hostnames the same blog has been served at — that is the part worth committing a
-file for. To browse a *pristine* production database instead — nothing
-search-replaced — set `canonical` to the production hostname
-(`https://www.example.com`) and leave `base` alone.
-
-Declaring the map also *replaces* the DDEV layer rather than merging with it, so
-a hostname the file leaves out has no variant and cannot be previewed.
-`hostshift check` names any that the project registers and the map does not.
-
-```console
-$ ddev hostshift init
-hostshift: slug "wt-a", from the git branch wt-a
-hostshift: wrote .ddev/.env
-map from hostshift.yaml
-main  https://acme.ddev.site                 ->  https://wt-a--acme.ddev.site
-      https://acme.staging.example.net           (alias)
-shop  https://shop.acme.ddev.site            ->  https://wt-a--shop.acme.ddev.site
-      https://shop.acme.staging.example.net      (alias)
-hostshift: now run `ddev restart`
-```
-
-```sh
-# .ddev/.env
-HOSTSHIFT_SLUG=wt-a
-HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site,wt-a--shop.acme.ddev.site
-HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
-HOSTSHIFT_MAP_ARGS=
-```
-
-`HOSTSHIFT_MAP_ARGS` is empty here because `hostshift.yaml` is mounted into the
-container and the proxy reads it directly — which it must, since a flat
-canonical=variant list cannot carry the aliases.
-
-Both variants reach the browser through `VIRTUAL_HOST` alone — no second file,
-and no hostname registered anywhere.
-
-One thing to know about a multisite worktree specifically. DDEV derives `name`
-from the directory but **not** `additional_hostnames`, so the worktree inherits
-`shop.acme` verbatim and registers it as its own. traefik has no cross-project
-uniqueness check and breaks the tie by rule length — a worktree's directory name
-is the parent's plus a suffix, so the worktree wins, silently, from its first
-`ddev start`. `HOSTSHIFT_WEB_HOSTS` hands the hostname back at the next restart,
-and `ddev hostshift init` says so when it sees the overlap; the exposure is the
-window in between. Upstream this is [ddev/ddev#5486][], reopened specifically
-for `git worktree` and unresolved.
+- **Routing and TLS.** Nothing registers the variant hostnames and nothing
+  needs to. The compose service puts `HOSTSHIFT_VARIANTS` into its
+  `VIRTUAL_HOST`, which is what traefik routes on, and DDEV feeds every
+  service's `VIRTUAL_HOST` into the mkcert SAN list too — verified on v1.25.2
+  with no hostshift config file on disk. Everything not named there keeps going
+  to `web`, so the canonical site stays reachable alongside the variant.
+- **Multiple hostnames.** A multisite needs nothing extra. If the parent
+  declares `additional_hostnames`, `init` derives a variant for each one.
+- **Keeping the two projects apart.** `HOSTSHIFT_WEB_HOSTS` narrows `web` back
+  to the worktree's own hostnames. DDEV derives `name` from the directory but
+  not `additional_hostnames`, so a worktree inherits the parent's extra
+  hostnames verbatim and — traefik breaking the tie by rule length — silently
+  wins them from its first `ddev start` until the next restart. `init` says so
+  when it sees the overlap. Upstream: [ddev/ddev#5486][].
+- **Staleness.** A `post-start` hook runs `ddev hostshift check` on every
+  `ddev start`, prints what is being served, and says so when `.ddev/.env` no
+  longer matches what the project resolves to — which happens on its own, since
+  the project name follows the directory while the file does not.
+- **The self-redirect carve-out.** 55 of the fleet's 63 DDEV repos ship an
+  nginx snippet that 302-redirects a missing `/app/uploads/` request to a
+  hardcoded production origin. Rewriting that `Location` would send the browser
+  back to the request it just made, so hostshift passes it through unmodified
+  and counts it as `self-redirect`. That is the single enumerated exception to
+  "no canonical origin reaches the browser"; `--strict-origins` returns 404
+  instead.
 
 [ddev/ddev#5486]: https://github.com/ddev/ddev/issues/5486
 
-A multisite needs one more step, because WP-CLI resolves a site by URL and every
-`ddev wp` would otherwise fail with "Site not found":
+## The map
+
+Resolved from three layers, each overriding the last. Discovery by probing is
+impossible and would be a silent no-op, so the map is always declared.
+
+1. **DDEV config** — `.ddev/config.yaml`'s `name` and `additional_hostnames`
+   give the ordered list of local hosts for free. Read, never written. With a
+   `--slug`, which says *which* variant to derive, this is enough on its own
+   for a single-environment site.
+2. **`hostshift.yaml`** — optional; see below. It *replaces* layer 1 rather
+   than merging with it, so a hostname it leaves out has no variant.
+3. **Flags** — `--slug`, `--upstream`, `--map C=V`, `--from`/`--to`.
+
+Variants are derived, not written out: `--slug wt-a` prefixes the leftmost
+label of each site's base host, giving `wt-a--acme.ddev.site` and
+`wt-a--shop.acme.ddev.site`. An explicit `variant:` overrides that.
+
+`hostshift check` validates the result and exits 2 if it is not usable:
 
 ```console
-$ ddev hostshift wp-cli > wp-cli.local.yml
+$ hostshift check --map https://acme.ddev.site=https://wt-a--acme.ddev.site
+hostshift: 1 site(s) from --from/--to — map is injective and anchored
 ```
 
-That emits the project's existing `wp-cli.yml` back verbatim — every alias, every
-path — with a root `url:` appended. It replaces rather than merges, because
-WP-CLI's own precedence does: measured with 2.12.0, a local file containing only
-`url:` loses `path:`, `require:` and every alias, and WP-CLI then cannot find the
-installation at all.
+**Injective** means no two sites share a variant hostname, so no rewrite is
+ambiguous. **Anchored** means running the matcher over each variant hostname
+yields no match, so a variant can never be rewritten a second time. Both are
+asserted at startup; the proxy refuses to start otherwise.
+
+In a worktree, run `ddev hostshift check` rather than the bare one. The bare
+command resolves *this* checkout's hostnames — not the ones the database holds
+— and reports that map as valid.
+
+## The database — required, and hostshift does not choose it
+
+**DDEV gives a new worktree an empty database of its own**, so the first thing
+you see after `ddev restart` is the CMS installer. hostshift maps hostnames and
+takes no part in this; pick one of two:
+
+**Share the parent's.** Right for previewing a branch. One gitignored file in
+the worktree, then `ddev restart`:
 
 ```yaml
-# wp-cli.local.yml, gitignored
-# generated by `ddev hostshift wp-cli` — do not commit
-path: web/wp
-require:
-  - config/wp-cli/pre-ssh.php
-
-'@ddev':
-  path: /var/www/html/web/wp
-  url: acme.ddev.site
-
-'@production':
-  ssh: deploy@ssh.example.net:22/srv/acme/current/web/wp
-  url: www.example.com
-
-'@shop':
-  ssh: deploy@ssh.example.net:22/srv/acme/current/web/wp
-  url: shop.example.com
-
-url: https://acme.ddev.site
+# .ddev/config.worktree.local.yaml
+web_environment:
+  - DATABASE_URL=mysql://db:db@ddev-acme-db:3306/db
 ```
 
-Aliases are left exactly as written. Some of them are SSH into production, and
-silently changing what `wp @shop` means is worse than leaving it alone — the
-honest instruction for a sibling blog is
-`wp --url=https://shop.acme.ddev.site`.
+Every DDEV container is already on `ddev_default`, so the parent's database
+container resolves by name with nothing else configured. Note that a shared
+database is shared: previewing is safe, but activating a plugin, running a
+migration or uploading media writes to the real thing.
 
-## The corpus diff
+**Or give it one of its own**, which a branch that has to write needs. The
+fastest source is the parent, and it is the state you are already working
+against:
 
-The only test that validates against reality. Fixtures would not have caught the
-double-port bug; this would.
-
-```
-hostshift diff -n 20
-hostshift diff --canonical-base http://127.0.0.1:8091 --variant-base http://127.0.0.1:8090
+```console
+$ ddev hostshift copy-db
 ```
 
-It crawls N pages on the canonical site, fetches the same N through the proxy,
-runs the canonical bytes through the same engine the proxy uses, and compares.
-Byte equality is reported, but the assertions that fail the run are the ones that
-cannot be innocent: **a canonical origin reaching the browser**, and **a page
-whose line count changed** — splicing never rebuilds whitespace, so a line-count
-change means something re-serialised.
+That streams the parent's database straight in — no dump on disk, no production
+round trip. It refuses to overwrite a database that already has tables unless
+you pass `--force`. It does not touch hostnames: the copy still holds the
+parent's, which is exactly why hostshift is needed afterwards just as much as
+before.
 
-## Tests
+## What is optional
 
-```
-go test ./...                       hermetic; no Docker, no network
-make test-addon                     the add-on command; needs neither Docker nor DDEV
-make test-integration               worktrees through real DDEV and a real router
-test/bootstrap-ddev.sh up           build a WordPress multisite from nothing and run the live suite
-test/bootstrap-ddev.sh down         delete it
-```
+### `hostshift.yaml` — only for aliases, or for production-canonical
 
-`test/integration-ddev.sh` is the one that asserts what is *served* rather than
-what is written: it creates a parent checkout and a `git worktree`, installs the
-add-on, starts both, and checks that the variant hostname reaches the app as the
-*canonical* one while the parent keeps its own. It defaults to the **published**
-image, because that is what `ddev add-on get` gives a developer, and two
-outages so far came from the compose file asking that image for a flag it did
-not have. It exists because three defects shipped in one day with every other
-suite green — a `post-start` hook that exited 127 on every start, a `--map` form
-the published binary parsed as one pair, and a `check` that called both correct.
+**`ddev restart` after editing it.** The proxy reads the file once, at startup,
+and nothing detects that you have changed it since — `ddev hostshift check`
+compares `.ddev/.env` and the running container's command line, and neither moves
+when the file's contents do. Two attempts at detecting this were worse than the
+gap: a checksum recorded at `init` time called a correctly-restarted project
+stale, and comparing the file's timestamp against the container's proved
+unreliable across platforms.
 
-`internal/e2e` drives hostshift against a real DDEV project and is skipped unless
-`HOSTSHIFT_E2E_VARIANT` is set, so `go test ./...` stays hermetic. It covers what
-no `httptest` can: the site served at a hostname its database has never heard of,
-per-blog multisite routing, live authenticated REST JSON, WP-CLI resolution,
-loopback containment, and the **database** half of tests 30 and 31 — a REST write
-carrying variant URLs is asserted *in `wp_posts`*, via WP-CLI, to have been
-stored canonical.
+Not needed because a site is a multisite. Needed for the two things a DDEV
+config genuinely cannot say: **alias hostnames**, so a residual `@staging` URL
+left behind by an imperfect `db:pull` is corrected too, and
+**production-canonical**, below. Commit it.
 
-`test/bootstrap-ddev.sh` creates the project it runs against: a stock DDEV
-WordPress multisite whose database is then moved to production hostnames, with
-the add-on installed. It takes about two minutes and needs nothing but `ddev`.
-
-One thing it has to do is worth knowing, because it is a precondition hostshift
-cannot supply: **the application must derive its host from the request.** §4.1
-records this as a fact about Bedrock (`config/application.php:49-60`), and it is
-what lets one database be served at more than one hostname. A *stock* DDEV
-WordPress does not — `wp-config-ddev.php:26` pins `WP_HOME` to
-`DDEV_PRIMARY_URL` — so the bootstrap writes the Bedrock equivalent. Any site
-that pins its own home URL cannot be proxied by hostshift or anything else.
-
-## Building
-
-```
-go build ./cmd/hostshift
-go test ./...
+```yaml
+version: 1
+upstream: http://web:80
+sites:
+  - name: main
+    canonical: https://www.example.com            # what the database holds
+    base:      https://acme.ddev.site             # what the variant derives from
+    aliases:   [https://acme.staging.example.net]
+  - name: shop
+    canonical: https://shop.example.com
+    base:      https://shop.acme.ddev.site
 ```
 
-Note for this machine: there is no `go` on `PATH`. Go 1.26.5 is in the nix store
-at `/nix/store/4im44k446822ixjai0mdaizqskc90qxr-go-1.26.5/bin/go`; put it on
-`PATH` (nix profile or devShell) before the commands above work from a plain
-shell.
+`base` is folded in as an alias automatically, so the canonical hostname, the
+base and every alias all rewrite to that site's one variant. `.ddev/.env` then
+carries `HOSTSHIFT_ARGS=--slug wt-a` and nothing more: the file is mounted into
+the container and the proxy reads it directly, which it must, since a flat
+canonical=variant list cannot carry aliases.
 
-## The invariant to keep
+### Production-canonical — only for a pristine dump
 
-Rewriting with an **identity map must produce byte-identical output**, over
-`spike/corpus` and `spike/adv`. It is asserted by
-`internal/rewrite.TestIdentityMapByteIdentity` and it holds by construction — the
-matcher never splices when a pair maps to itself. It catches every splice and
-offset defect, and it runs in milliseconds over 5.9 MB. Do not let it go red.
+The same engine pointed further: set `canonical` to the live production
+hostname and a database that was never search-replaced at all can be browsed
+locally. Opt-in per repo, and it is where the hazards live — see
+[`PLAN.md`](PLAN.md) §4.4. Two things become required with it:
+
+- **Loopback containment.** List the site's production hostnames in
+  `.ddev/docker-compose.hostshift-loopback.yaml`, or WordPress's internal
+  requests (wp-cron, Site Health) leave the machine for live production. That
+  file carries no generated-file marker, so your edit survives the next
+  `ddev add-on get`.
+- **WP-CLI.** `ddev hostshift wp-cli > wp-cli.local.yml`, gitignored. WP-CLI
+  resolves a site by URL, so without it every `ddev wp` on a multisite fails
+  with "Site not found". It emits the project's existing `wp-cli.yml` back
+  verbatim with a root `url:` appended — replacing rather than merging, because
+  WP-CLI's own precedence does. Aliases are left exactly as written; some of
+  them SSH into production, so for a sibling blog pass
+  `wp --url=https://shop.acme.ddev.site` rather than expecting `wp @shop` to
+  have changed meaning.
+
+Neither is needed when the database already holds DDEV hostnames.
+
+## Reference
+
+```
+hostshift rewrite   a filter — bytes on stdin, rewritten bytes on stdout
+hostshift proxy     the same rewriting in front of an upstream
+hostshift map       print the resolved map
+hostshift hosts     print the hostnames a project declares, one per line
+hostshift check     validate the map; exit 2 if it is not usable
+hostshift diff      crawl a site two ways and compare, to verify a deployment
+```
+
+```
+ddev hostshift init      write .ddev/.env         (required, per worktree)
+ddev hostshift check     is the deployed map still current  (also the post-start hook)
+ddev hostshift copy-db   copy the parent checkout's database into this worktree
+                         (refuses to overwrite a non-empty one without --force)
+ddev hostshift env       print what init would write, without writing
+ddev hostshift wp-cli    emit wp-cli.local.yml on stdout
+```
+
+`--slug NAME` overrides the slug derived from the git branch. `--dry-run` shows
+what `init` would write without writing it.
+
+Flags worth knowing:
+
+- `--dry-run` counts every rewrite it would make and changes nothing, so it is
+  safe to point at a live canonical checkout.
+- `--explain` traces every candidate that did *not* result in a rewrite, with
+  the reason: `not-a-url`, `host-not-in-map`, `unanchored`, `identity-map`,
+  `self-redirect`. This design has many silent-failure modes; that trace is the
+  difference between a five-minute diagnosis and an afternoon.
+- `--type` selects the surface. `text/html` (the default) streams;
+  `application/json` and `application/*+json` are buffered and get an RFC 6901
+  path in `--explain`.
+- `--reverse` maps variant origins back to canonical, as the request direction
+  does.
+- `--compress` (proxy) re-encodes per the client's `Accept-Encoding`. Off by
+  default; it exists for performance work where transfer size must resemble
+  production.
+
+Exit codes: 0 success, 1 runtime error, 2 invalid configuration.
+
+`hostshift diff -n 20` is the check that validates a deployment against
+reality: it crawls N pages canonically, fetches the same N through the proxy,
+runs the canonical bytes through the same engine, and compares. The assertions
+that fail a run are the ones that cannot be innocent — a canonical origin
+reaching the browser, and a page whose line count changed.
+
+## Building and testing
+
+```
+make build                     go build ./cmd/hostshift
+make test                      go test ./... plus the add-on command
+make test-integration          worktrees through real DDEV and a real router
+```
+
+Set `GO=` if `go` is not on `PATH`. `go test ./...` is hermetic: no Docker, no
+network. `internal/e2e` drives hostshift against a real DDEV project and is
+skipped unless `HOSTSHIFT_E2E_VARIANT` is set; `test/bootstrap-ddev.sh up`
+builds a WordPress multisite from nothing to run it against, `down` deletes it.
+
+**The invariant to keep:** rewriting with an identity map must produce
+byte-identical output. `internal/rewrite.TestIdentityMapByteIdentity` asserts
+it over 5.9 MB in milliseconds and catches every splice and offset defect. Do
+not let it go red.
+
+## Design
+
+[`PLAN.md`](PLAN.md) is the authoritative design and is not re-decided here.
+[`docs/`](docs/) has the pilot notes and the performance numbers;
+[`spike/`](spike/) is the evidence behind the Go decision. MIT licensed.

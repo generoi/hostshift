@@ -35,6 +35,7 @@ test-addon:
 .PHONY: test-integration
 test-integration:
 	GO=$(GO) bash test/integration-ddev.sh
+	GO=$(GO) bash test/integration-proxy-ddev.sh
 
 # The invariant that guards everything else (PLAN §5.2). If this goes red,
 # nothing downstream of it is trustworthy.

@@ -52,9 +52,37 @@ type scanIter struct {
 	// event stream identical, skips and all.
 	queued [2]candidate
 	n, i   int
+
+	// Where each separator literal next occurs, or -1 for "nowhere in the rest
+	// of the buffer". Without this, nextSep ran a bytes.Index for every literal
+	// over the whole remainder at every candidate position — and a literal that
+	// does not occur at all costs a full scan each time, so a body of "/" (which
+	// contains no `\/`, `%2F` or `%2f`) was quadratic: 32 KiB in 18 ms, 256 KiB
+	// in 1.5 s, and the 8 MiB request-body cap in minutes of pinned CPU, from
+	// one POST. Now each literal is searched again only once the position passes
+	// the hit it already found, so the whole scan is linear in the buffer.
+	sepAt [len(sepLits)]int
 }
 
-func (m *Matcher) scan(b []byte) *scanIter { return &scanIter{m: m, b: b} }
+// sepLits is every literal nextSep looks for, in one place so the cache in
+// scanIter can be indexed by the same position.
+var sepLits = [...]struct {
+	lit []byte
+	enc encoding
+}{
+	{sepRaw, encRaw},
+	{sepJSON, encJSON},
+	{sepPercentUpper, encPercent},
+	{sepPercentLower, encPercent},
+}
+
+func (m *Matcher) scan(b []byte) *scanIter {
+	it := &scanIter{m: m, b: b}
+	for i := range it.sepAt {
+		it.sepAt[i] = -2 // not yet searched for
+	}
+	return it
+}
 
 func (s *scanIter) Next() (candidate, bool) {
 	for {
@@ -72,7 +100,7 @@ func (s *scanIter) Next() (candidate, bool) {
 // fill advances to the next separator that starts a candidate.
 func (s *scanIter) fill() bool {
 	for s.pos < len(s.b) {
-		sep, enc, sepLen := s.m.nextSep(s.b, s.pos)
+		sep, enc, sepLen := s.nextSep(s.b, s.pos)
 		if sep < 0 {
 			s.pos = len(s.b)
 			return false
@@ -118,23 +146,25 @@ func (s *scanIter) fill() bool {
 
 // nextSep finds the next separator at or after from, and says which encoding
 // spells it that way.
-func (m *Matcher) nextSep(b []byte, from int) (at int, enc encoding, sepLen int) {
+func (s *scanIter) nextSep(b []byte, from int) (at int, enc encoding, sepLen int) {
 	best := -1
-	for _, c := range []struct {
-		lit []byte
-		enc encoding
-	}{
-		{sepRaw, encRaw},
-		{sepJSON, encJSON},
-		{sepPercentUpper, encPercent},
-		{sepPercentLower, encPercent},
-	} {
-		i := bytes.Index(b[from:], c.lit)
-		if i < 0 {
+	for i := range sepLits {
+		// Re-search only when the cached hit is behind us. -1 means the literal
+		// is not in the buffer at all, which is the case that was costing a full
+		// scan per position.
+		if s.sepAt[i] != -1 && s.sepAt[i] < from {
+			j := bytes.Index(b[from:], sepLits[i].lit)
+			if j < 0 {
+				s.sepAt[i] = -1
+			} else {
+				s.sepAt[i] = from + j
+			}
+		}
+		if s.sepAt[i] < 0 {
 			continue
 		}
-		if i += from; best < 0 || i < best {
-			best, enc = i, c.enc
+		if best < 0 || s.sepAt[i] < best {
+			best, enc = s.sepAt[i], sepLits[i].enc
 		}
 	}
 	if best < 0 {

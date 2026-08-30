@@ -320,7 +320,11 @@ func cmdProxy(args []string) (int, error) {
 	}
 
 	fmt.Fprintf(os.Stderr, "hostshift: map from %s\n%s", res.Source, res.Map.String())
-	fmt.Fprintf(os.Stderr, "hostshift: listening on %s, upstream %s\n", *listen, up)
+	// The version, on the line every `ddev logs -s hostshift` starts with. Both
+	// image-skew outages so far looked identical from the outside — the command
+	// line was right and the binary parsed it differently — and neither the
+	// startup banner nor `check` could tell you which binary was running.
+	fmt.Fprintf(os.Stderr, "hostshift %s: listening on %s, upstream %s\n", version, *listen, up)
 
 	// No daemonising: run in the foreground and let DDEV or a supervisor own the
 	// lifecycle. SIGTERM drains (PLAN §5.8).

@@ -20,7 +20,6 @@
 package ddev
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,19 +69,6 @@ func load(dir string) (*config, string, error) {
 	for _, g := range globs {
 		ob, err := os.ReadFile(g)
 		if err != nil {
-			continue
-		}
-		// An override file may opt out of being read here by carrying the line
-		// `# hostshift:ignore`. Exactly one thing needs it, and it needs it
-		// badly: whatever registers the *variant* hostnames has to write them
-		// into a config.*.yaml for mkcert to cover them, and that file then
-		// becomes input to the next run. The variants come back as canonical
-		// hosts, get variants of their own, and additional_hostnames grows
-		// without bound — four entries, then sixteen — while the map fills with
-		// wt-b--wt-a--site.ddev.site. Reading one's own output is the bug; a
-		// marker the writer opts into is the narrowest fix, and it costs a
-		// reader who never writes such a file nothing.
-		if bytes.Contains(ob, []byte("hostshift:ignore")) {
 			continue
 		}
 		var o config
