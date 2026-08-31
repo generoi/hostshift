@@ -38,6 +38,7 @@ const (
 
 type urlShape struct {
 	base      string // the document's scheme: "https" or "http"
+	enc       string // raw, refs, named, css — which decoder must run first
 	candidate string
 	resolved  string
 }
@@ -63,21 +64,15 @@ func loadShapes(t *testing.T) []urlShape {
 	sc := bufio.NewScanner(zr)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
-		line := sc.Text()
-		first := strings.IndexByte(line, '\t')
-		last := strings.LastIndexByte(line, '\t')
-		if first < 0 || last <= first {
+		f := strings.Split(sc.Text(), "\t")
+		if len(f) != 4 {
 			continue
 		}
 		var cand string
-		if err := json.Unmarshal([]byte(line[first+1:last]), &cand); err != nil {
-			t.Fatalf("corpus line %q: %v", line, err)
+		if err := json.Unmarshal([]byte(f[2]), &cand); err != nil {
+			t.Fatalf("corpus line %q: %v", sc.Text(), err)
 		}
-		out = append(out, urlShape{
-			base:      line[:first],
-			candidate: cand,
-			resolved:  line[last+1:],
-		})
+		out = append(out, urlShape{base: f[0], enc: f[1], candidate: cand, resolved: f[3]})
 	}
 	if err := sc.Err(); err != nil {
 		t.Fatal(err)
@@ -157,6 +152,28 @@ func knownRelativePortLimit(sh urlShape) bool {
 	return strings.HasSuffix(sh.resolved, ":443")
 }
 
+// decodesHere reports whether the surface's parser performs the encoding. An
+// HTML attribute decodes character references; a CSS context decodes hex
+// escapes; an HTML <script> decodes neither. Asserting an encoding on a surface
+// that does not decode it would demand a rewrite a browser never performs.
+func decodesHere(enc, surface string) bool {
+	switch enc {
+	case "raw":
+		return true
+	case "refs", "named":
+		// Attribute values only. An HTML parser decodes references in a text node
+		// too, but what it produces there is *displayed*, not resolved — test 28
+		// is about origins the browser dereferences, and nothing fetches a
+		// paragraph. In an attribute the decoded value is exactly what the URL
+		// parser is handed, and data-* counts because that is what a lazyload
+		// assigns to src.
+		return surface == "href" || surface == "src" || surface == "data-attr"
+	case "css":
+		return surface == "inline style"
+	}
+	return false
+}
+
 func TestURLShapesAgainstBrowserOracle(t *testing.T) {
 	shapes := loadShapes(t)
 	byBase := map[string]*origin.Matcher{
@@ -173,10 +190,17 @@ func TestURLShapesAgainstBrowserOracle(t *testing.T) {
 		for _, sh := range list {
 			for _, si := range only {
 				s := surfaces[si]
-				if s.cssEscapes && strings.ContainsRune(sh.candidate, '\\') {
+				// The skip is for *raw* candidates only. A raw backslash means
+				// something different to the CSS tokenizer than to the URL
+				// parser, so the raw-URL oracle does not describe it there — but
+				// a css-encoded row's backslashes are the encoding itself, and
+				// its resolved host already accounts for the decode. Skipping
+				// those made every CSS row invisible on the only two surfaces
+				// that decode them, which is the whole reason they were added.
+				if s.cssEscapes && sh.enc == "raw" && strings.ContainsRune(sh.candidate, '\\') {
 					continue
 				}
-				if knownRelativePortLimit(sh) {
+				if knownRelativePortLimit(sh) || !decodesHere(sh.enc, s.name) {
 					continue
 				}
 				in := s.wrap(sh.candidate)
@@ -291,7 +315,8 @@ func TestOracleShapesRoundTrip(t *testing.T) {
 
 	var bad int
 	for i, sh := range shapes {
-		if i%37 != 0 || sh.base != "https" || strings.TrimSuffix(sh.resolved, ".") != oracleCanonical {
+		if i%37 != 0 || sh.base != "https" || sh.enc != "raw" ||
+			strings.TrimSuffix(sh.resolved, ".") != oracleCanonical {
 			continue
 		}
 		for _, w := range wrappers {

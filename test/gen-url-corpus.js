@@ -12,9 +12,10 @@
 //
 //     node test/gen-url-corpus.js | gzip -9 > testdata/url-shapes.tsv.gz
 //
-// Columns: base scheme, candidate, resolved host ("" when the parser rejects
-// it). The candidate is escaped with JSON.stringify so control characters
-// survive a TSV.
+// Columns: base scheme, encoding, candidate, resolved host ("" when the parser
+// rejects it). The candidate is escaped with JSON.stringify so control
+// characters survive a TSV. The candidate is *encoded*; the resolved host is
+// what the *decoded* form resolves to, because the consumer decodes first.
 
 // Two bases, because the parser's rule for `scheme:host` with fewer than two
 // slashes turns on whether the reference's scheme matches the *document's* — so
@@ -91,6 +92,24 @@ for (const h of [
 }
 const hosts = [...hostSet];
 
+// Encodings that sit *above* the URL parser: the HTML and CSS decoders run
+// first, so the browser resolves the decoded form. Every mutator above is at or
+// below the URL parser, and both of the last two rounds' bugs lived up here —
+// the corpus contained zero character references and zero CSS escapes.
+//
+// The row records the *encoded* candidate and the host the decoded one resolves
+// to, which is exactly what the consumer does, and the Go test feeds each
+// encoding into a surface whose parser performs it.
+const encoders = {
+  raw: (u) => u,
+  // Numeric references: an HTML attribute value decodes these.
+  refs: (u) => u.replace(/\//g, "&#47;").replace(/:/g, "&#58;"),
+  // Named references, the other spelling of the same thing.
+  named: (u) => u.replace(/\//g, "&sol;").replace(/:/g, "&colon;"),
+  // CSS hex escapes, which the CSS tokenizer decodes before anything sees a URL.
+  css: (u) => u.replace(/:/g, "\\3a ").replace(/\//g, "\\2f "),
+};
+
 const seen = new Set();
 const out = [];
 for (const scheme of schemes) {
@@ -101,19 +120,34 @@ for (const scheme of schemes) {
           for (const tail of tails) {
             const candidate = scheme + slash + user + host + port + tail;
             for (const base of BASES) {
-              const key = base + "\u0000" + candidate;
-              if (seen.has(key)) continue;
-              seen.add(key);
               let resolved = "";
               try {
                 resolved = new URL(candidate, base).host;
               } catch {
                 resolved = "";
               }
-              out.push(
-                new URL(base).protocol.replace(":", "") +
-                  "\t" + JSON.stringify(candidate) + "\t" + resolved,
-              );
+              const scheme = new URL(base).protocol.replace(":", "");
+              for (const [enc, f] of Object.entries(encoders)) {
+                // Only the shapes worth encoding: the whole cross product of
+                // encodings and mutations would multiply the corpus fourfold for
+                // rows that add nothing, so the encoded forms cover the plain
+                // hosts and the fold family, which is where decoding matters.
+                if (enc !== "raw" && (port !== "" || user !== "" || tail === "")) continue;
+                // Only candidates the encoding can represent faithfully. A raw
+                // backslash already in the candidate collides with the CSS
+                // escape syntax — `\2f \w` decodes to `/w`, not to `/\w` — so
+                // the decoded form would stop matching the host this row's
+                // `resolved` was computed from, and the expectation would be
+                // wrong rather than the code.
+                if (enc !== "raw" && candidate.includes("\\")) continue;
+                const encoded = f(candidate);
+                const key = base + "\u0000" + enc + "\u0000" + encoded;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(
+                  scheme + "\t" + enc + "\t" + JSON.stringify(encoded) + "\t" + resolved,
+                );
+              }
             }
           }
         }
