@@ -290,6 +290,19 @@ out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
 contains "a parent declaring a different port is still called out" \
   "declares the hostnames its database" "$out"
 
+# A parent declaring a production canonical *and* a DDEV hostname.
+#
+# Set overlap cleared on the DDEV one and said nothing, while the production
+# origins were served to the browser unrewritten — `check` exit 0, and
+# `hostshift diff` GREEN too, because that origin is not in its map either. This
+# gate was the only thing that was ever going to catch it. What matters is
+# whether the map covers everything the parent declares, so the test is subset.
+printf 'version: 1\nsites:\n  - {name: prod, canonical: https://www.acme.example}\n  - {name: local, canonical: https://acme.ddev.site}\n' \
+  > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "a declared canonical the map does not cover is called out" \
+  "declares the hostnames its database" "$out"
+
 # And the case the warning exists for: a production canonical, where the map
 # really was built from the wrong side and would rewrite nothing.
 printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
@@ -297,6 +310,23 @@ printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example
 out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
 contains "a production canonical the map does not name is still called out" \
   "declares the hostnames its database" "$out"
+rm -f "$main/hostshift.yaml"
+
+# The remedy must not be the action that breaks the site.
+#
+# A developer whose database holds DDEV hostnames — what `copy-db` and a
+# search-replace leave behind — followed "copy it here", and every page became a
+# wp-signup.php redirect: `hostshift diff` went from GREEN to 8 errors RED.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
+  > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "the remedy says what to do when the database has not moved" \
+  "already right and there is nothing to do" "$out"
+case "$out" in
+  *"or copy it here"*)
+    fail "the remedy no longer offers the action that breaks the site" "$out" ;;
+  *) pass "the remedy no longer offers the action that breaks the site" ;;
+esac
 rm -f "$main/hostshift.yaml"
 
 # A declaration the comparison cannot read is not agreement. Silence here would
@@ -864,6 +894,8 @@ cat > "$fakecurl/curl" <<'FAKECURL'
 f="${HS_CURL_STATE:-/tmp/hs-curl-n}"
 n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$f"
+# The body too, since check now reads what the page says about itself.
+[ -n "${HS_CURL_BODY:-}" ] && printf '%s\n' "$HS_CURL_BODY"
 set -- ${HS_CURL_CODES:-200}
 [ "$n" -le $# ] && eval "printf '%s' "\${$n}"" || eval "printf '%s' "\${$#}""
 exit 0
@@ -956,6 +988,105 @@ case "$out" in
   *"the database says its home is"*) fail "and passes when the database agrees with the map" "$out" ;;
   *) pass "and passes when the database agrees with the map" ;;
 esac
+
+# The removal note's "does anything get inherited" test, run against the awk
+# program install.yaml actually ships rather than a copy of it.
+#
+# `additional_hostnames: []` is what `ddev config` writes into every project by
+# default, so matching the key alone told a developer their worktree might
+# hijack the parent's hostnames at the moment they were tearing it down. The
+# first fix anchored the empty-flow rule at end-of-line, which left
+# `[] # comment` and a flow list closed on the next line still reading as
+# inherited.
+ahprog="$(sed -n "/&& awk '/,/^      ' /p" "$repo/ddev/install.yaml" \
+  | sed -e "1s/.*&& awk '//" -e "\$d")"
+ahcase() { # name, config body, expected (yes|no)
+  printf 'name: x\n%b\n' "$2" > "$work/ah.yaml"
+  if awk "$ahprog" "$work/ah.yaml" 2>/dev/null; then got=yes; else got=no; fi
+  check "additional_hostnames $1" "$3" "$got"
+}
+ahcase "an empty list inherits nothing"          'additional_hostnames: []'            no
+ahcase "an empty list with a comment likewise"   'additional_hostnames: [] # none'     no
+ahcase "an empty list with spaces likewise"      'additional_hostnames: [  ]'          no
+ahcase "a flow list closed on the next line"     'additional_hostnames: [\n]'          no
+ahcase "a commented-out key"                     '#additional_hostnames:\n  - blog'    no
+ahcase "no key at all"                           'type: php'                           no
+ahcase "an inline list inherits"                 'additional_hostnames: [blog]'        yes
+ahcase "a multi-item inline list"                'additional_hostnames: [blog, shop]'  yes
+ahcase "a block list"                            'additional_hostnames:\n  - blog'     yes
+ahcase "a block list after a comment"            'additional_hostnames:\n  # c\n  - b' yes
+ahcase "a flow list spanning lines"              'additional_hostnames: [\n  - blog\n]' yes
+
+# What the page says it is.
+#
+# A stock DDEV WordPress pins WP_HOME to DDEV_PRIMARY_URL — this project's own
+# hostname, which is neither canonical nor variant. The preview then serves
+# links to `<project>.ddev.site`, nothing is rewritten because nothing on the
+# page names an origin the map knows, and every gate passed: injective and
+# anchored, containers up, probe 200. Only `hostshift diff` caught it, and the
+# README points worktree users at `check`.
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
+  HS_CURL_BODY='<a href="https://acme-wt-a.ddev.site/x">t</a>' \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a page answering with a hostname the map does not name is called out" \
+  "which is neither a canonical hostname nor a" "$out"
+# And a page that names only the variant says nothing.
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
+  HS_CURL_BODY='<a href="https://wt-a--acme.ddev.site/x">t</a>' \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"neither a canonical hostname nor a"*)
+    fail "a page naming only the variant is not called out" "$out" ;;
+  *) pass "a page naming only the variant is not called out" ;;
+esac
+
+# The worktree's own hostshift.yaml, left by the running-map test above, would
+# make the parent-declares gate correctly not engage at all — the whole gate is
+# for a worktree whose branch predates the parent's file.
+rm -f "$wt/hostshift.yaml"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+# Re-capture before writefake: the map just changed, and a fake container still
+# advertising the old one makes check refuse on a stale running map instead.
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+
+# The database has the last word, and the verdict is a warning, not a refusal.
+#
+# The refusal exited *before* the database gate ever ran, so `check` asserted
+# "the map does not name the hostnames the database holds" without having looked
+# at the database — on a deployment where the row said otherwise: three
+# hostnames serving 200, `hostshift diff` GREEN, and `wp_options.home` holding a
+# hostname the map names. Seventh consecutive round this gate has been wrong in
+# one direction or the other, and that time the printed remedy cost a working
+# deployment.
+#
+# It now keeps the signal and gives up the authority, for the same reason the
+# database gate did: a wrong answer costs a line of noise rather than every boot
+# of a healthy site. The probe is the hard measurement and it still refuses.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
+  > "$main/hostshift.yaml"
+# `rc=$?` after a bare assignment never runs under `set -e` — the assignment's
+# own status ends the script first.
+rc=0
+out="$(cd "$wt" && HS_FAKE_HOME="https://acme.ddev.site" \
+  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" || rc=$?
+check "a parent-declares mismatch no longer fails the start" "0" "$rc"
+case "$out" in
+  *"declares the hostnames its database"*)
+    fail "a database row that names the map settles it" "$out" ;;
+  *) pass "a database row that names the map settles it" ;;
+esac
+# But with no database answer, the warning still gets printed.
+rc2=0
+out="$(cd "$wt" && HS_FAKE_HOME="" PATH="$fakedb:$fakebin:$PATH" \
+  "$cmd" check --slug wt-a 2>&1)" || rc2=$?
+contains "with no database answer the warning still stands" \
+  "declares the hostnames its database" "$out"
+# And it is a warning: this is the half that must never become a refusal again.
+check "and it is still only a warning" "0" "$rc2"
+rm -f "$main/hostshift.yaml"
 
 # A rival whose directory no longer exists under that name.
 #

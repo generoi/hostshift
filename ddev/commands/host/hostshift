@@ -536,12 +536,17 @@ map_args=()
 # branches, so this is the common case rather than the odd one.
 parent_declares=""
 parent_declares_msg=""
+db_confirms_map=""
 parent_declares_warn() {
   echo "hostshift: warning: $parent_declares declares the hostnames its database" >&2
   echo "  holds, and this worktree's branch predates it — so the map below was" >&2
   echo "  built from that checkout's DDEV hostnames instead, and would rewrite" >&2
   echo "  nothing. Every link would point at the canonical site." >&2
-  echo "  Merge the branch that adds hostshift.yaml, or copy it here." >&2
+  echo "  If the database holds those hostnames, merge the branch that adds" >&2
+  echo "  hostshift.yaml. If it holds this checkout's DDEV hostnames — which is" >&2
+  echo "  what \`copy-db\` and a search-replace leave behind — the map below is" >&2
+  echo "  already right and there is nothing to do. Copying the file in when" >&2
+  echo "  the database has not moved makes every page redirect to wp-signup." >&2
 }
 # Detection only. Whether it is *true* is decided further down, once there is a
 # map to compare the parent's declaration against — see the block after
@@ -633,7 +638,7 @@ if [ -n "$parent_declares" ]; then
     | sed 's/=.*$//' | sort -u || true)"
   mapped="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
     --pairs 2>/dev/null | sed 's/=.*$//' | sort -u || true)"
-  # Overlap, not equality.
+  # Every declared canonical must be in the map — subset, not overlap.
   #
   # Equality was wrong in both directions. The warning's own text is "the map
   # was built from that checkout's DDEV hostnames instead, and would rewrite
@@ -649,8 +654,20 @@ if [ -n "$parent_declares" ]; then
   # Only when the parent actually declared something we could read. An empty
   # answer means the comparison failed, not that the two agree, and silence
   # there would reintroduce the leak this warning exists for.
-  if [ -n "$declared" ] && [ -n "$mapped" ] &&
-     [ -n "$(comm -12 <(printf '%s\n' "$declared") <(printf '%s\n' "$mapped"))" ]; then
+  #
+  # Overlap was too weak in the direction that leaks. A parent declaring a
+  # production canonical *and* a DDEV hostname overlapped on the DDEV one, the
+  # warning cleared, and the production origins were served to the browser
+  # unrewritten — `check` exit 0, and `hostshift diff` GREEN too, because that
+  # origin is not in its map either. This gate was the only thing that was ever
+  # going to catch it.
+  #
+  # What matters is whether the map covers everything the parent declares, so
+  # the leftover is `declared` minus `mapped`. Equality was wrong because the
+  # map legitimately holds more (DDEV lists a declared alias as an additional
+  # hostname); a non-empty leftover is the map holding *less*.
+  unmapped="$(comm -23 <(printf '%s\n' "$declared") <(printf '%s\n' "$mapped") || true)"
+  if [ -n "$declared" ] && [ -n "$mapped" ] && [ -z "$unmapped" ]; then
     parent_declares=""
     parent_declares_msg=""
   fi
@@ -1229,12 +1246,11 @@ if [ "$cmd" = "check" ]; then
     exit 2
   fi
 
-  if [ -n "$parent_declares" ]; then
-    [ -n "$parent_declares_msg" ] && parent_declares_warn
-    echo "hostshift: refusing to call this healthy — see the warning above." >&2
-    echo "  The map does not name the hostnames the database holds." >&2
-    exit 2
-  fi
+  # The parent-declares verdict is deferred to after the database gate, which is
+  # the only thing here that can actually answer the question it asks. Refusing
+  # at this point exited before that gate ever ran — so the check asserted "the
+  # map does not name the hostnames the database holds" without ever having
+  # looked at the database, on a deployment where the row said otherwise.
 
   if [ -n "$claimed" ]; then
     echo "hostshift: refusing to call this healthy — $claimed is claimed by" >&2
@@ -1370,8 +1386,11 @@ if [ "$cmd" = "check" ]; then
       # exactly the failure this probe exists to catch, certified healthy on an
       # ordering that is ordinary on a busy machine.
       rc=0
-      code="$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' \
+      # The body as well as the code, so the one check that actually fetches a
+      # page can say something about what came back. See probe_body below.
+      probe_body="$(curl -sk --noproxy '*' -w '\n%{http_code}' \
         --connect-timeout 3 --max-time 10 "https://$probe$port/" 2>/dev/null)" || rc=$?
+      code="$(printf '%s' "$probe_body" | sed -n '$p')"
       case "$code" in
         000|502) [ "$attempt" = 3 ] || sleep 2 ;;
         *) break ;;
@@ -1541,6 +1560,13 @@ if [ "$cmd" = "check" ]; then
     while IFS= read -r h; do
       [ "$h" = "$dbhost" ] && { known=1; break; }
     done <<<"$canon_hosts"
+    # A positive answer here settles the parent-declares question below: the
+    # database's own home is in the map, so the map is not on the wrong side,
+    # whatever the parent's hostshift.yaml declares. A measured row beats an
+    # inference drawn from two config files.
+    if [ -n "$known" ]; then
+      db_confirms_map=1
+    fi
     if [ -z "$known" ]; then
       echo "hostshift: warning: the database says its home is $dbhome, which this" >&2
       echo "  map does not name. If that is right, nothing on the page is being" >&2
@@ -1549,6 +1575,55 @@ if [ "$cmd" = "check" ]; then
       echo "  Either the database has not been moved to the hostnames" >&2
       echo "  hostshift.yaml declares, or the map is built from the wrong" >&2
       echo "  checkout. \`ddev hostshift wp-cli\` and a search-replace move it." >&2
+    fi
+  fi
+
+  # What the page actually says it is.
+  #
+  # A stock DDEV WordPress pins WP_HOME to DDEV_PRIMARY_URL — this project's own
+  # hostname, which is neither the canonical nor the variant. The preview then
+  # serves seventeen links to `<project>.ddev.site`, nothing is rewritten
+  # because nothing on the page names an origin the map knows, and every gate
+  # here passed: the map is injective and anchored, the containers are up, the
+  # probe answers 200, and the database's `home` row is whatever it is. Only
+  # `hostshift diff` caught it, and the README points worktree users here.
+  #
+  # This is not discovery of the map — it is reading the one page this command
+  # already fetched and noticing it is full of a hostname the map does not name.
+  if [ -n "${probe_body:-}" ] && [ -n "${DDEV_HOSTNAME:-}" ]; then
+    own="${DDEV_HOSTNAME%%,*}"
+    case ",$variants," in
+      *",$own,"*) ;;
+      *)
+        if printf '%s' "$probe_body" | grep -qF "//$own"; then
+          echo "hostshift: warning: the page served at https://$probe answers with" >&2
+          echo "  links to $own, which is neither a canonical hostname nor a" >&2
+          echo "  variant — so those links are not being rewritten and do not" >&2
+          echo "  reach this preview. A stock DDEV WordPress does this: its" >&2
+          echo "  wp-config-ddev.php pins WP_HOME to DDEV_PRIMARY_URL. Remove" >&2
+          echo "  that pin, or set WP_HOME to a canonical hostname." >&2
+        fi ;;
+    esac
+  fi
+
+  # The parent-declares verdict, now that the database has had its say.
+  #
+  # This was a refusal, and it has been wrong in one direction or the other for
+  # seven consecutive rounds — the last time costing a working deployment,
+  # because a developer who follows the printed remedy on a database that holds
+  # DDEV hostnames turns every page into a wp-signup.php redirect. That is the
+  # action this file's own comments elsewhere call "the action that silently
+  # breaks the site".
+  #
+  # So it keeps the signal and gives up the authority, for the same reason the
+  # database gate did in d203760: a wrong answer now costs a line of noise
+  # rather than every boot of a healthy site. The probe above is the hard
+  # measurement and it still refuses.
+  if [ -n "$parent_declares" ] && [ -z "$db_confirms_map" ]; then
+    [ -n "$parent_declares_msg" ] && parent_declares_warn
+    if [ -n "${unmapped:-}" ]; then
+      echo "  Declared there and not in this map:" >&2
+      printf '    %s\n' $unmapped >&2
     fi
   fi
 

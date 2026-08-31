@@ -325,9 +325,29 @@ removal_actions:
       # worktree may hijack the parent's hostnames at the moment they are
       # tearing it down, when HOSTSHIFT_WEB_HOSTS equals $DDEV_HOSTNAME and
       # removal restores nothing.
+      # An empty list is empty however it is spelled: `[]`, `[]` with a trailing
+      # comment, or a flow list opened on one line and closed on the next. The
+      # first version anchored the empty-flow rule at end-of-line, so
+      # `additional_hostnames: [] # none` read as inherited.
       if [ -n "$pdir" ] && awk '
-        /^additional_hostnames:[[:space:]]*\[[[:space:]]*\][[:space:]]*$/ { next }
-        /^additional_hostnames:[[:space:]]*\[/ { found = 1; exit }
+        /^additional_hostnames:[[:space:]]*\[/ {
+          rest = $0
+          sub(/^additional_hostnames:[[:space:]]*\[/, "", rest)
+          sub(/#.*$/, "", rest)
+          gsub(/[][[:space:],]/, "", rest)
+          if (rest != "") { found = 1; exit }
+          if ($0 ~ /\]/) { next }
+          inflow = 1
+          next
+        }
+        inflow {
+          rest = $0
+          sub(/#.*$/, "", rest)
+          gsub(/[][[:space:],]/, "", rest)
+          if (rest != "") { found = 1; exit }
+          if ($0 ~ /\]/) { inflow = 0 }
+          next
+        }
         /^additional_hostnames:/ { inlist = 1; next }
         inlist && /^[[:space:]]*-[[:space:]]*[^[:space:]]/ { found = 1; exit }
         inlist && /^[^[:space:]#-]/ { inlist = 0 }
