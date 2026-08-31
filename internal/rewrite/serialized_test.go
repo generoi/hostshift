@@ -2073,3 +2073,63 @@ func TestAPercentEncodedFloatExponentDoesNotDeclineItsField(t *testing.T) {
 		})
 	}
 }
+
+// The whole product of transport and escaping: raw or percent-encoded, crossed
+// with every spelling of the quote delimiter.
+//
+// The four spellings before this composed two layers at most, and percent over
+// entity was the pair nothing covered — percentSyntax matches `%3A` for the
+// colon and wants `%22` for the quote, htmlSyntax matches `&#34;` and wants a
+// literal colon, so neither parsed it. The value was skipped, and a skip is not
+// neutral: the host is rewritten and no length re-emitted. Three of eight cells
+// were served as bytes PHP refuses, in both directions, with the detector
+// reporting GREEN because it walks the same list of spellings.
+//
+// The matrix is the test because the bug is exactly a hole in a product: any
+// single cell passes for reasons that say nothing about its neighbours.
+func TestTheProductOfTransportAndEscaping(t *testing.T) {
+	canon, variant := "https://mz34a.ddev.site", "https://wt-b--mz34a.ddev.site"
+	// The bare host: percent-encoding hides the `://`, so a stub matching a
+	// full origin would fire on nothing and pass on untouched bytes.
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), "mz34a.ddev.site", "wt-b--mz34a.ddev.site"))
+	}
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	blob := func(host string) string {
+		inner := `a:1:{` + str("url") + str(host+"/sv/") + `}`
+		return `a:2:{` + str("home") + str(host) + str("items") + str(inner) + `}`
+	}
+	// rawurlencode: every reserved byte escaped, upper hex, letters left alone.
+	pct := func(s string) string {
+		var b strings.Builder
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+				c == '-' || c == '_' || c == '.' || c == '~' {
+				b.WriteByte(c)
+				continue
+			}
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+		return b.String()
+	}
+	for _, q := range []string{`"`, "&#34;", "&#x22;", "&quot;"} {
+		for _, transport := range []string{"raw", "percent"} {
+			enc := func(host string) string {
+				s := strings.ReplaceAll(blob(host), `"`, q)
+				if transport == "percent" {
+					return pct(s)
+				}
+				return s
+			}
+			in, want := enc(canon), enc(variant)
+			got := string(RepairSerialized([]byte(in), rw))
+			if got != want {
+				t.Errorf("%s / %s:\n got  %s\n want %s", transport, q, got, want)
+			}
+			if n := BrokenSerialized([]byte(got)); n != 0 {
+				t.Errorf("%s / %s: served %d value(s) PHP refuses:\n %s", transport, q, n, got)
+			}
+		}
+	}
+}

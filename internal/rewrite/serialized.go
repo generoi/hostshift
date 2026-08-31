@@ -247,7 +247,7 @@ func onlySpaceAfter(b []byte, end int) bool {
 // parse failed immediately, and "a failed candidate declines the buffer" then
 // declined every body containing a link.
 func repairAt(b []byte, i int, rw func([]byte) []byte, fieldOK func(end int) bool) (rep []byte, end int, ok, committed bool) {
-	for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
+	for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax} {
 		r, e, o, c, amb := tryBothPicks(b, i, rw, 0, base, fieldOK)
 		if o {
 			return r, e, true, c
@@ -988,6 +988,109 @@ var percentSyntax = syntax{
 	dlen:    decodedLen,
 }
 
+// pctEncodedWidth is the width at i of the percent-encoded spelling of s, where
+// each byte may be literal or `%XX`. Zero when it is not there.
+//
+// Encoders disagree about what to escape — `rawurlencode` takes `&`, `#` and
+// `;` and leaves the letters — so this accepts either form per byte rather than
+// enumerating the products.
+func pctEncodedWidth(b []byte, i int, s string) int {
+	j := i
+	for k := 0; k < len(s); k++ {
+		switch {
+		case j < len(b) && b[j] == s[k]:
+			j++
+		case pctIs(b, j, s[k]):
+			j += 3
+		default:
+			return 0
+		}
+	}
+	return j - i
+}
+
+// percentHTMLSyntax is a serialized value that was HTML-escaped and then
+// percent-encoded: `s%3A5%3A%26%2334%3B`.
+//
+// The other four spellings compose two layers at most, and this is the pair
+// nothing covered. percentSyntax matches `%3A` for the colon and wants `%22`
+// for the quote; htmlSyntax matches `&#34;` for the quote and wants a literal
+// colon. Neither parses it, so the value was skipped — and a skip is not
+// neutral: the fallback rewrites the host and re-emits no length. Confirmed on
+// five surfaces through the add-on, in both directions, and `BrokenSerialized`
+// walks the same list so it reported those pages GREEN.
+//
+// The escaping order is what fixes the counting: the entity layer is *below*
+// the percent layer, so `serialize` counted the quote it wrote as one byte and
+// this must too.
+var percentHTMLSyntax = syntax{
+	match: func(b []byte, i int, c byte) (int, bool) {
+		if c == '"' {
+			for _, e := range quoteEntities {
+				if w := pctEncodedWidth(b, i, e); w > 0 {
+					return w, true
+				}
+			}
+			return 0, false
+		}
+		if pctIs(b, i, c) {
+			return 3, true
+		}
+		return 0, false
+	},
+	emit: func(dst []byte, c byte) []byte {
+		const hex = "0123456789ABCDEF"
+		if c == '"' {
+			return append(dst, "%26quot%3B"...)
+		}
+		return append(dst, '%', hex[c>>4], hex[c&0xf])
+	},
+	advance: func(b []byte, i, n int) (int, bool) {
+		if n < 0 {
+			return 0, false
+		}
+		for n > 0 {
+			if i >= len(b) {
+				return 0, false
+			}
+			src, dec, _ := percentHTMLUnit(b, i)
+			if src == 0 || dec > n {
+				return 0, false
+			}
+			i, n = i+src, n-dec
+		}
+		return i, true
+	},
+	unit: percentHTMLUnit,
+}
+
+// percentHTMLUnit reads one decoded byte of the percent-over-entity spelling.
+func percentHTMLUnit(b []byte, i int) (src, dec, alt int) {
+	// A reference first, in either spelling: it is one byte to the serializer
+	// that wrote it, or its own literal bytes if the data already held it —
+	// the same ambiguity htmlUnit carries, one layer down.
+	for _, e := range quoteEntities {
+		if w := pctEncodedWidth(b, i, e); w > 0 {
+			return w, 1, 0
+		}
+	}
+	if w := refRun(b, i); w > 0 {
+		return w, 1, w
+	}
+	if i < len(b) && b[i] == '%' {
+		if i+2 < len(b) {
+			if _, ok := unhex(b[i+1], b[i+2]); ok {
+				return 3, 1, 0
+			}
+		}
+		return 0, 0, 0
+	}
+	if i < len(b) {
+		return 1, 1, 0
+	}
+	return 0, 0, 0
+}
+
 // repairValue parses one serialized value at i and returns its repaired bytes
 // and the offset one past it. ok is false if it does not parse completely.
 func repairValue(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax) ([]byte, int, bool) {
@@ -1689,7 +1792,7 @@ func BrokenSerialized(b []byte) int {
 		// an `esc_attr` input or a JSON string is not broken, it is escaped —
 		// and a check that is always RED is a check nobody reads, which is the
 		// mechanism that let five rounds of real corruption pass unnoticed.
-		for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
+		for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax} {
 			_, e, o, c, amb := tryBothPicks(b, i, id, 0, base, nil)
 			if o {
 				end, ok = e, true
