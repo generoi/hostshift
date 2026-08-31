@@ -66,7 +66,7 @@ func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 			return rw(b), false
 		}
 		// A structurally complete parse is still not proof, and this is the last
-		// place it can be caught.
+		// place it can be caught. See fieldEnd.
 		//
 		// When a declared length is stale, the walk can consume a *prefix* of
 		// the real string and still close every container — the false `";` ends
@@ -81,7 +81,7 @@ func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 		// parse if what follows is string or container punctuation. A real value
 		// is followed by the end of the body, a field separator, or ordinary
 		// surrounding text — never by a stray `"`, `;` or `}`.
-		if isTruncationResidue(b, end) {
+		if !occupiesItsField(b, i, end) {
 			return rw(b), false
 		}
 		out = append(out, rw(b[prev:i])...)
@@ -539,19 +539,50 @@ func unhex(a, b byte) (byte, bool) {
 	return byte(hi<<4 | lo), true
 }
 
-// isTruncationResidue reports whether what follows a parsed value looks like the
-// tail of a string the parse stopped short of.
-func isTruncationResidue(b []byte, i int) bool {
-	for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n') {
-		i++
+// occupiesItsField reports whether the value parsed from start to end fills the
+// whole field it sits in.
+//
+// This is the sixth rule tried here and the first that is structural rather than
+// a pattern. The five before it all asked "does this boundary look real" —
+// closes exactly; then also continues with a serialized token; then also leaves
+// a residue that does not start with `"`, `;` or `}`. Every one was a guess
+// about bytes whose values are unconstrained, and every one was wrong: a stale
+// length lands somewhere inside the string's own data, and the residue then
+// begins with whatever that string happened to contain. A measured sweep put
+// the last rule at 65% — nine bodies in twenty thousand still destroyed, and
+// `";` followed by a space is ordinary CSS.
+//
+// The question that *can* be answered is not "is this boundary real" but "did
+// the parse account for everything". A serialized value arrives as an entire
+// field: a form value between `=` and `&`, a decoded JSON string, a multipart
+// part, a whole text body. If the walk consumed all of it, the declared lengths
+// described the data. If anything is left over, some length was short, and
+// which one cannot be known — so nothing is re-emitted and the caller rewrites
+// without repair, which round-trips.
+//
+// What that costs: a serialized value embedded in a larger document — inside
+// CDATA in a WXR export, or mid-paragraph — no longer has its length re-emitted.
+// It is still rewritten, and the response direction declines for the same
+// reason, so the two directions stay consistent and the round trip is exact.
+func occupiesItsField(b []byte, start, end int) bool {
+	// It must begin the field as well as end it, or the bytes before it are
+	// unaccounted for in the same way.
+	if start > 0 {
+		switch b[start-1] {
+		case '&', '=':
+		default:
+			return false
+		}
 	}
-	if i >= len(b) {
-		return false
+	// And run to the end of the field: whitespace only, or the next separator.
+	for i := end; i < len(b); i++ {
+		switch b[i] {
+		case ' ', '\t', '\r', '\n':
+		case '&':
+			return true
+		default:
+			return false
+		}
 	}
-	switch b[i] {
-	case '"', ';', '}':
-		return true
-	}
-	// The percent spellings of the same three.
-	return pctIs(b, i, '"') || pctIs(b, i, ';') || pctIs(b, i, '}')
+	return true
 }

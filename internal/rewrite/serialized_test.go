@@ -29,7 +29,7 @@ func TestSerializedLengthsAreCorrectAtEveryDepth(t *testing.T) {
 			`a:1:{s:1:"o";` + blob(`a:1:{s:1:"u";`+blob("https://a.test/x")+`}`) + `}`},
 		{"three deep",
 			`a:1:{s:1:"o";` + blob(`a:1:{s:1:"p";`+blob(`a:1:{s:1:"u";`+blob("https://a.test/x")+`}`)+`}`) + `}`},
-		{"a span beside prose", `see https://a.test/b and ` + blob("https://a.test/x")},
+
 		{"multibyte content, where bytes and runes differ",
 			`a:1:{s:1:"u";` + blob("https://a.test/käyttö") + `}`},
 	} {
@@ -342,10 +342,11 @@ func TestAOneWayWriteIsRepaired(t *testing.T) {
 func TestATrailingContextDoesNotPreventRepair(t *testing.T) {
 	canon, variant := "https://a.test", "https://a.test.local"
 	body := `s:` + strconv.Itoa(len(canon)) + `:"` + canon + `";`
-	// A bare `"` is deliberately absent, and TestAQuoteAfterASpanIsDeclined says
-	// why: it is the one trailing byte that cannot be told from the residue of a
-	// truncated string.
-	for _, tail := range []string{"", "\n", "\r\n", " ", "\t", "]", ",", "]]>", "</meta>", "&x=1"} {
+	// Only what can end a *field*: nothing, whitespace, or the next `&`. A value
+	// followed by `]`, `,`, `"` or markup is embedded in a larger document, and
+	// there the walk cannot tell a short length from a real one — see
+	// occupiesItsField and TestAnEmbeddedValueIsNotRepaired.
+	for _, tail := range []string{"", "\n", "\r\n", " ", "\t", "&x=1"} {
 		t.Run(strconv.Quote(tail), func(t *testing.T) {
 			got := string(RepairSerialized([]byte(body+tail), func(b []byte) []byte {
 				return []byte(strings.ReplaceAll(string(b), canon, variant))
@@ -441,6 +442,83 @@ func TestAnArrayMustSatisfyItsArity(t *testing.T) {
 			if got != want {
 				t.Errorf("a malformed array was rebuilt rather than declined:\n"+
 					" got  %s\n want %s", got, want)
+			}
+		})
+	}
+}
+
+// A value embedded in a larger document is rewritten but not re-emitted.
+//
+// The walk can only trust the lengths when it accounts for the whole field: if
+// bytes are left over, some length was short and which one cannot be known.
+// Inside a paragraph, a CDATA section or an XML element there is always
+// something left over, so those decline — and the response direction declines
+// for the same reason, which keeps the two consistent and the round trip exact.
+//
+// This is the cost of the field rule, and it is the right way round: the five
+// pattern-matching rules it replaced each cost nothing here and destroyed rows
+// instead.
+func TestAnEmbeddedValueIsNotRepaired(t *testing.T) {
+	canon, variant := "https://a.test", "https://a.test.local"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	for _, c := range []struct{ name, in string }{
+		{"beside prose", `see ` + canon + `/b and ` + str(canon+"/x")},
+		{"inside CDATA", `<![CDATA[` + str(canon+"/x") + `]]>`},
+		{"inside an element", `<meta>` + str(canon+"/x") + `</meta>`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := string(RepairSerialized([]byte(c.in), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), canon, variant))
+			}))
+			// `want` is the input with every origin rewritten and no length
+			// touched, so comparing to it asserts both halves at once. A
+			// Contains check cannot: the canonical host is a prefix of the
+			// variant here, so it matches its own replacement.
+			want := strings.ReplaceAll(c.in, canon, variant)
+			if got != want {
+				t.Errorf("an embedded value had its length re-emitted:\n got  %s\n want %s",
+					got, want)
+			}
+		})
+	}
+}
+
+// The shapes round twenty-six measured as still corrupting, in both spellings.
+//
+// The residue rule caught roughly two thirds of false boundaries; these are
+// from the other third, where the truncated string's remainder begins with an
+// ordinary character — a space, a `.`, a letter — rather than the `"`, `;` or
+// `}` the rule looked for. `";` followed by a space is ordinary CSS.
+func TestTheResidueRulesBlindSpotComesHome(t *testing.T) {
+	canon, variant := "https://www.example.fi", "https://wt-a--example.ddev.site"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	css := `.a{background:url(` + canon + `/a.png);content:"x"; c:red}`
+
+	for _, seed := range []string{
+		str(css),
+		`a:1:{s:10:"custom_css";` + str(css) + `}`,
+		str(`.b{background:url(` + canon + `/b.png);content:"y";color:red}.c{d:1}`),
+	} {
+		t.Run(seed[:40], func(t *testing.T) {
+			assertEveryLength(t, seed)
+			wire := strings.ReplaceAll(seed, canon, variant)
+			if wire == seed {
+				t.Fatal("the fixture does not contain the canonical host")
+			}
+			got := string(RepairSerialized([]byte(wire), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), variant, canon))
+			}))
+			if got != seed {
+				t.Errorf("the row did not come home:\n got  %s\n want %s", got, seed)
+			}
+			// And the spelling a form actually sends.
+			penc := url.QueryEscape(wire)
+			pgot := string(RepairSerialized([]byte(penc), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b),
+					url.QueryEscape(variant), url.QueryEscape(canon)))
+			}))
+			if dec, err := url.QueryUnescape(pgot); err != nil || dec != seed {
+				t.Errorf("percent spelling did not come home:\n got  %s\n want %s", dec, seed)
 			}
 		})
 	}
