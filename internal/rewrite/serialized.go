@@ -137,7 +137,9 @@ func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 			// value that parses completely with nothing but whitespace after it.
 			// Anything else is skipped exactly as before — never a decline,
 			// never a count — so a page that worked cannot start failing here.
-			if rep, end, ok, _ := repairAt(b, i, rw); ok && onlySpaceAfter(b, end) {
+			if rep, end, ok, _ := repairAt(b, i, rw, func(e int) bool {
+				return onlySpaceAfter(b, e)
+			}); ok {
 				out = append(out, rw(b[prev:i])...)
 				out = append(out, rep...)
 				prev, i = end, end
@@ -147,7 +149,9 @@ func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 			i++
 			continue
 		}
-		rep, end, ok, committed := repairAt(b, i, rw)
+		rep, end, ok, committed := repairAt(b, i, rw, func(e int) bool {
+			return occupiesItsField(b, i, e)
+		})
 		if !ok && !committed {
 			// `https:` looks like a header until the length fails to parse.
 			i++
@@ -219,17 +223,62 @@ func onlySpaceAfter(b []byte, end int) bool {
 // Without that distinction every `https:` in a URL was a candidate whose length
 // parse failed immediately, and "a failed candidate declines the buffer" then
 // declined every body containing a link.
-func repairAt(b []byte, i int, rw func([]byte) []byte) (rep []byte, end int, ok, committed bool) {
-	for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
-		r, e, o, c := repairValueC(b, i, rw, 0, syn)
+func repairAt(b []byte, i int, rw func([]byte) []byte, fieldOK func(end int) bool) (rep []byte, end int, ok, committed bool) {
+	for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
+		r, e, o, c, amb := tryBothPicks(b, i, rw, 0, base, fieldOK)
 		if o {
 			return r, e, true, c
 		}
-		if c {
+		if c || amb {
 			committed = true
 		}
 	}
 	return nil, 0, false, committed
+}
+
+// tryBothPicks parses at i under one spelling, letting the enclosing parse
+// decide between readings rather than preferring one.
+//
+// Where a value's data holds a character reference, more than one reading can
+// close — and inside a nested payload that is the normal case, not a corner.
+// Choosing by preference would be the guess this file exists to avoid, so both
+// choices are run and the answer is kept only when they agree, or when only one
+// of them parses the whole value *and* satisfies its field. Where both parse to
+// different lengths the value is genuinely ambiguous and it declines, which is
+// the outcome every reading of it used to get.
+//
+// The second walk runs only when the first had a tie to break, which is what
+// `chose` reports — so an ordinary value is parsed once.
+func tryBothPicks(b []byte, i int, rw func([]byte) []byte, depth int, base syntax,
+	fieldOK func(end int) bool) (rep []byte, end int, ok, committed, ambiguous bool) {
+
+	run := func(pick int, chose *bool) ([]byte, int, bool, bool) {
+		syn := base
+		syn.pick, syn.chose = pick, chose
+		r, e, o, c := repairValueC(b, i, rw, depth, syn)
+		if o && fieldOK != nil && !fieldOK(e) {
+			return nil, 0, false, c
+		}
+		return r, e, o, c
+	}
+
+	chose := false
+	r1, e1, o1, c1 := run(pickFirst, &chose)
+	if !chose {
+		// No tie was broken, so the other policy would walk the same bytes.
+		return r1, e1, o1, c1, false
+	}
+	r2, e2, o2, c2 := run(pickLast, nil)
+	switch {
+	case o1 && o2 && (e1 != e2 || string(r1) != string(r2)):
+		// Two complete parses that disagree. Nothing here ranks them.
+		return nil, 0, false, c1 || c2, true
+	case o1:
+		return r1, e1, true, c1, false
+	case o2:
+		return r2, e2, true, c2, false
+	}
+	return nil, 0, false, c1 || c2, false
 }
 
 // repairValueC is repairValue, also reporting whether the candidate committed.
@@ -353,6 +402,14 @@ type syntax struct {
 	// bytes, how many decoded bytes they count for, and a second count when the
 	// source is ambiguous — 0 when it is not. Only the escaped spellings set it.
 	unit func(b []byte, i int) (src, dec, alt int)
+	// chose is set when pick actually had to break a tie, so a caller can skip
+	// the second walk when the two policies cannot differ.
+	chose *bool
+	// pick chooses between readings that all close, when more than one does:
+	// pickFirst takes the earliest, pickLast the latest. The two are run
+	// against each other by repairAt, and a value is repaired only when they
+	// agree or only one of them parses — so this is never the final word.
+	pick int
 	// dlen is how many bytes data decodes to, for the spellings where that has
 	// one answer. nil where a character reference makes it ambiguous, and a
 	// re-emitted length is then taken as a delta instead.
@@ -592,18 +649,42 @@ func spanEnd(b []byte, at, n int, syn syntax, closes func(int) bool) (int, bool)
 	if syn.unit == nil {
 		return 0, false
 	}
-	end, found := 0, 0
+	var closers []int
 	for _, e := range advanceReadings(b, at, n, syn.unit) {
 		if closes(e) {
-			found++
-			end = e
+			closers = append(closers, e)
 		}
 	}
-	if found != 1 {
+	if len(closers) == 0 {
 		return 0, false
 	}
-	return end, true
+	if len(closers) > 1 {
+		// More than one reading closes, which happens constantly once a payload
+		// is nested inside a string: the closer `&quot;;` stands at every
+		// internal boundary, so charging an `&amp;` its literal width lands on
+		// one of them. Refusing here declined 111 of 200 realistic ACF and
+		// wp_options blobs, and a decline still rewrites the host.
+		//
+		// So a choice is made and then checked. advanceReadings returns offsets
+		// in ascending order; the escaped reading of a reference consumes five
+		// source bytes for one, so it reaches the declared count later than the
+		// literal reading does. Neither is right on its own — which is why
+		// repairAt runs both and keeps the answer only if they agree, or if only
+		// one of them lets the whole value parse.
+		if syn.chose != nil {
+			*syn.chose = true
+		}
+		if syn.pick == pickLast {
+			return closers[len(closers)-1], true
+		}
+	}
+	return closers[0], true
 }
+
+const (
+	pickFirst = iota
+	pickLast
+)
 
 var literalSyntax = syntax{
 	match: func(b []byte, i int, c byte) (int, bool) {
@@ -1064,7 +1145,10 @@ func repairNested(b []byte, rw func([]byte) []byte, depth int, syn syntax) (rep 
 			i++
 			continue
 		}
-		r, end, parsed, committed := repairValueC(b, i, rw, depth, syn)
+		r, end, parsed, committed, amb := tryBothPicks(b, i, rw, depth, syn, nil)
+		if amb {
+			return nil, false, true
+		}
 		if !committed {
 			// Only a value with a length prefix has anything at stake here. A
 			// bare scalar cannot hold a host and has no number to re-emit, so
@@ -1530,13 +1614,18 @@ func BrokenSerialized(b []byte) int {
 		// an `esc_attr` input or a JSON string is not broken, it is escaped —
 		// and a check that is always RED is a check nobody reads, which is the
 		// mechanism that let five rounds of real corruption pass unnoticed.
-		for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
-			_, e, o, c := repairValueC(b, i, id, 0, syn)
+		for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
+			_, e, o, c, amb := tryBothPicks(b, i, id, 0, base, nil)
 			if o {
 				end, ok = e, true
 				break
 			}
-			if c {
+			// `amb` counts, like a failure to parse. Whether it *should* is
+			// arguable — an undecidable reading is not a wrong length, and this
+			// walk rewrites nothing — but every value reachable that way also
+			// takes the `c` path, so dropping it changed no measurement, and an
+			// unmeasurable change is not one to make.
+			if c || amb {
 				committed = true
 			}
 		}

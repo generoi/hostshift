@@ -843,25 +843,27 @@ func TestAnAmpersandUnderEscAttr(t *testing.T) {
 		}
 	})
 
-	t.Run("a value with two readings that both close declines", func(t *testing.T) {
+	t.Run("a value with two readings is decided by the enclosing parse", func(t *testing.T) {
 		// Found by exhaustive search over every string up to length six: with
 		// `aa<";a` the literal reading of `&lt;` closes at the first `&quot;;`
-		// and the escaped reading closes at the second. Both are structurally
-		// perfect and nothing in the bytes ranks them, which is exactly when
-		// this must decline rather than prefer one.
+		// and the escaped reading closes at the second. Locally nothing ranks
+		// them — which is why this used to decline.
+		//
+		// The array around it does rank them. Only one reading lets `a:1:{…}`
+		// parse to its end and fill its field, so both are tried and the one
+		// that survives is the answer. Declining here was not neutral: it left
+		// the host rewritten under the length it arrived with.
 		data := `aa<";a`
-		body := blob(canon + data)
-		in := `<input value="` + strings.NewReplacer(
-			`"`, "&quot;", "<", "&lt;").Replace(body) + `">`
-		// The inner blob's own quotes have to survive as delimiters, so encode
-		// the payload rather than the frame: what matters is that the declared
-		// length has two landings.
-		got := string(RepairSerialized([]byte(in), rw))
-		if strings.Contains(got, canon) {
-			t.Errorf("the origin was not rewritten:\n%s", got)
+		enc := func(host string) string {
+			return `<input value="` + strings.NewReplacer(
+				`"`, "&quot;", "<", "&lt;").Replace(blob(host+data)) + `">`
 		}
-		if !strings.Contains(got, `s:`+strconv.Itoa(len(canon+data))+`:`) {
-			t.Errorf("an ambiguous value was measured rather than declined:\n%s", got)
+		got := string(RepairSerialized([]byte(enc(canon)), rw))
+		if want := enc(variant); got != want {
+			t.Errorf("\n got  %s\n want %s", got, want)
+		}
+		if n := BrokenSerialized([]byte(enc(variant))); n != 0 {
+			t.Errorf("the repaired page counted %d broken values", n)
 		}
 	})
 }
@@ -1898,6 +1900,64 @@ func TestLiteralEntitiesInContentUnderTheCombinedSpelling(t *testing.T) {
 		}
 		if n := BrokenSerialized([]byte(want)); n != 0 {
 			t.Errorf("%s: the repaired page counted %d broken values", name, n)
+		}
+	}
+}
+
+// A serialized payload nested inside a serialized string, under esc_attr, with
+// ampersands in the content.
+//
+// This is ordinary WordPress — a transient, a widget instance, a cached ACF
+// payload, an option echoed into an `esc_attr` input or `esc_textarea`. It was
+// served unparseable about thirty per cent of the time, and the reason is that
+// `&quot;;` stands at every internal string boundary of a nested payload: charge
+// one `&amp;` its literal five bytes instead of one and the count lands on a
+// boundary that is not the real one. More than one reading closes, and refusing
+// to choose meant refusing constantly.
+//
+// The choice is not made by preference. Both are tried and the enclosing parse
+// decides — a reading that does not let the whole value parse and fill its
+// field is not a reading. What still declines is two *complete* parses that
+// disagree, which nothing in the bytes ranks.
+func TestAPayloadNestedInsideASerializedString(t *testing.T) {
+	canon, variant := "https://mz32d.ddev.site", "https://wt-b--mz32d.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// serialize(["cache"=>…, "payload"=>serialize([…]), "note"=>…]), every
+	// length computed, with the words a Finnish agency's content actually has.
+	blob := func(host, note string) string {
+		inner := `a:2:{` + str("k1") + str(host+"/sv/") + str("Hej!") + str(note) + `}`
+		payload := `a:1:{` + str("Åäö") + str(inner) + `}`
+		return `a:3:{` + str("cache") + str("x") +
+			str("payload") + str(payload) + str("note") + str(note) + `}`
+	}
+	carriers := map[string]func(string) string{
+		"esc_attr attribute": func(s string) string {
+			return `<div data-acf="` + escAttrNoDouble(s) + `">x</div>`
+		},
+		"esc_textarea": func(s string) string {
+			return `<textarea>` + escAttrNoDouble(s) + `</textarea>`
+		},
+		"esc_attr(wp_json_encode())": func(s string) string {
+			j, err := json.Marshal(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return `<div data-settings="` + escAttrNoDouble(string(j)) + `">x</div>`
+		},
+	}
+	for cname, carry := range carriers {
+		for _, note := range []string{"R&D", "A & B", "a<b", "Genero's", "plain", "Åäö"} {
+			in, want := carry(blob(canon, note)), carry(blob(variant, note))
+			if got := string(RepairSerialized([]byte(in), rw)); got != want {
+				t.Errorf("%s / %q:\n got  %s\n want %s", cname, note, got, want)
+			}
+			if n := BrokenSerialized([]byte(want)); n != 0 {
+				t.Errorf("%s / %q: the detector called %d value(s) broken on bytes PHP accepts",
+					cname, note, n)
+			}
 		}
 	}
 }
