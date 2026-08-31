@@ -2243,3 +2243,54 @@ func TestANonQuoteReferenceInThePercentEntitySpelling(t *testing.T) {
 		}
 	}
 }
+
+// A spelling the walk cannot read is counted when the rewrite touches it, and
+// counted on the variant side only.
+//
+// That asymmetry is the whole point. `BrokenSerialized` asks whether the served
+// bytes parse, and a spelling this build cannot read does not parse on the
+// canonical page either — so the corpus diff's baseline subtraction cancels it
+// to zero, which is how four consecutive rounds of real corruption were
+// reported GREEN. This asks whether the rewrite changed bytes it could not
+// account for, which is a no-op on the canonical side by construction.
+//
+// It exists because enumerating the spellings does not terminate: five real
+// encoders give twenty-five ordered pairs, and each one added multiplies them.
+// There will always be a composition outside the walk; what must not happen
+// again is that it is edited silently.
+func TestASpellingTheWalkCannotReadIsReportedWhenRewritten(t *testing.T) {
+	canon, variant := "www.mz37a.test", "v.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	id := func(b []byte) []byte { return b }
+	url := "https://" + canon + "/a.png"
+	blob := `a:1:{i:0;s:` + strconv.Itoa(len(url)) + `:"` + url + `";}`
+
+	for name, wire := range map[string]string{
+		// JSON_HEX_QUOT composed with percent-encoding: two encoders the walk
+		// reads separately and not together.
+		"percent over hex-quoted JSON": strings.ReplaceAll(blob, `"`, `%5Cu0022`),
+		"hex-quoted JSON twice":        strings.ReplaceAll(blob, `"`, `\\u0022`),
+	} {
+		if n := UnreadRewrites([]byte(wire), rw); n == 0 {
+			t.Errorf("%s: rewritten without being read, and not reported:\n %s", name, wire)
+		}
+		if n := UnreadRewrites([]byte(wire), id); n != 0 {
+			t.Errorf("%s: counted %d on the canonical side, so it cancels", name, n)
+		}
+	}
+
+	// And it stays quiet on everything it should: a spelling the walk does read,
+	// and content with nothing serialized in it at all.
+	for name, wire := range map[string]string{
+		"a spelling the walk reads": blob,
+		"esc_attr":                  escAttrNoDouble(blob),
+		"no serialized content":     `<a href="https://` + canon + `/a">x</a>`,
+		"prose naming the host":     `see https://` + canon + ` for details`,
+	} {
+		if n := UnreadRewrites([]byte(wire), rw); n != 0 {
+			t.Errorf("%s: reported %d on content that is fine:\n %s", name, n, wire)
+		}
+	}
+}

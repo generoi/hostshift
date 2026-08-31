@@ -54,6 +54,43 @@ func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	return repairField(b, rw)
 }
 
+// UnreadRewrites counts spans that look serialized, that no spelling could
+// read, and whose bytes the rewrite changed anyway.
+//
+// This exists because enumerating the spellings does not terminate. Five real
+// encoders give twenty-five ordered pairs and each one added multiplies them,
+// so there will always be a composition the walk cannot read — and a value it
+// cannot read still has its host rewritten and no length re-emitted, which is a
+// value PHP refuses.
+//
+// `BrokenSerialized` cannot report those, and the reason is structural rather
+// than an oversight: it asks whether the served bytes parse, and a spelling it
+// cannot read does not parse on the canonical page either, so the corpus diff's
+// baseline subtraction cancels it to zero. Four rounds of real corruption were
+// reported GREEN that way.
+//
+// This asks a different question, and the difference is what makes it visible:
+// *did we change bytes we could not account for*. That is host-dependent by
+// construction — on the canonical page the rewrite is a no-op, so the count is
+// zero there and non-zero on the variant, and the subtraction reports it. It
+// costs one extra walk of the fields the repair already declined, and it is
+// exact about the one thing it claims: not "this is broken" but "this is
+// outside what the walk models, and we edited it".
+func UnreadRewrites(b []byte, rw func([]byte) []byte) int {
+	n := 0
+	for start := 0; start <= len(b); {
+		end := fieldBreak(b, start)
+		f := b[start:end]
+		if _, found := repairField(f, rw); !found && mayHoldSerialized(f) {
+			if !bytes.Equal(rw(f), f) {
+				n++
+			}
+		}
+		start = end + 1
+	}
+	return n
+}
+
 // RepairSerializedFields is RepairSerialized for an
 // application/x-www-form-urlencoded body, whose `&` really are separators.
 //

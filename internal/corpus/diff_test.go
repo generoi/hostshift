@@ -585,3 +585,58 @@ func TestAPageReportsEveryNoteItEarned(t *testing.T) {
 		t.Errorf("the summary did not count both:\n%s", out)
 	}
 }
+
+// The report names a page whose serialized value was rewritten in a spelling
+// this build cannot read.
+//
+// It is a separate column from `broken` because it answers a different
+// question, and the difference is what makes it survive the canonical baseline:
+// `broken` asks whether the served bytes parse, which is false on both sides
+// for a spelling nothing reads, so the subtraction cancels it. This asks
+// whether the rewrite edited bytes it could not account for, which the
+// canonical pass never does.
+func TestTheReportNamesAnUnreadableRewrite(t *testing.T) {
+	var buf bytes.Buffer
+	WriteReport(&buf, []Result{{
+		Path: "/x", Equal: true, UnreadRewrites: 2, ContentType: "text/html",
+	}})
+	out := buf.String()
+	if !strings.Contains(out, "cannot read") {
+		t.Errorf("the page was not named:\n%s", out)
+	}
+	if !strings.Contains(out, "2 unread") {
+		t.Errorf("the summary did not count it:\n%s", out)
+	}
+	if strings.Contains(out, "GREEN") {
+		t.Errorf("a page rewritten in a spelling nothing reads was called green:\n%s", out)
+	}
+}
+
+// The scorer reports a page whose serialized value the rewrite touched in a
+// spelling the walk cannot read — and reports it on the variant side only, so
+// the canonical baseline does not cancel it.
+//
+// This is the end-to-end half of the guarantee. Asserting the counter in the
+// rewrite package proves the arithmetic; only running an actual comparison
+// proves the scorer asks for it at all.
+func TestTheScorerSeesARewriteItCouldNotRead(t *testing.T) {
+	canon := "https://www.canon.test"
+	variant := "https://v.ddev.site"
+	url := canon + "/a.png"
+	blob := `a:1:{i:0;s:` + strconv.Itoa(len(url)) + `:"` + url + `";}`
+	// JSON_HEX_QUOT composed with percent-encoding: two encoders the walk reads
+	// separately and not together, so nothing re-emits the length.
+	wire := strings.ReplaceAll(blob, `"`, `%5Cu0022`)
+	served := strings.ReplaceAll(wire, "www.canon.test", "v.ddev.site")
+
+	r := compareBodies(t, wire, served)
+	if r.UnreadRewrites == 0 {
+		t.Errorf("the scorer did not see it:\n canon   %s\n variant %s", wire, served)
+	}
+	// And a page in a spelling the walk *does* read is not reported.
+	clean := compareBodies(t, blob, strings.ReplaceAll(blob, "www.canon.test", "v.ddev.site"))
+	if clean.UnreadRewrites != 0 {
+		t.Errorf("a readable spelling was reported as unread: %d", clean.UnreadRewrites)
+	}
+	_ = variant
+}

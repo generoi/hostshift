@@ -84,6 +84,11 @@ type Result struct {
 	// whose declared length does not describe their data. PHP refuses those, or
 	// worse, truncates them silently and keeps parsing.
 	BrokenSerialized int
+	// UnreadRewrites counts spans the rewrite changed inside something
+	// serialized-shaped that no spelling could read. See rewrite.UnreadRewrites:
+	// it reports what BrokenSerialized cannot, because it is host-dependent and
+	// so does not cancel against the canonical baseline.
+	UnreadRewrites int
 
 	// Leaks counts canonical origins in the variant response. Any non-zero
 	// value is a test 28 failure and is what this whole exercise is for.
@@ -242,6 +247,19 @@ func compare(ctx context.Context, o Options, path string) Result {
 	if r.BrokenSerialized < 0 {
 		r.BrokenSerialized = 0
 	}
+
+	// And the spellings the walk cannot read at all, which BrokenSerialized is
+	// structurally unable to report: a value it cannot read does not parse on
+	// the canonical page either, so the subtraction above cancels it to zero.
+	//
+	// This asks the other question — did the rewrite change bytes inside
+	// something serialized-shaped that no spelling accounted for — which is
+	// host-dependent, so it is zero on the canonical side by construction and
+	// survives the same subtraction.
+	r.UnreadRewrites = rewrite.UnreadRewrites(canon.body, func(b []byte) []byte {
+		out, _ := o.Map.Forward().Rewrite(b, rewrite.SurfaceText, false)
+		return out
+	})
 
 	r.ContentType = variant.contentType
 	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
@@ -579,7 +597,7 @@ func countDiffLines(a, b string) int {
 // canonical origin reached the browser, and no page lost or gained lines.
 func WriteReport(w io.Writer, results []Result) bool {
 	green := true
-	var equal, leaks, errs, tier2, broken int
+	var equal, leaks, errs, tier2, broken, unread int
 
 	fmt.Fprintf(w, "%-46s %-8s %-7s %-7s %s\n", "PATH", "BYTES", "LEAKS", "LINES", "NOTE")
 	for _, r := range results {
@@ -596,6 +614,13 @@ func WriteReport(w io.Writer, results []Result) bool {
 		if r.Leaks > 0 {
 			notes = append(notes, "CANONICAL ORIGIN REACHED THE BROWSER")
 			leaks += r.Leaks
+			green = false
+		}
+		if r.UnreadRewrites > 0 {
+			notes = append(notes, fmt.Sprintf("%d serialized-shaped value(s) rewritten "+
+				"in a spelling this build cannot read, so no length was re-emitted",
+				r.UnreadRewrites))
+			unread += r.UnreadRewrites
 			green = false
 		}
 		if r.BrokenSerialized > 0 {
@@ -641,8 +666,8 @@ func WriteReport(w io.Writer, results []Result) bool {
 	// "3 pages, 3 byte-identical, 0 leaks, 0 errors" and then "corpus diff RED",
 	// naming nothing that was wrong — and this summary is what a developer
 	// reads before deciding whether to scroll up.
-	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d broken, %d errors\n",
-		len(results), equal, leaks, broken, errs)
+	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d broken, %d unread, %d errors\n",
+		len(results), equal, leaks, broken, unread, errs)
 	if tier2 > 0 {
 		fmt.Fprintf(w, "%d origins in Tier 2 types (text/css, JavaScript), which the "+
 			"proxy excludes by design — PLAN's fast path adds them \"only if the "+
