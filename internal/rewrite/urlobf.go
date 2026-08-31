@@ -1000,7 +1000,9 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool) []byte {
 	v = h.refsOnly(h.rewriteAll(v, value), value)
 	// And references spelling CSS escapes, which needs both decodes composed.
 	if h != nil && len(h.to) > 0 && bytes.IndexByte(v, '&') >= 0 {
-		v = h.spliceHostsIn(stripForRefsCSS(v), v, urlTokenStarts, value)
+		if n, ok := refsThenCSS(v); ok {
+			v = h.spliceHostsIn(n, v, urlTokenStarts, value)
+		}
 	}
 	return v
 }
@@ -1138,6 +1140,26 @@ func stripForRefsCSS(v []byte) normalised {
 	return composeView(stripForRefs(v), stripForCSS)
 }
 
+// refsThenCSS is stripForRefsCSS with the reference decode shared and the CSS
+// layer skipped when the references do not actually spell a backslash.
+//
+// Both call sites were gated on `&` alone and then decoded twice — once inside
+// refsOnly and again inside stripForRefsCSS — and built the CSS layer over
+// every value containing an ampersand, which is most of them. Transient
+// allocation had reached 186x the body: 1.5 GB churned and a 541 MB heap
+// high-water mark for one 8 MiB request. The decode that decides is the same
+// one the reference view needs anyway, so sharing it costs nothing.
+//
+// ok=false means there is no backslash to unescape and the caller should skip
+// the composed view entirely.
+func refsThenCSS(v []byte) (normalised, bool) {
+	n := stripForRefs(v)
+	if bytes.IndexByte(n.b, '\\') < 0 {
+		return normalised{}, false
+	}
+	return composeView(n, stripForCSS), true
+}
+
 // percentLeak is the percent-decoded view, for an encoding composed with
 // another one — `https%3A%5C%2F%5C%2Fhost`, which is what percent-encoding a
 // JSON-escaped URL produces and what WooCommerce hands to decodeURIComponent.
@@ -1185,7 +1207,11 @@ func (w *HTML) refsCSSLeak(surface string, base int, v []byte) []byte {
 	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForRefsCSS(v), v, urlTokenStarts, true)
+	n, ok := refsThenCSS(v)
+	if !ok {
+		return v
+	}
+	out, events := w.hosts.spliceHostsLog(n, v, urlTokenStarts, true)
 	w.record(surface, base, events)
 	return out
 }

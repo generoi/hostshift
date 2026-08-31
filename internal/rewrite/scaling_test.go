@@ -3,6 +3,7 @@ package rewrite
 import (
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -163,5 +164,58 @@ func TestHostLeaksStaysLinear(t *testing.T) {
 	}
 	if ratio := float64(b) / float64(a); ratio > 8 {
 		t.Error(fmt.Sprintf("4x the request body took %.1fx the time (%v → %v)", ratio, a, b))
+	}
+}
+
+// Transient allocation, held to a ceiling so it cannot drift unnoticed.
+//
+// Each view allocates a decoded copy plus two position maps — 17 bytes per
+// input byte — and composeView adds two more maps on top of an intermediate.
+// Round nineteen measured 186x the body on a shape that fires every view: 1.5 GB
+// churned and a 541 MB heap high-water mark for one 8 MiB request, against ~37x
+// recorded in earlier rounds. Sharing the reference decode between the reference
+// view and the composed one, and skipping the CSS layer when the references do
+// not spell a backslash, took the ampersand-only shapes from 118x to 85x and
+// from 104x to 80x. The worst case is unchanged, correctly: that shape really
+// does need all six views.
+//
+// The remaining structural halving would be `pos`/`end` as []int32 — safe,
+// since DefaultMaxBody is 8 MiB and well under 2^31, and worth about 47%. It is
+// 141 index sites in the most delicate arithmetic in this package, so it is
+// recorded here as a measured, deliberate deferral rather than done in the same
+// pass as a leak fix. This test is what makes it a tracked number.
+func TestAllocationStaysBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocation")
+	}
+	m, err := origin.NewMatcher([]origin.Pair{{
+		Canonical: origin.MustParse("https://www.example.fi"),
+		Variant:   origin.MustParse("https://wt-a--example.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, unit string
+		ceiling    float64
+	}{
+		{"every view fires", `&#92;3a %5C\3a [http:`, 200},
+		{"ampersands alone", `&`, 95},
+		{"references and brackets", `&#91;http:`, 90},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b := []byte(strings.Repeat(c.unit, (1<<20)/len(c.unit)))
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			HostLeaksBack(m, b)
+			runtime.ReadMemStats(&after)
+			ratio := float64(after.TotalAlloc-before.TotalAlloc) / float64(len(b))
+			t.Logf("%s: %.0fx the body", c.name, ratio)
+			if ratio > c.ceiling {
+				t.Errorf("%s: transient allocation is %.0fx the body, ceiling %.0fx",
+					c.name, ratio, c.ceiling)
+			}
+		})
 	}
 }
