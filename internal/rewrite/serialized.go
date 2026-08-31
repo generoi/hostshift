@@ -160,7 +160,7 @@ func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 // parse failed immediately, and "a failed candidate declines the buffer" then
 // declined every body containing a link.
 func repairAt(b []byte, i int, rw func([]byte) []byte) (rep []byte, end int, ok, committed bool) {
-	for _, syn := range []syntax{literalSyntax, percentSyntax} {
+	for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax} {
 		r, e, o, c := repairValueC(b, i, rw, 0, syn)
 		if o {
 			return r, e, true, c
@@ -200,11 +200,29 @@ func valueStart(b []byte, i int) bool {
 	// candidate that fails to parse now declines the whole buffer.
 	switch b[i] {
 	case 'N':
-		return i+1 < len(b) && (b[i+1] == ';' || pctIs(b, i+1, ';'))
+		if i+1 >= len(b) || !(b[i+1] == ';' || pctIs(b, i+1, ';')) {
+			return false
+		}
 	case 'b', 'i', 'd', 's', 'a', 'O', 'R', 'r', 'E', 'C':
-		return i+1 < len(b) && (b[i+1] == ':' || pctIs(b, i+1, ':'))
+		if i+1 >= len(b) || !(b[i+1] == ':' || pctIs(b, i+1, ':')) {
+			return false
+		}
+	default:
+		return false
 	}
-	return false
+	// And it must sit where a value can begin. Without this a URL path holding
+	// `s:3:"a"` was a candidate: it commits, fails to close, and the detector
+	// reported a healthy page as carrying broken serialized data.
+	if i == 0 {
+		return true
+	}
+	switch b[i-1] {
+	case '{', ';', '"', '=', '&', ':', ',':
+		return true
+	}
+	return pctIs(b, i-1, '{') || pctIs(b, i-1, ';') || pctIs(b, i-1, '"') ||
+		(i >= 6 && string(b[i-6:i]) == "&quot;") ||
+		(i >= 2 && b[i-2] == '\\' && b[i-1] == '"')
 }
 
 // maxSerializedDepth bounds the recursion. Exceeding it *declines* — it must
@@ -239,6 +257,90 @@ var literalSyntax = syntax{
 		return i + n, true
 	},
 	dlen: func(data []byte) int { return len(data) },
+}
+
+// htmlSyntax is the spelling `esc_attr` and `esc_textarea` produce: the quotes
+// become `&quot;`, everything else in the grammar stays literal.
+//
+// Without it the streamed HTML arm could not repair, so it served a blob whose
+// length was stale while every other arm repaired — and that asymmetry is the
+// whole of rounds twenty-two to twenty-six. The browser unescapes, posts back
+// real quotes over a stale length, and the request direction then had to guess
+// whether to believe it. With both directions repairing there is nothing to
+// guess: the wire is never stale in the first place.
+var htmlSyntax = syntax{
+	match: func(b []byte, i int, c byte) (int, bool) {
+		if c == '"' {
+			for _, e := range []string{"&quot;", "&#34;", "&#034;"} {
+				if i+len(e) <= len(b) && string(b[i:i+len(e)]) == e {
+					return len(e), true
+				}
+			}
+			return 0, false
+		}
+		if i < len(b) && b[i] == c {
+			return 1, true
+		}
+		return 0, false
+	},
+	emit: func(dst []byte, c byte) []byte {
+		if c == '"' {
+			return append(dst, `&quot;`...)
+		}
+		return append(dst, c)
+	},
+	advance: advanceEntities,
+	dlen:    entityLen,
+}
+
+// jsonSyntax is the spelling a JSON string value carries: the quotes become
+// `\"`, everything else stays literal.
+var jsonSyntax = syntax{
+	match: func(b []byte, i int, c byte) (int, bool) {
+		if c == '"' {
+			if i+1 < len(b) && b[i] == '\\' && b[i+1] == '"' {
+				return 2, true
+			}
+			return 0, false
+		}
+		if i < len(b) && b[i] == c {
+			return 1, true
+		}
+		return 0, false
+	},
+	emit: func(dst []byte, c byte) []byte {
+		if c == '"' {
+			return append(dst, '\\', '"')
+		}
+		return append(dst, c)
+	},
+	advance: func(b []byte, i, n int) (int, bool) {
+		if n < 0 {
+			return 0, false
+		}
+		for ; n > 0; n-- {
+			if i >= len(b) {
+				return 0, false
+			}
+			if b[i] == '\\' && i+1 < len(b) {
+				i += 2
+				continue
+			}
+			i++
+		}
+		return i, true
+	},
+	dlen: func(b []byte) int {
+		n := 0
+		for i := 0; i < len(b); n++ {
+			if b[i] == '\\' && i+1 < len(b) {
+				i += 2
+				continue
+			}
+			i++
+		}
+		return n
+	},
 }
 
 var percentSyntax = syntax{
@@ -790,7 +892,12 @@ func BrokenSerialized(b []byte) int {
 		id := func(x []byte) []byte { return x }
 		var end int
 		var ok, committed bool
-		for _, syn := range []syntax{literalSyntax, percentSyntax} {
+		// Every spelling, including the HTML-escaped one. Knowing only two made
+		// the detector flag correctly-escaped content — a serialized option in
+		// an `esc_attr` input or a JSON string is not broken, it is escaped —
+		// and a check that is always RED is a check nobody reads, which is the
+		// mechanism that let five rounds of real corruption pass unnoticed.
+		for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax} {
 			_, e, o, c := repairValueC(b, i, id, 0, syn)
 			if o {
 				end, ok = e, true
@@ -808,6 +915,55 @@ func BrokenSerialized(b []byte) int {
 			n++
 			// Past this header, so one broken value is counted once.
 			i += 2
+			continue
+		}
+		i++
+	}
+	return n
+}
+
+// entityRun is the length of an HTML character reference at i, or 0.
+func entityRun(b []byte, i int) int {
+	if i >= len(b) || b[i] != '&' {
+		return 0
+	}
+	for j := i + 1; j < len(b) && j < i+10; j++ {
+		if b[j] == ';' {
+			return j - i + 1
+		}
+		if !(b[j] >= 'a' && b[j] <= 'z' || b[j] >= 'A' && b[j] <= 'Z' ||
+			b[j] >= '0' && b[j] <= '9' || b[j] == '#') {
+			return 0
+		}
+	}
+	return 0
+}
+
+// advanceEntities walks n decoded bytes from i, counting a character reference
+// as the one byte it decodes to.
+func advanceEntities(b []byte, i, n int) (int, bool) {
+	if n < 0 {
+		return 0, false
+	}
+	for ; n > 0; n-- {
+		if i >= len(b) {
+			return 0, false
+		}
+		if w := entityRun(b, i); w > 0 {
+			i += w
+			continue
+		}
+		i++
+	}
+	return i, true
+}
+
+// entityLen is how many bytes b decodes to.
+func entityLen(b []byte) int {
+	n := 0
+	for i := 0; i < len(b); n++ {
+		if w := entityRun(b, i); w > 0 {
+			i += w
 			continue
 		}
 		i++

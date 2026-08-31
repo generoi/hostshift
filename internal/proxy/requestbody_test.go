@@ -467,3 +467,45 @@ func TestAQueryStringInsideASerializedValueSurvivesEveryArm(t *testing.T) {
 		})
 	}
 }
+
+// The HTML arm must repair too, or it is the one direction that cannot — and
+// that asymmetry is the whole of rounds twenty-two to twenty-six.
+//
+// A serialized option reaches the browser through an `esc_attr` hidden input or
+// an `esc_textarea`, where the quotes are `&quot;`. Rewriting a host inside one
+// without re-emitting its `s:NN:` served a stale length; the browser unescapes,
+// posts it back with real quotes, and the request direction then had to guess
+// whether to believe it. Repairing here is streaming-safe because an attribute
+// value and a text node are already handled as whole units.
+func TestTheHTMLArmRepairsSerializedLengths(t *testing.T) {
+	canonHost := "www.acmecorp.fi"
+	css := `body{background:url(https://` + canonHost + `/bg.png);font-family:"Inter";}`
+	blob := `a:1:{s:3:"css";s:` + strconv.Itoa(len(css)) + `:"` + css + `";}`
+	esc := strings.ReplaceAll(blob, `"`, "&quot;")
+
+	for _, page := range []string{
+		`<input type="hidden" name="opt" value="` + esc + `">`,
+		`<textarea name="opt">` + esc + `</textarea>`,
+	} {
+		t.Run(page[:20], func(t *testing.T) {
+			h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				_, _ = w.Write([]byte(page))
+			})
+			_, got := h.get(t, variantHost, "/wp-admin/options.php")
+			// Byte-exact against what the value must become, not a
+			// "does it close" check: at a stale offset the data itself often
+			// supplies a quote — `font-family:"Inter"` does — so the weaker
+			// assertion passes on the corruption it was written to catch. That
+			// is the blindness an earlier round found in this file's sibling
+			// oracle, and it hid this fix's own mutation.
+			vcss := strings.ReplaceAll(css, canonHost, variantHost)
+			wantBlob := `a:1:{s:3:"css";s:` + strconv.Itoa(len(vcss)) + `:"` + vcss + `";}`
+			un := strings.ReplaceAll(string(got), "&quot;", `"`)
+			if !strings.Contains(un, wantBlob) {
+				t.Errorf("the served value is not the repaired one:\n got  %s\n want %s",
+					un, wantBlob)
+			}
+		})
+	}
+}

@@ -240,7 +240,27 @@ func structuredAttr(name []byte) []byte {
 }
 
 // rewriteValue is the single seam every value passes through.
+// rewriteValue wraps the per-value pipeline in RepairSerialized.
+//
+// A serialized blob reaches the browser through an `esc_attr` hidden input, an
+// `esc_textarea` or a `wp_localize_script` line, and rewriting a host inside one
+// without re-emitting its `s:NN:` leaves a length PHP refuses. Doing it here
+// keeps the HTML arm streamed: an attribute value and a text node are already
+// handled as whole units, so nothing needs buffering that was not buffered
+// before.
+//
+// Until this existed the HTML arm was the one direction that could not repair,
+// and that asymmetry is the whole of rounds twenty-two to twenty-six: the
+// browser was served a stale length, posted it back, and the request direction
+// had to guess whether to believe it. With both directions repairing there is
+// nothing to guess.
 func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []byte {
+	return RepairSerialized(v, func(b []byte) []byte {
+		return w.rewriteValueInner(surface, name, base, b)
+	})
+}
+
+func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte) []byte {
 	if s := structuredAttr(name); s != nil {
 		w.stats.Structured(string(s))
 	}

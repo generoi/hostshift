@@ -442,9 +442,14 @@ func TestServedSerializedPayloadsMustParse(t *testing.T) {
 // "no canonical origin reached the browser, no page re-serialised".
 func TestAStaleLengthIsNotAGreenRun(t *testing.T) {
 	css := ".a{color:red}"
+	valid := `a:1:{s:3:"css";s:` + strconv.Itoa(len(css)) + `:"` + css + `";}`
 	stale := `a:1:{s:3:"css";s:` + strconv.Itoa(len(css)-6) + `:"` + css + `";}`
 
-	r := compareBodies(t, stale, stale)
+	// Valid at the canonical, broken at the variant: the proxy did this. The
+	// same body on both sides is a database that was already broken, which the
+	// baseline subtraction correctly attributes elsewhere — see
+	// TestAPreBrokenRowIsNotBlamedOnTheProxy.
+	r := compareBodies(t, valid, stale)
 	if r.BrokenSerialized == 0 {
 		t.Fatalf("a served stale length was not detected:\n%s", stale)
 	}
@@ -481,4 +486,53 @@ func compareBodies(t *testing.T, canonBody, variantBody string) Result {
 	return compare(context.Background(), Options{
 		Canonical: cu, Variant: vu, Map: m, Client: cs.Client(),
 	}, "/")
+}
+
+// A row that was already broken in the database is not the proxy's doing.
+//
+// Real WordPress databases carry these — from the careless search-replace
+// hostshift exists to avoid — and counting the variant body alone made every
+// such site RED forever, on bytes the proxy passed through untouched. A check
+// that is always RED is a check nobody reads, which is the mechanism that let
+// five rounds of real corruption go unnoticed.
+func TestAPreBrokenRowIsNotBlamedOnTheProxy(t *testing.T) {
+	css := ".a{color:red}"
+	stale := `a:1:{s:3:"css";s:` + strconv.Itoa(len(css)-6) + `:"` + css + `";}`
+
+	r := compareBodies(t, stale, stale)
+	if r.BrokenSerialized != 0 {
+		t.Errorf("a row broken on both sides was blamed on the proxy: %d", r.BrokenSerialized)
+	}
+	var buf bytes.Buffer
+	if !WriteReport(&buf, []Result{r}) {
+		t.Errorf("the run went RED for a payload the proxy did not touch:\n%s", buf.String())
+	}
+}
+
+// Correctly escaped content is not broken content.
+//
+// A serialized option reaches the browser through `esc_attr`, `esc_textarea` or
+// a JSON string, and in every one of those the quotes are escaped. A detector
+// that knows only the literal and percent spellings called all of them broken —
+// so a healthy WordPress settings page turned the run RED permanently, on bytes
+// the proxy had handled perfectly. A check that is always RED is a check nobody
+// reads.
+func TestEscapedSerializedContentIsNotBroken(t *testing.T) {
+	css := `body{color:red}`
+	blob := `a:1:{s:3:"css";s:` + strconv.Itoa(len(css)) + `:"` + css + `";}`
+	for _, c := range []struct{ name, body string }{
+		{"raw", blob},
+		{"esc_attr", `<input value="` + strings.ReplaceAll(blob, `"`, "&quot;") + `">`},
+		{"esc_textarea", `<textarea>` + strings.ReplaceAll(blob, `"`, "&quot;") + `</textarea>`},
+		{"a JSON string", `{"o":"` + strings.ReplaceAll(blob, `"`, `\"`) + `"}`},
+		{"a URL path that contains s:", `https://x/s:3:"a"`},
+		{"minified CSS", `nav a:hover{color:red}d:\shares\logo.png`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if n := rewrite.BrokenSerialized([]byte(c.body)); n != 0 {
+				t.Errorf("counted %d broken values in correctly formed content:\n%s",
+					n, c.body)
+			}
+		})
+	}
 }

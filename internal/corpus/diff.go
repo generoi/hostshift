@@ -232,7 +232,16 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// that is exactly how five rounds of silent wp_options destruction went
 	// unreported by the run PLAN §7 calls the only test that validates against
 	// reality.
-	r.BrokenSerialized = rewrite.BrokenSerialized(variant.body)
+	// Against the canonical baseline, so this blames the proxy for what the
+	// proxy did. Real WordPress databases carry broken serialized rows already —
+	// from the careless search-replace hostshift exists to avoid — and counting
+	// the variant alone made every such site RED forever, on bytes the proxy had
+	// passed through untouched.
+	r.BrokenSerialized = rewrite.BrokenSerialized(variant.body) -
+		rewrite.BrokenSerialized(canon.body)
+	if r.BrokenSerialized < 0 {
+		r.BrokenSerialized = 0
+	}
 
 	r.ContentType = variant.contentType
 	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
