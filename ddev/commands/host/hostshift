@@ -1054,104 +1054,6 @@ if [ "$cmd" = "check" ]; then
     exit 2
   fi
 
-  # Ask the database which hostnames it actually holds.
-  #
-  # Everything above compares configuration against configuration, and adopting
-  # production-canonical is a pincer between two states configuration cannot
-  # tell apart. A worktree whose branch predates the parent's hostshift.yaml has
-  # a map built from DDEV hostnames — which is *correct* while the database still
-  # holds them, and both variants return 200 — and check refused it on every
-  # start, every statement in the warning false. Merge the file, as that warning
-  # says, and check reports "hostshift is serving" and exits 0 while both URLs
-  # 302 to wp-signup, because the database has not moved yet. The developer's
-  # only escape from a permanent red is the action that silently breaks the site.
-  #
-  # One query separates them, and the add-on already talks to this database in
-  # copy-db. Best-effort throughout: no container, no WordPress, an unusual table
-  # prefix or a stopped db all yield nothing, and nothing is not evidence.
-  # ${DB_HOST:-db} — the database the *application* reads, not the one beside it.
-  #
-  # `-h db` is the worktree's own container, and the README's headline answer to
-  # "the worktree has an empty database" is to share the parent's. On exactly
-  # that configuration the query hit an idle container holding a leftover
-  # install, so a site serving 200s with every link correctly rewritten was told
-  # its database names a hostname the map does not cover — refused on every
-  # start, every clause false. Worse, the remedy it printed is destructive there:
-  # `ddev wp` targets the parent, so the search-replace it recommends would
-  # rewrite the parent's real content to a throwaway worktree hostname.
-  #
-  # copy-db thirty lines up already asks the web container for DB_HOST for this
-  # exact reason. Running the query inside the container with its own environment
-  # inherits that knowledge instead of duplicating it.
-  # `wp db query`, which reads the *row*, not the application's opinion of it.
-  #
-  # Reading DB_HOST from the container's shell environment was not the same
-  # question. The README's "Share the parent's" section sets DATABASE_URL, not
-  # DB_HOST, and Bedrock keeps credentials in a dotenv file that no `printenv`
-  # can see — so on the README's headline configuration the query hit the
-  # worktree's own idle container instead of the database the application reads.
-  #
-  # That was wrong in both directions, and the silent one is worse: a stale
-  # answer from the idle container *cleared* the parent-declares warning, so a
-  # preview serving live production origins was certified healthy. Reading a
-  # different database and calling it proof is the failure; asking the
-  # application removes the question.
-  #
-  # `wp option get home` was the wrong question, and PLAN §4.1 says why:
-  # "the application self-reports and cannot be interrogated — the map must be
-  # declared, never discovered". get_option('home') runs through
-  # `add_filter('option_home', '_config_wp_home')`, which WordPress registers
-  # unconditionally and which returns WP_HOME whenever it is defined — and
-  # Bedrock always defines it, from HTTP_HOST or DDEV_PRIMARY_URL. So under
-  # `ddev exec`, with no HTTP_HOST, the answer was the worktree's own project
-  # hostname, which is by construction neither canonical nor variant: a refusal
-  # on every start of a healthy site. And where a repo has wp-cli.local.yml, its
-  # `url:` sets HTTP_HOST, so the answer always equalled a canonical host and the
-  # check cleared the parent-declares warning by echoing generated config back at
-  # itself.
-  #
-  # The row is not an opinion. wp-cli resolves the connection from wp-config.php,
-  # so Bedrock's dotenv and the README's DATABASE_URL are both handled — the
-  # thing the shell-environment version got wrong — while `db query` bypasses
-  # every filter.
-  #
-  # Best-effort, and silence is the only safe failure. No wp-cli, no WordPress,
-  # a stopped container or an unusual layout all yield nothing — and nothing
-  # neither clears a warning nor raises one, because an answer we cannot trust
-  # must not be treated as evidence in either direction.
-  dbhome="$(ddev exec -s web wp --skip-plugins --skip-themes --quiet db query \
-    "select option_value from wp_options where option_name='home' limit 1" --skip-column-names \
-    2>/dev/null | tail -1 | tr -d '\r' || true)"
-  dbhost=""
-  case "$dbhome" in
-    http://*|https://*) dbhost="$(printf '%s' "$dbhome" | sed -e 's|^https\{0,1\}://||' -e 's|[/:].*$||')" ;;
-  esac
-
-  if [ -n "$dbhost" ]; then
-    canon_hosts="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
-      --canonical-hosts 2>/dev/null | sort -u || true)"
-    known=""
-    while IFS= read -r h; do
-      [ "$h" = "$dbhost" ] && { known=1; break; }
-    done <<<"$canon_hosts"
-    if [ -z "$known" ]; then
-      echo "hostshift: the database says its home is $dbhome, and this map does not" >&2
-      echo "  name that hostname — so nothing on the page would be rewritten and" >&2
-      echo "  every link would point at it. The map covers:" >&2
-      printf '    %s\n' $canon_hosts >&2
-      echo "  Either the database has not been moved to the hostnames" >&2
-      echo "  hostshift.yaml declares, or the map is built from the wrong" >&2
-      echo "  checkout. \`ddev hostshift wp-cli\` and a search-replace move it." >&2
-      exit 2
-    fi
-    # The database agrees with the deployed map, so the warning held above — that
-    # this worktree's branch predates a hostshift.yaml — describes a state that
-    # has not arrived yet. Refusing *or printing it* failed the hook, and told
-    # the developer to take the action that breaks the site.
-    parent_declares=""
-    parent_declares_msg=""
-  fi
-
   if [ -n "$parent_declares" ]; then
     [ -n "$parent_declares_msg" ] && parent_declares_warn
     echo "hostshift: refusing to call this healthy — see the warning above." >&2
@@ -1223,7 +1125,17 @@ if [ "$cmd" = "check" ]; then
   #
   # A warning, not a refusal: a lagging image is a reason to pull, not a reason
   # to fail every start. Nothing is said when either version is unknown.
+  # A banner with no version is evidence, not the absence of it.
+  #
+  # v0.1.0 prints `hostshift: listening on …` — the version was added to that
+  # line *after* it — so requiring a space after the name made running_ver empty
+  # on the only skew that actually exists today, and the warning was silent on
+  # exactly the case its comment cites as measured. A bannerless proxy is older
+  # than the change that added the banner.
   running_ver="$(printf '%s\n' "$logs" | sed -n 's/^hostshift \([^:]*\): listening on.*/\1/p' | tail -1)"
+  if [ -z "$running_ver" ] && printf '%s\n' "$logs" | grep -q '^hostshift: listening on'; then
+    running_ver="(older than v0.2.0)"
+  fi
   host_ver="$(hostshift --version 2>/dev/null | tail -1 | tr -d '\r' || true)"
   if [ -n "$running_ver" ] && [ -n "$host_ver" ] && [ "$running_ver" != "$host_ver" ] &&
      [ "$running_ver" != "dev" ] && [ "$host_ver" != "dev" ]; then
@@ -1232,8 +1144,7 @@ if [ "$cmd" = "check" ]; then
     echo "  engine from a published image, so anything added between those two" >&2
     echo "  versions is not running here — silently, since the map and the" >&2
     echo "  hostnames still check out." >&2
-    echo "  \`ddev exec -s hostshift true\` aside, the fix is to pull:" >&2
-    echo "  \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
+    echo "  Pull it: \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
   fi
   if [ -n "$running_map" ]; then
     want_map="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" 2>/dev/null \
@@ -1306,12 +1217,149 @@ if [ "$cmd" = "check" ]; then
         echo "  answers ${code:-nothing} — so something between the router and the" >&2
         echo "  proxy is broken, not the configuration." >&2
         echo "  A stale router from a renamed project does this, and so does" >&2
-        echo "  another project claiming the same hostname. Try \`ddev restart\`," >&2
-        echo "  then \`ddev stop && ddev start\` — which clears a stale router that" >&2
-        echo "  a restart does not — and only then \`ddev poweroff\`, which retires" >&2
-        echo "  every project's routers." >&2
+        echo "  another project claiming the same hostname." >&2
+        # Name the file, because none of the three remedies previously printed
+        # clears it. DDEV keeps per-project router config in
+        # .ddev/traefik/config/<name>.yaml *inside the project*, so renaming a
+        # directory leaves the old name's file there permanently: two routers
+        # register the same rule and traefik picks the one pointing at a
+        # container that no longer exists. Measured, `ddev restart`,
+        # `ddev stop && ddev start` and `ddev poweroff` all leave it — the file
+        # is on disk and comes back on the next start. Deleting it fixes it
+        # immediately, and the previous advice claimed the opposite in the very
+        # case it named.
+        stale=""
+        for f in .ddev/traefik/config/*.yaml; do
+          [ -f "$f" ] || continue
+          case "$(basename "$f" .yaml)" in "$name") ;; *) stale="${stale:+$stale }$f" ;; esac
+        done
+        if [ -n "$stale" ]; then
+          echo "  This project carries router config for a name it no longer has:" >&2
+          printf '    %s\n' $stale >&2
+          echo "  That is what a renamed directory leaves behind, and no restart" >&2
+          echo "  clears it. Delete those files and \`ddev restart\`." >&2
+        else
+          echo "  Try \`ddev restart\`, then \`ddev stop && ddev start\`, and only" >&2
+          echo "  then \`ddev poweroff\`, which retires every project's routers." >&2
+        fi
         exit 2 ;;
     esac
+  fi
+
+  # After the probe, not before it.
+  #
+  # The probe is the one hard measurement in this command; the database gate is
+  # a best-effort heuristic whose own comment says it must stay silent when it
+  # cannot tell. Running the heuristic first meant a wrong guess from it hid a
+  # real 502 behind advice to run a search-replace.
+  # Ask the database which hostnames it actually holds.
+  #
+  # Everything above compares configuration against configuration, and adopting
+  # production-canonical is a pincer between two states configuration cannot
+  # tell apart. A worktree whose branch predates the parent's hostshift.yaml has
+  # a map built from DDEV hostnames — which is *correct* while the database still
+  # holds them, and both variants return 200 — and check refused it on every
+  # start, every statement in the warning false. Merge the file, as that warning
+  # says, and check reports "hostshift is serving" and exits 0 while both URLs
+  # 302 to wp-signup, because the database has not moved yet. The developer's
+  # only escape from a permanent red is the action that silently breaks the site.
+  #
+  # One query separates them, and the add-on already talks to this database in
+  # copy-db. Best-effort throughout: no container, no WordPress, an unusual table
+  # prefix or a stopped db all yield nothing, and nothing is not evidence.
+  # ${DB_HOST:-db} — the database the *application* reads, not the one beside it.
+  #
+  # `-h db` is the worktree's own container, and the README's headline answer to
+  # "the worktree has an empty database" is to share the parent's. On exactly
+  # that configuration the query hit an idle container holding a leftover
+  # install, so a site serving 200s with every link correctly rewritten was told
+  # its database names a hostname the map does not cover — refused on every
+  # start, every clause false. Worse, the remedy it printed is destructive there:
+  # `ddev wp` targets the parent, so the search-replace it recommends would
+  # rewrite the parent's real content to a throwaway worktree hostname.
+  #
+  # copy-db thirty lines up already asks the web container for DB_HOST for this
+  # exact reason. Running the query inside the container with its own environment
+  # inherits that knowledge instead of duplicating it.
+  # `wp db query`, which reads the *row*, not the application's opinion of it.
+  #
+  # Reading DB_HOST from the container's shell environment was not the same
+  # question. The README's "Share the parent's" section sets DATABASE_URL, not
+  # DB_HOST, and Bedrock keeps credentials in a dotenv file that no `printenv`
+  # can see — so on the README's headline configuration the query hit the
+  # worktree's own idle container instead of the database the application reads.
+  #
+  # That was wrong in both directions, and the silent one is worse: a stale
+  # answer from the idle container *cleared* the parent-declares warning, so a
+  # preview serving live production origins was certified healthy. Reading a
+  # different database and calling it proof is the failure; asking the
+  # application removes the question.
+  #
+  # `wp option get home` was the wrong question, and PLAN §4.1 says why:
+  # "the application self-reports and cannot be interrogated — the map must be
+  # declared, never discovered". get_option('home') runs through
+  # `add_filter('option_home', '_config_wp_home')`, which WordPress registers
+  # unconditionally and which returns WP_HOME whenever it is defined — and
+  # Bedrock always defines it, from HTTP_HOST or DDEV_PRIMARY_URL. So under
+  # `ddev exec`, with no HTTP_HOST, the answer was the worktree's own project
+  # hostname, which is by construction neither canonical nor variant: a refusal
+  # on every start of a healthy site. And where a repo has wp-cli.local.yml, its
+  # `url:` sets HTTP_HOST, so the answer always equalled a canonical host and the
+  # check cleared the parent-declares warning by echoing generated config back at
+  # itself.
+  #
+  # The row is not an opinion. wp-cli resolves the connection from wp-config.php,
+  # so Bedrock's dotenv and the README's DATABASE_URL are both handled — the
+  # thing the shell-environment version got wrong — while `db query` bypasses
+  # every filter.
+  #
+  # Best-effort, and silence is the only safe failure. No wp-cli, no WordPress,
+  # a stopped container or an unusual layout all yield nothing — and nothing
+  # neither clears a warning nor raises one, because an answer we cannot trust
+  # must not be treated as evidence in either direction.
+  # The first line that looks like a URL, not `tail -1`.
+  #
+  # `wp db query` ends its output with a blank line, so `tail -1` assigned an
+  # empty string and the whole gate below — refusal *and* the parent-declares
+  # clearing — silently never ran. `option get home`, which this replaced,
+  # emitted exactly one line, which is why the idiom survived the change. Third
+  # time this gate has been wrong, and the first time it was wrong in the
+  # direction that says nothing at all.
+  #
+  # Matching the shape rather than a position also skips a column header or a
+  # warning line, and `sed -n '…{p;q;}'` is the file's existing way of taking a
+  # first match without `head -1` SIGPIPEing the writer under pipefail.
+  dbhome="$(ddev exec -s web wp --skip-plugins --skip-themes --quiet db query \
+    "select option_value from wp_options where option_name='home' limit 1" --skip-column-names \
+    2>/dev/null | tr -d '\r' | sed -n '/^https\{0,1\}:\/\//{p;q;}' || true)"
+  dbhost=""
+  case "$dbhome" in
+    http://*|https://*) dbhost="$(printf '%s' "$dbhome" | sed -e 's|^https\{0,1\}://||' -e 's|[/:].*$||')" ;;
+  esac
+
+  if [ -n "$dbhost" ]; then
+    canon_hosts="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+      --canonical-hosts 2>/dev/null | sort -u || true)"
+    known=""
+    while IFS= read -r h; do
+      [ "$h" = "$dbhost" ] && { known=1; break; }
+    done <<<"$canon_hosts"
+    if [ -z "$known" ]; then
+      echo "hostshift: the database says its home is $dbhome, and this map does not" >&2
+      echo "  name that hostname — so nothing on the page would be rewritten and" >&2
+      echo "  every link would point at it. The map covers:" >&2
+      printf '    %s\n' $canon_hosts >&2
+      echo "  Either the database has not been moved to the hostnames" >&2
+      echo "  hostshift.yaml declares, or the map is built from the wrong" >&2
+      echo "  checkout. \`ddev hostshift wp-cli\` and a search-replace move it." >&2
+      exit 2
+    fi
+    # The database agrees with the deployed map, so the warning held above — that
+    # this worktree's branch predates a hostshift.yaml — describes a state that
+    # has not arrived yet. Refusing *or printing it* failed the hook, and told
+    # the developer to take the action that breaks the site.
+    parent_declares=""
+    parent_declares_msg=""
   fi
 
   printf '\n  hostshift is serving:\n' >&2

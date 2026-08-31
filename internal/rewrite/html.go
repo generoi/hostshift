@@ -283,6 +283,12 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 			out = w.hosts.rewriteAllRefs(out, false)
 		}
 	}
+	// Percent-decoding, on every surface: an encoding composed with another one
+	// hides from all three of the engine's models at once. A JSON-escaped URL
+	// that is then percent-encoded — WooCommerce's inline
+	// `JSON.parse(decodeURIComponent("…"))` blobs — was invisible to the byte
+	// matcher, to the locator and to the census alike.
+	out = w.percentLeak(out)
 	// CSS unescapes before the URL parser runs, so a style surface needs that
 	// view too — see stripForCSS.
 	if surface == SurfaceInlineStyle || (surface == SurfaceHTMLAttr && len(name) == 5 && bytes.EqualFold(name, []byte("style"))) {

@@ -348,3 +348,38 @@ func TestObfuscationIsIdentitySafe(t *testing.T) {
 		}
 	}
 }
+
+// An encoding composed with another one hides from all three of the engine's
+// models at once.
+//
+// WooCommerce emits `JSON.parse(decodeURIComponent("…"))` inline, and
+// percent-encoding a JSON-escaped URL gives `https%3A%5C%2F%5C%2Fhost` — one
+// `%5C%2F` per `\/`. Measured on a live store: a logged-in /cart/ carried
+// fourteen canonical origins that way and wp-admin eighteen, with --json
+// reporting zero candidates and zero skips and diff printing GREEN.
+func TestComposedEncodings(t *testing.T) {
+	m := obfMatcher(t)
+	for _, c := range []struct {
+		name, in string
+		want     bool
+	}{
+		{"percent-encoded JSON escapes",
+			`<script>var d=decodeURIComponent("https%3A%5C%2F%5C%2Fwww.example.fi%5C%2Fshop");</script>`, true},
+		{"percent-encoded plain", `<script>var d="https%3A%2F%2Fwww.example.fi%2Fshop";</script>`, true},
+		{"in an attribute", `<a href="https%3A%5C%2F%5C%2Fwww.example.fi%5C%2Fx">y</a>`, true},
+		// Percent-encoding that is not an origin must be left exactly as written.
+		{"an ordinary escaped query", `<a href="/s?q=100%25%20off">y</a>`, false},
+		{"an unrelated host", `<a href="https%3A%2F%2Fcdn.other.example%2Fx">y</a>`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := rewriteHTML(t, m, c.in, NewStats(false))
+			got := strings.Contains(out, "wt-a--example.ddev.site")
+			if got != c.want {
+				t.Errorf("rewritten=%v, want %v:\n%s", got, c.want, out)
+			}
+			if !c.want && out != c.in {
+				t.Errorf("a value with no canonical origin was changed:\n got %s\nwant %s", out, c.in)
+			}
+		})
+	}
+}

@@ -135,7 +135,7 @@ post_install_actions:
       echo "  working when that goes."
       echo
       echo "  Delete it and install again:"
-      echo "      rm .ddev/commands/host/hostshift && ddev add-on get generoi/hostshift"
+      echo "      rm .ddev/commands/host/hostshift && ddev add-on get <path-to>/hostshift/ddev"
       echo
     fi
   - |

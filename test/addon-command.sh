@@ -756,6 +756,16 @@ case "$out" in
   *"the proxy image is"*) pass "check notices an image older than the command" ;;
   *) fail "check notices an image older than the command" "$out" ;;
 esac
+
+# v0.1.0's banner carries no version — the version was added to that line after
+# it — so requiring one made the warning silent on the only skew that exists.
+writefake
+printf 'hostshift: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"the proxy image is"*) pass "and one whose banner predates the version" ;;
+  *) fail "and one whose banner predates the version" "$out" ;;
+esac
 # The HTTP probe: a hard routing failure is fatal, an application answering is
 # not, and a cold start is retried rather than refused.
 #
@@ -824,7 +834,9 @@ cat > "$fakedb/ddev" <<'FAKEDDEV'
 # filters through WP_HOME and which therefore answers with generated config
 # rather than with what the database holds.
 case "$*" in
-  *"option_name='home'"*) printf '%s\n' "${HS_FAKE_HOME:-}" ;;
+  # A trailing blank line, exactly as `wp db query` emits one. `tail -1` read
+  # that blank and the whole gate silently stopped running.
+  *"option_name='home'"*) printf '%s\n\n' "${HS_FAKE_HOME:-}" ;;
 esac
 exit 0
 FAKEDDEV

@@ -64,6 +64,6 @@ hooks:
         grep -q '#ddev-generated' .ddev/commands/host/hostshift 2>/dev/null || {
           echo "hostshift: .ddev/commands/host/hostshift predates this add-on and was" >&2
           echo "  NOT replaced on upgrade, so the checks added since are not running." >&2
-          echo "  rm .ddev/commands/host/hostshift && ddev add-on get generoi/hostshift" >&2
+          echo "  rm .ddev/commands/host/hostshift && ddev add-on get <path-to>/hostshift/ddev" >&2
         }
         HOSTSHIFT_HOOK=1 .ddev/commands/host/hostshift check

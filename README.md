@@ -70,11 +70,19 @@ hostname, so a branch can be previewed without a database of its own.
 checkout goes on serving `acme.ddev.site` untouched. Whatever pulls the
 database keeps its search-replace; nothing about a normal pull changes.
 
-Install the add-on once per project:
+Install the add-on once per project, from a clone of this repository:
 
 ```
-ddev add-on get generoi/hostshift
+git clone git@github.com:generoi/hostshift.git ~/src/hostshift   # once, anywhere
+ddev add-on get ~/src/hostshift/ddev                             # per project
 ```
+
+`ddev add-on get generoi/hostshift` does **not** work, for two reasons worth
+stating rather than leaving you to discover: the repository is private, so
+DDEV's registry lookup 404s; and DDEV expects `install.yaml` at the repository
+root while hostshift keeps its add-on under `ddev/`, so even with
+`DDEV_GITHUB_TOKEN` set the download fails with `Unable to read … install.yaml`.
+The path form above is the supported one today.
 
 Then, in the worktree, one command:
 
@@ -95,7 +103,7 @@ DDEV project of its own with nothing configured.
 ```console
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
-$ ddev add-on get generoi/hostshift
+$ ddev add-on get ~/src/hostshift/ddev
 $ ddev hostshift init
 hostshift: slug "wt-a", from the git branch wt-a
 hostshift: canonical hostnames from /Users/you/Projects/acme, whose database this shares

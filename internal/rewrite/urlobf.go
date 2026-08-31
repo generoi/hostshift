@@ -222,6 +222,56 @@ func stripForRefs(v []byte) normalised {
 	return n
 }
 
+// stripForPercent is stripForURL with percent-escapes decoded into the view.
+//
+// The engine models three encodings and handles each in isolation; it did not
+// handle them *composed*. WooCommerce emits
+// `JSON.parse(decodeURIComponent("…"))` blobs inline, and percent-encoding a
+// JSON-escaped URL gives `https%3A%5C%2F%5C%2Fhost` — one `%5C%2F` per `\/`.
+// Measured on a live store, a logged-in /cart/ carried fourteen canonical
+// origins that way and wp-admin eighteen, with `--json` reporting zero
+// candidates and zero skips, and `diff` printing GREEN.
+//
+// Decoding into the view is enough: `\/\/` is a run of four slash-ish bytes, so
+// the locator finds the authority once the escapes are gone, and the splice
+// replaces only the host's original byte range — the percent-encoding around it
+// survives exactly as written.
+func stripForPercent(v []byte) normalised {
+	if bytes.IndexByte(v, '%') < 0 {
+		return stripForURL(v)
+	}
+	dec := make([]byte, 0, len(v))
+	pos := make([]int, 0, len(v))
+	end := make([]int, 0, len(v))
+	for i := 0; i < len(v); {
+		if v[i] == '%' && i+2 < len(v) {
+			hi, ok1 := digitVal(v[i+1], 16)
+			lo, ok2 := digitVal(v[i+2], 16)
+			if ok1 && ok2 {
+				dec = append(dec, byte(hi*16+lo))
+				pos = append(pos, i)
+				end = append(end, i+3)
+				i += 3
+				continue
+			}
+		}
+		dec = append(dec, v[i])
+		pos = append(pos, i)
+		end = append(end, i+1)
+		i++
+	}
+	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
+	for i := 0; i < len(dec); i++ {
+		if isURLStripped(dec[i]) {
+			continue
+		}
+		n.b = append(n.b, dec[i])
+		n.pos = append(n.pos, pos[i])
+		n.end = append(n.end, end[i])
+	}
+	return n
+}
+
 // stripForCSS is stripForURL with CSS escapes decoded first.
 //
 // `https\3a\2f\2fwww.example.fi/x` is a CSS-level spelling of an absolute URL:
@@ -868,6 +918,10 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool) []byte {
 	if bytes.IndexByte(v, '\\') >= 0 {
 		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value)
 	}
+	// And the percent view, for an encoding composed with another one.
+	if bytes.IndexByte(v, '%') >= 0 {
+		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value)
+	}
 	return v
 }
 
@@ -933,6 +987,16 @@ func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte)
 		return v
 	}
 	return append(out, v[prev:]...)
+}
+
+// percentLeak is the percent-decoded view, for an encoding composed with
+// another one — `https%3A%5C%2F%5C%2Fhost`, which is what percent-encoding a
+// JSON-escaped URL produces and what WooCommerce hands to decodeURIComponent.
+func (w *HTML) percentLeak(v []byte) []byte {
+	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '%') < 0 {
+		return v
+	}
+	return w.hosts.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, true)
 }
 
 // cssEscapeLeak is the CSS-tokenizer view of a style surface.
