@@ -278,3 +278,62 @@ func TestCorpusExercisesTheSplice(t *testing.T) {
 		t.Errorf("only %d adversarial fixtures contain an origin, was 13", advExercised)
 	}
 }
+
+// Matcher.Validate promises the map is a fixed point — that no variant origin
+// is matched by a canonical one, so nothing double-rewrites. It probes that with
+// three encodings through the byte matcher.
+//
+// It cannot do better: Validate lives in internal/origin, which this package
+// imports, so it structurally cannot run the locator, the fold or any of the
+// four views it now guards. The promise is therefore wider than the check, and
+// the difference is exactly the surface every round since nine has found a bug
+// in. So the property is asserted here instead, where the whole pipeline is
+// reachable, over the spellings the views decode.
+func TestValidatedMapsAreFixedPointsThroughEveryView(t *testing.T) {
+	for _, c := range []struct{ name, canonical, variant string }{
+		{"the ordinary ddev shape", "https://www.example.fi", "https://wt-a--example.ddev.site"},
+		{"a variant with a port", "https://www.example.fi", "http://localhost:8080"},
+		{"a variant on the other scheme", "https://www.example.fi", "http://v.ddev.site"},
+		{"a canonical with a port", "https://www.example.fi:8443", "https://v.ddev.site"},
+		{"an IPv6 variant", "https://www.example.fi", "http://[::1]:8080"},
+		// The shape most likely to break the promise: the variant is a label
+		// *under* the canonical, so anchoring is the only thing separating them.
+		{"a variant under the canonical host", "https://example.fi", "https://wt-a.example.fi"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			canon := origin.MustParse(c.canonical)
+			variant := origin.MustParse(c.variant)
+			m, err := origin.NewMatcher([]origin.Pair{{Canonical: canon, Variant: variant}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Validate(); err != nil {
+				t.Skipf("Validate refuses this map, so it makes no promise: %v", err)
+			}
+
+			host := variant.HostPort()
+			// Every spelling a view decodes, applied to the *variant* — which
+			// Validate says nothing may match.
+			for _, sp := range []struct{ name, in string }{
+				{"plain", `<a href="` + variant.String() + `/x">t</a>`},
+				{"json-escaped", `<a href="` + variant.Scheme + `:\/\/` + host + `/x">t</a>`},
+				{"backslashes", `<a href="` + variant.Scheme + `:\\` + host + `/x">t</a>`},
+				{"a long slash run", `<a href="` + variant.Scheme + `:///` + host + `/x">t</a>`},
+				{"uppercase", `<a href="` + variant.Scheme + `://` + strings.ToUpper(host) + `/x">t</a>`},
+				{"css-escaped", `<div style="background:url(` + variant.Scheme + `\3a \2f \2f ` + host + `/x.png)">t</div>`},
+				{"reference-encoded", `<a href="` + variant.Scheme + `:&#47;&#47;` + host + `/x">t</a>`},
+				{"refs spelling css", `<div style="background:url(` + variant.Scheme + `&#92;3a &#92;2f &#92;2f ` + host + `/x.png)">t</div>`},
+				{"in a text node", `<p>see ` + variant.String() + `/x</p>`},
+			} {
+				t.Run(sp.name, func(t *testing.T) {
+					out := rewriteHTML(t, m, sp.in, NewStats(false))
+					if out != sp.in {
+						t.Errorf("Validate called this map a fixed point, but a "+
+							"variant origin was rewritten — a second pass would "+
+							"double-rewrite:\n in  %s\n out %s", sp.in, out)
+					}
+				})
+			}
+		})
+	}
+}
