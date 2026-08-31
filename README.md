@@ -226,6 +226,15 @@ container resolves by name with nothing else configured. Note that a shared
 database is shared: previewing is safe, but activating a plugin, running a
 migration or uploading media writes to the real thing.
 
+Uploads split in a way worth knowing about. The row goes to the shared database
+and the *file* goes to the worktree's own `uploads/`, so the parent gets a row
+pointing at an image that is not there. On a stock DDEV WordPress it is worse:
+`wp-config-ddev.php` pins `WP_HOME` to this project's own hostname, so the
+attachment's `guid` is computed from a name that is neither canonical nor
+variant, and nothing will ever map it back. `ddev hostshift check` warns when
+the served page carries that hostname; the fix is to remove the pin, not to
+rewrite the row afterwards.
+
 **Or give it one of its own**, which a branch that has to write needs. The
 fastest source is the parent, and it is the state you are already working
 against:

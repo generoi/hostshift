@@ -34,7 +34,12 @@ set -euo pipefail
 # anywhere inside the project.
 [ -n "${DDEV_APPROOT:-}" ] && cd "$DDEV_APPROOT"
 
-cmd="${1:-init}"; shift || true
+# Usage, not init, when no subcommand is given. `init` writes .ddev/.env and
+# restarts every container, so a developer reaching for the usage text took
+# their project down instead — and for a six-subcommand tool the safe default is
+# the one that changes nothing. The post-start hook and every documented
+# invocation name their subcommand explicitly.
+cmd="${1:-}"; shift || true
 # Every flag, because --slug-from-branch is the documented way back from a
 # pinned slug and appeared in neither the usage line nor --help — its only
 # mention anywhere was one line init prints, which is also the only mention of
@@ -57,6 +62,15 @@ usage: ddev hostshift <command> [flags]
   --quiet, -q         say nothing when there is nothing to check
 USAGE
 }
+
+# Usage is printed here, after the function exists, rather than defaulting `cmd`
+# to `init` — which writes .ddev/.env and restarts every container, so a
+# developer reaching for the usage text took their project down instead. The
+# post-start hook and every documented invocation name their subcommand.
+if [ -z "$cmd" ]; then
+  usage
+  exit 0
+fi
 
 slug=""
 slug_explicit=""
@@ -1324,7 +1338,16 @@ if [ "$cmd" = "check" ]; then
   # exactly the case its comment cites as measured. A bannerless proxy is older
   # than the change that added the banner.
   running_ver="$(printf '%s\n' "$logs" | sed -n 's/^hostshift \([^:]*\): listening on.*/\1/p' | tail -1)"
-  if [ -z "$running_ver" ] && printf '%s\n' "$logs" | grep -q '^hostshift: listening on'; then
+  # `case` for the same reason as the probe body above: `docker logs` output
+  # passes 64 KiB once straggler WARNs accumulate, and the pipeline would then
+  # return 141 and silence the version-skew warning on the one image skew that
+  # actually exists.
+  logs_has_banner=""
+  case "$logs" in
+    "hostshift: listening on"*|*"
+hostshift: listening on"*) logs_has_banner=1 ;;
+  esac
+  if [ -z "$running_ver" ] && [ -n "$logs_has_banner" ]; then
     running_ver="(older than v0.2.0)"
   fi
   host_ver="$(hostshift --version 2>/dev/null | tail -1 | tr -d '\r' || true)"
@@ -1591,19 +1614,35 @@ if [ "$cmd" = "check" ]; then
   # This is not discovery of the map — it is reading the one page this command
   # already fetched and noticing it is full of a hostname the map does not name.
   if [ -n "${probe_body:-}" ] && [ -n "${DDEV_HOSTNAME:-}" ]; then
-    own="${DDEV_HOSTNAME%%,*}"
-    case ",$variants," in
-      *",$own,"*) ;;
-      *)
-        if printf '%s' "$probe_body" | grep -qF "//$own"; then
+    canon_list="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+      --canonical-hosts 2>/dev/null | paste -sd, - || true)"
+    # Every hostname DDEV registers, not just the first. DDEV joins the project
+    # hostname with each additional_hostnames entry, so reading one name looked
+    # at a fraction of what the project answers to.
+    owns="$(printf '%s' "${DDEV_HOSTNAME}" | tr ',' '\n')"
+    while IFS= read -r own; do
+      [ -n "$own" ] || continue
+      # A hostname the map already covers is not a stranger.
+      case ",$variants," in *",$own,"*) continue ;; esac
+      case ",$canon_list," in *",$own,"*) continue ;; esac
+      # `case`, not `printf | grep -q`. Under `set -o pipefail` a `grep -q` that
+      # matches early exits while printf is still writing, printf takes SIGPIPE,
+      # and the pipeline returns 141 — so the `if` was false on every body past
+      # the 64 KiB pipe buffer, which is every WordPress page. The warning could
+      # not fire on any deployment that had the problem, and the shipped test
+      # passed because its fixture body is 41 bytes. This file documents the
+      # same hazard in three other places and this walked into it anyway.
+      case "$probe_body" in
+        *"//$own"*)
           echo "hostshift: warning: the page served at https://$probe answers with" >&2
           echo "  links to $own, which is neither a canonical hostname nor a" >&2
           echo "  variant — so those links are not being rewritten and do not" >&2
           echo "  reach this preview. A stock DDEV WordPress does this: its" >&2
           echo "  wp-config-ddev.php pins WP_HOME to DDEV_PRIMARY_URL. Remove" >&2
           echo "  that pin, or set WP_HOME to a canonical hostname." >&2
-        fi ;;
-    esac
+          break ;;
+      esac
+    done <<<"$owns"
   fi
 
   # The parent-declares verdict, now that the database has had its say.
@@ -1619,11 +1658,31 @@ if [ "$cmd" = "check" ]; then
   # database gate did in d203760: a wrong answer now costs a line of noise
   # rather than every boot of a healthy site. The probe above is the hard
   # measurement and it still refuses.
-  if [ -n "$parent_declares" ] && [ -z "$db_confirms_map" ]; then
+  # Two independent facts, both reported, neither silencing the other.
+  #
+  # db_confirms_map was allowed to suppress this entirely, and it cannot: the
+  # row is about *one* origin — whatever `wp_options.home` happens to hold —
+  # while `unmapped` is a set difference over everything the parent declares.
+  # When `copy-db` had left `home` holding a DDEV hostname, the row was
+  # satisfied, the subset test's finding was thrown away, and a declared
+  # production canonical was served to the browser unrewritten with check
+  # exit 0. That re-opened the leak the subset test was added in the same
+  # commit to close.
+  #
+  # So the row now qualifies the warning instead of cancelling it. It is real
+  # evidence and worth printing — a developer whose database has not moved needs
+  # to know the map matches it — but it cannot speak for origins it says nothing
+  # about.
+  if [ -n "$parent_declares" ]; then
     [ -n "$parent_declares_msg" ] && parent_declares_warn
     if [ -n "${unmapped:-}" ]; then
       echo "  Declared there and not in this map:" >&2
       printf '    %s\n' $unmapped >&2
+    fi
+    if [ -n "$db_confirms_map" ]; then
+      echo "  The database's own home is in the map, so if none of those" >&2
+      echo "  hostnames appear in content this is expected — that is what" >&2
+      echo "  \`copy-db\` plus a search-replace leaves behind." >&2
     fi
   fi
 

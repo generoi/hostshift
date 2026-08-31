@@ -1030,6 +1030,49 @@ out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a page answering with a hostname the map does not name is called out" \
   "which is neither a canonical hostname nor a" "$out"
+# No subcommand prints usage rather than running init.
+#
+# `init` writes .ddev/.env and restarts every container, so a developer reaching
+# for the usage text took their project down instead.
+cp "$wt/.ddev/.env" "$work/env.before"
+out="$(cd "$wt" && "$cmd" 2>&1 || true)"
+contains "no subcommand prints usage" "usage: ddev hostshift" "$out"
+# And it changed nothing — the usage text mentions restarting, so asserting on
+# the words would pass whatever the command did.
+if cmp -s "$work/env.before" "$wt/.ddev/.env"; then
+  pass "no subcommand leaves .ddev/.env alone"
+else
+  fail "no subcommand leaves .ddev/.env alone" "the file was rewritten"
+fi
+
+# A body past the pipe buffer, which is every WordPress page.
+#
+# The check was `printf '%s' "$body" | grep -qF …` under `set -o pipefail`.
+# grep -q exits on its first match, printf takes SIGPIPE while still writing,
+# and the pipeline returns 141 — so the warning could not fire on any body over
+# 64 KiB, which is to say on any deployment that had the problem. The fixture
+# above is 41 bytes, three orders of magnitude under the threshold, which is why
+# this passed while the real thing was inert. The threshold was measured exactly:
+# 65536 bytes fires, 69374 does not.
+# Newlines matter, and getting this wrong is how the first attempt at this test
+# proved nothing: grep matches line by line, so a single enormous line forces it
+# to read to the end and the pipeline never fails. A real page is many lines,
+# grep exits on the first match, and everything still queued behind it dies.
+big="$(cd "$wt" && awk 'BEGIN{for(i=0;i<4000;i++)print "<p>filler filler filler</p>"}')"
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
+  HS_CURL_BODY="<a href=\"https://acme-wt-a.ddev.site/x\">t</a>
+$big" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a page larger than the pipe buffer is still inspected" \
+  "which is neither a canonical hostname nor a" "$out"
+
+# Every hostname DDEV registers, not just the first of the comma-separated list.
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site,extra-wt-a.ddev.site \
+  HS_CURL_BODY='<a href="https://extra-wt-a.ddev.site/x">t</a>' \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a hostname past the first in DDEV_HOSTNAME is inspected too" \
+  "links to extra-wt-a.ddev.site" "$out"
+
 # And a page that names only the variant says nothing.
 out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
   HS_CURL_BODY='<a href="https://wt-a--acme.ddev.site/x">t</a>' \
@@ -1073,11 +1116,19 @@ rc=0
 out="$(cd "$wt" && HS_FAKE_HOME="https://acme.ddev.site" \
   PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" || rc=$?
 check "a parent-declares mismatch no longer fails the start" "0" "$rc"
-case "$out" in
-  *"declares the hostnames its database"*)
-    fail "a database row that names the map settles it" "$out" ;;
-  *) pass "a database row that names the map settles it" ;;
-esac
+# The row qualifies the warning; it does not cancel it.
+#
+# This test used to assert suppression, and that expectation was the defect: the
+# row is about *one* origin — whatever `wp_options.home` holds — while `unmapped`
+# is a set difference over everything the parent declares. With `copy-db` having
+# left `home` on a DDEV hostname, the row was satisfied, the subset test's
+# finding was discarded, and a declared production canonical went to the browser
+# unrewritten with check exit 0 — re-opening the leak the subset test was added
+# in the same commit to close.
+contains "a database row that names the map qualifies the warning" \
+  "The database's own home is in the map" "$out"
+contains "but the unmapped canonical is still named" \
+  "Declared there and not in this map" "$out"
 # But with no database answer, the warning still gets printed.
 rc2=0
 out="$(cd "$wt" && HS_FAKE_HOME="" PATH="$fakedb:$fakebin:$PATH" \
