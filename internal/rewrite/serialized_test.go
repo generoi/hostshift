@@ -1382,3 +1382,70 @@ func TestAnEscapedCharacterInTheSameStringAsTheHost(t *testing.T) {
 		}
 	}
 }
+
+// A nested payload behind a label, in every spelling and after every prefix a
+// real field carries.
+//
+// A decline is not neutral — it rewrites the host and re-emits nothing — so a
+// nested payload the walk would not look at was served with lengths PHP
+// refuses. Twenty-two of these thirty-six combinations failed, for the sake of
+// an ACF field label or an option edited in a textarea.
+//
+// Two separate causes, and the matrix is what separated them. `occupiesItsField`
+// asks what *precedes* a value, which inside a string means nothing: scanning at
+// any offset is the point there, so a prefix is the ordinary case. And
+// `valueStart` matched raw whitespace only, so in a spelling that escapes a
+// newline the byte before the payload is an ordinary `n` and the header was
+// invisible — the scan then found the fields inside the payload instead and
+// declined, correctly, on a structure that was perfectly sound.
+func TestANestedPayloadBehindALabel(t *testing.T) {
+	canon, variant := "https://mz30c.ddev.site", "https://wt-a--mz30c.ddev.site"
+	ser := func(k, v string) string {
+		return `a:1:{s:` + strconv.Itoa(len(k)) + `:"` + k + `";` +
+			`s:` + strconv.Itoa(len(v)) + `:"` + v + `";}`
+	}
+	// The blob a real page carries: an outer array whose first field holds a
+	// prefix and then another serialized payload.
+	blob := func(host, prefix string) string {
+		inner := prefix + ser("link", host+"/inner/x")
+		return `a:2:{s:1:"f";s:` + strconv.Itoa(len(inner)) + `:"` + inner + `";` +
+			`s:4:"home";s:` + strconv.Itoa(len(host)) + `:"` + host + `";}`
+	}
+	escAttr := strings.NewReplacer(
+		`"`, "&quot;", `'`, "&#039;", "&", "&amp;", "<", "&lt;", ">", "&gt;")
+	jsonBody := func(s string) string {
+		j, err := json.Marshal(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(j[1 : len(j)-1])
+	}
+	spellings := map[string]func(string) string{
+		"raw":      func(s string) string { return s },
+		"attr":     escAttr.Replace,
+		"json":     jsonBody,
+		"jsonattr": func(s string) string { return escAttr.Replace(jsonBody(s)) },
+	}
+	prefixes := map[string]string{
+		"none": "", "space": " ", "newline": "\n", "tab": "\t",
+		"nordic": "Läs ", "amp": "A & B ", "apos": "Genero's ",
+		"quote": `say "hi" `, "prose": "Obs: ",
+	}
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	for sname, enc := range spellings {
+		for pname, prefix := range prefixes {
+			in := "<div>" + enc(blob(canon, prefix)) + "</div>"
+			want := "<div>" + enc(blob(variant, prefix)) + "</div>"
+			got := string(RepairSerialized([]byte(in), rw))
+			if got != want {
+				t.Errorf("%s / %s:\n got  %s\n want %s", sname, pname, got, want)
+			}
+			if n := BrokenSerialized([]byte(got)); n != 0 {
+				t.Errorf("%s / %s: served %d value(s) PHP refuses:\n %s",
+					sname, pname, n, got)
+			}
+		}
+	}
+}
