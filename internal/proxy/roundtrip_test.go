@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -516,5 +518,67 @@ func TestSetCookieHasItsDomainMappedAndItsValueLeftAlone(t *testing.T) {
 	// And the value is untouched, signature and all.
 	if !strings.Contains(value, url.QueryEscape(canon+"/sv/")) {
 		t.Errorf("the cookie value was rewritten, which breaks a signed cookie: %s", value)
+	}
+}
+
+// An identity map re-serves a compressed body exactly as it arrived.
+//
+// compressBody returns early under Identity() and finishBody guards Vary and
+// Set-Cookie on it, but the *decode* was guarded only on --dry-run. So a gzip
+// response came back decoded, with Content-Encoding gone and a different
+// length — test 24 failing on the one configuration whose whole purpose is to
+// prove it holds, and the third instance of this same shape.
+func TestAnIdentityMapReservesACompressedBodyUnchanged(t *testing.T) {
+	same := "https://acme.test"
+	mp, err := origin.NewMap([]origin.Site{{
+		Name: "main", Canonical: origin.MustParse(same), Variant: origin.MustParse(same),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `<a href="` + same + `/x">x</a>`
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	if _, err := zw.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := gz.Bytes()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write(want)
+	}))
+	defer up.Close()
+	upURL, err := url.Parse(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Proxy{Map: mp, Upstream: upURL, Stats: rewrite.NewStats(false)}
+	srv := httptest.NewServer(p.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/", nil)
+	req.Host = "acme.test"
+	// No transparent decompression, so the bytes on the wire are what is compared.
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := (&http.Transport{DisableCompression: true}).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enc := resp.Header.Get("Content-Encoding"); !strings.EqualFold(enc, "gzip") {
+		t.Errorf("Content-Encoding became %q, so the body was decoded", enc)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("the body changed under an identity map: %d bytes in, %d out",
+			len(want), len(got))
 	}
 }

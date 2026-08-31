@@ -1415,5 +1415,38 @@ else
   fail "--force still copies" "mysqldump did not run: $out"
 fi
 
+echo "== a proxy flag in HOSTSHIFT_ARGS survives check and init"
+
+# --max-body, --strict-origins, --compress and --no-sweep are real proxy flags
+# with no hostshift.yaml key, so .ddev/.env is the only place to set them. init
+# wrote the line wholesale and check compared it for equality, so adding one put
+# the project permanently "out of date" — and following the advice that printed,
+# `ddev hostshift init`, deleted the flag silently. Both directions at once,
+# with no message either way.
+d="$work/keepargs"; newproject "$d"
+git -C "$d" worktree add -q "$work/keepargs-wt" -b wt-k
+wtk="$work/keepargs-wt"
+(cd "$wtk" && "$cmd" init --slug wt-k >/dev/null 2>&1) || fail "init in the worktree" ""
+# The developer adds a flag by hand, which is the documented way.
+perl -pi -e 's/^(HOSTSHIFT_ARGS=.*)$/$1 --max-body 20000000/' "$wtk/.ddev/.env"
+
+out="$(cd "$wtk" && "$cmd" check --from https://a.test --to https://wt-k--a.test 2>&1 || true)"
+case "$out" in
+  *"out of date"*) fail "check accepts a flag it did not write" "$out" ;;
+  *) pass "check accepts a flag it did not write" ;;
+esac
+
+(cd "$wtk" && "$cmd" init --slug wt-k >/dev/null 2>&1) || fail "init runs again" ""
+args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wtk/.ddev/.env")"
+contains "init keeps it" "--max-body 20000000" "$args"
+# Its own part, in whatever form this project resolves to — here a map, because
+# the parent declares additional_hostnames, so `--slug` never appears.
+contains "and still writes its own" "--to https://wt-k--keepargs.ddev.site" "$args"
+# And it is kept once, not appended on every run.
+(cd "$wtk" && "$cmd" init --slug wt-k >/dev/null 2>&1) || true
+args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wtk/.ddev/.env")"
+n="$(printf '%s\n' "$args" | grep -o -- '--max-body' | wc -l | tr -d ' ')"
+check "a second init does not duplicate it" "1" "$n"
+
 if [ "$fails" -gt 0 ]; then echo "$fails failure(s)"; exit 1; fi
 echo "all passed"

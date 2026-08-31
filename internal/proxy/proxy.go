@@ -427,10 +427,24 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	//
 	// A compressed body therefore cannot be measured in that mode. Saying so is
 	// the point: a silent zero reads as "nothing to rewrite here".
-	if p.DryRun {
+	if p.DryRun || p.Map.Identity() {
+		// An identity map is the same promise as --dry-run about the *bytes*:
+		// nothing to rewrite, so nothing to change. Decoding a gzip body and
+		// re-serving it as identity is a change — the response goes out with a
+		// different encoding and a different length than the upstream sent —
+		// and that is test 24 failing on the one configuration whose whole
+		// purpose is to prove it holds. compressBody already returns early
+		// under Identity(); this is the other half, and it is the same shape as
+		// the Vary and Set-Cookie holes above.
+		//
+		// Only reachable when an upstream compresses despite
+		// `Accept-Encoding: identity`, which stock nginx does not and
+		// `ob_gzhandler` does.
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(strings.TrimSpace(enc), "identity") {
-			p.log().Info("--dry-run leaves a compressed body untouched, so it is not measured", "encoding", enc)
-			p.skipEncoding(enc)
+			if p.DryRun {
+				p.log().Info("--dry-run leaves a compressed body untouched, so it is not measured", "encoding", enc)
+				p.skipEncoding(enc)
+			}
 			return nil
 		}
 	} else if !p.decodeBody(resp) {
