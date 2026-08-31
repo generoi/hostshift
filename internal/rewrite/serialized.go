@@ -130,12 +130,25 @@ func headerAt(b []byte, i int) (span, bool) {
 			j++
 		}
 		if j > i+2 && j+1 < len(b) && b[j] == ':' && b[j+1] == '"' {
-			if n, err := strconv.Atoi(string(b[i+2 : j])); err == nil && n >= 0 {
+			if n, err := strconv.Atoi(string(b[i+2 : j])); err == nil && n >= 0 && n <= len(b) {
 				end := j + 2 + n
-				// The closer has to be exactly where the length says. A sentence
-				// quoting `s:6:"a.test"` is not a span unless it closes there.
+				// The closer has to be exactly where the length says, *and* what
+				// follows has to be a serialized token. A sentence quoting
+				// `s:6:"a.test"` is not a span unless it closes there — and a
+				// span whose declared length is stale can still land on a `";`
+				// inside its own data, which is the commonest two-byte sequence
+				// in serialized data holding HTML or CSS.
+				//
+				// That false boundary is how a valid row was destroyed. The HTML
+				// response arm does not repair, so the browser is served a blob
+				// whose length is stale; the request arm then trusted that length,
+				// found a `";` six bytes early, and wrote a *different* wrong
+				// number — turning a round trip that used to self-heal into
+				// permanent corruption. Requiring a valid continuation makes a
+				// mis-parse decline instead, which restores the self-healing.
 				if end < len(b) && b[end] == '"' &&
-					(end+1 >= len(b) || b[end+1] == ';') {
+					(end+1 >= len(b) || b[end+1] == ';') &&
+					validContinuation(b, end+2) {
 					return span{at: i, dataAt: j + 2, dataEnd: end}, true
 				}
 			}
@@ -154,8 +167,14 @@ func headerAt(b []byte, i int) (span, bool) {
 	if j == start || !pctIs(b, j, ':') || !pctIs(b, j+3, '"') {
 		return span{}, false
 	}
+	// `n <= len(b)` before it is used as an offset. A 19-digit length made
+	// `j + 2 + n` overflow to a negative index, the `end < len(b)` bounds check
+	// passed because negative is less than len, and the read panicked — a 502
+	// from the proxy on any request or response body carrying that byte
+	// sequence, which post and comment content can. No declared length larger
+	// than the buffer can be honest anyway.
 	n, err := strconv.Atoi(string(b[start:j]))
-	if err != nil || n < 0 {
+	if err != nil || n < 0 || n > len(b) {
 		return span{}, false
 	}
 	dataAt := j + 6
@@ -219,4 +238,30 @@ func unhex(a, b byte) (byte, bool) {
 		return 0, false
 	}
 	return byte(hi<<4 | lo), true
+}
+
+// validContinuation reports whether b at i begins something that can follow a
+// serialized value: another typed token, a container close, or the end.
+//
+// It is what separates a real span from a stale length that happened to land on
+// a `";` inside its own data. Declining there is always safe — the caller falls
+// back to rewriting without repair, which is what the code did before repair
+// existed and which round-trips.
+func validContinuation(b []byte, i int) bool {
+	if i >= len(b) {
+		return true
+	}
+	switch b[i] {
+	case '}', ')':
+		return true
+	// A form field separator. A whole option value can be a single span, and
+	// then what follows it is the end of that field, not another token.
+	case '&':
+		return true
+	case 'N':
+		return i+1 < len(b) && b[i+1] == ';'
+	case 's', 'i', 'd', 'b', 'a', 'O', 'C', 'E', 'R':
+		return i+1 < len(b) && b[i+1] == ':'
+	}
+	return false
 }

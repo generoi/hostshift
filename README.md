@@ -109,33 +109,6 @@ One site, one hostname, and `.ddev/config.yaml` deliberately has no `name:` —
 so DDEV names each project after its own directory, and a worktree becomes a
 DDEV project of its own with nothing configured.
 
-**If your repo pins `name:` — and most do — read this first.** A worktree
-inherits the tracked `.ddev/config.yaml`, so it inherits the name, and DDEV
-refuses before hostshift is ever involved:
-
-```console
-$ cd ../acme-wt-a
-$ ddev add-on get ~/src/hostshift/ddev
-Unable to get project : a project (web container) in running state already
-exists for acme that was created at /Users/you/Projects/acme
-```
-
-Give the worktree a name of its own, **from inside the worktree** — running
-this in the parent renames the parent. DDEV merges `config.*.yaml` over
-`config.yaml`, and the add-on's `.git/info/exclude` block ignores
-`.ddev/**/*hostshift*`, so a filename carrying that word is ignored once the
-add-on is installed. Between the two commands `git status` will list it; that
-is expected, because the install is what writes the exclude rule.
-
-```console
-$ printf 'name: acme-wt-a\n' > .ddev/config.hostshift-name.yaml   # in the worktree
-$ ddev add-on get ~/src/hostshift/ddev
-$ ddev hostshift init
-```
-
-The name only has to be unique; hostshift derives the preview hostnames from
-the parent's config and the slug, not from it.
-
 ```console
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
@@ -208,6 +181,36 @@ After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
   instead.
 
 [ddev/ddev#5486]: https://github.com/ddev/ddev/issues/5486
+
+
+### If your repo pins `name:`
+
+Most do. A worktree inherits the tracked `.ddev/config.yaml`, so it inherits the
+name, and DDEV refuses before hostshift is involved:
+
+```console
+$ ddev add-on get ~/src/hostshift/ddev
+Unable to get project : a project (web container) in running state already
+exists for acme that was created at /Users/you/Projects/acme
+```
+
+Give the worktree a name of its own. Every command here runs **inside the
+worktree** — running the `printf` in the parent renames the parent, and its
+canonical hostname, the one the database holds, stops resolving.
+
+```console
+$ git worktree add ../acme-wt-a -b wt-a
+$ cd ../acme-wt-a
+$ printf 'name: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
+$ ddev add-on get ~/src/hostshift/ddev
+$ ddev hostshift init
+```
+
+The name only has to be unique; hostshift derives the preview hostnames from the
+parent's config and the slug, not from it. Between the `printf` and the add-on
+install `git status` will list the file — that is expected, because the install
+is what writes the `.git/info/exclude` rule that hides it.
+
 
 ## The map
 

@@ -148,3 +148,60 @@ func TestDeepNestingIsBounded(t *testing.T) {
 		t.Errorf("an identity rewrite changed a deeply nested payload:\n in  %s\n out %s", in, out)
 	}
 }
+
+// A stale length that lands on a `";` inside its own data must not be believed.
+//
+// This is how a valid wp_options row was destroyed. The HTML response arm does
+// not repair, so the browser is served a blob whose declared length is stale;
+// the request arm then trusted that length, found a `";` six bytes early — and
+// `";` is the commonest two-byte sequence in serialized data holding HTML or
+// CSS — and wrote a *different* wrong number. A round trip that used to
+// self-heal became permanent corruption, `unserialize()` returning false.
+//
+// Declining a mis-parse is always safe: the caller falls back to rewriting
+// without repair, which is what the code did before repair existed.
+func TestAStaleLengthIsNotBelieved(t *testing.T) {
+	// The arithmetic has to be exact or the fixture proves nothing, so it is
+	// derived rather than written down. The row was valid at the canonical
+	// host; the response arm rewrote to a variant six bytes longer and left the
+	// length alone; the stale length now lands exactly on the `"` of the `";`
+	// inside the data.
+	const canon, variant = "https://x.ddev.site/x", "https://wt-a--x.ddev.site/x"
+	declared := len(canon + `";abcd`) // correct before the host changed
+	if declared != len(variant) {
+		t.Fatalf("the fixture does not set up a false boundary: declared %d, "+
+			"the quote sits at %d", declared, len(variant))
+	}
+	in := `a:1:{s:3:"css";s:` + strconv.Itoa(declared) + `:"` + variant + `";abcd";}`
+	out := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}))
+	// The number must be untouched, so the request direction restores exactly
+	// what the response direction changed and the round trip comes home.
+	if !strings.Contains(out, `s:`+strconv.Itoa(declared)+`:`) {
+		t.Errorf("a stale length was rewritten from a false boundary:\n in  %s\n out %s", in, out)
+	}
+	if strings.Contains(out, variant) {
+		t.Errorf("the host was not rewritten:\n%s", out)
+	}
+}
+
+// A declared length larger than the buffer cannot be honest, and using it as an
+// offset overflowed to a negative index — a panic, and a 502 from the proxy, on
+// any request or response body carrying that byte sequence. Post and comment
+// content can carry it.
+func TestAnAbsurdLengthDoesNotPanic(t *testing.T) {
+	for _, in := range []string{
+		`a:1:{s:9223372036854775807:"x";}`,
+		`a:1:{s:99999999999999999999:"x";}`,
+		`s%3A9223372036854775807%3A%22x%22%3B`,
+		`s:2147483647:"x";`,
+	} {
+		t.Run(in, func(t *testing.T) {
+			out := string(RepairSerialized([]byte(in), func(b []byte) []byte { return b }))
+			if out != in {
+				t.Errorf("an identity rewrite changed bytes:\n in  %s\n out %s", in, out)
+			}
+		})
+	}
+}

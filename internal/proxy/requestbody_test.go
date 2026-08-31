@@ -374,3 +374,55 @@ func TestAnIdentityMapLeavesSerializedJSONAlone(t *testing.T) {
 		})
 	}
 }
+
+// Test 24 across every arm, not just HTML.
+//
+// TestIdentityMapByteIdentity runs the corpus through the *HTML* filter only,
+// so the JSON, text and request-body arms had no identity coverage at all —
+// which is why two identity defects shipped: a length prefix re-emitted without
+// its leading zero, and `\/\/` re-quoted as `//` on every JSON body carrying a
+// serialized value. An identity map must be a no-op on every path the proxy
+// has, in both directions.
+func TestIdentityIsAByteNoOpOnEveryArm(t *testing.T) {
+	ident, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://www.acmecorp.fi"),
+		Variant:   origin.MustParse("https://www.acmecorp.fi"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodies := map[string]string{
+		"text/plain":                        `a:1:{s:3:"url";s:22:"https://www.acmecorp.fi";}`,
+		"text/plain; leading zero":          `s:04:"abcd";`,
+		"text/plain; lowercase percent":     `o=s%3a4%3a%22abcd%22%3b`,
+		"application/json":                  `{"v":"a:1:{s:1:\"u\";s:22:\"https:\/\/www.acmecorp.fi\";}"}`,
+		"application/json; escapes":         `{"u":"https:\/\/www.acmecorp.fi\/x"}`,
+		"application/xml":                   `<urlset><loc>https://www.acmecorp.fi/a</loc></urlset>`,
+		"text/html":                         `<a href="https://www.acmecorp.fi/a">t</a>`,
+		"application/x-www-form-urlencoded": `u=https%3A%2F%2Fwww.acmecorp.fi%2Fa`,
+	}
+	for name, body := range bodies {
+		ct := strings.SplitN(name, ";", 2)[0]
+		t.Run(name+" response", func(t *testing.T) {
+			h := newHarness(t, ident, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", ct)
+				_, _ = w.Write([]byte(body))
+			})
+			_, got := h.get(t, "www.acmecorp.fi", "/x")
+			if string(got) != body {
+				t.Errorf("an identity map changed a %s response:\n in  %s\n out %s", ct, body, got)
+			}
+		})
+		t.Run(name+" request", func(t *testing.T) {
+			h := newHarness(t, ident, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+			})
+			h.do(t, "POST", "www.acmecorp.fi", "/x", ct, []byte(body))
+			up, _ := io.ReadAll(h.seen.Body)
+			if string(up) != body {
+				t.Errorf("an identity map changed a %s request:\n in  %s\n out %s", ct, body, up)
+			}
+		})
+	}
+}
