@@ -217,7 +217,10 @@ func valueStart(b []byte, i int) bool {
 		return true
 	}
 	switch b[i-1] {
-	case '{', ';', '"', '=', '&', ':', ',':
+	// Whitespace and `>`, because a `<textarea>` WordPress indents and a text
+	// node both put a value there. occupiesItsField still decides whether the
+	// value fills its field; this gate only decides whether to look.
+	case '{', ';', '"', '=', '&', ':', ',', '\'', '>', '[', ' ', '\t', '\r', '\n':
 		return true
 	}
 	return pctIs(b, i-1, '{') || pctIs(b, i-1, ';') || pctIs(b, i-1, '"') ||
@@ -314,6 +317,12 @@ var jsonSyntax = syntax{
 		}
 		return append(dst, c)
 	},
+	// `\uXXXX` is six source bytes decoding to one rune — one to three bytes of
+	// UTF-8 — and `wp_json_encode` writes every non-ASCII character that way.
+	// Charging it five, as "any backslash pair is one byte" did, put a wrong
+	// number on the wire. Refusing to measure it declines instead, which costs
+	// a repair on a value with non-ASCII content and never writes a wrong
+	// length.
 	advance: func(b []byte, i, n int) (int, bool) {
 		if n < 0 {
 			return 0, false
@@ -323,6 +332,9 @@ var jsonSyntax = syntax{
 				return 0, false
 			}
 			if b[i] == '\\' && i+1 < len(b) {
+				if b[i+1] == 'u' {
+					return 0, false
+				}
 				i += 2
 				continue
 			}
@@ -754,26 +766,83 @@ func unhex(a, b byte) (byte, bool) {
 // It is still rewritten, and the response direction declines for the same
 // reason, so the two directions stay consistent and the round trip is exact.
 func occupiesItsField(b []byte, start, end int) bool {
-	// It must begin the field as well as end it, or the bytes before it are
-	// unaccounted for in the same way.
-	if start > 0 {
-		switch b[start-1] {
-		case '&', '=':
+	// Matched delimiters. A trailing `"` is both a legitimate close — the JSON
+	// string in `wp_localize_script`'s `{"opt":"…"}` — and the residue of a
+	// parse that stopped short inside a string. Which one it is depends on how
+	// the value *opened*, so the opener chooses what may close it.
+	//
+	// Requiring `&` or `=` alone accepted only a blob written tight against its
+	// attribute quote, and threw away an indented `<textarea>`, a second option
+	// in the same text node, and `wp_localize_script` — four of six realistic
+	// vehicles, including the one round twenty-seven's commit message named.
+	// Accepting any quote to fix that let a truncation residue through again.
+	// Pairing them does both.
+	const (
+		ownField = iota
+		dq
+		sq
+		textNode
+		escQuote
+		jsonQuote
+		cdata
+	)
+	open := ownField
+	for start > 0 {
+		c := b[start-1]
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+			start--
+			continue
+		}
+		switch {
+		case c == '&' || c == '=':
+		case c == '"':
+			open = dq
+		case c == '\'':
+			open = sq
+		case c == '>':
+			open = textNode
+		case c == '[':
+			// A CDATA section: `<![CDATA[…]]>`. This is the WXR export shape,
+			// which round twenty-seven documented as a limitation — a value
+			// taken through the preview and imported elsewhere kept the host it
+			// was rewritten to and the length it had before.
+			open = cdata
+		case start >= 6 && string(b[start-6:start]) == "&quot;":
+			open = escQuote
+		case start >= 2 && b[start-2] == '\\' && c == '"':
+			open = jsonQuote
 		default:
 			return false
 		}
+		break
 	}
-	// And run to the end of the field: whitespace only, or the next separator.
 	for i := end; i < len(b); i++ {
-		switch b[i] {
-		case ' ', '\t', '\r', '\n':
-		case '&':
-			return true
-		default:
-			return false
+		if b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n' {
+			continue
 		}
+		switch open {
+		case ownField:
+			// Its own field: only the next separator may follow, so a stray
+			// quote is residue rather than a close.
+			return b[i] == '&'
+		case dq:
+			return b[i] == '"'
+		case sq:
+			return b[i] == '\''
+		case textNode:
+			return b[i] == '<'
+		case escQuote:
+			return i+6 <= len(b) && string(b[i:i+6]) == "&quot;"
+		case jsonQuote:
+			return i+2 <= len(b) && b[i] == '\\' && b[i+1] == '"'
+		case cdata:
+			return b[i] == ']'
+		}
+		return false
 	}
-	return true
+	// Ran out of buffer: only a value that starts its own field may end that
+	// way, since every other opener promised a closer.
+	return open == ownField
 }
 
 // repairOpaqueString parses `X:len:"data";` and copies it verbatim.
@@ -922,18 +991,26 @@ func BrokenSerialized(b []byte) int {
 	return n
 }
 
-// entityRun is the length of an HTML character reference at i, or 0.
+// entityRun is the length of a `&quot;` spelling at i, or 0.
+//
+// Only the quote. Charging every `&…;` one byte was wrong, and wrong in the
+// direction that corrupts: `esc_attr` runs with `$double_encode = false`, so an
+// `&amp;` already in the data passes through as its five literal bytes and the
+// serialized length counts five — while a bare `&` in the data becomes `&amp;`
+// and counts one. The two are indistinguishable in the attribute, and guessing
+// either way writes a wrong length on the other.
+//
+// Counting only the quote makes the literal-`&amp;` reading the one taken, and
+// the other case then fails to close and declines. Declining costs a repair;
+// guessing costs a row. A value with no ampersand — most of them — is
+// unaffected either way.
 func entityRun(b []byte, i int) int {
 	if i >= len(b) || b[i] != '&' {
 		return 0
 	}
-	for j := i + 1; j < len(b) && j < i+10; j++ {
-		if b[j] == ';' {
-			return j - i + 1
-		}
-		if !(b[j] >= 'a' && b[j] <= 'z' || b[j] >= 'A' && b[j] <= 'Z' ||
-			b[j] >= '0' && b[j] <= '9' || b[j] == '#') {
-			return 0
+	for _, e := range []string{"&quot;", "&#34;", "&#034;"} {
+		if i+len(e) <= len(b) && string(b[i:i+len(e)]) == e {
+			return len(e)
 		}
 	}
 	return 0

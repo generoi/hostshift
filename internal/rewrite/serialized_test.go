@@ -461,10 +461,16 @@ func TestAnArrayMustSatisfyItsArity(t *testing.T) {
 func TestAnEmbeddedValueIsNotRepaired(t *testing.T) {
 	canon, variant := "https://a.test", "https://a.test.local"
 	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// A value that *fills* an element's text node or a CDATA section does
+	// occupy its field, and repairs — the delimiters are matched, so the close
+	// is expected rather than residue. That fixes the WXR export case round
+	// twenty-seven had to document as a limitation. What stays declined is a
+	// value with other content beside it, where the boundary is genuinely
+	// unknowable.
 	for _, c := range []struct{ name, in string }{
 		{"beside prose", `see ` + canon + `/b and ` + str(canon+"/x")},
-		{"inside CDATA", `<![CDATA[` + str(canon+"/x") + `]]>`},
-		{"inside an element", `<meta>` + str(canon+"/x") + `</meta>`},
+		{"with a second value after it", str(canon+"/x") + ` ` + str(canon+"/y")},
+		{"after unrelated content in the same attribute", `v1|` + str(canon+"/x")},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := string(RepairSerialized([]byte(c.in), func(b []byte) []byte {
@@ -684,4 +690,107 @@ func TestAQueryStringIsNotAFieldBoundary(t *testing.T) {
 		t.Errorf("a query string was treated as a field boundary:\n got  %s\n want %s",
 			got, want)
 	}
+}
+
+// The vehicles a serialized option actually travels in, and the delimiters that
+// pair with each.
+//
+// Requiring a value to sit tight against `&` or `=` accepted only a blob
+// written flush against its attribute quote. An indented `<textarea>`, a text
+// node, a CDATA section and `wp_localize_script`'s `{"opt":"…"}` were all found,
+// parsed correctly, and thrown away — and the throw-away is a whole-buffer
+// decline, so the host was rewritten under the old length. That was four of six
+// realistic vehicles, including the one the commit claiming to have fixed this
+// named.
+//
+// Accepting any quote to fix that let a truncation residue through again: a
+// trailing `"` is both a legitimate close and the remains of a parse that
+// stopped short. Which one it is depends on how the value opened, so the opener
+// chooses what may close it.
+func TestTheVehiclesAValueTravelsIn(t *testing.T) {
+	canon, variant := "https://www.acmecorp.fi", "https://wt-a--acmecorp.ddev.site"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	blob := func(host string) string { return `a:1:{s:3:"url";` + str(host+"/a") + `}` }
+	esc := func(v string) string { return strings.ReplaceAll(v, `"`, "&quot;") }
+	jsn := func(v string) string { return strings.ReplaceAll(v, `"`, `\"`) }
+
+	for _, c := range []struct {
+		name, in, want string
+	}{
+		{"tight in an attribute",
+			`<input value="` + esc(blob(canon)) + `">`,
+			`<input value="` + esc(blob(variant)) + `">`},
+		{"an indented textarea",
+			"\n  " + esc(blob(canon)) + "\n",
+			"\n  " + esc(blob(variant)) + "\n"},
+		{"a JSON string, as wp_localize_script writes it",
+			`{"opt":"` + jsn(blob(canon)) + `"}`,
+			`{"opt":"` + jsn(blob(variant)) + `"}`},
+		{"a CDATA section, as a WXR export writes it",
+			`<![CDATA[` + blob(canon) + `]]>`,
+			`<![CDATA[` + blob(variant) + `]]>`},
+		{"an element's whole text node",
+			`<meta>` + blob(canon) + `</meta>`,
+			`<meta>` + blob(variant) + `</meta>`},
+		{"its own field in a form body",
+			`opt=` + blob(canon),
+			`opt=` + blob(variant)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := string(RepairSerialized([]byte(c.in), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), canon, variant))
+			}))
+			if got != c.want {
+				t.Errorf("\n got  %s\n want %s", got, c.want)
+			}
+		})
+	}
+}
+
+// An ampersand under esc_attr, both readings.
+//
+// `esc_attr` runs with `$double_encode = false`, so an `&amp;` already in the
+// data passes through as its five literal bytes — and the serialized length
+// counts five — while a bare `&` in the data becomes `&amp;` and counts one.
+// The two are identical in the attribute.
+//
+// Counting every `&…;` as one byte, which is what "a reference decodes to one
+// byte" did, was right for the second reading and wrong for the first, and a
+// wrong length is a destroyed row. Counting only the quote entity makes the
+// first reading the one taken and the second decline, so the worst case is a
+// repair not made rather than a number invented.
+func TestAnAmpersandUnderEscAttr(t *testing.T) {
+	canon, variant := "https://www.canon.test", "https://v.ddev.site"
+	esc := func(v string) string { return strings.ReplaceAll(v, `"`, "&quot;") }
+	blob := func(data string) string {
+		return `a:1:{s:3:"url";s:` + strconv.Itoa(len(data)) + `:"` + data + `";}`
+	}
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+
+	t.Run("a literal &amp; in the data repairs", func(t *testing.T) {
+		data := canon + "/shop/?add-to-cart=42&amp;q=1"
+		vdata := strings.ReplaceAll(data, canon, variant)
+		in := `<input value="` + esc(blob(data)) + `">`
+		want := `<input value="` + esc(blob(vdata)) + `">`
+		if got := string(RepairSerialized([]byte(in), rw)); got != want {
+			t.Errorf("\n got  %s\n want %s", got, want)
+		}
+	})
+
+	t.Run("a bare & in the data declines", func(t *testing.T) {
+		// The data holds one `&`; esc_attr writes five bytes for it, so the
+		// attribute cannot say which reading was meant.
+		data := canon + "/shop/?a=1&b=2"
+		in := `<input value="` + strings.ReplaceAll(
+			strings.ReplaceAll(blob(data), `"`, "&quot;"), "&b=2", "&amp;b=2") + `">`
+		got := string(RepairSerialized([]byte(in), rw))
+		if strings.Contains(got, canon) {
+			t.Errorf("the origin was not rewritten:\n%s", got)
+		}
+		if !strings.Contains(got, `s:`+strconv.Itoa(len(data))+`:`) {
+			t.Errorf("an ambiguous ampersand was measured rather than declined:\n%s", got)
+		}
+	})
 }
