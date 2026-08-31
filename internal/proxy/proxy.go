@@ -400,12 +400,33 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 
 	ct := resp.Header.Get("Content-Type")
 	switch {
+	// First, and before anything content-type-shaped.
+	//
+	// A download is a file the developer saves, not a page the browser renders,
+	// so the hostnames in it outlive this machine. Placed third it could only
+	// ever fire for text/plain and XML — so ACF's "Export Field Groups" and
+	// Elementor's template export, both application/json with
+	// Content-Disposition: attachment, still came out full of worktree
+	// hostnames, which is the same harm the WXR carve-out exists to prevent.
+	//
+	// Recorded rather than silent: the arms beside it log a skip, and a body that
+	// was deliberately not rewritten should say so in --explain too.
+	case isAttachment(resp.Header):
+		p.Stats.Record(rewrite.SurfaceText, 0, []origin.Event{{
+			Surface: rewrite.SurfaceText, Action: origin.ActionSkipped,
+			Reason: origin.ReasonAttachment,
+		}})
+		return nil
+
 	case rewritableHTML(ct):
 		resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
 			DryRun:  p.DryRun,
 			NoSweep: p.NoSweep,
 			Stats:   p.Stats,
 			Log:     p.log(),
+			// XHTML is parsed by an XML parser, which decodes references inside
+			// script and style.
+			XMLEntities: strings.EqualFold(mediaType(ct), "application/xhtml+xml"),
 		})
 
 	case rewritableJSON(ct):
@@ -452,16 +473,6 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			return nil
 		}
 
-	case isAttachment(resp.Header):
-		// A download is a file the developer saves, not a page the browser
-		// renders, so the hostnames in it outlive this machine. `Tools → Export`
-		// returns text/xml with Content-Disposition: attachment, and every
-		// `<link>`, `<guid>` and `<wp:base_site_url>` in the WXR came back naming
-		// a worktree — a file that looks fine, imports fine, and points at a
-		// hostname that exists on one machine. The canonical origin is the right
-		// answer in an artifact meant to be carried somewhere else.
-		return nil
-
 	case rewritableText(ct):
 		// Buffered and swept like JSON, without a grammar.
 		//
@@ -492,7 +503,16 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		}
 		out, ev := p.Map.Forward().RewriteText(body, rewrite.SurfaceText, p.Stats.Explain())
 		p.Stats.Record(rewrite.SurfaceText, 0, ev)
-		out = rewrite.HostLeaks(p.Map.Forward(), out, false)
+		// References too, when the consumer decodes them. An SVG's `href` and a
+		// feed's `<link>` are read by an XML parser, which decodes `&#47;`
+		// exactly as HTML does in an attribute — and nothing here did. text/plain
+		// keeps HostLeaks: nothing parses references in plain text, so leaving
+		// them is correct there.
+		if strings.HasSuffix(strings.ToLower(mediaType(ct)), "xml") {
+			out = rewrite.HostLeaksXML(p.Map.Forward(), out, false)
+		} else {
+			out = rewrite.HostLeaks(p.Map.Forward(), out, false)
+		}
 		if !p.NoSweep {
 			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
 		}

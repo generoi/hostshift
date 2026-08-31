@@ -253,10 +253,11 @@ func cmdRewrite(args []string) (int, error) {
 	switch {
 	case mt == "text/html" || mt == "application/xhtml+xml":
 		src = rewrite.NewResponseBody(os.Stdin, m, nil, rewrite.Options{
-			DryRun:  *dryRun,
-			NoSweep: *noSweep,
-			Stats:   st,
-			Log:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+			DryRun:      *dryRun,
+			NoSweep:     *noSweep,
+			Stats:       st,
+			Log:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
+			XMLEntities: mt == "application/xhtml+xml",
 		})
 	case mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json"):
 		// JSON is buffered, not streamed (PLAN §5.8).
@@ -288,7 +289,13 @@ func cmdRewrite(args []string) (int, error) {
 		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 		out, ev := m.RewriteText(body, rewrite.SurfaceText, *explain)
 		st.Record(rewrite.SurfaceText, 0, ev)
-		out = rewrite.HostLeaks(m, out, false)
+		// The XML family's parser decodes character references; plain text has no
+		// parser, so leaving them is correct there.
+		if strings.HasSuffix(mt, "xml") {
+			out = rewrite.HostLeaksXML(m, out, false)
+		} else {
+			out = rewrite.HostLeaks(m, out, false)
+		}
 		if !*noSweep {
 			out = rewrite.SweepBytes(out, m, st, log)
 		}

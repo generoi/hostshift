@@ -318,6 +318,7 @@ const (
 	ReasonUnanchored    = "unanchored"      // protocol-relative match that is a path segment, not an origin
 	ReasonSelfRedirect  = "self-redirect"   // PLAN §4.4 / test 32, used by the proxy
 	ReasonSizeCap       = "size-cap-exceeded"
+	ReasonAttachment    = "attachment" // a download: its hostnames outlive this machine
 	ReasonNotDecodable  = "encoding-not-decodable"
 	ReasonDepthExceeded = "depth-limit"
 )

@@ -42,6 +42,7 @@ type HTML struct {
 	tail    io.Reader
 	attrs   []Attr // scratch for scanAttrsInto, reused across tags
 	hosts   *hostReplacer
+	xmlEnt  bool
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -106,6 +107,12 @@ type Options struct {
 	Log     *slog.Logger
 	// MaxToken caps the tokenizer's buffer. Zero means DefaultMaxToken.
 	MaxToken int
+	// XMLEntities says the document is parsed by an XML parser, which decodes
+	// character references inside <script> and <style> where an HTML parser does
+	// not — the reason XHTML scripts need CDATA. Set for
+	// application/xhtml+xml; without it a reference-encoded origin in an XHTML
+	// script was byte-identical out and fetched by the browser.
+	XMLEntities bool
 }
 
 // NewResponseBody is the full response-side pipeline: the tokenizer-based
@@ -157,6 +164,7 @@ func NewHTML(r io.Reader, m *origin.Matcher, src io.Closer, opt Options) *HTML {
 	z.SetMaxBuf(maxTok)
 	return &HTML{
 		hosts:  newHostReplacer(m),
+		xmlEnt: opt.XMLEntities,
 		z:      z,
 		m:      m,
 		stats:  st,
@@ -265,6 +273,14 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	// letters, U+3002 for the dots, NFD — shares no bytes with its pattern on any
 	// surface either.
 	out = w.foldedHostLeak(surface, base, out, value)
+	// An XML parser decodes references inside script and style; an HTML parser
+	// does not. Attribute values are already handled by decodeEntityLeak on both.
+	if w.xmlEnt && (surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
+		surface == SurfaceRawText || surface == SurfaceText) {
+		if w.hosts != nil {
+			out = w.hosts.rewriteAllRefs(out, false)
+		}
+	}
 	// CSS unescapes before the URL parser runs, so a style surface needs that
 	// view too — see stripForCSS.
 	if surface == SurfaceInlineStyle || (surface == SurfaceHTMLAttr && len(name) == 5 && bytes.EqualFold(name, []byte("style"))) {

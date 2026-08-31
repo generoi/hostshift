@@ -187,11 +187,31 @@ func TestDownloadsAreNotRewritten(t *testing.T) {
 		{"an inline body", "inline", true},
 		{"no disposition at all", "", true},
 	} {
-		t.Run(c.name, func(t *testing.T) {
+		// Every content type, not just the one where the arm happened to be
+		// reachable. Pinning text/xml here is why the arm sat third in the switch
+		// — after the HTML and JSON arms, which it could therefore never reach —
+		// while ACF and Elementor exports, both application/json with
+		// Content-Disposition: attachment, went on being rewritten.
+		for _, ct := range []string{
+			"text/xml; charset=UTF-8", "application/json", "text/html", "text/plain",
+		} {
+			t.Run(c.name+" as "+ct, func(t *testing.T) {
+				runDownload(t, mp, body, c.disposition, ct, c.rewrite)
+			})
+		}
+	}
+}
+
+func runDownload(t *testing.T, mp *origin.Map, body, disposition, ct string, want bool) {
+	t.Helper()
+	{
+		{
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/xml; charset=UTF-8")
-				if c.disposition != "" {
-					w.Header().Set("Content-Disposition", c.disposition)
+				w.Header().Set("Content-Type", ct)
+				c := struct{ disposition string }{disposition}
+				_ = c
+				if disposition != "" {
+					w.Header().Set("Content-Disposition", disposition)
 				}
 				w.Write([]byte(body))
 			}))
@@ -213,11 +233,88 @@ func TestDownloadsAreNotRewritten(t *testing.T) {
 			defer resp.Body.Close()
 			got, _ := io.ReadAll(resp.Body)
 
-			if c.rewrite && !strings.Contains(string(got), "wt-a--acme.ddev.site") {
-				t.Errorf("not rewritten:\n%s", got)
+			if want && !strings.Contains(string(got), "wt-a--acme.ddev.site") {
+				t.Errorf("not rewritten as %s:\n%s", ct, got)
 			}
-			if !c.rewrite && string(got) != body {
-				t.Errorf("a download was rewritten, so it names a hostname that exists on one machine:\n%s", got)
+			if !want && string(got) != body {
+				t.Errorf("a download was rewritten as %s, so it names a hostname that exists on one machine:\n%s", ct, got)
+			}
+		}
+	}
+}
+
+// Character references are decoded where the *consuming* parser decodes them,
+// not where HTML does.
+//
+// decodeURLRefs runs on HTML attribute values only, justified by "inside
+// <script> and <style> the browser does not decode references" — true of HTML,
+// false of XML. In XHTML the XML parser decodes them there (which is why XHTML
+// scripts need CDATA), and in the XML family it decodes them everywhere. Both
+// were confirmed dereferenced by a real browser. text/plain is the other way:
+// nothing parses references in it, so leaving them alone is correct.
+func TestReferencesDecodeWhereTheParserDoes(t *testing.T) {
+	mp, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://acme.ddev.site"),
+		Variant:   origin.MustParse("https://wt-a--acme.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, ct, body string
+		rewrite        bool
+	}{
+		{"an SVG href", "image/svg+xml",
+			`<svg><image href="https:&#47;&#47;acme.ddev.site/p.png"/></svg>`, true},
+		{"a feed link", "application/rss+xml",
+			`<rss><link>https:&#47;&#47;acme.ddev.site/p</link></rss>`, true},
+		{"a sitemap loc", "application/xml",
+			`<urlset><loc>https:&#47;&#47;acme.ddev.site/p</loc></urlset>`, true},
+		{"an XHTML script", "application/xhtml+xml",
+			`<html><script>var u="https:&#47;&#47;acme.ddev.site/s";</script></html>`, true},
+		{"an XHTML style", "application/xhtml+xml",
+			`<html><style>a{background:url(https:&#47;&#47;acme.ddev.site/c)}</style></html>`, true},
+		// An HTML parser does not decode inside script or style, so a reference
+		// there is not a URL and must not be touched.
+		{"an HTML script", "text/html",
+			`<html><script>var u="https:&#47;&#47;acme.ddev.site/s";</script></html>`, false},
+		// Nothing parses references in plain text.
+		{"plain text", "text/plain", `see https:&#47;&#47;acme.ddev.site/p`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", c.ct)
+				w.Write([]byte(c.body))
+			}))
+			defer up.Close()
+			upURL, err := url.Parse(up.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := &Proxy{Map: mp, Upstream: upURL, Stats: rewrite.NewStats(false)}
+			srv := httptest.NewServer(p.Handler())
+			defer srv.Close()
+
+			req, _ := http.NewRequest("GET", srv.URL+"/x", nil)
+			req.Host = "wt-a--acme.ddev.site"
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			got, _ := io.ReadAll(resp.Body)
+
+			if c.rewrite && !strings.Contains(string(got), "wt-a--acme.ddev.site") {
+				t.Errorf("a production origin the parser dereferences was left:\n%s", got)
+			}
+			if !c.rewrite && string(got) != c.body {
+				t.Errorf("a reference no parser decodes here was rewritten:\n%s", got)
+			}
+			// Whatever happened, the escapes themselves survive: the splice
+			// replaces the host's byte range and never re-serialises the value.
+			if !strings.Contains(string(got), "&#47;&#47;") {
+				t.Errorf("the references were re-serialised:\n%s", got)
 			}
 		})
 	}

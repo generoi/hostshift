@@ -184,6 +184,55 @@ func stripForURL(v []byte) normalised {
 	return n
 }
 
+// stripForRefs is stripForURL with character references decoded into the view.
+//
+// Decoding belongs where the *consuming* parser decodes, not where HTML does.
+// decodeURLRefs runs on HTML attribute values only, and its comment justifies
+// that with "inside <script> and <style> the browser does not decode references"
+// — true of HTML, false of XML. In XHTML the XML parser decodes them inside
+// script and style (which is why XHTML scripts need CDATA), and in the XML
+// family — SVG especially — it decodes them everywhere. Both were confirmed
+// dereferenced by a real browser.
+//
+// Nothing is re-serialised: the decoded bytes exist only in the view, and the
+// splice replaces the host's original byte range, so `&#47;&#47;` survives
+// untouched beside a rewritten host and an XML document keeps its `&amp;`.
+func stripForRefs(v []byte) normalised {
+	if bytes.IndexByte(v, '&') < 0 {
+		return stripForURL(v)
+	}
+	dec := make([]byte, 0, len(v))
+	pos := make([]int, 0, len(v))
+	end := make([]int, 0, len(v))
+	for i := 0; i < len(v); {
+		if v[i] == '&' {
+			if c, n := parseURLRef(v[i:]); n > 0 {
+				for k := 0; k < len(c); k++ {
+					dec = append(dec, c[k])
+					pos = append(pos, i)
+					end = append(end, i+n)
+				}
+				i += n
+				continue
+			}
+		}
+		dec = append(dec, v[i])
+		pos = append(pos, i)
+		end = append(end, i+1)
+		i++
+	}
+	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
+	for i := 0; i < len(dec); i++ {
+		if isURLStripped(dec[i]) {
+			continue
+		}
+		n.b = append(n.b, dec[i])
+		n.pos = append(n.pos, pos[i])
+		n.end = append(n.end, end[i])
+	}
+	return n
+}
+
 // stripForCSS is stripForURL with CSS escapes decoded first.
 //
 // `https\3a\2f\2fwww.example.fi/x` is a CSS-level spelling of an absolute URL:
@@ -802,7 +851,32 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool) []byte {
 	if hasNonASCII(v) {
 		v = h.spliceHosts(v, slashRunStarts, value)
 	}
+	// The CSS view too, because the *forward* direction emits it.
+	//
+	// cssEscapeLeak splices the host into the escaped spelling, so a style
+	// attribute goes to the browser as `url(https\3a \2f \2f <variant>/x)` —
+	// and the editor posts that back. Nothing on the way in could read it: the
+	// byte matcher's prefilter needs `//`, `\/` or `%2F` and that string has
+	// none, and stripForCSS was reachable only from the forward pass. So the
+	// variant hostname went upstream and into the database §4.3 says stays
+	// byte-identical to production.
+	//
+	// The rule this is an instance of: every spelling the forward direction can
+	// *emit*, the reverse direction must be able to *read*.
+	if bytes.IndexByte(v, '\\') >= 0 {
+		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value)
+	}
 	return v
+}
+
+// rewriteAllRefs is rewriteAll for a consumer that decodes character references
+// — the XML family, and XHTML's script and style.
+func (h *hostReplacer) rewriteAllRefs(v []byte, value bool) []byte {
+	v = h.rewriteAll(v, value)
+	if h == nil || len(h.to) == 0 || bytes.IndexByte(v, '&') < 0 {
+		return v
+	}
+	return h.spliceHostsIn(stripForRefs(v), v, urlTokenStarts, value)
 }
 
 // slashRunStarts yields the first byte of each run of two or more slashes, which
@@ -877,4 +951,14 @@ func HostLeaks(m *origin.Matcher, b []byte, value bool) []byte {
 		return b
 	}
 	return hostsFor(m).rewriteAll(b, value)
+}
+
+// HostLeaksXML is HostLeaks for a body whose parser decodes character
+// references: the XML family, where `href="https:&#47;&#47;host"` is a live
+// reference in an SVG, a feed or a sitemap.
+func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
+	if m == nil || len(b) == 0 {
+		return b
+	}
+	return hostsFor(m).rewriteAllRefs(b, value)
 }
