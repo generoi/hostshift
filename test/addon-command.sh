@@ -1357,5 +1357,63 @@ out="$(cd "$wt/web/app" && DDEV_APPROOT="$wt" "$cmd" env --slug wt-a 2>/dev/null
 contains "it works from a subdirectory" "HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site" "$out"
 
 echo
+
+echo "== copy-db --dry-run writes nothing"
+
+# copy-db is the one destructive subcommand, and it exits before the file's only
+# dry_run test — which sits at the very end, after the init path. So
+# `copy-db --dry-run` replaced the database it was asked to describe, and the
+# refusal it prints names --force, making `--dry-run --force` the natural second
+# command and the one that destroys.
+#
+# A fake `ddev` records every exec, so "wrote nothing" is asserted on what was
+# run rather than on what was printed.
+cdb="$work/copydb"; mkdir -p "$cdb/bin"
+export HS_FAKE_DIR="$cdb"
+cat > "$cdb/bin/ddev" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${HS_FAKE_DIR}/ddev-calls"
+case "$*" in
+  # The shared-database probe: say the worktree has its own db container.
+  *printenv*)                     echo "DB_HOST=ddev-wt-db" ;;
+  *information_schema.tables*)    cat "${HS_FAKE_DIR}/tablecount" 2>/dev/null || echo 0 ;;
+  *mysqldump*)                    echo copied > "${HS_FAKE_DIR}/DESTROYED" ;;
+esac
+exit 0
+FAKE
+chmod +x "$cdb/bin/ddev"
+: > "$HS_FAKE_DIR/ddev-calls"
+printf '7\n' > "$HS_FAKE_DIR/tablecount"
+
+copydb() {
+  rm -f "$HS_FAKE_DIR/DESTROYED"
+  (cd "$wt" && PATH="$cdb/bin:$PATH" "$cmd" copy-db "$@" 2>&1 || true)
+}
+
+out="$(copydb --dry-run)"
+if [ -f "$HS_FAKE_DIR/DESTROYED" ]; then
+  fail "--dry-run does not copy the database" "mysqldump ran"
+else
+  pass "--dry-run does not copy the database"
+fi
+contains "--dry-run says it wrote nothing" "nothing written" "$out"
+contains "--dry-run says what it would replace" "7 table(s)" "$out"
+
+# The pair a developer reaches for after reading the refusal.
+out="$(copydb --dry-run --force)"
+if [ -f "$HS_FAKE_DIR/DESTROYED" ]; then
+  fail "--dry-run --force does not copy either" "mysqldump ran"
+else
+  pass "--dry-run --force does not copy either"
+fi
+
+# And the guard has not disarmed the command itself.
+out="$(copydb --force)"
+if [ -f "$HS_FAKE_DIR/DESTROYED" ]; then
+  pass "--force still copies"
+else
+  fail "--force still copies" "mysqldump did not run: $out"
+fi
+
 if [ "$fails" -gt 0 ]; then echo "$fails failure(s)"; exit 1; fi
 echo "all passed"

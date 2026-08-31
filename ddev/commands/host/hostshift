@@ -496,19 +496,39 @@ if [ "$cmd" = "copy-db" ]; then
     exit 2
   fi
 
+  tables="$(ddev exec -s web bash -c \
+    "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
+    2>/dev/null | tail -1 | tr -dc '0-9' || true)"
+  has_tables=""
+  [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null && has_tables=1
+
+  # --dry-run stops here, before anything is written, and before the --force
+  # gate below rather than after it.
+  #
+  # The only dry_run test in this file is at the end, after this block has run
+  # and exited 0 — so `copy-db --dry-run` replaced the database it was asked to
+  # describe. copy-db is the one destructive subcommand, which makes it the one
+  # place the flag had to work. And putting it after the gate would not be
+  # enough: the refusal names --force, so the natural second command is
+  # `--dry-run --force`, which is the pair that destroys.
+  if [ -n "$dry_run" ]; then
+    echo "hostshift: --dry-run, nothing written" >&2
+    echo "  would replace this worktree's database with a copy of $from's" >&2
+    if [ -n "$has_tables" ]; then
+      echo "  the $tables table(s) here would be dropped, and there is no undo" >&2
+      [ -n "$force" ] || echo "  without --dry-run this would refuse; pass --force to go ahead" >&2
+    fi
+    exit 0
+  fi
+
   # It overwrites. Refuse to do that silently to a database that has something
   # in it — the caller may well have meant `ddev import-db`, or may be in the
   # wrong directory, and there is no undo.
-  if [ -z "$force" ]; then
-    tables="$(ddev exec -s web bash -c \
-      "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
-      2>/dev/null | tail -1 | tr -dc '0-9' || true)"
-    if [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null; then
-      echo "hostshift: this worktree's database already has $tables table(s)." >&2
-      echo "  Copying from $from replaces them, and there is no undo." >&2
-      echo "  Pass --force if that is what you want." >&2
-      exit 2
-    fi
+  if [ -z "$force" ] && [ -n "$has_tables" ]; then
+    echo "hostshift: this worktree's database already has $tables table(s)." >&2
+    echo "  Copying from $from replaces them, and there is no undo." >&2
+    echo "  Pass --force if that is what you want." >&2
+    exit 2
   fi
 
   echo "hostshift: copying the database from $from" >&2

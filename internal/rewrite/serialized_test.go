@@ -2,6 +2,7 @@ package rewrite
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
@@ -755,11 +756,12 @@ func TestTheVehiclesAValueTravelsIn(t *testing.T) {
 // counts five — while a bare `&` in the data becomes `&amp;` and counts one.
 // The two are identical in the attribute.
 //
-// Counting every `&…;` as one byte, which is what "a reference decodes to one
-// byte" did, was right for the second reading and wrong for the first, and a
-// wrong length is a destroyed row. Counting only the quote entity makes the
-// first reading the one taken and the second decline, so the worst case is a
-// repair not made rather than a number invented.
+// Neither can be chosen locally, and both attempts to try were wrong in one
+// direction or the other: counting every reference as one byte destroyed the
+// first reading, and counting only the quote entity declined the second, which
+// still writes the old length onto a rewritten value. So the closing delimiter
+// decides — the reading that lands on `&quot;;` is the one the data was written
+// under — and where both land, nothing is chosen.
 func TestAnAmpersandUnderEscAttr(t *testing.T) {
 	canon, variant := "https://www.canon.test", "https://v.ddev.site"
 	esc := func(v string) string { return strings.ReplaceAll(v, `"`, "&quot;") }
@@ -780,18 +782,42 @@ func TestAnAmpersandUnderEscAttr(t *testing.T) {
 		}
 	})
 
-	t.Run("a bare & in the data declines", func(t *testing.T) {
-		// The data holds one `&`; esc_attr writes five bytes for it, so the
-		// attribute cannot say which reading was meant.
+	t.Run("a bare & in the data repairs", func(t *testing.T) {
+		// The data holds one `&`, which esc_attr writes as five bytes. Reading
+		// those five as one lands on the closing `&quot;;`; reading them as five
+		// lands four bytes short, in the middle of the text. Only one closes, so
+		// only one was ever the reading the data was written under.
 		data := canon + "/shop/?a=1&b=2"
-		in := `<input value="` + strings.ReplaceAll(
-			strings.ReplaceAll(blob(data), `"`, "&quot;"), "&b=2", "&amp;b=2") + `">`
+		vdata := strings.ReplaceAll(data, canon, variant)
+		enc := func(v string) string {
+			return strings.ReplaceAll(esc(blob(v)), "&b=2", "&amp;b=2")
+		}
+		in := `<input value="` + enc(data) + `">`
+		want := `<input value="` + enc(vdata) + `">`
+		if got := string(RepairSerialized([]byte(in), rw)); got != want {
+			t.Errorf("\n got  %s\n want %s", got, want)
+		}
+	})
+
+	t.Run("a value with two readings that both close declines", func(t *testing.T) {
+		// Found by exhaustive search over every string up to length six: with
+		// `aa<";a` the literal reading of `&lt;` closes at the first `&quot;;`
+		// and the escaped reading closes at the second. Both are structurally
+		// perfect and nothing in the bytes ranks them, which is exactly when
+		// this must decline rather than prefer one.
+		data := `aa<";a`
+		body := blob(canon + data)
+		in := `<input value="` + strings.NewReplacer(
+			`"`, "&quot;", "<", "&lt;").Replace(body) + `">`
+		// The inner blob's own quotes have to survive as delimiters, so encode
+		// the payload rather than the frame: what matters is that the declared
+		// length has two landings.
 		got := string(RepairSerialized([]byte(in), rw))
 		if strings.Contains(got, canon) {
 			t.Errorf("the origin was not rewritten:\n%s", got)
 		}
-		if !strings.Contains(got, `s:`+strconv.Itoa(len(data))+`:`) {
-			t.Errorf("an ambiguous ampersand was measured rather than declined:\n%s", got)
+		if !strings.Contains(got, `s:`+strconv.Itoa(len(canon+data))+`:`) {
+			t.Errorf("an ambiguous value was measured rather than declined:\n%s", got)
 		}
 	})
 }
@@ -1047,6 +1073,138 @@ func TestEveryLengthPrefixedTypeCommits(t *testing.T) {
 	for name, body := range cases {
 		if n := BrokenSerialized([]byte(body)); n == 0 {
 			t.Errorf("%s: a length that overruns its data was reported clean:\n %s", name, body)
+		}
+	}
+}
+
+// The content a real site actually has, in the two spellings an attribute
+// carries it in.
+//
+// Every one of these was served with a length PHP refuses. `wp_json_encode`
+// writes non-ASCII as `\uXXXX`, six source bytes for one to three decoded ones,
+// and the walk declined rather than measure it — so every ä, ö and å on the
+// fleet. `esc_attr` writes `&`, `<` and `'` as references, and the walk charged
+// them their literal width — so every client name with an ampersand in it.
+//
+// A decline is not neutral, which is the part the old comments had wrong: it
+// still rewrites the host and re-emits nothing, leaving the old length on a
+// value whose byte count has changed.
+func TestTheContentARealSiteHas(t *testing.T) {
+	canon, variant := "https://mz29d.ddev.site", "https://wt-a--mz29d.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	// serialize(["u" => host, "t" => text]), lengths in bytes as PHP counts them.
+	blob := func(host, text string) string {
+		return `a:2:{s:1:"u";s:` + strconv.Itoa(len(host)) + `:"` + host + `";` +
+			`s:1:"t";s:` + strconv.Itoa(len(text)) + `:"` + text + `";}`
+	}
+	// esc_attr with $double_encode = false.
+	escAttr := strings.NewReplacer(
+		`"`, "&quot;", `'`, "&#039;", "&", "&amp;", "<", "&lt;", ">", "&gt;")
+	spellings := map[string]func(string) string{
+		"esc_attr(serialize)": escAttr.Replace,
+		"esc_attr(wp_json_encode(serialize))": func(s string) string {
+			j, err := json.Marshal(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return escAttr.Replace(string(j))
+		},
+	}
+	texts := map[string]string{
+		"ascii":  "Read more",
+		"nordic": "Läs mer",
+		"amp":    "Snellman & Co",
+		"apos":   "Genero's",
+		"lt":     "a < b",
+		"emoji":  "ok \U0001F389",
+	}
+	for sname, enc := range spellings {
+		for tname, text := range texts {
+			in := `<div data-x="` + enc(blob(canon, text)) + `">y</div>`
+			want := `<div data-x="` + enc(blob(variant, text)) + `">y</div>`
+			got := string(RepairSerialized([]byte(in), rw))
+			if got != want {
+				t.Errorf("%s / %s:\n got  %s\n want %s", sname, tname, got, want)
+			}
+			if n := BrokenSerialized([]byte(got)); n != 0 {
+				t.Errorf("%s / %s: served %d value(s) PHP refuses:\n %s", sname, tname, n, got)
+			}
+		}
+	}
+}
+
+// phpJSONEncode escapes the way PHP's json_encode does by default: every
+// non-ASCII rune as `\uXXXX`, a rune outside the BMP as a surrogate pair, and
+// the solidus as `\/`.
+//
+// Go's json.Marshal does the opposite — it leaves non-ASCII raw and escapes
+// `<`, `>` and `&` — so a fixture built with it contains no `\uXXXX` at all.
+// Two mutation tests passed against such a fixture while the `\u` measurement
+// was disabled, which is what this exists to prevent.
+func phpJSONEncode(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '"':
+			b.WriteString(`\"`)
+		case r == '\\':
+			b.WriteString(`\\`)
+		case r == '/':
+			b.WriteString(`\/`)
+		case r < 0x20:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		case r < 0x80:
+			b.WriteRune(r)
+		case r > 0xFFFF:
+			r -= 0x10000
+			fmt.Fprintf(&b, `\u%04x\u%04x`, 0xD800+(r>>10), 0xDC00+(r&0x3FF))
+		default:
+			fmt.Fprintf(&b, `\u%04x`, r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// A serialized blob inside a plain JSON string — wp_localize_script, a REST
+// response, an admin-ajax reply — with the non-ASCII escaped as PHP writes it.
+//
+// `\uXXXX` is six source bytes for one to three decoded ones, and twelve for a
+// surrogate pair. The walk used to refuse to measure it and decline, under a
+// comment claiming that "never writes a wrong length" — but a decline rewrites
+// the host and re-emits nothing, so the old length stayed on a value that had
+// changed size. That is every ä, ö and å on the fleet.
+func TestPHPJSONEscapedContent(t *testing.T) {
+	canon, variant := "https://mz29e.ddev.site", "https://wt-a--mz29e.ddev.site"
+	// json_encode escapes the solidus, so the host reaches the rewriter as
+	// `https:\/\/…`. The engine's decoder view sees through that; a plain
+	// string replace has to be told.
+	esc := func(v string) string { return strings.ReplaceAll(v, "/", `\/`) }
+	rw := func(b []byte) []byte {
+		s := strings.ReplaceAll(string(b), canon, variant)
+		return []byte(strings.ReplaceAll(s, esc(canon), esc(variant)))
+	}
+	blob := func(host, text string) string {
+		return `a:2:{s:1:"u";s:` + strconv.Itoa(len(host)) + `:"` + host + `";` +
+			`s:1:"t";s:` + strconv.Itoa(len(text)) + `:"` + text + `";}`
+	}
+	for name, text := range map[string]string{
+		"ascii":     "Read more",
+		"nordic":    "Läs mer",
+		"threeByte": "日本語",
+		"surrogate": "ok \U0001F389",
+		"mixed":     "Snellman & Co — Läs mer \U0001F389",
+	} {
+		in := `{"settings":` + phpJSONEncode(blob(canon, text)) + `}`
+		want := `{"settings":` + phpJSONEncode(blob(variant, text)) + `}`
+		if got := string(RepairSerialized([]byte(in), rw)); got != want {
+			t.Errorf("%s:\n got  %s\n want %s", name, got, want)
+		}
+		if n := BrokenSerialized([]byte(want)); n != 0 {
+			t.Errorf("%s: the repaired page counted %d broken values", name, n)
 		}
 	}
 }

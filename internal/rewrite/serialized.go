@@ -3,6 +3,7 @@ package rewrite
 import (
 	"bytes"
 	"strconv"
+	"unicode/utf8"
 )
 
 // RepairSerialized rewrites a PHP-serialized payload and re-emits its length
@@ -250,8 +251,160 @@ type syntax struct {
 	emit func(dst []byte, c byte) []byte
 	// advance skips n decoded bytes from i.
 	advance func(b []byte, i, n int) (int, bool)
-	// dlen is how many bytes data decodes to.
-	dlen func(data []byte) int
+	// unit reports how the spelling reads the bytes at i: their width in source
+	// bytes, how many decoded bytes they count for, and a second count when the
+	// source is ambiguous — 0 when it is not. Only the escaped spellings set it.
+	unit func(b []byte, i int) (src, dec, alt int)
+}
+
+// refRun is the width of a character reference at i, or 0.
+func refRun(b []byte, i int) int {
+	if i >= len(b) || b[i] != '&' {
+		return 0
+	}
+	for j := i + 1; j < len(b) && j-i <= 12; j++ {
+		c := b[j]
+		switch {
+		case c == ';':
+			if j == i+1 {
+				return 0
+			}
+			return j - i + 1
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9', c == '#':
+		default:
+			return 0
+		}
+	}
+	return 0
+}
+
+// htmlUnit reads the `esc_attr` spelling.
+//
+// `esc_attr` runs with $double_encode = false, so `&amp;` in an attribute is
+// either an escaped `&`, counting one byte, or five literal bytes that were
+// already `&amp;` in the data, counting five. Nothing local separates them.
+// Charging every reference one byte was wrong. Charging only `&quot;` one and
+// every other reference its literal width — which is where round 28 landed —
+// is also wrong, just in the other direction, and it is why "Snellman & Co" and
+// "Genero's" were served with lengths PHP refuses.
+//
+// So both readings are offered and the parse decides, which is what the rest of
+// this file does with every boundary it cannot settle locally.
+func htmlUnit(b []byte, i int) (src, dec, alt int) {
+	if w := refRun(b, i); w > 0 {
+		return w, 1, w
+	}
+	return 1, 1, 0
+}
+
+// jsonHTMLUnit reads the combined spelling. Only a bare reference is ambiguous:
+// a `\` escape is unambiguously one, because json_encode writes a literal
+// backslash as `\\`.
+func jsonHTMLUnit(b []byte, i int) (src, dec, alt int) {
+	if s, d := jsonHTMLRun(b, i); s > 0 {
+		return s, d, 0
+	}
+	if i < len(b) && b[i] == '\\' {
+		return 0, 0, 0
+	}
+	if w := refRun(b, i); w > 0 {
+		return w, 1, w
+	}
+	return 1, 1, 0
+}
+
+// maxStringReadings bounds the search. Every ambiguous reference in the span
+// can double the number of live readings, so a value carrying a great many of
+// them is declined rather than explored — which is what the code did with all
+// of them until now.
+const maxStringReadings = 2048
+
+// advanceReadings returns every offset at which exactly n decoded bytes have
+// passed from i. More than one means the source is genuinely ambiguous and the
+// caller must not choose.
+func advanceReadings(b []byte, i, n int, unit func([]byte, int) (int, int, int)) []int {
+	if n < 0 {
+		return nil
+	}
+	type st struct{ i, n int }
+	seen := map[st]bool{{i, n}: true}
+	work := []st{{i, n}}
+	var ends []int
+	for len(work) > 0 {
+		s := work[len(work)-1]
+		work = work[:len(work)-1]
+		if s.n == 0 {
+			ends = append(ends, s.i)
+			continue
+		}
+		if s.i >= len(b) {
+			continue
+		}
+		src, dec, alt := unit(b, s.i)
+		if src == 0 {
+			continue
+		}
+		for _, d := range [2]int{dec, alt} {
+			// A unit wider than what is left would straddle the declared end,
+			// which valid data does not do: a length counts whole characters.
+			if d <= 0 || d > s.n {
+				continue
+			}
+			k := st{s.i + src, s.n - d}
+			if seen[k] {
+				continue
+			}
+			if len(seen) >= maxStringReadings {
+				return nil
+			}
+			seen[k] = true
+			work = append(work, k)
+		}
+	}
+	return ends
+}
+
+// stringEnd finds where the data of a string of n decoded bytes ends, given
+// that a `";` must follow it.
+//
+// The fast path is the spelling's own single reading, and for a span with no
+// character reference in it that reading is the only one. Otherwise the closer
+// picks: exactly one reading that closes is the answer, and two are an
+// ambiguity this must not resolve by preference.
+func stringEnd(b []byte, dataAt, n int, syn syntax) (dataEnd, cw, tw int, ok bool) {
+	closes := func(e int) (int, int, bool) {
+		cw, ok := syn.match(b, e, '"')
+		if !ok {
+			return 0, 0, false
+		}
+		tw, ok := syn.match(b, e+cw, ';')
+		if !ok {
+			return 0, 0, false
+		}
+		return cw, tw, true
+	}
+	if e, ok := syn.advance(b, dataAt, n); ok {
+		if cw, tw, ok := closes(e); ok {
+			if syn.unit == nil || bytes.IndexByte(b[dataAt:e], '&') < 0 {
+				return e, cw, tw, true
+			}
+		}
+	}
+	if syn.unit == nil {
+		return 0, 0, 0, false
+	}
+	found := 0
+	for _, e := range advanceReadings(b, dataAt, n, syn.unit) {
+		if c, t, ok := closes(e); ok {
+			found++
+			dataEnd, cw, tw = e, c, t
+		}
+	}
+	if found != 1 {
+		return 0, 0, 0, false
+	}
+	return dataEnd, cw, tw, true
 }
 
 var literalSyntax = syntax{
@@ -268,7 +421,6 @@ var literalSyntax = syntax{
 		}
 		return i + n, true
 	},
-	dlen: func(data []byte) int { return len(data) },
 }
 
 // htmlSyntax is the spelling `esc_attr` and `esc_textarea` produce: the quotes
@@ -302,7 +454,7 @@ var htmlSyntax = syntax{
 		return append(dst, c)
 	},
 	advance: advanceEntities,
-	dlen:    entityLen,
+	unit:    htmlUnit,
 }
 
 // jsonSyntax is the spelling a JSON string value carries: the quotes become
@@ -327,41 +479,99 @@ var jsonSyntax = syntax{
 		return append(dst, c)
 	},
 	// `\uXXXX` is six source bytes decoding to one rune — one to three bytes of
-	// UTF-8 — and `wp_json_encode` writes every non-ASCII character that way.
-	// Charging it five, as "any backslash pair is one byte" did, put a wrong
-	// number on the wire. Refusing to measure it declines instead, which costs
-	// a repair on a value with non-ASCII content and never writes a wrong
-	// length.
+	// UTF-8, four for a surrogate pair — and `wp_json_encode` writes every
+	// non-ASCII character that way. So it is measured, by jsonUnicodeRun.
+	//
+	// It used to decline, under a comment claiming that "never writes a wrong
+	// length". It does: a decline still rewrites the host, and re-emits nothing,
+	// so the old length stays on a value whose byte count has changed. That is
+	// every ä, ö and å in the fleet — measured on an Elementor `data-settings`
+	// carrying "Läs mer", `unserialize()` returned false on the served bytes.
 	advance: func(b []byte, i, n int) (int, bool) {
 		if n < 0 {
 			return 0, false
 		}
-		for ; n > 0; n-- {
+		for n > 0 {
 			if i >= len(b) {
 				return 0, false
 			}
 			if b[i] == '\\' && i+1 < len(b) {
 				if b[i+1] == 'u' {
-					return 0, false
+					src, dec, ok := jsonUnicodeRun(b, i)
+					// A character straddling the declared end is not something
+					// valid data does: a length counts whole characters.
+					if !ok || dec > n {
+						return 0, false
+					}
+					i, n = i+src, n-dec
+					continue
 				}
-				i += 2
+				i, n = i+2, n-1
 				continue
 			}
-			i++
+			i, n = i+1, n-1
 		}
 		return i, true
 	},
-	dlen: func(b []byte) int {
-		n := 0
-		for i := 0; i < len(b); n++ {
-			if b[i] == '\\' && i+1 < len(b) {
-				i += 2
-				continue
-			}
-			i++
+}
+
+// jsonUnicodeRun measures a `\uXXXX` escape at i: how many source bytes it
+// occupies, and how many bytes it decodes to, which is what a serialized length
+// counts. Six source bytes for a rune in the BMP, twelve for a surrogate pair.
+//
+// A lone surrogate is refused rather than charged a width. It is not text, so
+// no valid length was ever computed over it, and inventing one is the guess
+// this file exists to avoid.
+func jsonUnicodeRun(b []byte, i int) (src, dec int, ok bool) {
+	r, ok := jsonHex4(b, i)
+	if !ok {
+		return 0, 0, false
+	}
+	src = 6
+	switch {
+	case r >= 0xD800 && r <= 0xDBFF:
+		lo, ok := jsonHex4(b, i+6)
+		if !ok || lo < 0xDC00 || lo > 0xDFFF {
+			return 0, 0, false
 		}
-		return n
-	},
+		r = 0x10000 + (r-0xD800)<<10 + (lo - 0xDC00)
+		src = 12
+	case r >= 0xDC00 && r <= 0xDFFF:
+		return 0, 0, false
+	}
+	w := utf8.RuneLen(rune(r))
+	if w < 0 {
+		return 0, 0, false
+	}
+	return src, w, true
+}
+
+// jsonHex4 reads the four hex digits of a `\uXXXX` escape at i.
+func jsonHex4(b []byte, i int) (int, bool) {
+	if i+6 > len(b) || b[i] != '\\' || b[i+1] != 'u' {
+		return 0, false
+	}
+	v := 0
+	for _, c := range b[i+2 : i+6] {
+		d, ok := hexDigit(c)
+		if !ok {
+			return 0, false
+		}
+		v = v<<4 | d
+	}
+	return v, true
+}
+
+func hexDigit(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10, true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10, true
+	}
+	return 0, false
 }
 
 // jsonHTMLSyntax is `esc_attr(wp_json_encode(…))`: the JSON escaping runs first,
@@ -398,43 +608,51 @@ var jsonHTMLSyntax = syntax{
 		if n < 0 {
 			return 0, false
 		}
-		for ; n > 0; n-- {
+		for n > 0 {
 			if i >= len(b) {
 				return 0, false
 			}
-			if w := jsonHTMLRun(b, i); w > 0 {
-				i += w
+			src, dec := jsonHTMLRun(b, i)
+			if src == 0 {
+				// Every backslash in this spelling opens something. One that
+				// opens nothing measurable is not data we can count.
+				if b[i] == '\\' {
+					return 0, false
+				}
+				i, n = i+1, n-1
 				continue
 			}
-			i++
+			if dec > n {
+				return 0, false
+			}
+			i, n = i+src, n-dec
 		}
 		return i, true
 	},
-	dlen: func(b []byte) int {
-		n := 0
-		for i := 0; i < len(b); n++ {
-			if w := jsonHTMLRun(b, i); w > 0 {
-				i += w
-				continue
-			}
-			i++
-		}
-		return n
-	},
+	unit: jsonHTMLUnit,
 }
 
-// jsonHTMLRun is the width of one source byte in the combined spelling.
-func jsonHTMLRun(b []byte, i int) int {
+// jsonHTMLRun measures one decoded unit of the combined spelling at i: how many
+// source bytes it occupies and how many it counts toward a serialized length.
+// src is zero when i is an ordinary byte, or a backslash opening nothing this
+// can measure.
+func jsonHTMLRun(b []byte, i int) (src, dec int) {
 	if i >= len(b) || b[i] != '\\' {
-		return 0
+		return 0, 0
 	}
 	if i+7 <= len(b) && string(b[i+1:i+7]) == "&quot;" {
-		return 7
+		return 7, 1
 	}
-	if i+2 <= len(b) && b[i+1] != 'u' {
-		return 2
+	if i+1 < len(b) && b[i+1] == 'u' {
+		if s, d, ok := jsonUnicodeRun(b, i); ok {
+			return s, d
+		}
+		return 0, 0
 	}
-	return 0
+	if i+2 <= len(b) {
+		return 2, 1
+	}
+	return 0, 0
 }
 
 var percentSyntax = syntax{
@@ -449,7 +667,6 @@ var percentSyntax = syntax{
 		return append(dst, '%', hex[c>>4], hex[c&0xf])
 	},
 	advance: advanceDecoded,
-	dlen:    decodedLen,
 }
 
 // repairValue parses one serialized value at i and returns its repaired bytes
@@ -648,15 +865,7 @@ func repairString(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax
 		return nil, 0, false
 	}
 	dataAt := j + qw
-	dataEnd, ok := syn.advance(b, dataAt, n)
-	if !ok {
-		return nil, 0, false
-	}
-	cw, ok := syn.match(b, dataEnd, '"')
-	if !ok {
-		return nil, 0, false
-	}
-	tw, ok := syn.match(b, dataEnd+cw, ';')
+	dataEnd, cw, tw, ok := stringEnd(b, dataAt, n, syn)
 	if !ok {
 		return nil, 0, false
 	}
@@ -702,10 +911,19 @@ func repairString(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax
 	if string(repaired) == string(data) {
 		return b[i:end], end, true
 	}
+	// The new length is the declared one plus the change in source bytes, not a
+	// fresh measurement of the result.
+	//
+	// Measuring again asks dlen to reproduce whatever reading the parse settled
+	// on, and where a reference was ambiguous it cannot: the walk may have read
+	// `&amp;` as one byte and dlen would count five, putting a wrong number on a
+	// value that parsed perfectly. The delta needs no reading at all. A rewrite
+	// substitutes hostnames, which are plain in every spelling here, so a byte
+	// added to the source is a byte added to the data.
 	var out []byte
 	out = append(out, 's')
 	out = syn.emit(out, ':')
-	out = append(out, strconv.Itoa(syn.dlen(repaired))...)
+	out = append(out, strconv.Itoa(n+len(repaired)-len(data))...)
 	out = syn.emit(out, ':')
 	out = syn.emit(out, '"')
 	out = append(out, repaired...)
@@ -849,22 +1067,6 @@ func advanceDecoded(b []byte, i, n int) (int, bool) {
 		i++
 	}
 	return i, true
-}
-
-// decodedLen is how many bytes b decodes to. `+` counts as one byte, which is
-// what it decodes to — treating it as an escape would be the bug.
-func decodedLen(b []byte) int {
-	n := 0
-	for i := 0; i < len(b); n++ {
-		if b[i] == '%' && i+2 < len(b) {
-			if _, ok := unhex(b[i+1], b[i+2]); ok {
-				i += 3
-				continue
-			}
-		}
-		i++
-	}
-	return n
 }
 
 func unhex(a, b byte) (byte, bool) {
@@ -1066,9 +1268,12 @@ func repairCustom(b []byte, i int, rw func([]byte) []byte, syn syntax) ([]byte, 
 	if string(repaired) == string(data) {
 		return b[i : dataEnd+clw], dataEnd + clw, true
 	}
+	// By delta, for the reason repairString re-emits that way: a fresh
+	// measurement has to reproduce whatever reading the walk settled on, and
+	// where a character reference was ambiguous it cannot.
 	out := append([]byte{}, b[i:nameEnd+cw]...)
 	out = syn.emit(out, ':')
-	out = append(out, strconv.Itoa(syn.dlen(repaired))...)
+	out = append(out, strconv.Itoa(dataLen+len(repaired)-len(data))...)
 	out = syn.emit(out, ':')
 	out = syn.emit(out, '{')
 	out = append(out, repaired...)
@@ -1145,9 +1350,15 @@ func BrokenSerialized(b []byte) int {
 // either way writes a wrong length on the other.
 //
 // Counting only the quote makes the literal-`&amp;` reading the one taken, and
-// the other case then fails to close and declines. Declining costs a repair;
-// guessing costs a row. A value with no ampersand — most of them — is
-// unaffected either way.
+// the other case then fails to close. This is the fast path, and it is right
+// whenever the span holds no reference at all — most values. Where it does,
+// stringEnd runs both readings through htmlUnit and lets the closer decide.
+//
+// "Declining costs a repair; guessing costs a row" was the old justification
+// for stopping here, and it was wrong about the first half. A decline still
+// rewrites the host and re-emits nothing, so the old length stays on a value
+// whose byte count has changed: declining costs a row too, just a recoverable
+// one. That is why the reading is now decided rather than assumed.
 func entityRun(b []byte, i int) int {
 	if i >= len(b) || b[i] != '&' {
 		return 0
@@ -1177,19 +1388,6 @@ func advanceEntities(b []byte, i, n int) (int, bool) {
 		i++
 	}
 	return i, true
-}
-
-// entityLen is how many bytes b decodes to.
-func entityLen(b []byte) int {
-	n := 0
-	for i := 0; i < len(b); n++ {
-		if w := entityRun(b, i); w > 0 {
-			i += w
-			continue
-		}
-		i++
-	}
-	return n
 }
 
 // mayHoldSerialized is the cheap gate before the walk: a serialized header is a
