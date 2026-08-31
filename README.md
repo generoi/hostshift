@@ -14,9 +14,18 @@ created. An optional DDEV add-on sits on top and does the opinionated part.
 **You have this problem if** one database has to be browsed at more than one
 hostname — a git worktree previewing a branch beside the main checkout, or a
 production dump you want to open locally without search-replacing it first.
-**The one precondition hostshift cannot supply** is that the application derive
-its host from the request. Bedrock does; a site that pins `WP_HOME` to a
-constant cannot be proxied by hostshift or by anything else.
+**The one precondition hostshift cannot supply** is that the application answer
+to a hostname the map names. Deriving `WP_HOME` from the request satisfies that
+for free; so does pinning it, as long as it is pinned to the canonical or the
+variant. What cannot work is a site pinned to a *third* hostname — stock DDEV
+WordPress does this, setting `WP_HOME` to `DDEV_PRIMARY_URL`, which is the
+project's own name and neither side of the map. `ddev hostshift check` says so
+when it sees it.
+
+(Stock Bedrock does not derive its host from the request either: its
+`config/application.php` *requires* `WP_HOME` and defines it as a constant. The
+`env('WP_HOME') ?: 'https://'.$host` form PLAN §4.1 quotes is a local edit, not
+upstream. It works fine either way.)
 
 ## Install
 
@@ -100,25 +109,27 @@ One site, one hostname, and `.ddev/config.yaml` deliberately has no `name:` —
 so DDEV names each project after its own directory, and a worktree becomes a
 DDEV project of its own with nothing configured.
 
-**If your repo pins `name:` — and most do — start here instead.** A worktree
+**If your repo pins `name:` — and most do — read this first.** A worktree
 inherits the tracked `.ddev/config.yaml`, so it inherits the name, and DDEV
 refuses before hostshift is ever involved:
 
 ```console
+$ cd ../acme-wt-a
 $ ddev add-on get ~/src/hostshift/ddev
 Unable to get project : a project (web container) in running state already
 exists for acme that was created at /Users/you/Projects/acme
 ```
 
-Give the worktree a name of its own first. DDEV merges `config.*.yaml` over
+Give the worktree a name of its own, **from inside the worktree** — running
+this in the parent renames the parent. DDEV merges `config.*.yaml` over
 `config.yaml`, and the add-on's `.git/info/exclude` block ignores
-`.ddev/**/*hostshift*` — so a filename carrying that word stays out of the
-branch without any further setup:
+`.ddev/**/*hostshift*`, so a filename carrying that word is ignored once the
+add-on is installed. Between the two commands `git status` will list it; that
+is expected, because the install is what writes the exclude rule.
 
 ```console
-$ printf 'name: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
+$ printf 'name: acme-wt-a\n' > .ddev/config.hostshift-name.yaml   # in the worktree
 $ ddev add-on get ~/src/hostshift/ddev
-$ ddev hostshift init
 ```
 
 The name only has to be unique; hostshift derives the preview hostnames from

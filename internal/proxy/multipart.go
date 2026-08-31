@@ -89,7 +89,15 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 			continue
 		}
 
-		nv, ev := m.Rewrite(body[bodyStart:end], rewrite.SurfaceRequestBody, explain)
+		// Through RepairSerialized for the same reason the flat arm is: a part
+		// can carry a PHP-serialized blob, and a stale length prefix makes PHP
+		// refuse the whole structure.
+		var ev []origin.Event
+		nv := rewrite.RepairSerialized(body[bodyStart:end], func(b []byte) []byte {
+			out, nev := m.Rewrite(b, rewrite.SurfaceRequestBody, explain)
+			ev = append(ev, nev...)
+			return out
+		})
 		// HostLeaksBack, not HostLeaks: this is a *request* body, and the two
 		// directions are not symmetric surfaces. HostLeaks has no reference view
 		// and no composed refs→CSS view, so a part carrying
@@ -99,7 +107,9 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 		// database. Every other request-direction call site was moved; this one
 		// was missed, and a multipart POST is what any form with a file field
 		// sends: the media library, an editor with an attachment, Gravity Forms.
-		nv = rewrite.HostLeaksBackCounted(m, nv, st, rewrite.SurfaceRequestBody, bodyStart)
+		nv = rewrite.RepairSerialized(nv, func(b []byte) []byte {
+			return rewrite.HostLeaksBackCounted(m, b, st, rewrite.SurfaceRequestBody, bodyStart)
+		})
 		st.Record(rewrite.SurfaceRequestBody, bodyStart, ev)
 		if bytes.Equal(nv, body[bodyStart:end]) {
 			continue

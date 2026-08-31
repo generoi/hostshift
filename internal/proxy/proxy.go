@@ -522,18 +522,30 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			}
 			break
 		}
-		out, ev := p.Map.Forward().RewriteText(body, rewrite.SurfaceText, p.Stats.Explain())
+		// Wrapped in RepairSerialized, which has to *contain* the rewrite rather
+		// than follow it: by the time the host has changed, the declared length
+		// no longer matches the data and the span can no longer be found. The
+		// response direction needs this as much as the request direction — serve
+		// a blob whose prefix counts the canonical host over variant data and
+		// the way back cannot parse it, so the round trip never comes home.
+		var ev []origin.Event
+		isXML := strings.HasSuffix(strings.ToLower(mediaType(ct)), "xml")
+		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
+			nv, nev := p.Map.Forward().RewriteText(b, rewrite.SurfaceText, p.Stats.Explain())
+			ev = append(ev, nev...)
+			// References too, when the consumer decodes them. An SVG's `href`
+			// and a feed's `<link>` are read by an XML parser, which decodes
+			// `&#47;` exactly as HTML does in an attribute. text/plain keeps
+			// HostLeaks: nothing parses references in plain text, so leaving
+			// them is correct there.
+			if isXML {
+				return rewrite.HostLeaksXMLCounted(p.Map.Forward(), nv, false, p.Stats,
+					rewrite.SurfaceText, 0)
+			}
+			return rewrite.HostLeaksCounted(p.Map.Forward(), nv, false, p.Stats,
+				rewrite.SurfaceText, 0)
+		})
 		p.Stats.Record(rewrite.SurfaceText, 0, ev)
-		// References too, when the consumer decodes them. An SVG's `href` and a
-		// feed's `<link>` are read by an XML parser, which decodes `&#47;`
-		// exactly as HTML does in an attribute — and nothing here did. text/plain
-		// keeps HostLeaks: nothing parses references in plain text, so leaving
-		// them is correct there.
-		if strings.HasSuffix(strings.ToLower(mediaType(ct)), "xml") {
-			out = rewrite.HostLeaksXMLCounted(p.Map.Forward(), out, false, p.Stats, rewrite.SurfaceText, 0)
-		} else {
-			out = rewrite.HostLeaksCounted(p.Map.Forward(), out, false, p.Stats, rewrite.SurfaceText, 0)
-		}
 		if !p.NoSweep {
 			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
 		}
@@ -643,25 +655,18 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 			out = rewrite.SweepBytes(out, rev, p.Stats, p.log())
 		}
 	default:
-		// A PHP-serialized payload is length-prefixed, so any rewrite that
-		// changes a byte count leaves `s:33:` over a 24-byte string and PHP
-		// refuses the whole structure. See rewrite.LooksSerialized: PLAN sells
-		// the design partly on "nothing ever rewrites serialized data", which is
-		// true of data at rest and was false here.
-		if rewrite.LooksSerialized(buf) {
-			p.log().Warn("request body carries PHP-serialized data, passing it through "+
-				"untouched: rewriting it would leave the length prefixes stale",
-				"content-type", r.Header.Get("Content-Type"), "bytes", len(buf))
-			p.Stats.Record(rewrite.SurfaceRequestBody, 0, []origin.Event{{
-				Surface: rewrite.SurfaceRequestBody, Action: origin.ActionSkipped,
-				Reason: origin.ReasonSerialized,
-			}})
-			out = buf
-			break
-		}
+		// Through RepairSerialized, which keeps any PHP-serialized length
+		// prefix correct. `s:51:"…"` rewritten to a shorter canonical leaves the
+		// prefix over the wrong byte count and PHP refuses the whole structure.
+		// Both spellings matter: a form percent-encodes, so `options.php` sends
+		// `s%3A51%3A%22` and a literal scanner never sees it.
 		var ev []origin.Event
-		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
-		out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceRequestBody, 0)
+		out = rewrite.RepairSerialized(buf, func(b []byte) []byte {
+			nv, nev := rev.Rewrite(b, rewrite.SurfaceRequestBody, explain)
+			ev = append(ev, nev...)
+			return rewrite.HostLeaksBackCounted(rev, nv, p.Stats,
+				rewrite.SurfaceRequestBody, 0)
+		})
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
 	}
 	if p.DryRun {

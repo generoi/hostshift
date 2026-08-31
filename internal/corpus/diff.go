@@ -7,6 +7,7 @@
 package corpus
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -254,11 +255,14 @@ func countLeaks(m *origin.Matcher, r response) (leaks, tier2 int) {
 	if r.attachment {
 		return 0, 0
 	}
-	n := originsIn(m, r.body, r.contentType)
 	if isTier2(r.contentType) {
-		return 0, n
+		// Scanned with the text arm on purpose. The proxy does nothing to these
+		// types, so asking "what would the proxy have done" answers "nothing" —
+		// and the whole point of the Tier 2 count is to find the origins it is
+		// leaving behind, which is PLAN's stated trigger for adding them.
+		return 0, originsIn(m, r.body, "text/plain")
 	}
-	return n, 0
+	return originsIn(m, r.body, r.contentType), 0
 }
 
 // isTier2 reports whether the proxy deliberately leaves this type alone.
@@ -318,20 +322,64 @@ func applyLikeTheProxy(m *origin.Matcher, body []byte, ct string, st *rewrite.St
 	if err != nil {
 		mt = strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
 	}
+	mt = strings.ToLower(mt)
 	switch {
 	case mt == "text/html" || mt == "application/xhtml+xml":
 		return io.ReadAll(rewrite.NewResponseBody(strings.NewReader(string(body)), m, nil,
 			rewrite.Options{Stats: st, XMLEntities: mt == "application/xhtml+xml"}))
-	case mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json"):
-		return rewrite.RewriteJSON(body, m, st, nil, false), nil
-	case strings.HasSuffix(mt, "xml"), mt == "image/svg+xml":
-		return rewrite.HostLeaksXMLCounted(m, body, false, st, rewrite.SurfaceText, 0), nil
-	case strings.HasPrefix(mt, "text/"):
-		return rewrite.HostLeaksCounted(m, body, false, st, rewrite.SurfaceText, 0), nil
+
+	// Ahead of the XML arm, because `application/ld+json` ends in neither and
+	// the proxy tests JSON first.
+	case mt == "application/json", mt == "text/json", strings.HasSuffix(mt, "+json"):
+		out := rewrite.RewriteJSON(body, m, st, nil, false)
+		return rewrite.SweepBytes(out, m, st, nil), nil
+
+	// The enumerated set plus `+xml`, exactly as rewritableText has it — not
+	// `HasSuffix(mt, "xml")`, which also swallows text/xml-external-parsed-entity
+	// and application/vnd.foo.xml, and not `HasPrefix(mt, "text/")`, which
+	// swallows text/markdown. Either one made the scorer rewrite a body the
+	// proxy passes through, and the run went RED on a healthy deployment.
+	case isTextArm(mt):
+		// The proxy's `{`/`[` sniff first. wp-admin/async-upload.php sets
+		// text/plain before wp_send_json can set application/json, so the body
+		// that reports every media upload arrives on this arm as JSON — and
+		// wp_json_encode writes its origins with \uXXXX escapes, which only
+		// RewriteJSON decodes. Without the sniff the scorer served that body
+		// back unrewritten and called the page clean.
+		if t := bytes.TrimLeft(body, " \t\r\n"); len(t) > 0 && (t[0] == '{' || t[0] == '[') {
+			out := rewrite.RewriteJSON(body, m, st, nil, false)
+			return rewrite.SweepBytes(out, m, st, nil), nil
+		}
+		// All three passes the proxy runs, in order. Running only the middle one
+		// scored a plain, unencoded, dereferenceable origin as clean: stripForURL
+		// *deletes* tab, LF and CR — right for a single URL value, wrong for a
+		// whole document, where those bytes are token separators. Removing the
+		// newline welds the previous word onto `https:`, tokenBoundary is then
+		// false, and no candidate is emitted. The byte matcher and the sweep,
+		// which the proxy runs and this did not, see the raw bytes.
+		out, ev := m.RewriteText(body, rewrite.SurfaceText, false)
+		st.Record(rewrite.SurfaceText, 0, ev)
+		if strings.HasSuffix(mt, "xml") {
+			out = rewrite.HostLeaksXMLCounted(m, out, false, st, rewrite.SurfaceText, 0)
+		} else {
+			out = rewrite.HostLeaksCounted(m, out, false, st, rewrite.SurfaceText, 0)
+		}
+		return rewrite.SweepBytes(out, m, st, nil), nil
 	}
-	// An unlabelled body is scored the way the crawler found it: as a page.
-	return io.ReadAll(rewrite.NewResponseBody(strings.NewReader(string(body)), m, nil,
-		rewrite.Options{Stats: st}))
+	// Everything else the proxy streams through untouched, so scoring it as a
+	// page would report a leak on a type it never claimed to rewrite.
+	return body, nil
+}
+
+// isTextArm is proxy.rewritableText, and the two must not drift —
+// TestTheScorerMatchesTheProxy asserts they have not.
+func isTextArm(mt string) bool {
+	switch mt {
+	case "text/plain", "text/xml", "application/xml",
+		"application/rss+xml", "application/atom+xml", "image/svg+xml":
+		return true
+	}
+	return strings.HasSuffix(mt, "+xml")
 }
 
 // response is what a comparison needs: the body, and the parts of the response

@@ -4,11 +4,10 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/generoi/hostshift/internal/origin"
 )
 
 // Every spelling the response direction can emit, the request direction must be
@@ -209,42 +208,133 @@ func TestRequestSideRewritesAreCounted(t *testing.T) {
 	}
 }
 
-// A PHP-serialized request body is passed through, not rewritten.
+// A PHP-serialized request body is rewritten with its length prefixes repaired.
 //
-// These are length-prefixed: `s:33:"https://variant/x"` rewritten to a shorter
-// canonical leaves `s:33:` over a 24-byte string, and PHP then refuses the
-// whole structure — "unserialize(): Error at offset 5" and a bool(false) where
-// an options array should be. PLAN sells the design partly on "nothing ever
-// rewrites serialized data, so nothing can corrupt it", which is true of data
-// at rest and was false of anything travelling through a request body.
+// `s:LEN:"DATA"` counts DATA in bytes, so a rewrite that changes a byte count
+// leaves LEN stale and PHP refuses the whole structure — `false` where an
+// options array should be, into a shared database, with no undo and no error.
 //
-// A round trip is self-healing, which is why nothing caught it: the length is
-// restored on the way back. Only a one-way flow corrupts, and it lands in a
-// shared database with no undo and no error.
+// Skipping such a body was tried first and was worse. The response direction
+// rewrites too, so the browser is served a blob whose prefix already counts the
+// canonical host while the data holds the variant; passing the POST back
+// untouched then wrote that stale prefix *and* the variant hostname upstream —
+// both failures at once, where rewriting without repair at least round-tripped.
 //
-// Skipping is the conservative half of a real trade: the variant hostname then
-// reaches the database, which is wrong but recoverable by search-replace, where
-// a stale length prefix is not recoverable at all.
-func TestSerializedRequestBodiesArePassedThrough(t *testing.T) {
-	body := `a:1:{s:3:"url";s:` +
-		strconv.Itoa(len("https://"+variantHost+"/x")) +
-		`:"https://` + variantHost + `/x";}`
+// Both spellings are here because a form percent-encodes: `options.php` sends
+// `s%3A51%3A%22`, and the literal scanner the first attempt used never saw it.
+// That is the settings flow the whole problem is about.
+func TestSerializedRequestBodiesKeepTheirLengths(t *testing.T) {
+	variantURL := "https://" + variantHost + "/wp-content/uploads"
+	canonURL := "https://www.acmecorp.fi/wp-content/uploads"
+	blob := func(u string) string {
+		return `a:1:{s:3:"url";s:` + strconv.Itoa(len(u)) + `:"` + u + `";}`
+	}
 
+	for _, c := range []struct {
+		name, ctype string
+		body        string
+		want        string
+	}{
+		{"a literal blob", "text/plain", blob(variantURL), blob(canonURL)},
+		{"percent-encoded, the way a form sends it",
+			"application/x-www-form-urlencoded",
+			"option=" + url.QueryEscape(blob(variantURL)),
+			"option=" + url.QueryEscape(blob(canonURL))},
+		{"inside a JSON string value", "application/json",
+			`{"b":` + jsonQuote(blob(variantURL)) + `}`,
+			`{"b":` + jsonQuote(blob(canonURL)) + `}`},
+		{"a multipart part", "multipart/form-data; boundary=BXX",
+			"--BXX\r\nContent-Disposition: form-data; name=\"o\"\r\n\r\n" +
+				blob(variantURL) + "\r\n--BXX--\r\n",
+			"--BXX\r\nContent-Disposition: form-data; name=\"o\"\r\n\r\n" +
+				blob(canonURL) + "\r\n--BXX--\r\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+			})
+			h.do(t, "POST", variantHost, "/wp-admin/options.php", c.ctype, []byte(c.body))
+			up, _ := io.ReadAll(h.seen.Body)
+			if string(up) != c.want {
+				t.Errorf("\n got  %s\n want %s", up, up)
+				t.Errorf("expected:\n%s", c.want)
+			}
+			assertLengthsAgree(t, string(up))
+		})
+	}
+}
+
+// assertLengthsAgree checks every `s:N:"…"` in s declares its real byte length,
+// in either spelling. A stale prefix is what PHP refuses.
+func assertLengthsAgree(t *testing.T, s string) {
+	t.Helper()
+	dec, err := url.QueryUnescape(s)
+	if err != nil {
+		dec = s
+	}
+	for _, hay := range []string{s, dec} {
+		for i := 0; ; {
+			j := strings.Index(hay[i:], `s:`)
+			if j < 0 {
+				break
+			}
+			j += i
+			k := j + 2
+			for k < len(hay) && hay[k] >= '0' && hay[k] <= '9' {
+				k++
+			}
+			if k == j+2 || k+1 >= len(hay) || hay[k] != ':' || hay[k+1] != '"' {
+				i = j + 2
+				continue
+			}
+			n, _ := strconv.Atoi(hay[j+2 : k])
+			start := k + 2
+			if start+n >= len(hay) || hay[start+n] != '"' {
+				t.Errorf("s:%d: does not end where it says it does, so PHP will "+
+					"refuse this:\n%s", n, hay)
+			}
+			i = start + n
+		}
+	}
+}
+
+// The round trip a developer actually performs: the row is served through the
+// proxy, edited in the browser, and posted back. It has to come home unchanged.
+func TestASerializedRoundTripComesHomeUnchanged(t *testing.T) {
+	row := `a:1:{s:3:"url";s:42:"https://www.acmecorp.fi/wp-content/uploads";}`
+
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(row))
+	})
+	_, served := h.get(t, variantHost, "/wp-admin/options.php")
+	if !bytes.Contains(served, []byte(variantHost)) {
+		t.Fatalf("the response direction did not rewrite, so this asserts nothing:\n%s", served)
+	}
+	assertLengthsAgree(t, string(served))
+
+	h.do(t, "POST", variantHost, "/wp-admin/options.php", "text/plain", served)
+	up, _ := io.ReadAll(h.seen.Body)
+	if string(up) != row {
+		t.Errorf("the round trip did not come home:\n got  %s\n want %s", up, row)
+	}
+}
+
+// Prose that merely looks serialized is not, and must still be rewritten.
+func TestProseThatLooksSerializedIsStillRewritten(t *testing.T) {
+	body := `The slide reads s:12:"hello world" — see https://` + variantHost + `/a`
 	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
-	h.do(t, "POST", variantHost, "/wp-admin/options.php",
-		"application/x-www-form-urlencoded", []byte(body))
+	h.do(t, "POST", variantHost, "/x", "text/plain", []byte(body))
 	up, _ := io.ReadAll(h.seen.Body)
-	if string(up) != body {
-		t.Errorf("a serialized body was rewritten, so its length prefixes are now "+
-			"stale and PHP will refuse it:\n in  %s\n out %s", body, up)
+	if bytes.Contains(up, []byte(variantHost)) {
+		t.Errorf("a variant hostname reached the upstream because the body merely "+
+			"looked serialized:\n%s", up)
 	}
-	// And the skip is counted, so the census says something happened rather than
-	// reporting a clean pass-through — the instrument-lies failure this project
-	// has hit four times.
-	// Skips are keyed by reason, not by surface.
-	if n := h.stats.Snapshot().Skips[origin.ReasonSerialized]; n == 0 {
-		t.Error("the body was skipped silently; the census reports nothing")
-	}
+}
+
+// jsonQuote is the minimal quoting these fixtures need.
+func jsonQuote(v string) string {
+	return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
 }

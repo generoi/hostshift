@@ -134,14 +134,30 @@ func RewriteJSON(b []byte, m *origin.Matcher, st *Stats, log *slog.Logger, expla
 			continue
 		}
 
-		nv, ev := m.Rewrite(v, SurfaceJSONString, explain)
+		// A JSON string value routinely *is* a PHP-serialized blob — a settings
+		// export, an admin-ajax payload — and rewriting the host inside one
+		// without re-emitting `s:NN:` leaves PHP refusing the whole structure.
+		//
+		// It has to be handled here, before the raw pass changes a byte: the
+		// lengths are only trustworthy while they still match the data, and in
+		// the raw span the quotes are `\"`, which the literal parser cannot see.
+		// Unquoting first puts it in the spelling RewriteSerialized reads.
+		serialized := false
+		nv, ev, ok := serializedJSONValue(m, v, explain)
+		if ok {
+			serialized = true
+		} else {
+			nv, ev = m.Rewrite(v, SurfaceJSONString, explain)
+		}
 		for i := range ev {
 			ev[i].Path = ptr
 			ev[i].Offset += start
 		}
 		pending = append(pending, ev...)
 
-		if dv, ok := decodeJSONLeak(m, nv); ok {
+		// The escape pass would decode the value and rewrite it again, which on
+		// a serialized payload re-breaks the lengths just repaired.
+		if dv, ok := decodeJSONLeak(m, nv); ok && !serialized {
 			pendingEsc = append(pendingEsc, origin.Event{
 				Surface: SurfaceJSONEscape, Action: origin.ActionRewrote,
 				Offset: start, Path: ptr, Text: string(v),
@@ -203,7 +219,15 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 	}
 	dec, _ = decodeURLRefs(dec)
 
-	out, _ := m.Rewrite(dec, SurfaceJSONEscape, false)
+	// Through RepairSerialized, because a JSON string value routinely *is* a
+	// PHP-serialized blob — `{"b":"a:1:{s:3:\"url\";s:25:\"http://…\";}"}` is
+	// what a settings export or an admin-ajax payload looks like. Rewriting the
+	// host inside without re-emitting `s:25:` leaves PHP refusing the whole
+	// structure. The JSON arm was the one request path the first repair missed.
+	out := RepairSerialized(dec, func(b []byte) []byte {
+		nv, _ := m.Rewrite(b, SurfaceJSONEscape, false)
+		return nv
+	})
 	// The same two catchers the HTML surfaces get. Without them the REST body
 	// was the one surface with neither: `{"u":"https:\\h/x"}` and an NFD host in
 	// content.rendered both went out untouched while the identical bytes in the
@@ -236,4 +260,30 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 		return nil, false // invalid UTF-8: passing it through beats corrupting it
 	}
 	return q, true
+}
+
+// serializedJSONValue rewrites a JSON string value that carries a PHP-serialized
+// payload, keeping its length prefixes correct.
+//
+// ok is false when the value holds nothing serialized, so the caller falls back
+// to the ordinary raw-span rewrite.
+func serializedJSONValue(m *origin.Matcher, v []byte, explain bool) ([]byte, []origin.Event, bool) {
+	dec, err := jsontext.AppendUnquote(nil, v)
+	if err != nil {
+		return nil, nil, false
+	}
+	var ev []origin.Event
+	out, ok := RewriteSerialized(dec, func(b []byte) []byte {
+		nv, nev := m.Rewrite(b, SurfaceJSONString, explain)
+		ev = append(ev, nev...)
+		return nv
+	})
+	if !ok {
+		return nil, nil, false
+	}
+	q, err := jsontext.AppendQuote(nil, out)
+	if err != nil {
+		return nil, nil, false // invalid UTF-8: passing through beats corrupting
+	}
+	return q, ev, true
 }
