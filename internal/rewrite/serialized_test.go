@@ -1010,46 +1010,48 @@ func TestASerializedBlobInsideAJSONStringAttribute(t *testing.T) {
 	}
 }
 
-// A nested payload that parses short and leaves residue is declined, so the
-// page is reported rather than quietly certified.
+// A nested payload with text after it is repaired, and a nested payload whose
+// length overruns its data is reported.
 //
-// This is the shape the file's opening comment describes, one level down: the
-// declared length lands on a `"`, the `;` after it closes the string and the
-// next `}` closes the array with its arity met, so the walk finishes cleanly
-// having read a prefix. What gives it away is the residue — the rest of the
-// true string.
+// This replaces an assertion that was simply wrong. It held that a payload
+// followed by other bytes must be declined, because a stale length consumes a
+// prefix of its data and closes cleanly, so residue is the signature. PHP says
+// otherwise: unserialize stops at the end of the first complete value and
+// ignores whatever follows, without an error. So residue is not evidence of
+// anything, and the fixture that test called broken parses at both levels.
 //
-// Believing it re-emits the *outer* length over the truncated reading, which
-// makes the outer correct and leaves the inner stale. That is worse than
-// useless: the bytes PHP refuses are unchanged, and the one number that would
-// have shown it is now right. `BrokenSerialized` then reads the outer length,
-// skips to the end of the string and reports zero.
-func TestAStalePayloadInsideAStringIsNotQuietlyCertified(t *testing.T) {
-	canon := "https://mz29b.ddev.site/a"
-	// s:3: over a string that is longer than three bytes — stale on arrival,
-	// exactly as a previous rewrite would have left it.
-	trueData := `AAA";}` + canon
-	nested := `a:1:{s:1:"c";s:3:"` + trueData + `";}`
-	body := `a:1:{s:3:"raw";s:` + strconv.Itoa(len(nested)) + `:"` + nested + `";}`
-
-	if n := BrokenSerialized([]byte(body)); n == 0 {
-		t.Errorf("a stale length inside a string was reported clean:\n %s", body)
+// Declining on it made the walk disagree with PHP, and that disagreement is
+// what destroyed pages: `serialize([...]) . " (cachad)"` in a field is ordinary
+// content, and it was served with every length stale. What is actually broken
+// is a length that overruns its data, and that is what the detector must see.
+func TestTrailingTextIsRepairedAndAnOverrunIsReported(t *testing.T) {
+	canon, variant := "https://mz31f.ddev.site", "https://wt-a--mz31f.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	nest := func(host, suffix string) string {
+		inner := `a:1:{` + str("u") + str(host+"/x") + `}` + suffix
+		return `a:1:{` + str("a") + str(inner) + `}`
+	}
+	for name, suffix := range map[string]string{
+		"none": "", "prose": " (cachad)", "punctuation": "!", "quote": `"`,
+	} {
+		in, want := nest(canon, suffix), nest(variant, suffix)
+		if got := string(RepairSerialized([]byte(in), rw)); got != want {
+			t.Errorf("%s:\n got  %s\n want %s", name, got, want)
+		}
+		if n := BrokenSerialized([]byte(want)); n != 0 {
+			t.Errorf("%s: the detector called %d value(s) broken on bytes PHP accepts", name, n)
+		}
 	}
 
-	// And the decline round-trips: the response direction rewrites without
-	// re-emitting either length, so the request direction restores the bytes.
-	fwd := func(b []byte) []byte {
-		return []byte(strings.ReplaceAll(string(b), canon, "https://wt-a--mz29b.ddev.site/a"))
-	}
-	rev := func(b []byte) []byte {
-		return []byte(strings.ReplaceAll(string(b), "https://wt-a--mz29b.ddev.site/a", canon))
-	}
-	out := RepairSerialized([]byte(body), fwd)
-	if strings.Contains(string(out), canon) {
-		t.Errorf("the origin survived the rewrite:\n %s", out)
-	}
-	if back := string(RepairSerialized(out, rev)); back != body {
-		t.Errorf("a decline did not round-trip:\n got  %s\n want %s", back, body)
+	// And the real defect: a declared length longer than the data it describes.
+	// The value cannot parse at all, at either level, and PHP refuses it.
+	inner := `a:1:{` + str("u") + `s:99:"` + canon + `/x";}`
+	over := `a:1:{` + str("a") + str(inner) + `}`
+	if n := BrokenSerialized([]byte(over)); n == 0 {
+		t.Errorf("a length overrunning its data was reported clean:\n %s", over)
 	}
 }
 
@@ -1430,6 +1432,12 @@ func TestANestedPayloadBehindALabel(t *testing.T) {
 		"none": "", "space": " ", "newline": "\n", "tab": "\t",
 		"nordic": "Läs ", "amp": "A & B ", "apos": "Genero's ",
 		"quote": `say "hi" `, "prose": "Obs: ",
+		// Labels that end in a letter or a digit, with no separator between
+		// them and the payload. Every prefix above ends in one — a space, a
+		// colon, a quote — and the nested scan's gate tested exactly that byte,
+		// so a label written without trailing punctuation was invisible and the
+		// whole column passed for the wrong reason.
+		"bare letter": "x", "word": "Åtgärd", "digit": "v2",
 	}
 	rw := func(b []byte) []byte {
 		return []byte(strings.ReplaceAll(string(b), canon, variant))

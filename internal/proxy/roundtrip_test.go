@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -364,5 +365,92 @@ func TestEscapedIDNUnderATextLabel(t *testing.T) {
 				t.Errorf("an escaped IDN canonical reached the browser as %s:\n%s", ct, got)
 			}
 		})
+	}
+}
+
+// A serialized blob in the query string, the Referer, and a Location keeps a
+// length that describes its data.
+//
+// Every body arm has gone through RepairSerialized since round 22. The request
+// line and the headers never did — they called Matcher.Rewrite directly — so a
+// blob carried in a link hostshift itself served with its lengths repaired came
+// back through the query string with every length stale, and PHP refused it.
+//
+// Nothing scored it. `hostshift diff` does not look at requests at all, and
+// compares headers only for leaks; the integration suite's redirect_to
+// assertion carries a bare URL, which has no length prefix to get wrong.
+func TestASerializedBlobSurvivesTheRequestLineAndHeaders(t *testing.T) {
+	canon, variant := "https://www.example.fi", "https://wt-a--example.ddev.site"
+	mp, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse(canon),
+		Variant:   origin.MustParse(variant),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// Two levels, because one level's length is re-emitted by the outer walk
+	// even when the nested one is missed.
+	blob := func(host string) string {
+		inner := `a:1:{` + str("href") + str(host+"/sv/produkter/") + `}`
+		return `a:1:{` + str("note") + str("Obs: "+inner) + `}`
+	}
+
+	var gotQuery, gotReferer string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		gotReferer = r.Header.Get("Referer")
+		w.Header().Set("Location", "/landing.php?state="+url.QueryEscape(blob(canon)))
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer up.Close()
+	upURL, err := url.Parse(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Proxy{Map: mp, Upstream: upURL, Stats: rewrite.NewStats(false)}
+	srv := httptest.NewServer(p.Handler())
+	defer srv.Close()
+
+	// The browser sends the variant spelling, which is what it was served.
+	req, _ := http.NewRequest("GET", srv.URL+"/c.php?blob="+url.QueryEscape(blob(variant)), nil)
+	req.Host = "wt-a--example.ddev.site"
+	req.Header.Set("Referer", variant+"/p?state="+url.QueryEscape(blob(variant)))
+	cl := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := cl.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	// What the application received, and what the browser is sent.
+	for name, got := range map[string]string{
+		"query string":    gotQuery,
+		"Referer":         gotReferer,
+		"Location header": resp.Header.Get("Location"),
+	} {
+		i := strings.Index(got, "=")
+		if i < 0 {
+			t.Fatalf("%s: no value in %q", name, got)
+		}
+		dec, err := url.QueryUnescape(got[i+1:])
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := blob(canon)
+		if name == "Location header" {
+			want = blob(variant)
+		}
+		if dec != want {
+			t.Errorf("%s:\n got  %s\n want %s", name, dec, want)
+		}
+		if n := rewrite.BrokenSerialized([]byte(dec)); n != 0 {
+			t.Errorf("%s: %d value(s) with a length that does not describe the data:\n %s",
+				name, n, dec)
+		}
 	}
 }

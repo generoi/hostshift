@@ -224,8 +224,20 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// returns to the wrong place. The percent-encoded form is in the token set,
 	// which is what makes redirect_to=https%3A%2F%2F… work.
 	if q := r.Out.URL.RawQuery; q != "" {
-		out, ev := rev.Rewrite([]byte(q), rewrite.SurfaceRequestLine, explain)
-		out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceRequestLine, 0)
+		// Through RepairSerializedFields, because a query string is `&`-delimited
+		// fields and a serialized blob is a routine thing to carry in one — an
+		// ACF value round-tripped through a link, a `state=` parameter, the
+		// `blob=` in a link hostshift itself served with its lengths repaired.
+		// Without this the user clicks that link and the application is handed a
+		// value PHP refuses. Nothing scores it: `hostshift diff` never looks at a
+		// request, and the integration suite's redirect_to assertion carries a
+		// bare URL, which has no length prefix to get wrong.
+		var ev []origin.Event
+		out := rewrite.RepairSerializedFields([]byte(q), func(b []byte) []byte {
+			nv, nev := rev.Rewrite(b, rewrite.SurfaceRequestLine, explain)
+			ev = append(ev, nev...)
+			return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceRequestLine, 0)
+		})
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun {
 			r.Out.URL.RawQuery = string(out)
@@ -236,8 +248,14 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// so that EscapedPath() returns exactly these bytes rather than re-encoding
 	// — URL.String() percent-encodes, which would break test 24's spirit.
 	if esc := r.Out.URL.EscapedPath(); esc != "" {
-		out, ev := rev.Rewrite([]byte(esc), rewrite.SurfaceRequestLine, explain)
-		out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceRequestLine, 0)
+		// Not the field-splitting form: a path has no `&` separators, and a `&`
+		// in one is data.
+		var ev []origin.Event
+		out := rewrite.RepairSerialized([]byte(esc), func(b []byte) []byte {
+			nv, nev := rev.Rewrite(b, rewrite.SurfaceRequestLine, explain)
+			ev = append(ev, nev...)
+			return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceRequestLine, 0)
+		})
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun && string(out) != esc {
 			if dec, err := url.PathUnescape(string(out)); err == nil {
@@ -250,8 +268,12 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	for _, h := range requestOriginHeaders {
 		vs := r.Out.Header.Values(h)
 		for i, v := range vs {
-			out, ev := rev.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
-			out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceHeader, 0)
+			var ev []origin.Event
+			out := rewrite.RepairSerialized([]byte(v), func(b []byte) []byte {
+				nv, nev := rev.Rewrite(b, rewrite.SurfaceHeader, explain)
+				ev = append(ev, nev...)
+				return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceHeader, 0)
+			})
 			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun {
 				vs[i] = string(out)
@@ -328,11 +350,19 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		}
 		vs := resp.Header.Values(h)
 		for i, v := range vs {
-			out, ev := fwd.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
-			// Location, Link, Refresh and CSP had the byte matcher alone, so
-			// every obfuscated and folded spelling passed straight through — and
-			// a Location is followed by the browser through the URL parser.
-			out = rewrite.HostLeaksCounted(fwd, out, true, p.Stats, rewrite.SurfaceHeader, 0)
+			// Through RepairSerialized for the same reason the bodies are: a
+			// `Location: /landing.php?state=<blob>` is built by the application
+			// out of a serialized value, and rewriting the host inside it
+			// changes a byte count the length still describes.
+			var ev []origin.Event
+			out := rewrite.RepairSerialized([]byte(v), func(b []byte) []byte {
+				nv, nev := fwd.Rewrite(b, rewrite.SurfaceHeader, explain)
+				ev = append(ev, nev...)
+				// Location, Link, Refresh and CSP had the byte matcher alone, so
+				// every obfuscated and folded spelling passed straight through —
+				// and a Location is followed by the browser through the parser.
+				return rewrite.HostLeaksCounted(fwd, nv, true, p.Stats, rewrite.SurfaceHeader, 0)
+			})
 			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun && string(out) != v {
 				vs[i] = string(out)

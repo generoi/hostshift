@@ -972,42 +972,6 @@ func readLen(b []byte, i int, syn syntax) (int, int, bool) {
 // cannot be told from a real one. Indentation pairs, and so does markup: `>`
 // opens a text node and `<` closes it, so a blob inside a `<p>` is repaired.
 // A line of prose ending in `:` does not pair, and declines.
-// runsToTheEnd reports whether a value parsed to end has nothing but whitespace
-// after it. It is `occupiesItsField` without the opener half, which is the half
-// that does not apply inside a string.
-//
-// The field there is the string's data, and its extent is already known
-// exactly: the enclosing length says where it stops. What is left to check is
-// only the residue, and that check is the load-bearing one — a stale length
-// consumes a *prefix* of its data and closes cleanly, so what gives it away is
-// bytes left at the end.
-//
-// The opener half asks what precedes the value, which at the top level tells
-// you whether the value is the whole field. Inside a string it tells you
-// nothing: a prefix is the ordinary case there, since scanning at any offset is
-// the point. Applying it anyway declined on `ä`, on an apostrophe, on a quote,
-// on a line of prose — and on a newline in any spelling that escapes it, since
-// the walk skipped raw whitespace and JSON writes `\n` as two bytes. Twenty-two
-// of thirty-six prefix-and-spelling combinations were served with lengths PHP
-// refuses, for a field label in front of a blob.
-func runsToTheEnd(b []byte, end int) bool {
-	for i := end; i < len(b); i++ {
-		switch b[i] {
-		case ' ', '\t', '\r', '\n':
-		case '\\':
-			// The same whitespace as an escape, which is how it reaches a JSON
-			// or attribute-borne payload.
-			if i+1 < len(b) && (b[i+1] == 't' || b[i+1] == 'r' || b[i+1] == 'n') {
-				i++
-				continue
-			}
-			return false
-		default:
-			return false
-		}
-	}
-	return true
-}
 
 func repairNested(b []byte, rw func([]byte) []byte, depth int, syn syntax) (rep []byte, ok, decline bool) {
 	var out []byte
@@ -1027,7 +991,7 @@ func repairNested(b []byte, rw func([]byte) []byte, depth int, syn syntax) (rep 
 			i++
 			continue
 		}
-		if !parsed || !runsToTheEnd(b, end) {
+		if !parsed {
 			return nil, false, true
 		}
 		out = append(out, rw(b[prev:i])...)
