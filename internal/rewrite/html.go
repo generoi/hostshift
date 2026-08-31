@@ -366,9 +366,15 @@ func (w *HTML) urlLeaks(base int, v []byte) []byte {
 			cur = out
 		}
 	}
-	if out := w.normaliseURLLeak(SurfaceHTMLObfuscated, base, cur, true); !bytes.Equal(out, cur) {
-		return out
-	}
+	// Carried forward, not returned. The comment above records that the *entity*
+	// pass's early return here was a leak and was removed; this one was left,
+	// and it skips refsLeak — which the comment five lines down calls "the view
+	// that survives a value decodeURLRefs declines". So a srcset holding a
+	// fusing fragment, an origin the locator catches, and a reference-encoded
+	// origin rewrote the first and served the second live, with the census
+	// reporting a successful rewrite and zero skips. Chrome decodes `&#47;&#47;`
+	// in that attribute and POSTs to it on click.
+	cur = w.normaliseURLLeak(SurfaceHTMLObfuscated, base, cur, true)
 	// Three paths cover a reference-encoded origin in an attribute, and that is
 	// deliberate rather than accidental: decodeEntityLeak above, this view, and
 	// normaliseURLLeak — which runs on `dec`, the decoded form, so it locates one

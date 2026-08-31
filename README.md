@@ -100,6 +100,30 @@ One site, one hostname, and `.ddev/config.yaml` deliberately has no `name:` —
 so DDEV names each project after its own directory, and a worktree becomes a
 DDEV project of its own with nothing configured.
 
+**If your repo pins `name:` — and most do — start here instead.** A worktree
+inherits the tracked `.ddev/config.yaml`, so it inherits the name, and DDEV
+refuses before hostshift is ever involved:
+
+```console
+$ ddev add-on get ~/src/hostshift/ddev
+Unable to get project : a project (web container) in running state already
+exists for acme that was created at /Users/you/Projects/acme
+```
+
+Give the worktree a name of its own first. DDEV merges `config.*.yaml` over
+`config.yaml`, and the add-on's `.git/info/exclude` block ignores
+`.ddev/**/*hostshift*` — so a filename carrying that word stays out of the
+branch without any further setup:
+
+```console
+$ printf 'name: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
+$ ddev add-on get ~/src/hostshift/ddev
+$ ddev hostshift init
+```
+
+The name only has to be unique; hostshift derives the preview hostnames from
+the parent's config and the slug, not from it.
+
 ```console
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a

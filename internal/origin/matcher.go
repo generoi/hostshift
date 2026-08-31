@@ -312,13 +312,17 @@ const (
 	ActionRewrote = "rewrote"
 	ActionSkipped = "skipped"
 
-	ReasonNotAURL       = "not-a-url"       // no delimiter after the host: it is a longer host, or prose
-	ReasonHostNotInMap  = "host-not-in-map" // anchored origin, but its port makes it a different origin
-	ReasonIdentityMap   = "identity-map"    // canonical == variant, so there is nothing to change
-	ReasonUnanchored    = "unanchored"      // protocol-relative match that is a path segment, not an origin
-	ReasonSelfRedirect  = "self-redirect"   // PLAN §4.4 / test 32, used by the proxy
-	ReasonSizeCap       = "size-cap-exceeded"
-	ReasonAttachment    = "attachment" // a download: its hostnames outlive this machine
+	ReasonNotAURL      = "not-a-url"       // no delimiter after the host: it is a longer host, or prose
+	ReasonHostNotInMap = "host-not-in-map" // anchored origin, but its port makes it a different origin
+	ReasonIdentityMap  = "identity-map"    // canonical == variant, so there is nothing to change
+	ReasonUnanchored   = "unanchored"      // protocol-relative match that is a path segment, not an origin
+	ReasonSelfRedirect = "self-redirect"   // PLAN §4.4 / test 32, used by the proxy
+	ReasonSizeCap      = "size-cap-exceeded"
+	ReasonAttachment   = "attachment" // a download: its hostnames outlive this machine
+	// ReasonSerialized: a PHP-serialized payload is length-prefixed, so a
+	// rewrite that changes a byte count leaves `s:33:` over a 24-byte string and
+	// PHP refuses the whole structure.
+	ReasonSerialized    = "serialized"
 	ReasonNotDecodable  = "encoding-not-decodable"
 	ReasonDepthExceeded = "depth-limit"
 )

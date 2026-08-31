@@ -193,9 +193,10 @@ func compare(ctx context.Context, o Options, path string) Result {
 		return r
 	}
 
-	// The canonical bytes through the same engine the proxy runs.
-	want, err := io.ReadAll(rewrite.NewResponseBody(
-		strings.NewReader(string(canon.body)), o.Map.Forward(), nil, rewrite.Options{}))
+	// The canonical bytes through the same arm the proxy would run for this
+	// content type — not the HTML pipeline regardless, which made `want`
+	// byte-identical to a leaking XML body and scored it "same".
+	want, err := applyLikeTheProxy(o.Map.Forward(), canon.body, variant.contentType, nil)
 	if err != nil {
 		r.Err = err
 		return r
@@ -253,7 +254,7 @@ func countLeaks(m *origin.Matcher, r response) (leaks, tier2 int) {
 	if r.attachment {
 		return 0, 0
 	}
-	n := originsIn(m, r.body)
+	n := originsIn(m, r.body, r.contentType)
 	if isTier2(r.contentType) {
 		return 0, n
 	}
@@ -284,10 +285,9 @@ func isTier2(ct string) bool {
 // CSS escapes, character references — was invisible by construction to the one
 // test §7 calls the only one that validates against reality, and it printed
 // GREEN on a page whose `<a href>` a real browser resolved to production.
-func originsIn(m *origin.Matcher, body []byte) int {
+func originsIn(m *origin.Matcher, body []byte, ct string) int {
 	st := rewrite.NewStats(false)
-	out, err := io.ReadAll(rewrite.NewResponseBody(
-		strings.NewReader(string(body)), m, nil, rewrite.Options{Stats: st}))
+	out, err := applyLikeTheProxy(m, body, ct, st)
 	if err != nil {
 		return 0
 	}
@@ -300,6 +300,38 @@ func originsIn(m *origin.Matcher, body []byte) int {
 		return 1
 	}
 	return 0
+}
+
+// applyLikeTheProxy runs the arm the proxy would run for this content type.
+//
+// This ran NewResponseBody — the HTML pipeline, XMLEntities off — on every body,
+// while proxy.go dispatches every `*xml` media type to HostLeaksXMLCounted,
+// which applies the reference and CSS views over the whole buffer. The HTML
+// pipeline applies the reference view only where an *HTML* parser decodes one:
+// attributes and foreign content. Element content in an ordinary XML element is
+// the gap — and that is where every sitemap `<loc>` and every RSS `<link>`
+// lives. So the one test PLAN §7 calls "the only test that validates against
+// reality" scored an unrewritten feed GREEN, and the byte-equality half
+// positively rewarded the leak, because `want` was computed the same blind way.
+func applyLikeTheProxy(m *origin.Matcher, body []byte, ct string, st *rewrite.Stats) ([]byte, error) {
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		mt = strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
+	}
+	switch {
+	case mt == "text/html" || mt == "application/xhtml+xml":
+		return io.ReadAll(rewrite.NewResponseBody(strings.NewReader(string(body)), m, nil,
+			rewrite.Options{Stats: st, XMLEntities: mt == "application/xhtml+xml"}))
+	case mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json"):
+		return rewrite.RewriteJSON(body, m, st, nil, false), nil
+	case strings.HasSuffix(mt, "xml"), mt == "image/svg+xml":
+		return rewrite.HostLeaksXMLCounted(m, body, false, st, rewrite.SurfaceText, 0), nil
+	case strings.HasPrefix(mt, "text/"):
+		return rewrite.HostLeaksCounted(m, body, false, st, rewrite.SurfaceText, 0), nil
+	}
+	// An unlabelled body is scored the way the crawler found it: as a page.
+	return io.ReadAll(rewrite.NewResponseBody(strings.NewReader(string(body)), m, nil,
+		rewrite.Options{Stats: st}))
 }
 
 // response is what a comparison needs: the body, and the parts of the response

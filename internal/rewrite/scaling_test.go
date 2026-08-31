@@ -210,14 +210,21 @@ func TestAllocationStaysBounded(t *testing.T) {
 		{"references and brackets", `&#91;http:`, 115},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			b := []byte(strings.Repeat(c.unit, (1<<20)/len(c.unit)))
+			// At the shipped cap, not a convenient megabyte. Measuring at 1 MiB
+			// and printing a ratio invites the reader to multiply wrong: the
+			// number that matters is the peak heap for one request at
+			// DefaultMaxBody, and concurrent bodies multiply it.
+			b := []byte(strings.Repeat(c.unit, (8<<20)/len(c.unit)))
 			runtime.GC()
 			var before, after runtime.MemStats
 			runtime.ReadMemStats(&before)
 			HostLeaksBack(m, b)
 			runtime.ReadMemStats(&after)
 			ratio := float64(after.TotalAlloc-before.TotalAlloc) / float64(len(b))
-			t.Logf("%s: %.0fx the body", c.name, ratio)
+			t.Logf("%s: %.0fx the body — %.0f MB churned, %.0f MB peak heap for one "+
+				"%d MiB request", c.name, ratio,
+				float64(after.TotalAlloc-before.TotalAlloc)/(1<<20),
+				float64(after.HeapSys)/(1<<20), len(b)>>20)
 			if ratio > c.ceiling {
 				t.Errorf("%s: transient allocation is %.0fx the body, ceiling %.0fx",
 					c.name, ratio, c.ceiling)

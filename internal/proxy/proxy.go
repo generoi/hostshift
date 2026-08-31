@@ -643,6 +643,22 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 			out = rewrite.SweepBytes(out, rev, p.Stats, p.log())
 		}
 	default:
+		// A PHP-serialized payload is length-prefixed, so any rewrite that
+		// changes a byte count leaves `s:33:` over a 24-byte string and PHP
+		// refuses the whole structure. See rewrite.LooksSerialized: PLAN sells
+		// the design partly on "nothing ever rewrites serialized data", which is
+		// true of data at rest and was false here.
+		if rewrite.LooksSerialized(buf) {
+			p.log().Warn("request body carries PHP-serialized data, passing it through "+
+				"untouched: rewriting it would leave the length prefixes stale",
+				"content-type", r.Header.Get("Content-Type"), "bytes", len(buf))
+			p.Stats.Record(rewrite.SurfaceRequestBody, 0, []origin.Event{{
+				Surface: rewrite.SurfaceRequestBody, Action: origin.ActionSkipped,
+				Reason: origin.ReasonSerialized,
+			}})
+			out = buf
+			break
+		}
 		var ev []origin.Event
 		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
 		out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceRequestBody, 0)

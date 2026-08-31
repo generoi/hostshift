@@ -108,6 +108,20 @@ const encoders = {
   named: (u) => u.replace(/\//g, "&sol;").replace(/:/g, "&colon;"),
   // CSS hex escapes, which the CSS tokenizer decodes before anything sees a URL.
   css: (u) => u.replace(/:/g, "\\3a ").replace(/\//g, "\\2f "),
+  // A character reference spelling a control the URL parser *removes*. The
+  // corpus had zero of these and two consecutive leaks lived here: the decoders
+  // strip tab, LF and CR and their reference spellings, but only stripForURL
+  // did, and its three siblings reached it solely as a fall-through. So a
+  // reference-encoded separator with a reference-encoded LF between its slashes
+  // survived every decode that actually fired.
+  refsctl: (u) => u.replace(/\//g, "&#47;").replace(/:/g, "&#58;")
+    .replace("&#47;&#47;", "&#47;&#10;&#47;"),
+  //
+  // The other half of that shape — an unrelated backslash elsewhere in the
+  // *buffer* — is a property of the document, not of the URL, so it belongs in
+  // the Go surface wrappers rather than here: prefixing one to the candidate
+  // would change what the candidate resolves to and the row's expectation with
+  // it.
 };
 
 const seen = new Set();

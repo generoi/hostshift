@@ -121,6 +121,23 @@ var surfaces = []struct {
 	// TestCSSEscapesAreRewritten covers that path against a real browser.
 	{"inline style", true, func(u string) string { return `<style>a{background:url(` + u + `)}</style>` }},
 	{"comment", false, func(u string) string { return `<!-- ` + u + ` -->` }},
+	// Foreign content, where the HTML tokenizer never enters a raw-text state —
+	// so a <script> or <style> inside <svg> decodes character references that
+	// the same element outside it does not. Two of the last three leaks lived on
+	// exactly these surfaces and the matrix had no entry for any of them.
+	{"svg image href", false, func(u string) string {
+		return `<svg xmlns="http://www.w3.org/2000/svg"><image href="` + u + `"/></svg>`
+	}},
+	{"svg script", false, func(u string) string { return `<svg><script>fetch("` + u + `")</script></svg>` }},
+	{"svg text", false, func(u string) string { return `<svg><text>` + u + `</text></svg>` }},
+	{"svg style", true, func(u string) string { return `<svg><style>a{background:url(` + u + `)}</style></svg>` }},
+	// The same attribute with an unrelated backslash elsewhere in the document.
+	// That is a property of the buffer rather than of the URL, so the corpus
+	// cannot express it — and it is what sent stripForCSS down its real decode
+	// path and re-opened a leak for every origin in the body.
+	{"href, backslash in the document", false, func(u string) string {
+		return `<p>C:\tmp and a c quote</p><a href="` + u + `">x</a>`
+	}},
 }
 
 // knownRelativePortLimit is the one place hostshift and the parser disagree, and
@@ -160,16 +177,30 @@ func decodesHere(enc, surface string) bool {
 	switch enc {
 	case "raw":
 		return true
-	case "refs", "named":
+	// refsctl is refs with a reference-spelled LF or TAB between the slashes —
+	// a control the URL parser removes. It decodes exactly where refs does.
+	case "refs", "named", "refsctl":
 		// Attribute values only. An HTML parser decodes references in a text node
 		// too, but what it produces there is *displayed*, not resolved — test 28
 		// is about origins the browser dereferences, and nothing fetches a
 		// paragraph. In an attribute the decoded value is exactly what the URL
 		// parser is handed, and data-* counts because that is what a lazyload
 		// assigns to src.
-		return surface == "href" || surface == "src" || surface == "data-attr"
+		//
+		// And every surface inside <svg>, where the tokenizer never enters a
+		// raw-text state: a reference in an svg <script>, <text> or <style> is
+		// decoded, and the svg <image href> is an attribute like any other.
+		// That is where round twenty-one's leak was, and the matrix could not
+		// express it.
+		switch surface {
+		case "href", "src", "data-attr",
+			"svg image href", "svg script", "svg text", "svg style",
+			"href, backslash in the document":
+			return true
+		}
+		return false
 	case "css":
-		return surface == "inline style"
+		return surface == "inline style" || surface == "svg style"
 	}
 	return false
 }

@@ -565,3 +565,81 @@ func TestBothPathsAgreeOnWhatIsAnAuthority(t *testing.T) {
 		})
 	}
 }
+
+// slashRunStarts must stay a subset of urlTokenStarts.
+//
+// Anchoring slashRunStarts on a token boundary — which it needed, to stop
+// mistaking a path segment for an authority — made its second pass over the
+// same view unable to find anything the first had not, so rewriteAll dropped
+// it. That saved a full extra pass on every buffer containing one non-ASCII
+// byte: on an 8 MiB body a single `ä` was costing 136 MB of transient
+// allocation for a pass that could no longer match.
+//
+// This is the property that made the removal safe, so it is asserted rather
+// than assumed. If either scan changes, this fails before a leak appears.
+func TestSlashRunStartsAreASubsetOfTokenStarts(t *testing.T) {
+	alphabet := []byte(`/\:hs.aä[]& `)
+	var buf []byte
+	var rec func(depth int)
+	rec = func(depth int) {
+		if depth == 0 {
+			tok := map[int]bool{}
+			for _, i := range urlTokenStarts(buf) {
+				tok[i] = true
+			}
+			for _, i := range slashRunStarts(buf) {
+				if !tok[i] {
+					t.Fatalf("slashRunStarts(%q) yields %d, which urlTokenStarts does not",
+						buf, i)
+				}
+			}
+			return
+		}
+		for _, c := range alphabet {
+			buf = append(buf, c)
+			rec(depth - 1)
+			buf = buf[:len(buf)-1]
+		}
+	}
+	// Every string of length 5 over the alphabet that matters: the slashes and
+	// backslashes the scan looks for, a scheme, a host character, a non-ASCII
+	// byte to arm the old gate, the brackets that made hostRange quadratic, an
+	// ampersand, and a space to make a boundary.
+	rec(5)
+}
+
+// urlLeaks must not return after the locator and skip the reference view.
+//
+// The comment above that call records that the *entity* pass's early return
+// there was a leak and was removed; this one was left. It skipped refsLeak —
+// "the view that survives a value decodeURLRefs declines" — so an attribute
+// holding a fusing fragment, an origin the locator catches, and a
+// reference-encoded origin rewrote the first and served the second live, with
+// the census reporting a successful rewrite and zero skips.
+//
+// The fusing fragment is what forces the path: `&#6`+`&#48;`+`;` makes
+// decodeURLRefs decline the whole value, so only the view can see the second
+// origin. Chrome decodes `&#47;&#47;` in srcset and ping, and POSTs to a ping
+// URL on click.
+func TestTheLocatorDoesNotShortCircuitTheReferenceView(t *testing.T) {
+	m := viewMap(t)
+	for _, c := range []struct{ name, in string }{
+		{"srcset", `<img srcset="https:\\www.example.fi/1.png 1x, &#6&#48;; ` +
+			`https:&#47;&#47;www.example.fi/2.png 2x">`},
+		{"ping", `<a ping="https:\\www.example.fi/1 &#6&#48;; ` +
+			`https:&#47;&#47;www.example.fi/2" href="/x">t</a>`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			st := NewStats(false)
+			out := rewriteHTML(t, m, c.in, st)
+			if strings.Contains(out, "www.example.fi") {
+				t.Errorf("one origin was rewritten and another left live:\n in  %s\n out %s",
+					c.in, out)
+			}
+			if st.Total() < 2 {
+				t.Errorf("the census counted %d, so it reports a clean rewrite on a "+
+					"value that had two origins:\n%s", st.Total(), out)
+			}
+		})
+	}
+}

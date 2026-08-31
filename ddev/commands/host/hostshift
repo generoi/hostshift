@@ -1632,16 +1632,30 @@ hostshift: listening on"*) logs_has_banner=1 ;;
       # not fire on any deployment that had the problem, and the shipped test
       # passed because its fixture body is 41 bytes. This file documents the
       # same hazard in three other places and this walked into it anyway.
-      case "$probe_body" in
-        *"//$own"*)
+      # A count, not a substring, and a boundary after the host.
+      #
+      # One occurrence is an ordinary content link — a developer's note pointing
+      # at the worktree's own mailpit is exactly that, and mailpit is
+      # deliberately not proxied. The defect this exists for produces thirty-odd
+      # in <head> alone: canonical, feed, REST, oEmbed, shortlink. Warning on one
+      # meant warning on every `ddev start` of a healthy site, which is the
+      # warning a developer learns to ignore.
+      #
+      # The boundary stops `//own.ddev.site` matching inside
+      # `//own.ddev.site.cdn.example.net`, which is a different host.
+      hits="$(printf '%s' "$probe_body" \
+        | grep -oE "//${own//./\\.}[/\"'\''<> ?#:]" 2>/dev/null | wc -l | tr -d ' ' || true)"
+      [ -n "$hits" ] || hits=0
+      if [ "$hits" -ge 5 ]; then
           echo "hostshift: warning: the page served at https://$probe answers with" >&2
           echo "  links to $own, which is neither a canonical hostname nor a" >&2
           echo "  variant — so those links are not being rewritten and do not" >&2
           echo "  reach this preview. A stock DDEV WordPress does this: its" >&2
           echo "  wp-config-ddev.php pins WP_HOME to DDEV_PRIMARY_URL. Remove" >&2
-          echo "  that pin, or set WP_HOME to a canonical hostname." >&2
-          break ;;
-      esac
+          echo "  that pin, or set WP_HOME to a canonical hostname. If the marker" >&2
+          echo "  \`#ddev-generated\` is still on wp-config.php, remove that first" >&2
+          echo "  or DDEV will restore the pin on the next start." >&2
+      fi
     done <<<"$owns"
   fi
 

@@ -345,3 +345,51 @@ func TestVerdictFollowsWhatTheProxyActuallyDoes(t *testing.T) {
 		})
 	}
 }
+
+// The scorer must run the arm the proxy would run for this content type.
+//
+// originsIn ran NewResponseBody — the HTML pipeline — on every body, while the
+// proxy dispatches every `*xml` type to HostLeaksXMLCounted. The HTML pipeline
+// applies the reference view only where an HTML parser decodes one: attributes
+// and foreign content. Element content in an ordinary XML element is the gap,
+// and that is where every sitemap `<loc>` and every RSS `<link>` lives — so an
+// unrewritten feed scored GREEN, on the content types the proxy grew a
+// dedicated arm for, and against exactly the leak class two rounds were spent
+// fixing.
+//
+// The `<link href>` case is the control that shows it was a dispatch bug and
+// not a decode bug: an attribute, so the HTML parser's own entity pass caught it
+// and that one shape always worked.
+func TestTheScorerRunsTheArmTheProxyWouldRun(t *testing.T) {
+	m, err := origin.NewMatcher([]origin.Pair{{
+		Canonical: origin.MustParse("https://www.canon.test"),
+		Variant:   origin.MustParse("https://v.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ name, ctype, body string }{
+		{"a sitemap loc, reference-encoded", "application/xml",
+			`<urlset><url><loc>https:&#47;&#47;www.canon.test/x</loc></url></urlset>`},
+		{"an rss link, reference-encoded", "application/rss+xml",
+			`<rss><channel><item><link>https:&#47;&#47;www.canon.test/x</link></item></channel></rss>`},
+		{"an rss guid", "application/rss+xml",
+			`<rss><channel><item><guid>https:&#47;&#47;www.canon.test/x</guid></item></channel></rss>`},
+		{"a sitemap loc, css-escaped", "application/xml",
+			`<urlset><url><loc>https\3a \2f \2f www.canon.test/x</loc></url></urlset>`},
+		{"css escapes in plain text", "text/plain",
+			`a{background:url(https\3a \2f \2f www.canon.test/x)}`},
+		{"an atom link href, which always worked", "application/atom+xml",
+			`<feed><entry><link href="https:&#47;&#47;www.canon.test/x"/></entry></feed>`},
+		{"an ordinary page, which always worked", "text/html",
+			`<a href="https://www.canon.test/x">t</a>`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			leaks, tier2 := countLeaks(m, response{body: []byte(c.body), contentType: c.ctype})
+			if leaks == 0 && tier2 == 0 {
+				t.Errorf("a canonical origin the proxy rewrites was scored clean "+
+					"under %s:\n%s", c.ctype, c.body)
+			}
+		})
+	}
+}

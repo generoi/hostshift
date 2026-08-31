@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/generoi/hostshift/internal/origin"
 )
 
 // Every spelling the response direction can emit, the request direction must be
@@ -203,5 +206,45 @@ func TestRequestSideRewritesAreCounted(t *testing.T) {
 					"nothing:\n in  %s\n out %s", c.body, up)
 			}
 		})
+	}
+}
+
+// A PHP-serialized request body is passed through, not rewritten.
+//
+// These are length-prefixed: `s:33:"https://variant/x"` rewritten to a shorter
+// canonical leaves `s:33:` over a 24-byte string, and PHP then refuses the
+// whole structure — "unserialize(): Error at offset 5" and a bool(false) where
+// an options array should be. PLAN sells the design partly on "nothing ever
+// rewrites serialized data, so nothing can corrupt it", which is true of data
+// at rest and was false of anything travelling through a request body.
+//
+// A round trip is self-healing, which is why nothing caught it: the length is
+// restored on the way back. Only a one-way flow corrupts, and it lands in a
+// shared database with no undo and no error.
+//
+// Skipping is the conservative half of a real trade: the variant hostname then
+// reaches the database, which is wrong but recoverable by search-replace, where
+// a stale length prefix is not recoverable at all.
+func TestSerializedRequestBodiesArePassedThrough(t *testing.T) {
+	body := `a:1:{s:3:"url";s:` +
+		strconv.Itoa(len("https://"+variantHost+"/x")) +
+		`:"https://` + variantHost + `/x";}`
+
+	h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	})
+	h.do(t, "POST", variantHost, "/wp-admin/options.php",
+		"application/x-www-form-urlencoded", []byte(body))
+	up, _ := io.ReadAll(h.seen.Body)
+	if string(up) != body {
+		t.Errorf("a serialized body was rewritten, so its length prefixes are now "+
+			"stale and PHP will refuse it:\n in  %s\n out %s", body, up)
+	}
+	// And the skip is counted, so the census says something happened rather than
+	// reporting a clean pass-through — the instrument-lies failure this project
+	// has hit four times.
+	// Skips are keyed by reason, not by surface.
+	if n := h.stats.Snapshot().Skips[origin.ReasonSerialized]; n == 0 {
+		t.Error("the body was skipped silently; the census reports nothing")
 	}
 }

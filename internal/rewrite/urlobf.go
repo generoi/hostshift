@@ -984,10 +984,20 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	if h == nil || len(h.to) == 0 {
 		return v
 	}
+	// One pass, not two.
+	//
+	// The second pass over slashRunStarts existed because that scan found
+	// scheme-relative authorities urlTokenStarts did not. Anchoring
+	// slashRunStarts on a token boundary — which it needed, to stop rewriting
+	// path segments — made it a strict subset of urlTokenStarts, so the pass
+	// could no longer find anything the pass above it had not already found.
+	// TestSlashRunStartsAreASubsetOfTokenStarts pins that, because it is what
+	// makes removing this safe.
+	//
+	// It was not free: the gate is one non-ASCII byte anywhere in the buffer, so
+	// every Finnish page, feed, sitemap and request body paid for it. On an
+	// 8 MiB body a single `ä` took transient allocation from 156 MB to 292 MB.
 	v = h.spliceHosts(v, urlTokenStarts, value, ev)
-	if hasNonASCII(v) {
-		v = h.spliceHosts(v, slashRunStarts, value, ev)
-	}
 	// The CSS view too, because the *forward* direction emits it.
 	//
 	// cssEscapeLeak splices the host into the escaped spelling, so a style
@@ -1327,6 +1337,9 @@ func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
 // the filter became a Counted caller in the same change — and are kept because
 // the internal chain still needs a nil-accumulator path.
 func HostLeaksCounted(m *origin.Matcher, b []byte, value bool, st *Stats, surface string, base int) []byte {
+	if m == nil || len(b) == 0 {
+		return b
+	}
 	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
 		return hostsFor(m).rewriteAll(b, value, ev)
 	})
@@ -1344,6 +1357,9 @@ func HostLeaksBackCounted(m *origin.Matcher, b []byte, st *Stats, surface string
 
 // HostLeaksXMLCounted is HostLeaksXML with the census wired up.
 func HostLeaksXMLCounted(m *origin.Matcher, b []byte, value bool, st *Stats, surface string, base int) []byte {
+	if m == nil || len(b) == 0 {
+		return b
+	}
 	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
 		return hostsFor(m).rewriteAllRefs(b, value, ev)
 	})
@@ -1358,4 +1374,41 @@ func counted(st *Stats, surface string, base int, f func(*[]origin.Event) []byte
 	}
 	st.Record(surface, base, ev)
 	return out
+}
+
+// LooksSerialized reports whether b carries a PHP-serialized string, which is
+// length-prefixed and therefore cannot survive a rewrite that changes a byte
+// count.
+//
+// `s:33:"https://variant/x"` becomes `s:33:"https://canonical/x"` with the
+// prefix left stale, and PHP then refuses the whole structure:
+// "unserialize(): Error at offset 5" and a bool(false) where an options array
+// should be. PLAN §"Runtime component" sells the design partly on "nothing ever
+// rewrites serialized data, so nothing can corrupt it" — true of data at rest,
+// and false of anything travelling through a request body, which §5.1
+// explicitly rewrites. Settings import/export textareas, page-builder blobs and
+// custom-field editors all carry these, and the write lands in a shared
+// database with no undo and no error.
+//
+// A round trip is self-healing, which is why nothing caught it: the length is
+// restored on the way back. Only a one-way flow corrupts.
+//
+// Skipping is the conservative half of the trade. An origin inside a serialized
+// payload then reaches the database as the variant, which is wrong but
+// recoverable by a search-replace; a broken length prefix is not recoverable at
+// all, because the structure no longer parses.
+func LooksSerialized(b []byte) bool {
+	for i := 0; i+3 < len(b); i++ {
+		if b[i] != 's' || b[i+1] != ':' {
+			continue
+		}
+		j := i + 2
+		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+			j++
+		}
+		if j > i+2 && j+1 < len(b) && b[j] == ':' && b[j+1] == '"' {
+			return true
+		}
+	}
+	return false
 }

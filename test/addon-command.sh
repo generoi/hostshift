@@ -1025,11 +1025,47 @@ ahcase "a flow list spanning lines"              'additional_hostnames: [\n  - b
 # page names an origin the map knows, and every gate passed: injective and
 # anchored, containers up, probe 200. Only `hostshift diff` caught it, and the
 # README points worktree users at `check`.
+# The real shape: WP_HOME pinned puts the hostname in canonical, feed, REST,
+# oEmbed and shortlink links, thirty-odd times in <head> alone.
+pinned='<link rel="canonical" href="https://acme-wt-a.ddev.site/">
+<link rel="alternate" href="https://acme-wt-a.ddev.site/feed/">
+<link rel="https://api.w.org/" href="https://acme-wt-a.ddev.site/wp-json/">
+<link rel="shortlink" href="https://acme-wt-a.ddev.site/?p=1">
+<link rel="alternate" href="https://acme-wt-a.ddev.site/oembed/">
+<a href="https://acme-wt-a.ddev.site/x">t</a>'
 out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
-  HS_CURL_BODY='<a href="https://acme-wt-a.ddev.site/x">t</a>' \
+  HS_CURL_BODY="$pinned" \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a page answering with a hostname the map does not name is called out" \
   "which is neither a canonical hostname nor a" "$out"
+
+# But one incidental content link is not that, and warning on it meant warning
+# on every `ddev start` of a healthy site. A developer's note pointing at the
+# worktree's own mailpit is exactly one such link, and mailpit is deliberately
+# not proxied.
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
+  HS_CURL_BODY='<p>mail goes to <a href="https://acme-wt-a.ddev.site:8026/">mailpit</a></p>' \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"which is neither a canonical hostname nor a"*)
+    fail "one incidental link is not a pinned WP_HOME" "$out" ;;
+  *) pass "one incidental link is not a pinned WP_HOME" ;;
+esac
+
+# And a hostname that is only a prefix of a longer one is a different host.
+long='<img src="https://acme-wt-a.ddev.site.cdn.example.net/1.png">
+<img src="https://acme-wt-a.ddev.site.cdn.example.net/2.png">
+<img src="https://acme-wt-a.ddev.site.cdn.example.net/3.png">
+<img src="https://acme-wt-a.ddev.site.cdn.example.net/4.png">
+<img src="https://acme-wt-a.ddev.site.cdn.example.net/5.png">
+<img src="https://acme-wt-a.ddev.site.cdn.example.net/6.png">'
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site HS_CURL_BODY="$long" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"which is neither a canonical hostname nor a"*)
+    fail "a longer hostname that merely starts the same is not a match" "$out" ;;
+  *) pass "a longer hostname that merely starts the same is not a match" ;;
+esac
 # No subcommand prints usage rather than running init.
 #
 # `init` writes .ddev/.env and restarts every container, so a developer reaching
@@ -1060,7 +1096,7 @@ fi
 # grep exits on the first match, and everything still queued behind it dies.
 big="$(cd "$wt" && awk 'BEGIN{for(i=0;i<4000;i++)print "<p>filler filler filler</p>"}')"
 out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
-  HS_CURL_BODY="<a href=\"https://acme-wt-a.ddev.site/x\">t</a>
+  HS_CURL_BODY="$pinned
 $big" \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a page larger than the pipe buffer is still inspected" \
@@ -1068,7 +1104,7 @@ contains "a page larger than the pipe buffer is still inspected" \
 
 # Every hostname DDEV registers, not just the first of the comma-separated list.
 out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site,extra-wt-a.ddev.site \
-  HS_CURL_BODY='<a href="https://extra-wt-a.ddev.site/x">t</a>' \
+  HS_CURL_BODY="${pinned//acme-wt-a/extra-wt-a}" \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a hostname past the first in DDEV_HOSTNAME is inspected too" \
   "links to extra-wt-a.ddev.site" "$out"
