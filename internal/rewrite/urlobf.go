@@ -80,17 +80,6 @@ func newHostReplacer(m *origin.Matcher) *hostReplacer {
 	return h
 }
 
-// sameSchemeAsDocument reports whether a reference written with this scheme is
-// resolved against a base of the same scheme, which is what decides whether
-// `https:host` is an authority or a relative path.
-//
-// When the map spans both schemes the answer is unknowable from here, and the
-// safe reading is "not the same" — that treats more references as authorities,
-// which can only ever rewrite an origin that is already in the map.
-func (h *hostReplacer) sameSchemeAsDocument(scheme string) bool {
-	return len(h.schemes) == 1 && h.schemes[scheme]
-}
-
 // key normalises a parsed host to the form the table is keyed on: lowercase,
 // no root dot, and the browser's domain-to-ASCII.
 //
@@ -421,25 +410,32 @@ func (h *hostReplacer) schemeAt(b []byte, at int) string {
 	return "https"
 }
 
-func (h *hostReplacer) authorityStart(b []byte) int {
-	if n, scheme := schemeLen(b); n > 0 {
+func (h *hostReplacer) authorityStart(b []byte) (int, bool) {
+	if n, _ := schemeLen(b); n > 0 {
 		i := n
 		for i < len(b) && isSlashish(b[i]) {
 			i++
 		}
-		if i-n >= 2 || !h.sameSchemeAsDocument(scheme) {
-			return i
+		if i-n >= 2 {
+			return i, false
 		}
-		return -1
+		// Fewer than two slashes: an authority only if this scheme differs from
+		// the document's. Whether it does cannot be known until the host is
+		// looked up, because the document is served at *this host's* variant —
+		// so the caller is told to confirm it, rather than a whole-map guess
+		// being made here. Guessing from the map was wrong on a mixed-scheme
+		// map: `https:www.example.fi/x`, a path to a browser on an https page,
+		// was rewritten because some *other* site's variant happened to be http.
+		return i, true
 	}
 	i := 0
 	for i < len(b) && isSlashish(b[i]) {
 		i++
 	}
 	if i >= 2 {
-		return i
+		return i, false
 	}
-	return -1
+	return -1, false
 }
 
 // hostRange returns the byte range of the host in b, starting at the authority.
@@ -612,7 +608,7 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 	// `http://h:443`, whose 443 is not http's default and so is a different
 	// origin, was rewritten.
 	scheme := h.schemeAt(n.b, at)
-	rel := h.authorityStart(n.b[at:])
+	rel, needsDifferingScheme := h.authorityStart(n.b[at:])
 	if rel < 0 {
 		return 0, 0, "", false
 	}
@@ -646,6 +642,12 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 		to, ok = h.to[host]
 	}
 	if !ok {
+		return 0, 0, "", false
+	}
+	// The confirmation authorityStart asked for: with fewer than two slashes this
+	// is an authority only when the reference's scheme differs from the one the
+	// document is served on, which is this host's own variant scheme.
+	if needsDifferingScheme && to.Scheme == scheme {
 		return 0, 0, "", false
 	}
 	// Whatever the original spelled the host with — a tab, a reference, a

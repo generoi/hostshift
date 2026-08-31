@@ -104,3 +104,44 @@ func TestOneHostCannotMapTwoWays(t *testing.T) {
 		t.Errorf("the error does not say what is wrong: %v", err)
 	}
 }
+
+// On a mixed-scheme map the "does this scheme differ from the document's"
+// question has to be asked per *host*, not per map.
+//
+// The document is served at the matched host's own variant, so guessing from
+// whether the map as a whole spans both schemes rewrote a path: `https:h/x` is a
+// relative path to a browser on an https page, and it was being rewritten
+// because some other site's variant happened to be http.
+func TestSchemeQuestionIsPerHost(t *testing.T) {
+	m, err := origin.NewMatcher([]origin.Pair{
+		{Name: "a", Canonical: origin.MustParse("https://www.example.fi"),
+			Variant: origin.MustParse("https://wt-a--example.ddev.site")},
+		{Name: "b", Canonical: origin.MustParse("https://www.example2.fi"),
+			Variant: origin.MustParse("http://wt-a--example2.ddev.site")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, in string
+		change   bool
+	}{
+		// Served on https, so a same-scheme reference with no slashes is a path.
+		{"same scheme is a path", `<a href="https:www.example.fi/x">y</a>`, false},
+		// A differing scheme is an authority, whatever the slash count.
+		{"a differing scheme is an authority", `<a href="http:www.example.fi/x">y</a>`, true},
+		// The site served on http is the mirror image.
+		{"the http site's own scheme is a path", `<a href="http:www.example2.fi/x">y</a>`, false},
+		{"and https is an authority for it", `<a href="https:www.example2.fi/x">y</a>`, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := rewriteHTML(t, m, c.in, NewStats(false))
+			if c.change && out == c.in {
+				t.Errorf("an authority was not rewritten:\n%s", out)
+			}
+			if !c.change && out != c.in {
+				t.Errorf("a path was rewritten:\n got %s\nwant %s", out, c.in)
+			}
+		})
+	}
+}
