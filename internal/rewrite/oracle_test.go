@@ -238,6 +238,17 @@ func TestURLShapesAgainstBrowserOracle(t *testing.T) {
 // the wrapper survives — and the request direction has to reverse every one of
 // them, or a form post writes a worktree-local hostname into the database §4.3
 // says stays byte-identical to production.
+// cssEscapeScheme rewrites `https://` as CSS writes it, so the forward pass has
+// something to splice a host into in escaped form.
+func cssEscapeScheme(u string) string {
+	for _, s := range []string{"https://", "http://"} {
+		if strings.HasPrefix(u, s) {
+			return strings.TrimSuffix(s, "://") + `\3a \2f \2f ` + u[len(s):]
+		}
+	}
+	return u
+}
+
 func TestOracleShapesRoundTrip(t *testing.T) {
 	shapes := loadShapes(t)
 	fwd := oracleMatcher(t, "https")
@@ -249,24 +260,55 @@ func TestOracleShapesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Every surface, not just href. The forward direction splices in place, so
+	// each surface's own encoding survives into what the browser is handed — and
+	// round sixteen found the CSS one emitting `url(https\3a \2f \2f <variant>/x)`,
+	// which nothing on the request path could read, so the *variant* hostname was
+	// written into the database §4.3 says stays byte-identical to production.
+	// That is the general rule this asserts: every spelling the forward direction
+	// can emit, the reverse must be able to read.
+	wrappers := []struct {
+		name string
+		wrap func(string) string
+	}{
+		{"href", func(u string) string { return `<a href="` + u + `">x</a>` }},
+		{"style attribute", func(u string) string { return `<div style="background:url(` + u + `)">x</div>` }},
+		{"style element", func(u string) string { return `<style>a{background:url(` + u + `)}</style>` }},
+		{"inline script", func(u string) string { return `<script>fetch("` + u + `")</script>` }},
+		{"text", func(u string) string { return `<p>` + u + `</p>` }},
+		{"srcset", func(u string) string { return `<img srcset="` + u + ` 1x">` }},
+		// CSS-escaped input, which is what makes the forward pass *emit* the
+		// escaped spelling — the one round sixteen found the request path could
+		// not read. Wrapping a plain URL in a style attribute is not enough: the
+		// ordinary locator handles that and emits a plain variant.
+		{"css-escaped style attribute", func(u string) string {
+			return `<div style="background:url(` + cssEscapeScheme(u) + `)">x</div>`
+		}},
+		{"css-escaped style element", func(u string) string {
+			return `<style>a{background:url(` + cssEscapeScheme(u) + `)}</style>`
+		}},
+	}
+
 	var bad int
 	for i, sh := range shapes {
 		if i%37 != 0 || sh.base != "https" || strings.TrimSuffix(sh.resolved, ".") != oracleCanonical {
 			continue
 		}
-		served := rewriteHTML(t, fwd, `<a href="`+sh.candidate+`">x</a>`, NewStats(false))
-		// What the browser would send back: the rewritten value, through the
-		// request direction.
-		back := string(HostLeaks(rev, []byte(served), true))
-		if strings.Contains(back, oracleVariant) {
-			bad++
-			if bad <= 10 {
-				t.Errorf("a variant hostname survives the request direction:\n from %q\n sent %q\n back %q",
-					sh.candidate, served, back)
+		for _, w := range wrappers {
+			served := rewriteHTML(t, fwd, w.wrap(sh.candidate), NewStats(false))
+			// What the browser would send back: the rewritten value, through the
+			// request direction.
+			back := string(HostLeaks(rev, []byte(served), true))
+			if strings.Contains(back, oracleVariant) {
+				bad++
+				if bad <= 10 {
+					t.Errorf("[%s] a variant hostname survives the request direction:\n from %q\n sent %q\n back %q",
+						w.name, sh.candidate, served, back)
+				}
 			}
 		}
 	}
 	if bad > 10 {
-		t.Errorf("%d shapes did not round-trip", bad)
+		t.Errorf("%d shape/surface combinations did not round-trip", bad)
 	}
 }
