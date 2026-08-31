@@ -1,6 +1,7 @@
 package rewrite
 
 import (
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -201,6 +202,201 @@ func TestAnAbsurdLengthDoesNotPanic(t *testing.T) {
 			out := string(RepairSerialized([]byte(in), func(b []byte) []byte { return b }))
 			if out != in {
 				t.Errorf("an identity rewrite changed bytes:\n in  %s\n out %s", in, out)
+			}
+		})
+	}
+}
+
+// The failure that drove three rewrites of this file: a valid row, served
+// through an arm that cannot repair, and posted back.
+//
+// The streamed HTML arm rewrites hosts without re-emitting lengths, so what the
+// browser holds has every length stale. The request direction must put it back
+// exactly — and to do that it has to *decline*, because the numbers it would
+// compute are for the variant, not for what the row originally held.
+//
+// Earlier attempts guessed locally: believe the length if the span closes where
+// it says, then also if what follows can follow a serialized value. Both were
+// wrong, because `";}` and `";i:` are what correct serialized data looks like.
+// Only walking the grammar separates a real boundary from a false one.
+func TestAStaleBlobComesHomeUnchanged(t *testing.T) {
+	canon, variant := "https://www.acmecorp.fi", "https://wt-a--acmecorp.ddev.site"
+	toVariant := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	toCanon := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}
+
+	// Every length is computed. Three fixtures in this file have now been wrong
+	// by a byte or two because they were written by hand, and a span that does
+	// not parse exercises nothing — the test passes and proves nothing.
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	arr := func(parts ...string) string {
+		return `a:` + strconv.Itoa(len(parts)/2) + `:{` + strings.Join(parts, "") + `}`
+	}
+	for _, row := range []string{
+		// The shape the breaker measured: an array serialized inside a string,
+		// so the stale outer length lands on the inner string's own `";`.
+		str(arr(`i:0;`, str(canon), `i:1;`, `N;`)),
+		// Three URLs, so the deltas accumulate.
+		arr(`i:0;`, str(canon), `i:1;`, str(canon+"/a"), `i:2;`, str(canon+"/b")),
+		// An object.
+		`O:8:"stdClass":1:{` + str("u") + str(canon) + `}`,
+		// Doubly serialized.
+		str(str(arr(`i:0;`, str(canon), `i:1;`, `N;`))),
+	} {
+		t.Run(row, func(t *testing.T) {
+			// Assert the fixture is what we think before asserting the result.
+			assertEveryLength(t, row)
+			// What a streamed arm serves: hosts swapped, no length re-emitted.
+			wire := string(toVariant([]byte(row)))
+			if wire == row {
+				t.Fatal("the fixture does not contain the canonical host")
+			}
+			for _, ct := range []string{"literal", "percent"} {
+				in := wire
+				rw := toCanon
+				if ct == "percent" {
+					in = url.QueryEscape(wire)
+					rw = func(b []byte) []byte {
+						return []byte(strings.ReplaceAll(string(b),
+							url.QueryEscape(variant), url.QueryEscape(canon)))
+					}
+				}
+				got := string(RepairSerialized([]byte(in), rw))
+				want := row
+				if ct == "percent" {
+					got, _ = url.QueryUnescape(got)
+				}
+				if got != want {
+					t.Errorf("%s: the row did not come home:\n got  %s\n want %s", ct, got, want)
+				}
+			}
+		})
+	}
+}
+
+// A one-way write — content composed at the variant and posted, never served —
+// must still have its lengths re-emitted, because nothing will restore them.
+func TestAOneWayWriteIsRepaired(t *testing.T) {
+	canon, variant := "https://www.acmecorp.fi", "https://wt-a--acmecorp.ddev.site"
+	row := `a:1:{s:1:"u";s:` + strconv.Itoa(len(variant)) + `:"` + variant + `";}`
+	assertEveryLength(t, row)
+	got := string(RepairSerialized([]byte(row), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}))
+	want := `a:1:{s:1:"u";s:` + strconv.Itoa(len(canon)) + `:"` + canon + `";}`
+	if got != want {
+		t.Errorf("a one-way write was not repaired:\n got  %s\n want %s", got, want)
+	}
+}
+
+// A value that ends a line, an element or a CDATA section still repairs. The
+// previous attempt required the next bytes to be a serialized token, which made
+// the text and XML response arms stop repairing entirely.
+func TestATrailingContextDoesNotPreventRepair(t *testing.T) {
+	canon, variant := "https://a.test", "https://a.test.local"
+	body := `s:` + strconv.Itoa(len(canon)) + `:"` + canon + `";`
+	// A bare `"` is deliberately absent, and TestAQuoteAfterASpanIsDeclined says
+	// why: it is the one trailing byte that cannot be told from the residue of a
+	// truncated string.
+	for _, tail := range []string{"", "\n", "\r\n", " ", "\t", "]", ",", "]]>", "</meta>", "&x=1"} {
+		t.Run(strconv.Quote(tail), func(t *testing.T) {
+			got := string(RepairSerialized([]byte(body+tail), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), canon, variant))
+			}))
+			want := `s:` + strconv.Itoa(len(variant)) + `:"` + variant + `";` + tail
+			if got != want {
+				t.Errorf("a trailing %q prevented repair:\n got  %s\n want %s", tail, got, want)
+			}
+		})
+	}
+}
+
+// The one trailing byte that costs a repair, and why that is the right way
+// round.
+//
+// A value followed immediately by `"` is indistinguishable from a parse that
+// stopped short inside a string: both leave a quote sitting where the walk
+// finished. Believing it is how an ordinary `custom_css` option silently lost
+// six bytes on every view-and-save, parsing cleanly each time so nothing ever
+// reported it. Declining costs a repair on a shape that is rare — a serialized
+// value abutting a quote with no separator — and buys back the one failure in
+// this file that destroys data.
+func TestAQuoteAfterASpanIsDeclined(t *testing.T) {
+	canon, variant := "https://a.test", "https://a.test.local"
+	body := `s:` + strconv.Itoa(len(canon)) + `:"` + canon + `";"`
+	got := string(RepairSerialized([]byte(body), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}))
+	// The host is still rewritten — only the length is left alone.
+	if !strings.Contains(got, variant) {
+		t.Errorf("the host was not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, `s:`+strconv.Itoa(len(canon))+`:`) {
+		t.Errorf("the length was re-emitted from a parse that may have been "+
+			"truncated:\n%s", got)
+	}
+}
+
+// The measured failure, kept as a fixture: an ordinary Customizer `custom_css`
+// option whose CSS ends in `";}` and three newlines.
+//
+// The stale length lands on that `"`, the string closes, the very next `}`
+// closes the array with its arity satisfied, and the parse is *structurally
+// complete* — so walking the grammar is not by itself enough. What gives it
+// away is the residue: the tail of the true string, left over after a parse
+// that consumed a prefix. Each view-and-save trimmed six more bytes, and the
+// row parsed cleanly every time, so nothing reported it.
+func TestAnOrdinaryCustomCSSOptionSurvivesARoundTrip(t *testing.T) {
+	canon, variant := "https://jz25.ddev.site", "https://wt-a--jz25.ddev.site"
+	css := `.hero{background:url(` + canon + `/wp-content/uploads/bg.png);` +
+		`font-family:"Inter";}` + "\n\n\n"
+	seed := `a:1:{s:10:"custom_css";s:` + strconv.Itoa(len(css)) + `:"` + css + `";}`
+	assertEveryLength(t, seed)
+
+	// What a streamed arm serves: hosts swapped, no length re-emitted.
+	wire := strings.ReplaceAll(seed, canon, variant)
+	// Assert the setup really does create a false boundary, or this proves
+	// nothing — three fixtures in this file have failed that way.
+	stale := strings.Index(wire, `s:`+strconv.Itoa(len(css))+`:"`) + len(`s:`+strconv.Itoa(len(css))+`:"`)
+	if wire[stale+len(css)] != '"' {
+		t.Fatalf("the fixture does not put a quote at the stale offset; it has %q",
+			wire[stale+len(css)])
+	}
+
+	back := string(RepairSerialized([]byte(wire), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}))
+	if back != seed {
+		t.Errorf("the row did not come home:\n got  %q\n want %q", back, seed)
+	}
+}
+
+// An array whose contents do not match its declared arity is not something we
+// understand, and must be declined rather than partly rebuilt.
+//
+// Stopping at the first child that fails and closing the array anyway would
+// emit a *shorter* structure than arrived — which is the same class of silent
+// data loss as believing a stale length, arrived at from the other direction.
+func TestAnArrayMustSatisfyItsArity(t *testing.T) {
+	canon, variant := "https://a.test", "https://a.test.local"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	for _, c := range []struct{ name, in string }{
+		{"declares two pairs, holds one", `a:2:{s:1:"u";` + str(canon) + `}`},
+		{"declares one pair, holds none", `a:1:{}`},
+		{"a child that does not parse", `a:1:{s:1:"u";s:99:"` + canon + `";}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := string(RepairSerialized([]byte(c.in), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), canon, variant))
+			}))
+			// The host is still rewritten; nothing is re-emitted or dropped.
+			want := strings.ReplaceAll(c.in, canon, variant)
+			if got != want {
+				t.Errorf("a malformed array was rebuilt rather than declined:\n"+
+					" got  %s\n want %s", got, want)
 			}
 		})
 	}
