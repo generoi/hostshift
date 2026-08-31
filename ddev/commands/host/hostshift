@@ -1083,9 +1083,25 @@ if [ "$cmd" = "check" ]; then
   # copy-db thirty lines up already asks the web container for DB_HOST for this
   # exact reason. Running the query inside the container with its own environment
   # inherits that knowledge instead of duplicating it.
-  dbhome="$(ddev exec -s web bash -c \
-    "mysql -h \"\${DB_HOST:-db}\" -u\"\${DB_USER:-db}\" -p\"\${DB_PASSWORD:-db}\" -N -B \
-     -e \"select option_value from wp_options where option_name='home' limit 1\" \"\${DB_NAME:-db}\"" \
+  # wp-cli, which reads wp-config.php — the application's own answer.
+  #
+  # Reading DB_HOST from the container's shell environment was not the same
+  # question. The README's "Share the parent's" section sets DATABASE_URL, not
+  # DB_HOST, and Bedrock keeps credentials in a dotenv file that no `printenv`
+  # can see — so on the README's headline configuration the query hit the
+  # worktree's own idle container instead of the database the application reads.
+  #
+  # That was wrong in both directions, and the silent one is worse: a stale
+  # answer from the idle container *cleared* the parent-declares warning, so a
+  # preview serving live production origins was certified healthy. Reading a
+  # different database and calling it proof is the failure; asking the
+  # application removes the question.
+  #
+  # Best-effort, and silence is the only safe failure. No wp-cli, no WordPress,
+  # a stopped container or an unusual layout all yield nothing — and nothing
+  # neither clears a warning nor raises one, because an answer we cannot trust
+  # must not be treated as evidence in either direction.
+  dbhome="$(ddev exec -s web wp --skip-plugins --skip-themes --quiet option get home \
     2>/dev/null | tail -1 | tr -d '\r' || true)"
   dbhost=""
   case "$dbhome" in
@@ -1172,7 +1188,34 @@ if [ "$cmd" = "check" ]; then
   # to skip on the host side — `hostshift map` prints its `map from` header to
   # stderr, so stdout is pair lines only, and dropping one ate a real pair.
   norm_map() { awk '{ sub(/^[^ \t]+[ \t]+/, ""); gsub(/[ \t]+/, " "); print }' | LC_ALL=C sort -u; }
-  running_map="$(docker logs "ddev-$name-hostshift" 2>&1 | awk "$extract_map" | norm_map || true)"
+  logs="$(docker logs "ddev-$name-hostshift" 2>&1 || true)"
+  running_map="$(printf '%s\n' "$logs" | awk "$extract_map" | norm_map || true)"
+
+  # The image's version against this command's.
+  #
+  # `ddev add-on get` installs the command and the compose file from the repo,
+  # but the *engine* comes from a published image — so a developer can run
+  # today's command in front of last week's proxy, and every behaviour added in
+  # between is silently absent. Measured: on the published v0.1.0 image a feed
+  # came back with eighteen canonical URLs unrewritten and `check` still said
+  # "hostshift is serving", because it compares the map the container logged and
+  # never its version. The proxy prints its version on the line every
+  # `ddev logs -s hostshift` starts with, precisely so this is answerable.
+  #
+  # A warning, not a refusal: a lagging image is a reason to pull, not a reason
+  # to fail every start. Nothing is said when either version is unknown.
+  running_ver="$(printf '%s\n' "$logs" | sed -n 's/^hostshift \([^:]*\): listening on.*/\1/p' | tail -1)"
+  host_ver="$(hostshift --version 2>/dev/null | tail -1 | tr -d '\r' || true)"
+  if [ -n "$running_ver" ] && [ -n "$host_ver" ] && [ "$running_ver" != "$host_ver" ] &&
+     [ "$running_ver" != "dev" ] && [ "$host_ver" != "dev" ]; then
+    echo "hostshift: warning: the proxy image is $running_ver and this command is" >&2
+    echo "  $host_ver. The add-on installs the command from the repository and the" >&2
+    echo "  engine from a published image, so anything added between those two" >&2
+    echo "  versions is not running here — silently, since the map and the" >&2
+    echo "  hostnames still check out." >&2
+    echo "  \`ddev exec -s hostshift true\` aside, the fix is to pull:" >&2
+    echo "  \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
+  fi
   if [ -n "$running_map" ]; then
     want_map="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" 2>/dev/null \
       | norm_map || true)"
@@ -1216,6 +1259,12 @@ if [ "$cmd" = "check" ]; then
     code=""
     rc=0
     for attempt in 1 2 3; do
+      # Reset per attempt. Set once outside the loop, a first-attempt timeout —
+      # the cold-start race the retries exist for — left rc=28 sticky, so two
+      # subsequent 502s were relabelled "slow" and the refusal never ran. That is
+      # exactly the failure this probe exists to catch, certified healthy on an
+      # ordering that is ordinary on a busy machine.
+      rc=0
       code="$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' \
         --connect-timeout 3 --max-time 10 "https://$probe$port/" 2>/dev/null)" || rc=$?
       case "$code" in

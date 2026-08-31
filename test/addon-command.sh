@@ -22,7 +22,10 @@ GO="${GO:-go}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-"$GO" build -o "$work/hostshift" "$repo/cmd/hostshift"
+# Stamped, so the image-version comparison is exercisable. An unstamped build
+# reports "dev", which check deliberately says nothing about — a developer
+# running their own binary against a published image built it themselves.
+"$GO" build -ldflags "-X main.version=vtest" -o "$work/hostshift" "$repo/cmd/hostshift"
 export PATH="$work:$PATH"
 
 fails=0
@@ -739,6 +742,20 @@ printf 'hostshift: map from /project/hostshift.yaml\nmain  https://old.example  
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "check catches a hostshift.yaml edited without a restart" \
   "running a different map" "$out"
+
+# The image's version against the command's. `ddev add-on get` installs the
+# command from the repository and the engine from a published image, so a
+# developer can run today's command in front of last week's proxy — measured, a
+# feed came back with eighteen canonical URLs unrewritten while check said
+# "hostshift is serving", because it compared the logged map and never the
+# version.
+writefake
+printf 'hostshift v0.0.1-old: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"the proxy image is"*) pass "check notices an image older than the command" ;;
+  *) fail "check notices an image older than the command" "$out" ;;
+esac
 # The HTTP probe: a hard routing failure is fatal, an application answering is
 # not, and a cold start is retried rather than refused.
 #
@@ -772,6 +789,15 @@ out="$(cd "$wt" && HS_CURL_CODES="502" PATH="$fakecurl:$fakebin:$PATH" \
   "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a persistent 502 is refused" "so something between the router" "$out"
 
+# A timeout on the first attempt must not mask a 502 on the later ones. `rc` was
+# set once outside the loop, so a cold-start timeout left it sticky and the
+# refusal never ran — the failure this probe exists to catch, passed as healthy.
+: > "$HS_CURL_STATE"
+out="$(cd "$wt" && HS_CURL_CODES="000 502 502" HS_CURL_RC="28 0 0" \
+  PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a first-attempt timeout does not mask a later 502" \
+  "so something between the router" "$out"
+
 # An application answering — a 404, a redirect to wp-signup, an auth challenge —
 # means the request got there, which is the question being asked.
 for code in 404 302 401 200; do
@@ -794,10 +820,10 @@ fakedb="$work/fakedb"
 mkdir -p "$fakedb"
 cat > "$fakedb/ddev" <<'FAKEDDEV'
 #!/usr/bin/env bash
-# Only `ddev exec -s web bash -c <mysql...>` matters here.
+# `wp option get home` — the application's own answer, which is what check
+# asks for now rather than reading DB_HOST out of the container's environment.
 case "$*" in
-  *wp_options*) printf '%s
-' "${HS_FAKE_HOME:-}" ;;
+  *"option get home"*) printf '%s\n' "${HS_FAKE_HOME:-}" ;;
 esac
 exit 0
 FAKEDDEV

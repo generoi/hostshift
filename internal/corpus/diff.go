@@ -137,18 +137,45 @@ func compare(ctx context.Context, o Options, path string) Result {
 		return r
 	}
 
+	// A redirect verifies nothing about the body, and its Location is the header
+	// this design worries about most.
+	//
+	// Comparing bodies alone scored an all-redirect crawl as "3 pages, 3
+	// byte-identical, 0 leaks — GREEN" with hostshift not in the path at all,
+	// because two empty bodies are equal. The shapes that produce such a crawl
+	// are the documented ones: a worktree whose database is empty redirects every
+	// page to install.php, and a login-walled preview does the same. The README
+	// calls this the check that validates a deployment against reality.
+	if canon.status != variant.status {
+		r.Err = fmt.Errorf("status %d canonical, %d variant", canon.status, variant.status)
+		return r
+	}
+	if canon.location != "" || variant.location != "" {
+		wantLoc, _ := o.Map.Forward().Rewrite([]byte(canon.location), "header", false)
+		if string(wantLoc) != variant.location {
+			r.Err = fmt.Errorf("Location %q, want %q", variant.location, wantLoc)
+			return r
+		}
+		// A redirect with a matching Location and no body is verified; one with a
+		// body still has its body compared below.
+	}
+	if len(canon.body) == 0 && len(variant.body) == 0 && canon.location == "" {
+		r.Err = fmt.Errorf("empty body and no Location: nothing was verified")
+		return r
+	}
+
 	// The canonical bytes through the same engine the proxy runs.
 	want, err := io.ReadAll(rewrite.NewResponseBody(
-		strings.NewReader(string(canon)), o.Map.Forward(), nil, rewrite.Options{}))
+		strings.NewReader(string(canon.body)), o.Map.Forward(), nil, rewrite.Options{}))
 	if err != nil {
 		r.Err = err
 		return r
 	}
 
-	r.Equal = string(want) == string(variant)
+	r.Equal = string(want) == string(variant.body)
 	r.LinesCanonical = strings.Count(string(want), "\n")
-	r.LinesVariant = strings.Count(string(variant), "\n")
-	r.DiffLines = countDiffLines(string(want), string(variant))
+	r.LinesVariant = strings.Count(string(variant.body), "\n")
+	r.DiffLines = countDiffLines(string(want), string(variant.body))
 
 	// The safety-critical assertion, independent of byte equality: a live site
 	// differs between two fetches for a dozen innocent reasons (nonces,
@@ -163,7 +190,7 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// definition exactly the set of origins the proxy claims to rewrite, which
 	// makes this assertion say what it means: anything it still finds in the
 	// variant body is one the proxy should have caught and did not.
-	r.Leaks = countLeaks(o.Map.Forward(), variant)
+	r.Leaks = countLeaks(o.Map.Forward(), variant.body)
 	return r
 }
 
@@ -180,17 +207,25 @@ func countLeaks(m *origin.Matcher, body []byte) int {
 	return n
 }
 
-func fetch(ctx context.Context, o Options, base *url.URL, path string) ([]byte, error) {
+// response is what a comparison needs: the body, and the parts of the response
+// that decide whether the body means anything.
+type response struct {
+	body     []byte
+	status   int
+	location string
+}
+
+func fetch(ctx context.Context, o Options, base *url.URL, path string) (response, error) {
 	u := *base
 	ref, err := url.Parse(path)
 	if err != nil {
-		return nil, err
+		return response{}, err
 	}
 	u.Path, u.RawQuery = ref.Path, ref.RawQuery
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
-		return nil, err
+		return response{}, err
 	}
 	// Ask for identity so the comparison is over the bytes the rewriter saw.
 	req.Header.Set("Accept-Encoding", "identity")
@@ -201,10 +236,11 @@ func fetch(ctx context.Context, o Options, base *url.URL, path string) ([]byte, 
 	}
 	res, err := o.Client.Do(req)
 	if err != nil {
-		return nil, err
+		return response{}, err
 	}
 	defer res.Body.Close()
-	return io.ReadAll(res.Body)
+	b, err := io.ReadAll(res.Body)
+	return response{body: b, status: res.StatusCode, location: res.Header.Get("Location")}, err
 }
 
 // crawl collects same-host paths from the canonical site, breadth first.
@@ -229,11 +265,11 @@ func crawl(ctx context.Context, o Options) ([]string, error) {
 		queue = queue[1:]
 		out = append(out, p)
 
-		body, err := fetch(ctx, o, o.Canonical, p)
+		res, err := fetch(ctx, o, o.Canonical, p)
 		if err != nil {
 			continue
 		}
-		for _, link := range links(body) {
+		for _, link := range links(res.body) {
 			u, err := url.Parse(link)
 			if err != nil || u.Path == "" {
 				continue
