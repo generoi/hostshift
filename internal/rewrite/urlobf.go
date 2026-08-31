@@ -506,10 +506,72 @@ func (h *hostReplacer) authorityStart(b []byte) (int, bool) {
 // pinned CPU for one 8 MiB JSON request body, with no timeout on that path.
 // Third instance of the bug class scan.go documents; the other two callers were
 // fixed and this one was not.
+// An IPv6 literal is at most `[` plus 45 characters plus `]`; the slack is for a
+// zone id. It bounds the `]` search, which used to run to the end of the buffer.
+const maxIPv6 = 64
+
 const maxHost = 253 * 3
 
 func hostRange(b []byte, at int) (start, hostEnd, end int, port string) {
 	end = len(b)
+	// A bracket terminates the scan unless the authority *starts* with one.
+	//
+	// `[` and `]` are authority bytes, for an IPv6 literal, and tokenBoundary
+	// also treats them as boundaries — so `[` both began a candidate and failed
+	// to end one, and `[http:` repeated made every candidate scan to the end of
+	// the buffer. 400 KB took 58 seconds, 8 MiB extrapolates to about seven
+	// hours, on the response path, the request-body path and the JSON path
+	// alike. maxHost is checked after the scan, so it bounded the result and not
+	// the work.
+	//
+	// This is the fourth instance of the class, and the comment claiming "a
+	// candidate only starts after a non-authority byte, so the sum over
+	// candidates stays linear" was exactly the false premise: brackets are the
+	// counterexample, and they were made boundaries deliberately.
+	// The bracketed literal is settled first, and within a fixed window.
+	//
+	// `[` and `]` are authority bytes, for an IPv6 literal, and tokenBoundary
+	// also treats them as boundaries — so `[` both began a candidate and failed
+	// to end one. `[http:` repeated put a candidate every six bytes and an
+	// authority start on every `[`, and both the forward scan and the `]` search
+	// then ran to the end of the buffer: 400 KB took 58 seconds, and 8 MiB —
+	// DefaultMaxBody — extrapolates to about seven hours of pinned CPU for one
+	// request, on the response path, the request-body path and the JSON path
+	// alike. maxHost is checked after the scan, so it bounded the result and not
+	// the work.
+	//
+	// This is the fourth instance of the class in this file, and the comment
+	// below claiming "a candidate only starts after a non-authority byte, so the
+	// sum over candidates stays linear" was exactly the false premise: brackets
+	// are the counterexample, and they were made boundaries deliberately.
+	//
+	// Both halves are bounded by what the grammar allows rather than by a guess.
+	// A literal is at most `[` + 45 characters + `]`, plus a zone id; nothing
+	// longer is one, so a `]` that is not inside the window means this is not an
+	// authority rather than a literal we should keep looking for. And there is no
+	// userinfo to search for, because userinfo would precede the bracket.
+	if at < len(b) && b[at] == '[' {
+		lim := at + maxIPv6
+		if lim > len(b) {
+			lim = len(b)
+		}
+		k := bytes.IndexByte(b[at:lim], ']')
+		if k < 0 {
+			return at, at, at, ""
+		}
+		hostEnd = at + k + 1
+		end = hostEnd
+		for i := hostEnd; i < len(b); i++ {
+			if !isAuthorityByte(b[i]) || b[i] == '[' || b[i] == ']' {
+				break
+			}
+			end = i + 1
+		}
+		if hostEnd < end && b[hostEnd] == ':' {
+			port = string(b[hostEnd+1 : end])
+		}
+		return at, hostEnd, end, port
+	}
 	// Stop at anything that cannot be in an authority, not just at `/ \ ? #`.
 	//
 	// In an attribute the value *is* the URL, so the end of the buffer is the end
@@ -520,6 +582,10 @@ func hostRange(b []byte, at int) (start, hostEnd, end int, port string) {
 	// quote ends a host.
 	for i := at; i < end; i++ {
 		if !isAuthorityByte(b[i]) {
+			end = i
+			break
+		}
+		if b[i] == '[' || b[i] == ']' {
 			end = i
 			break
 		}
@@ -540,18 +606,6 @@ func hostRange(b []byte, at int) (start, hostEnd, end int, port string) {
 		return start, start, start, ""
 	}
 	hostEnd = end
-	// A bracketed IPv6 literal keeps its colons. Splitting at the first one put
-	// half the address in the "host" and the rest in the "port", so an IPv6
-	// variant could not be reversed at all.
-	if start < end && b[start] == '[' {
-		if k := bytes.IndexByte(b[start:end], ']'); k >= 0 {
-			hostEnd = start + k + 1
-			if hostEnd < end && b[hostEnd] == ':' {
-				port = string(b[hostEnd+1 : end])
-			}
-			return start, hostEnd, end, port
-		}
-	}
 	if k := bytes.IndexByte(b[start:end], ':'); k >= 0 {
 		port = string(b[start+k+1 : end])
 		hostEnd = start + k
@@ -671,7 +725,15 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 	// prose, and only the caller knows which surface it is on — the same
 	// distinction Matcher.RewriteText exists for. Absorbing it in a text node
 	// would eat the sentence's punctuation.
-	if !value && he > hs && n.b[he-1] == '.' {
+	//
+	// Only when the dot ends the authority, though: a full stop is never
+	// followed by `:80`, so in `http:www.example.fi.:80` the dot is the root
+	// label whatever the surface. Dropping it there split the host from its port
+	// and the splice replaced neither, so the forward pass emitted a *variant*
+	// with a root dot and a port that the request direction could not read back
+	// — the round trip §4.3 exists to hold. authorityEnd re-widening to the
+	// whole authority had been hiding it.
+	if !value && he == end && he > hs && n.b[he-1] == '.' {
 		he--
 	}
 	if hs >= he {
@@ -734,8 +796,15 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 }
 
 // authorityEnd is one past the port, or one past the host when there is none.
+//
+// The `:` check is the one portOf already makes, and leaving it out re-widened
+// the range to the whole authority — silently undoing the trailing-dot carve-out
+// locateHostIn had just applied for a text node, where a dot is a full stop and
+// not the host's root label. `See http:www.example.fi. Thanks` came out as
+// `See https://v.ddev.site Thanks`. Prose corruption rather than a leak, but it
+// is the `value` distinction this file is careful about everywhere else.
 func authorityEnd(n normalised, he, end int) int {
-	if end > he {
+	if end > he && n.b[he] == ':' {
 		return n.end[end-1]
 	}
 	return n.end[he-1]
@@ -926,9 +995,14 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool) []byte {
 }
 
 // rewriteAllRefs is rewriteAll for a consumer that decodes character references
-// — the XML family, and XHTML's script and style.
+// — the XML family, XHTML's script and style, and every request body.
 func (h *hostReplacer) rewriteAllRefs(v []byte, value bool) []byte {
-	return h.refsOnly(h.rewriteAll(v, value), value)
+	v = h.refsOnly(h.rewriteAll(v, value), value)
+	// And references spelling CSS escapes, which needs both decodes composed.
+	if h != nil && len(h.to) > 0 && bytes.IndexByte(v, '&') >= 0 {
+		v = h.spliceHostsIn(stripForRefsCSS(v), v, urlTokenStarts, value)
+	}
+	return v
 }
 
 // refsOnly is the reference view alone, for callers where the other views would
@@ -966,7 +1040,23 @@ func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bo
 }
 
 func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte) []int, value bool) []byte {
+	out, _ := h.spliceHostsLog(n, v, starts, value)
+	return out
+}
+
+// spliceHostsLog is spliceHostsIn with the events it performed, for the callers
+// that have a census to report to.
+//
+// Every view but the reference one went through the discarding wrapper, so
+// `--dry-run` on a page whose origins are all percent- or CSS-encoded printed
+// zero rewrites and zero candidates — and §5.8 makes that mode the thing you
+// point at a canonical checkout to decide whether a site needs hostshift at all.
+// It answered "nothing to do" on the very WooCommerce blob stripForPercent was
+// written for. That is the instrument-reporting-health-it-did-not-measure
+// failure the PLAN already records twice, reintroduced by the fix for it.
+func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte) []int, value bool) ([]byte, []origin.Event) {
 	var out []byte
+	var events []origin.Event
 	prev := 0
 	for _, off := range starts(n.b) {
 		if off < len(n.pos) && n.pos[off] < prev {
@@ -981,30 +1071,120 @@ func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte)
 		}
 		out = append(out, v[prev:from]...)
 		out = append(out, repl...)
+		events = append(events, origin.Event{
+			Offset: from,
+			Action: origin.ActionRewrote,
+			Text:   string(v[from:until]),
+		})
 		prev = until
 	}
 	if out == nil {
-		return v
+		return v, nil
 	}
-	return append(out, v[prev:]...)
+	return append(out, v[prev:]...), events
+}
+
+// composeView applies a second decoder to an already-decoded view, mapping the
+// result's positions all the way back to the original bytes.
+//
+// The views were siblings, never a stack: each one decoded the raw value its own
+// way and none of them ever saw another's output. So a spelling that needs two
+// decodes to become a URL went out byte-identical, and the census called the page
+// clean.
+func composeView(outer normalised, f func([]byte) normalised) normalised {
+	inner := f(outer.b)
+	n := normalised{
+		b:   inner.b,
+		pos: make([]int, len(inner.b)),
+		end: make([]int, len(inner.b)),
+	}
+	for i := range inner.b {
+		from, until := inner.pos[i], inner.end[i]-1
+		if from < 0 || from >= len(outer.pos) {
+			return inner // shapes we cannot map back: decline rather than corrupt
+		}
+		if until < from {
+			until = from
+		}
+		if until >= len(outer.end) {
+			until = len(outer.end) - 1
+		}
+		n.pos[i], n.end[i] = outer.pos[from], outer.end[until]
+	}
+	return n
+}
+
+// stripForRefsCSS is the CSS tokenizer's view of a value that the HTML parser
+// decodes references in first — a `style` attribute, or a `<style>` element
+// inside `<svg>`.
+//
+// `style="background:url(https&#92;3a &#92;2f &#92;2f h/x.png)"` is one Chrome
+// fetches: getAttribute returns exactly the bytes the plain `\3a ` spelling
+// gives, because HTML decodes `&#92;` to a backslash before the CSS tokenizer
+// ever runs. Neither view alone can see it — stripForCSS's `\` guard is false on
+// the still-encoded bytes, and stripForRefs decodes to a `\3a ` that no
+// reference view then unescapes. Any sanitiser or editor that entity-encodes a
+// backslash in an inline style produces it, and inline styles are where a page
+// builder's background images live.
+func stripForRefsCSS(v []byte) normalised {
+	return composeView(stripForRefs(v), stripForCSS)
 }
 
 // percentLeak is the percent-decoded view, for an encoding composed with
 // another one — `https%3A%5C%2F%5C%2Fhost`, which is what percent-encoding a
 // JSON-escaped URL produces and what WooCommerce hands to decodeURIComponent.
-func (w *HTML) percentLeak(v []byte) []byte {
+func (w *HTML) percentLeak(surface string, base int, v []byte, value bool) []byte {
 	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '%') < 0 {
 		return v
 	}
-	return w.hosts.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, true)
+	out, events := w.hosts.spliceHostsLog(stripForPercent(v), v, urlTokenStarts, value)
+	w.record(surface, base, events)
+	return out
+}
+
+// record stamps a view's events with its surface and the value's offset in the
+// document, which spliceHostsLog does not know, and hands them to the census.
+func (w *HTML) record(surface string, base int, events []origin.Event) {
+	for i := range events {
+		events[i].Surface = surface
+		events[i].Offset += base
+	}
+	w.stats.Record(surface, base, events)
+}
+
+// refsLeak is the reference view as a recorded HTML-surface catcher.
+//
+// The foreign-content and XHTML gate reached it through rewriteAllRefs, which
+// records nothing, so a reference-encoded origin inside `<svg><style>` was
+// rewritten with the census reporting a clean page.
+func (w *HTML) refsLeak(surface string, base int, v []byte, value bool) []byte {
+	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '&') < 0 {
+		return v
+	}
+	out, events := w.hosts.spliceHostsLog(stripForRefs(v), v, urlTokenStarts, value)
+	w.record(surface, base, events)
+	return out
+}
+
+// refsCSSLeak is stripForRefsCSS as a recorded HTML-surface catcher, for a style
+// surface whose references the parser decodes before the CSS tokenizer runs.
+func (w *HTML) refsCSSLeak(surface string, base int, v []byte) []byte {
+	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '&') < 0 {
+		return v
+	}
+	out, events := w.hosts.spliceHostsLog(stripForRefsCSS(v), v, urlTokenStarts, true)
+	w.record(surface, base, events)
+	return out
 }
 
 // cssEscapeLeak is the CSS-tokenizer view of a style surface.
-func (w *HTML) cssEscapeLeak(v []byte) []byte {
+func (w *HTML) cssEscapeLeak(surface string, base int, v []byte) []byte {
 	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '\\') < 0 {
 		return v
 	}
-	return w.hosts.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, true)
+	out, events := w.hosts.spliceHostsLog(stripForCSS(v), v, urlTokenStarts, true)
+	w.record(surface, base, events)
+	return out
 }
 
 // HostLeaks applies the URL-parser locator and the IDNA fold to a standalone
@@ -1028,6 +1208,24 @@ func HostLeaks(m *origin.Matcher, b []byte, value bool) []byte {
 // HostLeaksXML is HostLeaks for a body whose parser decodes character
 // references: the XML family, where `href="https:&#47;&#47;host"` is a live
 // reference in an SVG, a feed or a sitemap.
+// HostLeaksBack is HostLeaks for the request direction, which must be able to
+// read every spelling the response direction can emit.
+//
+// The two directions are not symmetric surfaces. Nothing decodes a character
+// reference in a text/plain *response*, so decoding one there would corrupt the
+// text — but the forward pass splices hosts into reference-encoded and
+// CSS-escaped spellings inside a page, and the editor or form that posts that
+// content back sends it as text/plain, urlencoded or JSON. Reading only the
+// plain spelling on the way in meant a *variant* hostname went upstream and into
+// the shared database, which is the one failure §4.3 says the whole design
+// exists to prevent.
+//
+// The rule, stated once: every spelling the forward direction can emit, the
+// reverse direction must be able to read.
+func HostLeaksBack(m *origin.Matcher, b []byte) []byte {
+	return hostsFor(m).rewriteAllRefs(b, true)
+}
+
 func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
 	if m == nil || len(b) == 0 {
 		return b

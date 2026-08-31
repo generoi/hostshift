@@ -37,13 +37,28 @@ func TestForwardEmissionsAreReadableInReverse(t *testing.T) {
 		`<a href="https:\\www.example.fi/x">y</a>`,
 		`<a href="https://u@www.example.fi/x">y</a>`,
 		`<a href="http:www.example.fi/x">y</a>`,
+		// The reference spellings. refsOnly splices the host into the *encoded*
+		// form, so the page carries `https:&#47;&#47;<variant>/x` — and the
+		// reverse direction had only one reference path where the HTML side has
+		// three, the one that declines a whole value when a fragment would fuse.
+		`<a href="https:&#47;&#47;www.example.fi/x">y</a>`,
+		`<a href="https:&#47;&#47;www.example.fi/x?a=&#6&#48;;b">y</a>`,
+		`<a href="https&colon;&sol;&sol;www.example.fi/x">y</a>`,
+		// And references spelling CSS escapes, which needs both decodes at once.
+		`<div style="background:url(https&#92;3a &#92;2f &#92;2f www.example.fi/h.jpg)">x</div>`,
+		// Percent, which is what percent-encoding a JSON-escaped URL produces.
+		`<script>f(decodeURIComponent("https%3A%5C%2F%5C%2Fwww.example.fi%2Fx"))</script>`,
 	} {
 		t.Run(in, func(t *testing.T) {
 			served := rewriteHTML(t, fwd, in, NewStats(false))
 			if strings.Contains(served, canon.Host) {
 				t.Fatalf("the forward pass left a canonical origin:\n%s", served)
 			}
-			back := string(HostLeaks(rev, []byte(served), true))
+			// HostLeaksBack, which is what the proxy uses on a request body:
+			// the response direction must not invent decodes a plain-text
+			// consumer does not perform, but the request direction has to read
+			// every spelling the response direction can emit.
+			back := string(HostLeaksBack(rev, []byte(served)))
 			if strings.Contains(back, variant.Host) {
 				t.Errorf("a variant hostname survives the request direction, so it "+
 					"would be written into the shared database:\n served %s\n back   %s",

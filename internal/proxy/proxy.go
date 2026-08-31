@@ -225,7 +225,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// which is what makes redirect_to=https%3A%2F%2F… work.
 	if q := r.Out.URL.RawQuery; q != "" {
 		out, ev := rev.Rewrite([]byte(q), rewrite.SurfaceRequestLine, explain)
-		out = rewrite.HostLeaks(rev, out, true)
+		out = rewrite.HostLeaksBack(rev, out)
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun {
 			r.Out.URL.RawQuery = string(out)
@@ -237,7 +237,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// — URL.String() percent-encodes, which would break test 24's spirit.
 	if esc := r.Out.URL.EscapedPath(); esc != "" {
 		out, ev := rev.Rewrite([]byte(esc), rewrite.SurfaceRequestLine, explain)
-		out = rewrite.HostLeaks(rev, out, true)
+		out = rewrite.HostLeaksBack(rev, out)
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun && string(out) != esc {
 			if dec, err := url.PathUnescape(string(out)); err == nil {
@@ -251,7 +251,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 		vs := r.Out.Header.Values(h)
 		for i, v := range vs {
 			out, ev := rev.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
-			out = rewrite.HostLeaks(rev, out, true)
+			out = rewrite.HostLeaksBack(rev, out)
 			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun {
 				vs[i] = string(out)
@@ -632,7 +632,7 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 	default:
 		var ev []origin.Event
 		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
-		out = rewrite.HostLeaks(rev, out, true)
+		out = rewrite.HostLeaksBack(rev, out)
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
 	}
 	if p.DryRun {

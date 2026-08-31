@@ -279,20 +279,30 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	if (w.xmlEnt || w.foreign > 0) &&
 		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
 			surface == SurfaceRawText || surface == SurfaceText) {
-		if w.hosts != nil {
-			out = w.hosts.rewriteAllRefs(out, false)
-		}
+		out = w.refsLeak(surface, base, out, false)
 	}
 	// Percent-decoding, on every surface: an encoding composed with another one
 	// hides from all three of the engine's models at once. A JSON-escaped URL
 	// that is then percent-encoded — WooCommerce's inline
 	// `JSON.parse(decodeURIComponent("…"))` blobs — was invisible to the byte
 	// matcher, to the locator and to the census alike.
-	out = w.percentLeak(out)
+	//
+	// `value` is threaded here like everywhere else. It was hardcoded true, so
+	// the percent spelling took the full stop at the end of a sentence into the
+	// host — `See https%3A%2F%2Fwww.example.fi. Thanks` lost the dot — while the
+	// plain and JSON spellings of the same sentence correctly kept it.
+	out = w.percentLeak(surface, base, out, value)
 	// CSS unescapes before the URL parser runs, so a style surface needs that
 	// view too — see stripForCSS.
 	if surface == SurfaceInlineStyle || (surface == SurfaceHTMLAttr && len(name) == 5 && bytes.EqualFold(name, []byte("style"))) {
-		out = w.cssEscapeLeak(out)
+		out = w.cssEscapeLeak(surface, base, out)
+		// And the two decodes composed, where the parser performs both: an
+		// attribute value always has its references decoded, and a `<style>`
+		// element does inside `<svg>`/`<math>` or in XHTML — the same gate the
+		// reference pass above uses.
+		if surface == SurfaceHTMLAttr || w.xmlEnt || w.foreign > 0 {
+			out = w.refsCSSLeak(surface, base, out)
+		}
 	}
 	// Every surface, because a host that only folds onto a canonical one — a
 	// soft hyphen, fullwidth letters, U+3002 for the dots, NFD — shares no bytes

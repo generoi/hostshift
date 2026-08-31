@@ -215,7 +215,16 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 	//
 	// value=true: a JSON string holding a URL is a value, so a trailing dot is
 	// the host's root label rather than a sentence's full stop.
-	out = hostsFor(m).rewriteAll(out, true)
+	//
+	// rewriteAllRefs, not rewriteAll: decodeURLRefs above declines an entire
+	// value when any fragment in it would fuse into a new reference, and a
+	// `&#6`+`&#48;`+`;` anywhere in a query string was enough to disable
+	// decoding for an ordinary `https:&#47;&#47;canonical/` in the same string.
+	// The HTML side grew refsOnly for exactly that; the JSON side kept the one
+	// path that declines. `content.rendered` is injected into the page as HTML,
+	// so that href was a live production link — the asymmetry this function's
+	// own header calls out, in the surface it was written to fix.
+	out = hostsFor(m).rewriteAllRefs(out, true)
 	if bytes.Equal(out, dec) {
 		return nil, false
 	}

@@ -60,6 +60,26 @@ func TestPassesStayLinear(t *testing.T) {
 			func(n int) string { return `<a ping="` + strings.Repeat(" /", n*3) + `">x</a>` },
 		},
 		{
+			// Brackets, the fourth instance of the class. `[` is an authority
+			// byte — for an IPv6 literal — *and* a token boundary, so it both
+			// began a candidate and failed to end one, and the `]` search in the
+			// bracketed branch ran to the end of the buffer as well. 400 KB took
+			// 58 seconds; 8 MiB, which is DefaultMaxBody, extrapolates to about
+			// seven hours of pinned CPU for one request.
+			"brackets, which are both an authority byte and a boundary",
+			func(n int) string { return "<p>" + strings.Repeat("[http:", n) + "</p>" },
+		},
+		{
+			// The same bug in the other branch, and the two need separate
+			// shapes: with `[http:` the authority starts *on* the bracket and
+			// takes the IPv6 path, whose `]` search is what runs away. One byte
+			// after the colon moves the start off the bracket and onto the
+			// general scan, where `[` was an authority byte that did not
+			// terminate it. Bounding one branch leaves the other quadratic.
+			"a bracket the general authority scan has to stop at",
+			func(n int) string { return "<p>" + strings.Repeat("[http:a", n) + "</p>" },
+		},
+		{
 			// CSS escapes, the newest decoder.
 			"css escapes",
 			func(n int) string {
@@ -114,7 +134,7 @@ func TestHostLeaksStaysLinear(t *testing.T) {
 		t.Fatal(err)
 	}
 	build := func(n int) []byte {
-		return []byte(`{"u":"` + strings.Repeat("http:", n) + `"}`)
+		return []byte(`{"u":"` + strings.Repeat("[http:", n) + `"}`)
 	}
 	run := func(n int) time.Duration {
 		b := build(n)
