@@ -279,6 +279,16 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	if (w.xmlEnt || w.foreign > 0) &&
 		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
 			surface == SurfaceRawText || surface == SurfaceText) {
+		// refsLeak alone, deliberately. The composed refs-then-CSS view would
+		// also fire here, and it is the wrong tool: a `<script>` inside <svg> is
+		// not CSS, so unescaping `\3a ` there would rewrite something no browser
+		// resolves — the mirror of the error this whole file guards against.
+		//
+		// What made `<svg><script>fetch("https:&#47;&#10;&#47;canonical/x")</script>`
+		// leak was not the missing composition but stripForRefs's removal pass,
+		// which tested isURLStripped alone and so left a reference-spelled LF in
+		// place. stripRemovals fixes it for every decoder at once, which is why
+		// this surface needs nothing of its own.
 		out = w.refsLeak(surface, base, out, false)
 	}
 	// Percent-decoding, on every surface: an encoding composed with another one

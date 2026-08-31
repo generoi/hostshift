@@ -210,15 +210,7 @@ func stripForRefs(v []byte) normalised {
 		end = append(end, i+1)
 		i++
 	}
-	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
-	for i := 0; i < len(dec); i++ {
-		if isURLStripped(dec[i]) {
-			continue
-		}
-		n.b = append(n.b, dec[i])
-		n.pos = append(n.pos, pos[i])
-		n.end = append(n.end, end[i])
-	}
+	n := stripRemovals(dec, pos, end)
 	return n
 }
 
@@ -260,15 +252,7 @@ func stripForPercent(v []byte) normalised {
 		end = append(end, i+1)
 		i++
 	}
-	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
-	for i := 0; i < len(dec); i++ {
-		if isURLStripped(dec[i]) {
-			continue
-		}
-		n.b = append(n.b, dec[i])
-		n.pos = append(n.pos, pos[i])
-		n.end = append(n.end, end[i])
-	}
+	n := stripRemovals(dec, pos, end)
 	return n
 }
 
@@ -331,14 +315,39 @@ func stripForCSS(v []byte) normalised {
 	}
 	// Now the URL parser's own removals, over the decoded bytes, carrying the
 	// map through.
+	n := stripRemovals(dec, pos, end)
+	return n
+}
+
+// stripRemovals is the URL parser's own removal pass over already-decoded bytes:
+// tab, LF and CR, and the character references that spell them.
+//
+// Each decoder used to run this inline and test isURLStripped alone, so a
+// reference-spelled control survived every decode that actually fired. The
+// removal only happened in stripForURL — which the three decoders reach only as
+// a *fall-through*, when their own trigger byte is absent. So one unrelated
+// backslash anywhere in the buffer sent stripForCSS down its real decode path
+// and re-opened the leak that composing the views was supposed to close, for
+// every origin in that buffer: a Windows path in an `<desc>`, a `\201c` in a
+// stylesheet, a regex in a sitemap. The trigger is buffer-wide, and for the XML
+// entry points the buffer is the whole body.
+func stripRemovals(dec []byte, pos, end []int) normalised {
 	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
-	for i := 0; i < len(dec); i++ {
+	for i := 0; i < len(dec); {
 		if isURLStripped(dec[i]) {
+			i++
 			continue
+		}
+		if dec[i] == '&' {
+			if k := removableRef(dec[i:]); k > 0 {
+				i += k
+				continue
+			}
 		}
 		n.b = append(n.b, dec[i])
 		n.pos = append(n.pos, pos[i])
 		n.end = append(n.end, end[i])
+		i++
 	}
 	return n
 }
@@ -888,7 +897,13 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 			out = append(out, repl...)
 			prev = until
 			w.stats.Record(surface, base, []origin.Event{{
-				Offset:  base + from,
+				// Not base+from: Stats.Record adds base itself. d3ad6a7 fixed
+				// that for the views going through w.record and said "all five
+				// newer views" — these two build their events inline and were
+				// missed, so the surfaces whose own comments say "a non-zero
+				// count is worth looking at" were the ones reporting an offset
+				// past the end of the document.
+				Offset:  from,
 				Surface: surface,
 				Action:  origin.ActionRewrote,
 				Text:    string(v[from:until]),
@@ -936,7 +951,8 @@ func (w *HTML) normaliseURLLeak(surface string, base int, v []byte, value bool) 
 		out = append(out, repl...)
 		prev = until
 		w.stats.Record(surface, base, []origin.Event{{
-			Offset:  base + from,
+			// Not base+from — see the note on the other inline builder above.
+			Offset:  from,
 			Surface: surface,
 			Action:  origin.ActionRewrote,
 			Text:    string(v[from:until]),
@@ -1029,7 +1045,15 @@ func slashRunStarts(b []byte) []int {
 		for run < len(b) && isSlashish(b[run]) {
 			run++
 		}
-		if run-i >= 2 {
+		// Anchored, the way foldedHostLeak anchors — its comment cites this
+		// exact input. `https://cdn.other/p//www.example.fi/q` is a path
+		// segment, not an authority, and the standalone path rewrote it while
+		// the HTML path correctly left it alone. The two spellings disagreeing
+		// is the model error the oracle's second half calls a false positive,
+		// and in the request direction it edits a path on its way into the
+		// shared database. The gate is one non-ASCII byte anywhere in the
+		// buffer, so one `ä` in a Finnish feed armed it for every candidate.
+		if run-i >= 2 && tokenBoundary(b, i) {
 			out = append(out, i)
 		}
 		i = run - 1
@@ -1299,8 +1323,9 @@ func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
 // The plain forms above rewrite silently, and every one of the proxy's eleven
 // call sites used them — so a body the engine rewrote forty origins in reported
 // zero, and `--dry-run` said a site needed no hostshift. Anything with a Stats
-// to report to should call these; the plain forms remain for the filter, where
-// there is no census, and for tests.
+// to report to should call these. The plain forms now have no non-test callers —
+// the filter became a Counted caller in the same change — and are kept because
+// the internal chain still needs a nil-accumulator path.
 func HostLeaksCounted(m *origin.Matcher, b []byte, value bool, st *Stats, surface string, base int) []byte {
 	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
 		return hostsFor(m).rewriteAll(b, value, ev)

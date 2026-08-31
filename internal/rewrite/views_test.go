@@ -50,6 +50,12 @@ func TestReferencesSpellingCSSEscapes(t *testing.T) {
 			`<svg><style>#d{background:url(` + ref + `)}</style></svg>`, true},
 		{"an HTML style element decodes neither",
 			`<style>#d{background:url(` + ref + `)}</style>`, false},
+		// A script inside <svg> decodes references but is not CSS, so the
+		// escapes stay escaped and no browser resolves this. Wiring the
+		// composed view to that surface would be the mirror error — rewriting
+		// where the consumer performs no decode.
+		{"a script inside svg decodes references but is not CSS",
+			`<svg><script>f("` + ref + `")</script></svg>`, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			st := NewStats(false)
@@ -371,6 +377,20 @@ func TestExplainOffsetsPointAtTheHost(t *testing.T) {
 			`<a href="https://www.example.fi/x" data-x="` + pad + `">t</a>`},
 		{"the byte matcher in prose",
 			`<p>` + pad + ` see https://www.example.fi/x</p>`},
+		// The two views that build their events inline rather than through
+		// w.record. d3ad6a7's message said it had fixed "all five newer views";
+		// these were missed, and they are the ones whose own comments say a
+		// non-zero count is worth looking at — so the surfaces that send a
+		// developer to --explain were the ones reporting an offset past the end
+		// of the document.
+		{"the obfuscated-separator view",
+			`<p>` + pad + ` see https:\\www.example.fi/x</p>`},
+		{"the fold, in an attribute",
+			`<a href="https://WWW.EXAMPLE.FI/x" data-x="` + pad + `">t</a>`},
+		// A literal soft hyphen, which is what the fold is for — the reference
+		// spelling is not decoded in a text node.
+		{"the fold, in prose",
+			"<p>" + pad + " see https://www.exam\u00adple.fi/x</p>"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			st := NewStats(true)
@@ -466,18 +486,81 @@ func TestRemovableReferencesInsideAnOrigin(t *testing.T) {
 		`https:&#47;&Tab;&#47;www.example.fi/x`,
 		`https:&#47;&NewLine;&#47;www.example.fi/x`,
 	} {
-		t.Run(sp, func(t *testing.T) {
-			// A standalone SVG or XML body, which has no HTML parser above it.
-			svg := `<svg xmlns="http://www.w3.org/2000/svg"><image href="` + sp + `"/></svg>`
-			if out := string(HostLeaksXML(m, []byte(svg), false)); strings.Contains(out, "www.example.fi") {
-				t.Errorf("standalone XML: a canonical origin survives:\n%s", out)
+		// The two dimensions this test did not vary, and the two the next
+		// round's leaks lived in: *which surface*, and whether an unrelated
+		// backslash appears anywhere else in the buffer.
+		//
+		// The composed view was wired to style surfaces alone, so a <script> or
+		// a text node inside <svg>/<math> was uncovered — and Chrome decodes
+		// references in both. And each decoder's removal pass tested
+		// isURLStripped alone, reaching the reference-aware pass only as a
+		// fall-through when its own trigger byte was absent; so one `\` anywhere
+		// in the body — a Windows path, a CSS escape, a regex — disarmed it for
+		// every origin in that body.
+		for _, noise := range []struct{ name, extra string }{
+			{"alone", ""},
+			{"with a backslash elsewhere in the buffer", `<desc>C:\tmp</desc>`},
+		} {
+			t.Run(sp+" "+noise.name, func(t *testing.T) {
+				// A standalone SVG or XML body, which has no HTML parser above it.
+				svg := `<svg xmlns="http://www.w3.org/2000/svg">` + noise.extra +
+					`<image href="` + sp + `"/></svg>`
+				if out := string(HostLeaksXML(m, []byte(svg), false)); strings.Contains(out, "www.example.fi") {
+					t.Errorf("standalone XML: a canonical origin survives:\n%s", out)
+				}
+				// And every surface inside foreign content, where the HTML
+				// tokenizer never enters a raw-text state so references decode.
+				for _, shape := range []string{
+					`<svg>` + noise.extra + `<style>a{background:url(` + sp + `)}</style></svg>`,
+					`<svg>` + noise.extra + `<script>fetch("` + sp + `")</script></svg>`,
+					`<svg>` + noise.extra + `<text>` + sp + `</text></svg>`,
+				} {
+					if out := rewriteHTML(t, m, shape, NewStats(false)); strings.Contains(out, "www.example.fi") {
+						t.Errorf("a canonical origin survives:\n in  %s\n out %s", shape, out)
+					}
+				}
+				// The control: an HTML <script> is raw text, so its references
+				// are not decoded and Chrome does not resolve this. Rewriting it
+				// would be the mirror error.
+				plain := `<script>y("` + sp + `")</script>`
+				if out := rewriteHTML(t, m, plain, NewStats(false)); out != plain {
+					t.Errorf("an HTML script decodes no references, but it was rewritten:\n%s", out)
+				}
+			})
+		}
+	}
+}
+
+// The two paths must agree about what is a path segment and what is an
+// authority.
+//
+// foldedHostLeak anchors its slash-run candidates on a token boundary, and its
+// comment cites `https://cdn.other/p//www.example.fi/q` as the reason. The
+// standalone path ran the same scan with no anchor, so the HTML pipeline left
+// that path segment alone and HostLeaks rewrote it — and the gate is one
+// non-ASCII byte *anywhere in the buffer*, so a single `ä` in a Finnish feed
+// armed it for every candidate in the body. In the request direction that edits
+// a path on its way into the shared database.
+func TestBothPathsAgreeOnWhatIsAnAuthority(t *testing.T) {
+	m := viewMap(t)
+	for _, c := range []struct {
+		name, in string
+		change   bool
+	}{
+		{"a path segment that looks like a scheme-relative authority",
+			"https://cdn.other/p//www.example.fi/q ä", false},
+		{"a real scheme-relative reference", "//www.example.fi/q ä", true},
+		{"one at the start of a value after a space", "see //www.example.fi/q ä", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			flat := string(HostLeaks(m, []byte(c.in), false))
+			html := rewriteHTML(t, m, "<p>"+c.in+"</p>", NewStats(false))
+			htmlInner := strings.TrimSuffix(strings.TrimPrefix(html, "<p>"), "</p>")
+			if flat != htmlInner {
+				t.Errorf("the two paths disagree:\n flat %s\n html %s", flat, htmlInner)
 			}
-			// And a style element inside foreign content, where the HTML
-			// tokenizer never enters a raw-text state so references decode.
-			html := `<svg><style>a{background:url(` + sp + `)}</style></svg>`
-			st := NewStats(false)
-			if out := rewriteHTML(t, m, html, st); strings.Contains(out, "www.example.fi") {
-				t.Errorf("svg style: a canonical origin survives:\n%s", out)
+			if got := flat != c.in; got != c.change {
+				t.Errorf("rewrote=%v, want %v:\n in  %s\n out %s", got, c.change, c.in, flat)
 			}
 		})
 	}
