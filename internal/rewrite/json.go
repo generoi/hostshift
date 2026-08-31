@@ -273,12 +273,25 @@ func serializedJSONValue(m *origin.Matcher, v []byte, explain bool) ([]byte, []o
 		return nil, nil, false
 	}
 	var ev []origin.Event
-	out, ok := RewriteSerialized(dec, func(b []byte) []byte {
+	out, found := RepairSerializedFound(dec, func(b []byte) []byte {
 		nv, nev := m.Rewrite(b, SurfaceJSONString, explain)
 		ev = append(ev, nev...)
 		return nv
 	})
-	if !ok {
+	// Only a value that actually carries a span belongs on this path. Routing
+	// on "did anything change" instead sent every rewritten value here and
+	// skipped the escape pass below, which is the one that catches `\uXXXX`.
+	if !found {
+		return nil, nil, false
+	}
+	// Nothing changed: hand the value back untouched rather than re-quoting it.
+	//
+	// AppendQuote does not escape `/` and wp_json_encode always does, so
+	// re-quoting unconditionally turned `\/\/` into `//` on every REST body
+	// carrying a serialized option — six bytes changed under an identity map,
+	// which test 24 forbids, and enough to defeat the equality check that
+	// decides whether the upstream's ETag still describes the body.
+	if bytes.Equal(out, dec) {
 		return nil, nil, false
 	}
 	q, err := jsontext.AppendQuote(nil, out)

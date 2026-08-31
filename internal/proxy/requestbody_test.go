@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/generoi/hostshift/internal/origin"
 )
 
 // Every spelling the response direction can emit, the request direction must be
@@ -337,4 +339,38 @@ func TestProseThatLooksSerializedIsStillRewritten(t *testing.T) {
 // jsonQuote is the minimal quoting these fixtures need.
 func jsonQuote(v string) string {
 	return `"` + strings.ReplaceAll(v, `"`, `\"`) + `"`
+}
+
+// An identity map must not change a byte of a JSON body carrying a serialized
+// value — test 24, on the one shape that defeats it.
+//
+// serializedJSONValue re-quoted unconditionally whenever a span was found.
+// jsontext.AppendQuote does not escape `/` and wp_json_encode always does, so
+// `\/\/` came back as `//`: six bytes changed under a map the proxy was asked
+// to make a no-op, and enough to defeat the equality check that decides whether
+// the upstream's ETag still describes the body.
+func TestAnIdentityMapLeavesSerializedJSONAlone(t *testing.T) {
+	ident, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://www.acmecorp.fi"),
+		Variant:   origin.MustParse("https://www.acmecorp.fi"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		`{"value":"a:1:{s:3:\"url\";s:22:\"https:\/\/www.acmecorp.fi\";}"}`,
+		`{"v":"a:1:{s:1:\"u\";s:5:\"a\/b\/c\";}"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			h := newHarness(t, ident, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			})
+			_, got := h.get(t, "www.acmecorp.fi", "/wp-json/x")
+			if string(got) != body {
+				t.Errorf("an identity map changed the bytes:\n in  %s\n out %s", body, got)
+			}
+		})
+	}
 }

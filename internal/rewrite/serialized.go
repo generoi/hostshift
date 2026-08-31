@@ -1,137 +1,92 @@
 package rewrite
 
-import "strconv"
+import (
+	"bytes"
+	"strconv"
+)
 
-// RewriteSerialized rewrites a PHP-serialized payload and re-emits its length
+// RepairSerialized rewrites a PHP-serialized payload and re-emits its length
 // prefixes, so the result still parses.
 //
-// `s:LEN:"DATA";` counts DATA in bytes, so any rewrite that changes a byte count
-// leaves LEN stale and PHP refuses the whole structure — `false` where an
+// `s:LEN:"DATA";` counts DATA in bytes, so any rewrite that changes a byte
+// count leaves LEN stale and PHP refuses the whole structure — `false` where an
 // options array should be, into a shared database, with no undo and no error.
 //
 // Skipping such a body instead was tried and was worse. The response direction
-// rewrites too, so the browser is *served* a blob whose prefix already counts
-// the canonical host while the data holds the variant; passing the POST back
-// through untouched then writes that stale prefix *and* the variant hostname
-// upstream. Rewriting without repair at least round-trips: the length the
-// response direction broke, the request direction restores. Repairing is the
-// only option that is correct in both directions.
+// rewrites too, so the browser is served a blob whose prefix already counts the
+// canonical host while the data holds the variant; passing the POST back
+// untouched then writes that stale prefix *and* the variant hostname upstream.
+// Repairing is the only option that is correct in both directions.
 //
-// The lengths are read from the *input*, where they are still right, so the
-// spans are found exactly rather than by guessing where a string ends. A body
-// that does not parse is not serialized data and is returned untouched, for the
-// caller to rewrite however it would have.
-func RewriteSerialized(b []byte, rw func([]byte) []byte) ([]byte, bool) {
-	out, ok := rewriteSerializedIn(b, rw, 0)
-	return out, ok
+// Three spellings reach us and all three are handled in one pass: the literal
+// `s:5:"…"`, the percent-encoded `s%3A5%3A%22…%22%3B` a form sends, and — via
+// serializedJSONValue in json.go — the JSON-escaped one. Scanning for them
+// separately meant a body carrying two spellings had the second rewritten by
+// the first pass's gap handling and never repaired.
+//
+// The lengths are read from the *input*, where they are still right, so spans
+// are found exactly rather than guessed. That is also why the recursion for a
+// nested payload takes the original bytes: reading a length from data whose
+// host has already changed finds nothing, which left every inner prefix stale
+// while the outer one was repaired — the worst of both, because the outer then
+// parses and only the second unserialize fails, silently.
+func RepairSerialized(b []byte, rw func([]byte) []byte) []byte {
+	out, _ := RepairSerializedFound(b, rw)
+	return out
 }
 
-// maxSerializedDepth bounds the recursion for a doubly-serialized payload — a
-// serialized string whose data is itself serialized, which WordPress produces
-// whenever an option value is an array of serialized values. Without the
-// recursion the inner prefix goes stale exactly as the outer one did.
+// RepairSerializedFound is RepairSerialized, also reporting whether a
+// serialized span was found — which is not the same question as whether
+// anything changed, and callers that route on it need the first.
+func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
+	out, ok := repairIn(b, rw, 0)
+	if !ok {
+		return rw(b), false
+	}
+	return out, true
+}
+
+// maxSerializedDepth bounds the recursion for a payload nested inside a
+// serialized string, which WordPress produces whenever an option value is an
+// array of serialized values.
 const maxSerializedDepth = 8
 
-func rewriteSerializedIn(b []byte, rw func([]byte) []byte, depth int) ([]byte, bool) {
+// span is one `s:LEN:"DATA"` header, in whichever spelling matched.
+type span struct {
+	at, dataAt, dataEnd int // header start, data start, one past data end
+	pct                 bool
+}
+
+func repairIn(b []byte, rw func([]byte) []byte, depth int) ([]byte, bool) {
 	if depth > maxSerializedDepth {
 		return b, false
 	}
 	var out []byte
 	prev, found := 0, false
-	for i := 0; i+3 < len(b); {
-		// `s:` then digits then `:"`.
-		if b[i] != 's' || b[i+1] != ':' {
-			i++
-			continue
-		}
-		j := i + 2
-		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
-			j++
-		}
-		if j == i+2 || j+1 >= len(b) || b[j] != ':' || b[j+1] != '"' {
-			i++
-			continue
-		}
-		n, err := strconv.Atoi(string(b[i+2 : j]))
-		if err != nil || n < 0 {
-			i++
-			continue
-		}
-		start := j + 2
-		end := start + n
-		// The closing `";` has to be exactly where the length says it is. If it
-		// is not, this is not a serialized string — a sentence containing
-		// `s:12:"` is not one — and nothing here is touched.
-		if end+1 >= len(b)+1 || end+1 > len(b) || b[end] != '"' {
-			i++
-			continue
-		}
-		if end+1 < len(b) && b[end+1] != ';' {
-			i++
-			continue
-		}
-		inner := b[start:end]
-		rewritten := rw(inner)
-		// A serialized string can hold another serialized payload.
-		if nested, ok := rewriteSerializedIn(rewritten, rw, depth+1); ok {
-			rewritten = nested
-		}
-		found = true
-		// The gap is rewritten too. Structural bytes hold no origins so this is
-		// a no-op on well-formed data — but a buffer that is only *partly*
-		// serialized (a sentence quoting `s:11:"hello world"`, or a blob whose
-		// trailing span has a stale length) would otherwise have everything
-		// after the last good span copied out verbatim and never rewritten.
-		out = append(out, rw(b[prev:i])...)
-		out = append(out, 's', ':')
-		out = append(out, strconv.Itoa(len(rewritten))...)
-		out = append(out, ':', '"')
-		out = append(out, rewritten...)
-		out = append(out, '"')
-		prev = end + 1
-		i = end + 1
-	}
-	if !found {
-		return b, false
-	}
-	return append(out, rw(b[prev:])...), true
-}
-
-// RewriteSerializedPct is RewriteSerialized for a percent-encoded payload,
-// which is how a form actually sends one.
-//
-// `options.php` and `admin-ajax.php` percent-encode their bodies, so the header
-// arrives as `s%3A51%3A%22` and a scanner looking for the literal `s:51:"`
-// never sees it — while the percent view rewrites the host inside it perfectly
-// happily. That is the settings flow the whole problem is about, and it is the
-// one spelling the literal parser misses.
-//
-// The length counts *decoded* bytes, so the span is found by walking the
-// encoded data until that many decoded bytes have passed.
-func RewriteSerializedPct(b []byte, rw func([]byte) []byte) ([]byte, bool) {
-	var out []byte
-	prev, found := 0, false
 	for i := 0; i < len(b); {
-		j, n, ok := pctStringHeader(b, i)
+		sp, ok := headerAt(b, i)
 		if !ok {
 			i++
 			continue
 		}
-		end, ok := advanceDecoded(b, j, n)
-		if !ok || !pctHasSuffix(b, end) {
-			i++
-			continue
+		// The gap since the last span, rewritten once.
+		out = append(out, rw(b[prev:sp.at])...)
+
+		inner := b[sp.dataAt:sp.dataEnd]
+		// The nested repair runs on the *input* bytes, so the inner lengths are
+		// still trustworthy. Only when the data holds nothing serialized does rw
+		// apply to it directly — otherwise rw would run twice over the same
+		// bytes, once here and once inside the nested call's own gap handling.
+		rewritten, nested := repairIn(inner, rw, depth+1)
+		if !nested {
+			rewritten = rw(inner)
 		}
-		inner := b[j:end]
-		rewritten := rw(inner)
+
 		found = true
-		out = append(out, rw(b[prev:i])...)
-		out = append(out, `s%3A`...)
-		out = append(out, strconv.Itoa(decodedLen(rewritten))...)
-		out = append(out, `%3A%22`...)
+		out = appendHeader(out, b[sp.at:sp.dataAt], rewritten, inner, sp.pct)
 		out = append(out, rewritten...)
-		prev = end
-		i = end
+		prev = sp.dataEnd
+		i = sp.dataEnd
 	}
 	if !found {
 		return b, false
@@ -139,11 +94,57 @@ func RewriteSerializedPct(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	return append(out, rw(b[prev:])...), true
 }
 
-// pctStringHeader matches `s%3A<digits>%3A%22` at i, returning where the data
-// starts and the declared decoded length.
-func pctStringHeader(b []byte, i int) (int, int, bool) {
-	if i+10 > len(b) || b[i] != 's' || !pctIs(b, i+1, ':') {
-		return 0, 0, false
+// appendHeader writes the `s:LEN:"` prefix, keeping the original bytes verbatim
+// when nothing about the data changed.
+//
+// Re-emitting unconditionally changed bytes under an identity map, which test 24
+// forbids: strconv.Itoa drops a leading zero from `s:05:` and the literals here
+// force uppercase hex, so a client that percent-encodes in lowercase had its
+// body altered by a proxy asked to be a no-op.
+func appendHeader(out, orig, rewritten, inner []byte, pct bool) []byte {
+	if bytes.Equal(rewritten, inner) {
+		return append(out, orig...)
+	}
+	n := len(rewritten)
+	if pct {
+		n = decodedLen(rewritten)
+		out = append(out, `s%3A`...)
+		out = append(out, strconv.Itoa(n)...)
+		return append(out, `%3A%22`...)
+	}
+	out = append(out, 's', ':')
+	out = append(out, strconv.Itoa(n)...)
+	return append(out, ':', '"')
+}
+
+// headerAt matches a serialized string header at i, in either spelling, and
+// locates its data exactly using the declared length.
+func headerAt(b []byte, i int) (span, bool) {
+	if i >= len(b) || b[i] != 's' {
+		return span{}, false
+	}
+	// Literal: s:LEN:"DATA";
+	if i+1 < len(b) && b[i+1] == ':' {
+		j := i + 2
+		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
+			j++
+		}
+		if j > i+2 && j+1 < len(b) && b[j] == ':' && b[j+1] == '"' {
+			if n, err := strconv.Atoi(string(b[i+2 : j])); err == nil && n >= 0 {
+				end := j + 2 + n
+				// The closer has to be exactly where the length says. A sentence
+				// quoting `s:6:"a.test"` is not a span unless it closes there.
+				if end < len(b) && b[end] == '"' &&
+					(end+1 >= len(b) || b[end+1] == ';') {
+					return span{at: i, dataAt: j + 2, dataEnd: end}, true
+				}
+			}
+		}
+		return span{}, false
+	}
+	// Percent-encoded: s%3ALEN%3A%22DATA%22%3B
+	if !pctIs(b, i+1, ':') {
+		return span{}, false
 	}
 	j := i + 4
 	start := j
@@ -151,27 +152,27 @@ func pctStringHeader(b []byte, i int) (int, int, bool) {
 		j++
 	}
 	if j == start || !pctIs(b, j, ':') || !pctIs(b, j+3, '"') {
-		return 0, 0, false
+		return span{}, false
 	}
 	n, err := strconv.Atoi(string(b[start:j]))
 	if err != nil || n < 0 {
-		return 0, 0, false
+		return span{}, false
 	}
-	return j + 6, n, true
+	dataAt := j + 6
+	end, ok := advanceDecoded(b, dataAt, n)
+	if !ok || !pctIs(b, end, '"') || !pctIs(b, end+3, ';') {
+		return span{}, false
+	}
+	return span{at: i, dataAt: dataAt, dataEnd: end, pct: true}, true
 }
 
 // pctIs reports whether b at i is the percent escape for c.
 func pctIs(b []byte, i int, c byte) bool {
-	if i+2 >= len(b) || b[i] != '%' {
+	if i < 0 || i+2 >= len(b) || b[i] != '%' {
 		return false
 	}
 	v, ok := unhex(b[i+1], b[i+2])
 	return ok && v == c
-}
-
-// pctHasSuffix reports whether the encoded `";` closer sits at i.
-func pctHasSuffix(b []byte, i int) bool {
-	return pctIs(b, i, '"') && pctIs(b, i+3, ';')
 }
 
 // advanceDecoded walks n decoded bytes from i and returns the encoded offset.
@@ -195,7 +196,8 @@ func advanceDecoded(b []byte, i, n int) (int, bool) {
 	return i, true
 }
 
-// decodedLen is how many bytes b decodes to.
+// decodedLen is how many bytes b decodes to. `+` counts as one byte, which is
+// what it decodes to — treating it as an escape would be the bug.
 func decodedLen(b []byte) int {
 	n := 0
 	for i := 0; i < len(b); n++ {
@@ -217,19 +219,4 @@ func unhex(a, b byte) (byte, bool) {
 		return 0, false
 	}
 	return byte(hi<<4 | lo), true
-}
-
-// RepairSerialized rewrites b with rw, keeping any PHP-serialized length
-// prefixes correct, in either the literal or the percent-encoded spelling.
-//
-// It returns rw(b) unchanged when b holds nothing serialized, so a caller can
-// use it in place of rw everywhere without deciding first.
-func RepairSerialized(b []byte, rw func([]byte) []byte) []byte {
-	if out, ok := RewriteSerialized(b, rw); ok {
-		return out
-	}
-	if out, ok := RewriteSerializedPct(b, rw); ok {
-		return out
-	}
-	return rw(b)
 }

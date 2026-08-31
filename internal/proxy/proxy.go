@@ -452,7 +452,14 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			// what turns a malformed-document pass-through — a duplicate object
 			// member is legal JSON and jsontext rejects it — from a silent leak
 			// into a rewrite plus a WARN.
-			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, p.Map.Forward(), p.Stats, p.log())
+			})
 		}
 		if p.DryRun {
 			out = body
@@ -511,7 +518,14 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		if t := bytes.TrimLeft(body, " \t\r\n"); len(t) > 0 && (t[0] == '{' || t[0] == '[') {
 			out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.log(), p.Stats.Explain())
 			if !p.NoSweep {
-				out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+				// Inside the repair: the sweep is a raw byte matcher, so a host it
+				// rewrites inside a serialized string leaves the length stale. On
+				// RewriteJSON's decline path — a duplicate member is legal JSON and
+				// is rejected — the sweep is the only pass that touches the body, so
+				// it corrupted the blob while logging a line that reads like a save.
+				out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+					return rewrite.SweepBytes(b, p.Map.Forward(), p.Stats, p.log())
+				})
 			}
 			if p.DryRun {
 				out = body
@@ -547,7 +561,14 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		})
 		p.Stats.Record(rewrite.SurfaceText, 0, ev)
 		if !p.NoSweep {
-			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, p.Map.Forward(), p.Stats, p.log())
+			})
 		}
 		if p.DryRun {
 			out = body
@@ -652,7 +673,14 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// asymmetry is backwards: a leak into a response is one page view, a
 		// leak into a request is written down.
 		if !p.NoSweep {
-			out = rewrite.SweepBytes(out, rev, p.Stats, p.log())
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, rev, p.Stats, p.log())
+			})
 		}
 	default:
 		// Through RepairSerialized, which keeps any PHP-serialized length

@@ -268,7 +268,14 @@ func cmdRewrite(args []string) (int, error) {
 		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 		out := rewrite.RewriteJSON(body, m, st, log, *explain)
 		if !*noSweep {
-			out = rewrite.SweepBytes(out, m, st, log)
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, m, st, log)
+			})
 		}
 		if *dryRun {
 			out = body
@@ -287,20 +294,32 @@ func cmdRewrite(args []string) (int, error) {
 			return exitRuntime, err
 		}
 		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-		out, ev := m.RewriteText(body, rewrite.SurfaceText, *explain)
+		// Wrapped in RepairSerialized, exactly as the proxy's text arm is. This
+		// command documents itself as "the same engine"; it was not, and a
+		// serialized blob piped through it came out with its length prefix stale
+		// — the very corruption the proxy had just been taught to prevent.
+		var ev []origin.Event
+		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
+			nv, nev := m.RewriteText(b, rewrite.SurfaceText, *explain)
+			ev = append(ev, nev...)
+			// The XML family's parser decodes character references; plain text
+			// has no parser, so leaving them is correct there. The counted forms
+			// because --json and --dry-run are this command's whole output.
+			if strings.HasSuffix(mt, "xml") {
+				return rewrite.HostLeaksXMLCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+			}
+			return rewrite.HostLeaksCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+		})
 		st.Record(rewrite.SurfaceText, 0, ev)
-		// The XML family's parser decodes character references; plain text has no
-		// parser, so leaving them is correct there.
-		// The counted forms: --json and --dry-run are this command's whole
-		// output, and the plain forms rewrite silently. A sitemap whose origins
-		// were CSS-escaped came out rewritten with "rewrites": {} beside it.
-		if strings.HasSuffix(mt, "xml") {
-			out = rewrite.HostLeaksXMLCounted(m, out, false, st, rewrite.SurfaceText, 0)
-		} else {
-			out = rewrite.HostLeaksCounted(m, out, false, st, rewrite.SurfaceText, 0)
-		}
 		if !*noSweep {
-			out = rewrite.SweepBytes(out, m, st, log)
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, m, st, log)
+			})
 		}
 		if *dryRun {
 			out = body

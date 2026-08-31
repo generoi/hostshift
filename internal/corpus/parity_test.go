@@ -1,6 +1,7 @@
 package corpus
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,11 +28,12 @@ import (
 //
 // Comparing prose about the dispatch cannot catch that. Running both can.
 //
-// One honest limit: within the text arm, RewriteText and SweepBytes are both
-// byte matchers over the whole buffer, so for every body here either one alone
-// suffices and removing just one is invisible. Removing both is caught. The
-// arm *boundaries* are the part this pins tightly — dropping isTextArm for the
-// looser prefix/suffix test it replaced fails 37 of these combinations.
+// The remaining honest limit: dropping SweepBytes alone is still invisible,
+// because Rewrite is a superset of RewriteText on this arm and nothing here
+// needs the sweep that the earlier pass does not already catch. Dropping
+// RewriteText alone is caught, by the trailing-root-label body below. The arm
+// *boundaries* are pinned tightest — dropping isTextArm for the looser
+// prefix/suffix test it replaced fails 37 of these combinations.
 func TestTheScorerMatchesTheProxy(t *testing.T) {
 	m, err := origin.NewMap([]origin.Site{{
 		Name:      "main",
@@ -58,6 +60,25 @@ func TestTheScorerMatchesTheProxy(t *testing.T) {
 		// written in \uXXXX escapes that only RewriteJSON decodes.
 		{"json escapes under a text label",
 			`{"success":true,"data":{"url":"http://\u0077ww.canon.test/x.png"}}`},
+		// Serialized payloads, in both spellings and nested. The scorer and the
+		// proxy were wrapped in RepairSerialized by different commits, and none
+		// of the bodies above contains an `s:N:"…"` so nothing noticed.
+		//
+		// The lengths are computed, not written by hand. My first attempt hard-
+		// coded them, got one wrong by a single byte, and the span therefore
+		// never parsed — so the fixtures exercised nothing and the mutation that
+		// should have failed passed. A fixture that silently does not reach the
+		// code it names is the failure mode this whole loop keeps finding.
+		{"a serialized blob", ser("u", canonA)},
+		{"a serialized blob, percent-encoded", "o=" + serPct("u", canonA)},
+		{"a nested serialized blob", serRaw("o", ser("u", canonA))},
+		{"a serialized blob beside prose",
+			"see https://www.canon.test/b\n" + ser("u", canonA)},
+		// The body that separates the two byte-matcher passes, which the test's
+		// own comment used to record as unreachable: with RewriteText dropped,
+		// SweepBytes runs with value=true and absorbs the trailing root label.
+		// The newline is load-bearing.
+		{"a trailing root label after a newline", "x\nhttps://www.canon.test."},
 		{"nothing to do", `<p>no origins here</p>`},
 	}
 	types := []string{
@@ -116,4 +137,18 @@ func TestTheScorerMatchesTheProxy(t *testing.T) {
 			})
 		}
 	}
+}
+
+const canonA = "https://www.canon.test/a"
+
+// ser builds `a:1:{s:K:"key";s:N:"val";}` with correct lengths.
+func ser(key, val string) string { return serRaw(key, val) }
+
+func serRaw(key, val string) string {
+	return fmt.Sprintf(`a:1:{s:%d:%q;s:%d:%q;}`, len(key), key, len(val), val)
+}
+
+// serPct is ser, percent-encoded the way a form sends it.
+func serPct(key, val string) string {
+	return url.QueryEscape(serRaw(key, val))
 }

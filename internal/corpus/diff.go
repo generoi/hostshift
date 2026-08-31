@@ -332,7 +332,14 @@ func applyLikeTheProxy(m *origin.Matcher, body []byte, ct string, st *rewrite.St
 	// the proxy tests JSON first.
 	case mt == "application/json", mt == "text/json", strings.HasSuffix(mt, "+json"):
 		out := rewrite.RewriteJSON(body, m, st, nil, false)
-		return rewrite.SweepBytes(out, m, st, nil), nil
+		// Inside the repair: the sweep is a raw byte matcher, so a host it
+		// rewrites inside a serialized string leaves the length stale. On
+		// RewriteJSON's decline path — a duplicate member is legal JSON and
+		// is rejected — the sweep is the only pass that touches the body, so
+		// it corrupted the blob while logging a line that reads like a save.
+		return rewrite.RepairSerialized(out, func(b []byte) []byte {
+			return rewrite.SweepBytes(b, m, st, nil)
+		}), nil
 
 	// The enumerated set plus `+xml`, exactly as rewritableText has it — not
 	// `HasSuffix(mt, "xml")`, which also swallows text/xml-external-parsed-entity
@@ -348,7 +355,14 @@ func applyLikeTheProxy(m *origin.Matcher, body []byte, ct string, st *rewrite.St
 		// back unrewritten and called the page clean.
 		if t := bytes.TrimLeft(body, " \t\r\n"); len(t) > 0 && (t[0] == '{' || t[0] == '[') {
 			out := rewrite.RewriteJSON(body, m, st, nil, false)
-			return rewrite.SweepBytes(out, m, st, nil), nil
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			return rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, m, st, nil)
+			}), nil
 		}
 		// All three passes the proxy runs, in order. Running only the middle one
 		// scored a plain, unencoded, dereferenceable origin as clean: stripForURL
@@ -357,14 +371,28 @@ func applyLikeTheProxy(m *origin.Matcher, body []byte, ct string, st *rewrite.St
 		// newline welds the previous word onto `https:`, tokenBoundary is then
 		// false, and no candidate is emitted. The byte matcher and the sweep,
 		// which the proxy runs and this did not, see the raw bytes.
-		out, ev := m.RewriteText(body, rewrite.SurfaceText, false)
+		// Wrapped in RepairSerialized, exactly as proxy.go's text arm is. Both
+		// were edited in the same commit and only one got the wrapper, so the
+		// scorer disagreed with the proxy on any body carrying an `s:N:"…"` —
+		// which sends the run spuriously RED on a real page.
+		var ev []origin.Event
+		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
+			nv, nev := m.RewriteText(b, rewrite.SurfaceText, false)
+			ev = append(ev, nev...)
+			if strings.HasSuffix(mt, "xml") {
+				return rewrite.HostLeaksXMLCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+			}
+			return rewrite.HostLeaksCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+		})
 		st.Record(rewrite.SurfaceText, 0, ev)
-		if strings.HasSuffix(mt, "xml") {
-			out = rewrite.HostLeaksXMLCounted(m, out, false, st, rewrite.SurfaceText, 0)
-		} else {
-			out = rewrite.HostLeaksCounted(m, out, false, st, rewrite.SurfaceText, 0)
-		}
-		return rewrite.SweepBytes(out, m, st, nil), nil
+		// Inside the repair: the sweep is a raw byte matcher, so a host it
+		// rewrites inside a serialized string leaves the length stale. On
+		// RewriteJSON's decline path — a duplicate member is legal JSON and
+		// is rejected — the sweep is the only pass that touches the body, so
+		// it corrupted the blob while logging a line that reads like a save.
+		return rewrite.RepairSerialized(out, func(b []byte) []byte {
+			return rewrite.SweepBytes(b, m, st, nil)
+		}), nil
 	}
 	// Everything else the proxy streams through untouched, so scoring it as a
 	// page would report a leak on a type it never claimed to rewrite.

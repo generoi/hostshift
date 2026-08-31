@@ -130,6 +130,7 @@ is expected, because the install is what writes the exclude rule.
 ```console
 $ printf 'name: acme-wt-a\n' > .ddev/config.hostshift-name.yaml   # in the worktree
 $ ddev add-on get ~/src/hostshift/ddev
+$ ddev hostshift init
 ```
 
 The name only has to be unique; hostshift derives the preview hostnames from
