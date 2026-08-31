@@ -46,16 +46,32 @@ func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	// ordinary CSS — left every other option in the same POST with a stale
 	// length. `options.php` posts every option on a settings page in one body,
 	// and the contaminating field need not contain a hostname at all.
-	// Only a form body has fields. Splitting every buffer on `&` cut HTML apart
-	// at its character references — `&#47;` is not a separator — so a host
-	// spelled across one stopped being found.
-	if !looksLikeForm(b) {
-		return repairField(b, rw)
-	}
+	return repairField(b, rw)
+}
+
+// RepairSerializedFields is RepairSerialized for an
+// application/x-www-form-urlencoded body, whose `&` really are separators.
+//
+// The split has to come from the caller's knowledge of the content type rather
+// than from looking at the bytes. Guessing it — "no whitespace and a `=`, so
+// this is a form" — classified a decoded JSON string and a multipart part as
+// forms, and then cut a serialized value in half at the `&utm_medium=` inside
+// an ordinary tracking URL: both halves declined and the length was re-emitted
+// from neither. In a properly encoded form body a `&` inside a value is `%26`,
+// so there the separator is unambiguous.
+//
+// Splitting matters because a decline is otherwise buffer-wide: one option
+// holding `a:hover{color:red}` — ordinary CSS, no hostname — left every other
+// option in the same POST with a stale length, and `options.php` posts them all
+// in one body.
+func RepairSerializedFields(b []byte, rw func([]byte) []byte) []byte {
 	var out []byte
 	found := false
 	for start := 0; start <= len(b); {
-		end := nextFieldBreak(b, start)
+		end := start + indexByteFrom(b[start:], '&')
+		if end < start {
+			end = len(b)
+		}
 		rep, ok := repairField(b[start:end], rw)
 		out = append(out, rep...)
 		found = found || ok
@@ -64,7 +80,10 @@ func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 		}
 		start = end + 1
 	}
-	return out, found
+	if !found {
+		return rw(b)
+	}
+	return out
 }
 
 // indexByteFrom is bytes.IndexByte, returning -1 when absent.
@@ -284,11 +303,8 @@ func repairValue(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax)
 		return repairArray(b, i, rw, depth, syn)
 
 	case 'C':
-		// Custom serialization: C:len:"Class":datalen:{opaque}. The payload is
-		// whatever the class wrote, with no grammar we can walk, so the value is
-		// copied verbatim — rewriting inside it could not have its length
-		// re-emitted safely.
-		return repairCustom(b, i, syn)
+		// Custom serialization: C:len:"Class":datalen:{opaque}.
+		return repairCustom(b, i, rw, syn)
 
 	case 'O':
 		return repairObject(b, i, rw, depth, syn)
@@ -658,56 +674,6 @@ func occupiesItsField(b []byte, start, end int) bool {
 	return true
 }
 
-// nextFieldBreak finds the `&` that starts the next `key=` pair, or len(b).
-//
-// Not every `&` is a separator: a value can carry `&#47;` — which is exactly
-// what the response direction emits into an href — and splitting there cut the
-// origin in half so nothing could find it. A real separator is followed by a
-// field name and an `=` before the next `&`.
-func nextFieldBreak(b []byte, from int) int {
-	for i := from; i < len(b); i++ {
-		if b[i] != '&' {
-			continue
-		}
-		j := i + 1
-		for j < len(b) && b[j] != '&' && b[j] != '=' {
-			if !isFieldNameByte(b[j]) {
-				break
-			}
-			j++
-		}
-		if j < len(b) && b[j] == '=' && j > i+1 {
-			return i
-		}
-	}
-	return len(b)
-}
-
-func isFieldNameByte(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
-		c == '_' || c == '-' || c == '.' || c == '[' || c == ']' || c == '%'
-}
-
-// looksLikeForm reports whether b is application/x-www-form-urlencoded shaped:
-// `key=value` pairs, which by definition carry no raw whitespace or markup —
-// those are percent-encoded or `+`. Anything else is one field.
-func looksLikeForm(b []byte) bool {
-	if indexByteFrom(b, '=') < 0 {
-		return false
-	}
-	for _, c := range b {
-		switch c {
-		// Whitespace and markup are the discriminators. A quote is not: a form
-		// value carrying serialized data has them unencoded often enough, and
-		// rejecting on one meant the whole body was treated as a single field —
-		// so a neighbour's decline still destroyed it.
-		case ' ', '\t', '\r', '\n', '<', '>':
-			return false
-		}
-	}
-	return true
-}
-
 // repairOpaqueString parses `X:len:"data";` and copies it verbatim.
 func repairOpaqueString(b []byte, i int, syn syntax) ([]byte, int, bool) {
 	n, j, ok := readLen(b, i+1, syn)
@@ -733,8 +699,20 @@ func repairOpaqueString(b []byte, i int, syn syntax) ([]byte, int, bool) {
 	return b[i : end+cw+tw], end + cw + tw, true
 }
 
-// repairCustom parses `C:len:"Class":datalen:{opaque}` and copies it verbatim.
-func repairCustom(b []byte, i int, syn syntax) ([]byte, int, bool) {
+// repairCustom parses `C:len:"Class":datalen:{opaque}`, rewrites the payload and
+// re-emits its length.
+//
+// Copying it verbatim was a leak. The payload is arbitrary bytes — whatever the
+// class wrote — so it holds origins as readily as any string, and skipping it
+// sent a production URL inside a WooCommerce `C:` blob to the browser while the
+// structure was rewritten around it; in the other direction it wrote the
+// variant hostname into the database. Before `C:` was handled at all the field
+// declined and the whole-buffer rewrite covered the payload, so adding the case
+// traded a stale length for a live origin.
+//
+// The length is declared, so it re-emits exactly like a string's. The class
+// name is a PHP identifier and cannot hold a host, so it is copied.
+func repairCustom(b []byte, i int, rw func([]byte) []byte, syn syntax) ([]byte, int, bool) {
 	nameLen, j, ok := readLen(b, i+1, syn)
 	if !ok {
 		return nil, 0, false
@@ -759,7 +737,8 @@ func repairCustom(b []byte, i int, syn syntax) ([]byte, int, bool) {
 	if !ok {
 		return nil, 0, false
 	}
-	dataEnd, ok := syn.advance(b, k+ow, dataLen)
+	dataAt := k + ow
+	dataEnd, ok := syn.advance(b, dataAt, dataLen)
 	if !ok {
 		return nil, 0, false
 	}
@@ -767,7 +746,19 @@ func repairCustom(b []byte, i int, syn syntax) ([]byte, int, bool) {
 	if !ok {
 		return nil, 0, false
 	}
-	return b[i : dataEnd+clw], dataEnd + clw, true
+	data := b[dataAt:dataEnd]
+	repaired := rw(data)
+	if string(repaired) == string(data) {
+		return b[i : dataEnd+clw], dataEnd + clw, true
+	}
+	out := append([]byte{}, b[i:nameEnd+cw]...)
+	out = syn.emit(out, ':')
+	out = append(out, strconv.Itoa(syn.dlen(repaired))...)
+	out = syn.emit(out, ':')
+	out = syn.emit(out, '{')
+	out = append(out, repaired...)
+	out = syn.emit(out, '}')
+	return out, dataEnd + clw, true
 }
 
 // BrokenSerialized reports how many serialized headers in b commit and then fail

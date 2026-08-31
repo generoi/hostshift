@@ -426,3 +426,44 @@ func TestIdentityIsAByteNoOpOnEveryArm(t *testing.T) {
 		})
 	}
 }
+
+// A `&name=` inside a URL is a query separator, not a field separator — and
+// only the caller's content type can tell the difference.
+//
+// Field splitting exists so one option's decline cannot destroy its neighbours
+// in an `options.php` POST. Guessing which bodies have fields, from "no
+// whitespace and a `=`", classified a decoded JSON string and a multipart part
+// as forms and then cut a serialized value in half at the `&utm_medium=` of an
+// ordinary tracking URL: both halves declined and the length was re-emitted
+// from neither, so a one-way write put a stale length into wp_postmeta.
+//
+// In a real urlencoded body a `&` inside a value is `%26`, so there the
+// separator is unambiguous; everywhere else the body is one field.
+func TestAQueryStringInsideASerializedValueSurvivesEveryArm(t *testing.T) {
+	u := "https://" + variantHost + "/landing/?utm_source=news&utm_medium=email"
+	cu := strings.ReplaceAll(u, variantHost, "www.acmecorp.fi")
+	blob := func(v string) string {
+		return `a:1:{s:3:"url";s:` + strconv.Itoa(len(v)) + `:"` + v + `";}`
+	}
+	for _, c := range []struct{ name, ctype, body, want string }{
+		{"text/plain", "text/plain", blob(u), blob(cu)},
+		{"json", "application/json",
+			`{"m":` + jsonQuote(blob(u)) + `}`, `{"m":` + jsonQuote(blob(cu)) + `}`},
+		{"multipart", "multipart/form-data; boundary=BXX",
+			"--BXX\r\nContent-Disposition: form-data; name=\"m\"\r\n\r\n" +
+				blob(u) + "\r\n--BXX--\r\n",
+			"--BXX\r\nContent-Disposition: form-data; name=\"m\"\r\n\r\n" +
+				blob(cu) + "\r\n--BXX--\r\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(200)
+			})
+			h.do(t, "POST", variantHost, "/wp-json/wp/v2/posts/1", c.ctype, []byte(c.body))
+			up, _ := io.ReadAll(h.seen.Body)
+			if string(up) != c.want {
+				t.Errorf("\n got  %s\n want %s", up, c.want)
+			}
+		})
+	}
+}

@@ -566,7 +566,10 @@ func TestOneFieldDoesNotContaminateAnother(t *testing.T) {
 	good := `opt_a=a:1:{s:4:"logo";` + str(variant+"/logo.png") + `}`
 	wantGood := `opt_a=a:1:{s:4:"logo";` + str(canon+"/logo.png") + `}`
 
-	got := string(RepairSerialized([]byte(good+"&"+bad), func(b []byte) []byte {
+	// RepairSerializedFields, because contamination is a form-body concern and
+	// the split now comes from the caller's content type rather than a guess
+	// about the bytes.
+	got := string(RepairSerializedFields([]byte(good+"&"+bad), func(b []byte) []byte {
 		return []byte(strings.ReplaceAll(string(b), variant, canon))
 	}))
 	if !strings.HasPrefix(got, wantGood) {
@@ -618,5 +621,67 @@ func TestTheOtherSerializedTypesParse(t *testing.T) {
 				t.Errorf("%s stopped the repair:\n got  %s\n want %s", c.name, got, want)
 			}
 		})
+	}
+}
+
+// A `C:` payload is arbitrary bytes and must be rewritten like any other.
+//
+// Copying it verbatim sent a production URL inside a WooCommerce-shaped blob to
+// the browser while the structure around it was rewritten, and wrote the
+// variant hostname into the database on the way back. Before `C:` was handled
+// at all, the field declined and the whole-buffer rewrite covered the payload —
+// so adding the case traded a stale length for a live origin, which is the
+// worse of the two.
+//
+// The previous fixture for this type used `C:3:"Foo":4:{abcd}`, whose payload
+// holds no hostname, so it asserted only that the type does not stop the repair
+// — never the question `C:` actually raises.
+func TestACustomPayloadIsRewritten(t *testing.T) {
+	canon, variant := "https://www.example.fi", "https://v.ddev.site"
+	for _, c := range []struct{ name, in, want string }{
+		{"a bare custom value",
+			`C:7:"WC_Data":` + strconv.Itoa(len(canon)) + `:{` + canon + `}`,
+			`C:7:"WC_Data":` + strconv.Itoa(len(variant)) + `:{` + variant + `}`},
+		// No `;` after the `}` — `C:` has no terminator, unlike every other
+		// type. Writing one made the array fail to parse, so the fixture fell
+		// back to the whole-buffer rewrite and measured nothing.
+		{"inside an array",
+			`a:1:{i:0;C:7:"WC_Data":` + strconv.Itoa(len(canon)) + `:{` + canon + `}}`,
+			`a:1:{i:0;C:7:"WC_Data":` + strconv.Itoa(len(variant)) + `:{` + variant + `}}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := string(RepairSerialized([]byte(c.in), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), canon, variant))
+			}))
+			if strings.Contains(got, canon) {
+				t.Errorf("an origin inside a custom payload was not rewritten:\n%s", got)
+			}
+			if got != c.want {
+				t.Errorf("\n got  %s\n want %s", got, c.want)
+			}
+		})
+	}
+}
+
+// A `&name=` inside a URL query string is not a field separator.
+//
+// Guessing field boundaries from the bytes cut a serialized value in half at
+// the `&utm_medium=` of an ordinary tracking URL — both halves declined and the
+// length was re-emitted from neither, so a one-way write put a stale length
+// into wp_postmeta permanently. The split now comes from the caller knowing the
+// body is urlencoded, where a `&` inside a value is `%26`.
+func TestAQueryStringIsNotAFieldBoundary(t *testing.T) {
+	canon, variant := "https://hs27.test", "https://wt-a--hs27.test"
+	u := variant + "/landing/?utm_source=news&utm_medium=email"
+	in := `a:1:{s:3:"url";s:` + strconv.Itoa(len(u)) + `:"` + u + `";}`
+	cu := strings.ReplaceAll(u, variant, canon)
+	want := `a:1:{s:3:"url";s:` + strconv.Itoa(len(cu)) + `:"` + cu + `";}`
+
+	got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}))
+	if got != want {
+		t.Errorf("a query string was treated as a field boundary:\n got  %s\n want %s",
+			got, want)
 	}
 }

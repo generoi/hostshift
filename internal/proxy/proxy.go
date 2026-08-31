@@ -689,7 +689,15 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// Both spellings matter: a form percent-encodes, so `options.php` sends
 		// `s%3A51%3A%22` and a literal scanner never sees it.
 		var ev []origin.Event
-		out = rewrite.RepairSerialized(buf, func(b []byte) []byte {
+		// The field-splitting form only for a real urlencoded body, where `&` is
+		// unambiguously a separator because a `&` inside a value is `%26`.
+		// Guessing that from the bytes cut serialized values apart at the
+		// `&utm_medium=` inside ordinary tracking URLs.
+		repair := rewrite.RepairSerialized
+		if mediaType(r.Header.Get("Content-Type")) == "application/x-www-form-urlencoded" {
+			repair = rewrite.RepairSerializedFields
+		}
+		out = repair(buf, func(b []byte) []byte {
 			nv, nev := rev.Rewrite(b, rewrite.SurfaceRequestBody, explain)
 			ev = append(ev, nev...)
 			return rewrite.HostLeaksBackCounted(rev, nv, p.Stats,
