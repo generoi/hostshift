@@ -98,7 +98,11 @@ fi
 
 echo "== the map comes from the checkout whose database it is"
 
-main="$work/acme"; newproject "$main" 'name: acme\nadditional_hostnames:\n  - nat.acme'
+# docroot, because the database gate has to run wp-cli from it. `ddev exec -s
+# web` lands in /var/www/html; WordPress lives under the docroot, and stock DDEV
+# WordPress uses `web`. Leaving it out of the fixture is what let the gate be a
+# silent no-op while this suite passed.
+main="$work/acme"; newproject "$main" 'name: acme\ndocroot: web\nadditional_hostnames:\n  - nat.acme'
 wt="$work/acme-wt-a"
 git -C "$main" worktree add -q -b feature/x "$wt"
 mkdir -p "$wt/.ddev"
@@ -233,6 +237,41 @@ printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example
   > "$main/hostshift.yaml"
 out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
 contains "a parent's hostshift.yaml a worktree cannot see is called out" \
+  "declares the hostnames its database" "$out"
+
+# And the case that made the warning a permanent, unconditional refusal.
+#
+# The condition was pure file existence: the parent has a hostshift.yaml this
+# branch does not. But the most ordinary reason to adopt one is an alias, with
+# `canonical` naming the hostname the map already uses — and then the worktree's
+# map names exactly what the parent declares, nothing is wrong, and `check`
+# still said "would rewrite nothing, every link would point at the canonical
+# site" and exited 2. Measured against a live deployment: 200s, 32 origins
+# rewritten, `hostshift diff` GREEN, refused on every `ddev start` with nothing
+# that could ever clear it.
+#
+# Comparing two declarations is not the discovery §4.1 forbids — the database
+# gate was wrong four rounds running because it interrogated the application.
+# This asks two config files what they say, which is what builds the map anyway.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://acme.ddev.site, aliases: [https://nat.acme.ddev.site]}\n' \
+  > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"declares the hostnames its database"*)
+    fail "a parent declaring what the map already names is not called out" "$out" ;;
+  *) pass "a parent declaring what the map already names is not called out" ;;
+esac
+# A declaration the comparison cannot read is not agreement. Silence here would
+# reintroduce the leak the warning exists for, so a parent whose hostshift.yaml
+# does not parse must still be called out.
+#
+# (The comparison also refuses to treat two *empty* answers as a match. Nothing
+# below drives that: it needs the worktree's own map to fail at the same moment,
+# and the script has already exited by then if it did. It is guesswork-free
+# insurance, not a tested path, and this comment is the honest label.)
+printf 'version: 1\nsites: [[[ not yaml\n' > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "a parent declaration that will not parse is still called out" \
   "declares the hostnames its database" "$out"
 rm -f "$main/hostshift.yaml"
 
@@ -834,9 +873,20 @@ cat > "$fakedb/ddev" <<'FAKEDDEV'
 # filters through WP_HOME and which therefore answers with generated config
 # rather than with what the database holds.
 case "$*" in
-  # A trailing blank line, exactly as `wp db query` emits one. `tail -1` read
-  # that blank and the whole gate silently stopped running.
-  *"option_name='home'"*) printf '%s\n\n' "${HS_FAKE_HOME:-}" ;;
+  # The working directory is part of the question, not decoration.
+  #
+  # This used to match on the query alone, so it answered wherever the script
+  # ran wp-cli from — and the real `ddev exec -s web` lands in /var/www/html,
+  # which is the project root, not the docroot. wp-cli said "This does not seem
+  # to be a WordPress installation", the script swallowed it, and the gate was a
+  # silent no-op on every project without a root wp-cli.yml — while this test
+  # went on passing. An instrument that cannot fail on the real defect is not
+  # measuring anything.
+  *"-d /var/www/html/web"*"option_name='home'"*) printf '%s\n\n' "${HS_FAKE_HOME:-}" ;;
+  *"option_name='home'"*)
+    echo "Error: This does not seem to be a WordPress installation." >&2
+    echo "The used path is: /var/www/html/" >&2
+    exit 1 ;;
 esac
 exit 0
 FAKEDDEV

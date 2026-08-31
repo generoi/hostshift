@@ -348,6 +348,29 @@ ddev_name() {
   esac
 }
 
+# ddev_docroot prints the project's docroot, from the same merged config
+# ddev_name reads. `ddev exec -s web` lands in /var/www/html, which is the
+# project root and not where WordPress lives, so wp-cli answered "This does not
+# seem to be a WordPress installation" and the `2>/dev/null … || true` swallowed
+# it — the database gate was a silent no-op on every project without a
+# root-level wp-cli.yml supplying `path:`. That includes stock DDEV WordPress
+# with `docroot: web`, and the fixture test/bootstrap-ddev.sh builds.
+ddev_docroot() {
+  for f in "$1"/config.yaml "$1"/config.*.yaml; do
+    [ -f "$f" ] || continue
+    v="$(sed -n 's/^docroot:[[:space:]]*//p' "$f" | sed -n 1p | tr -d '\r' \
+      | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" \
+      -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//')"
+    # An `if`, not `[ -n "$v" ] && …`. With `pipefail` set, a false `&&` on the
+    # loop's last iteration is the whole pipeline's status, so a project whose
+    # final config file declares no docroot made this function *fail* — and
+    # `set -e` then ended the script at the assignment, several blocks before
+    # anything it was called for.
+    if [ -n "$v" ]; then printf '%s\n' "$v"; fi
+  done | sed -n '$p'
+  return 0
+}
+
 if [ "$cmd" = "copy-db" ]; then
   [ -n "$parent" ] || {
     echo "hostshift: no parent checkout to copy from — this is not a linked worktree" >&2
@@ -520,6 +543,9 @@ parent_declares_warn() {
   echo "  nothing. Every link would point at the canonical site." >&2
   echo "  Merge the branch that adds hostshift.yaml, or copy it here." >&2
 }
+# Detection only. Whether it is *true* is decided further down, once there is a
+# map to compare the parent's declaration against — see the block after
+# `hostshift map --variant-hosts`.
 if [ ! -f hostshift.yaml ] && [ -n "$parent" ] && [ -f "$parent/hostshift.yaml" ]; then
   parent_declares="$parent/hostshift.yaml"
   # Held, not printed, when `check` is the one asking.
@@ -530,11 +556,10 @@ if [ ! -f hostshift.yaml ] && [ -n "$parent" ] && [ -f "$parent/hostshift.yaml" 
   # said "would rewrite nothing, every link would point at the canonical site"
   # on every start, and recommended the one action this file's own comments call
   # "the action that silently breaks the site" in that state.
-  if [ "$cmd" = "check" ]; then
-    parent_declares_msg=1
-  else
-    parent_declares_warn
-  fi
+  # Held in every mode, not just `check`: the comparison that decides whether
+  # this is true has not run yet at this point in the file, and printing first
+  # and comparing afterwards is how it came to be printed over healthy sites.
+  parent_declares_msg=1
 fi
 
 if [ ! -f hostshift.yaml ] && [ -n "$unreadable_parent" ]; then
@@ -550,7 +575,12 @@ fi
 if [ ! -f hostshift.yaml ] && [ -n "$parent_hosts" ]; then
   # Said out loud, because "map from --from/--to" does not tell anyone which
   # checkout those origins came from, and that is the one thing worth knowing.
-  echo "hostshift: canonical hostnames from $parent, whose database this shares" >&2
+  # What this line can honestly claim is where the hostnames came from. It used
+  # to add "whose database this shares", which `copy-db` exists to make false —
+  # and it kept printing on every boot afterwards, a factual claim about the
+  # developer's environment contradicted by the command's own closing line.
+  # Asking the container would be discovery, and §4.1 says the map is declared.
+  echo "hostshift: canonical hostnames from $parent, the checkout this was made from" >&2
   while IFS= read -r h; do
     [ -n "$h" ] && map_args+=(--from "https://$h")
   done <<<"$parent_hosts"
@@ -559,6 +589,43 @@ fi
 # The map is the binary's business; parse only what this needs from it.
 variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --variant-hosts \
   | paste -sd, -)"
+
+# Now that there *is* a map, ask whether the parent's declaration disagrees with
+# it — which is the question the warning above claims to answer and never asked.
+#
+# The condition was pure file existence: the parent has a hostshift.yaml this
+# branch does not. That fires in the ordinary case where the worktree's map
+# already names exactly what the parent declares, and it printed "the map would
+# rewrite nothing, every link would point at the canonical site" over a
+# deployment serving 200s with every origin rewritten and `hostshift diff`
+# GREEN — then exited 2, so `ddev start` failed and an unattended check saw a
+# correct deployment fail, permanently, with no way to clear it.
+#
+# Comparing two *declarations* is not the discovery mechanism §4.1 forbids. The
+# database gate was wrong four rounds running because it interrogated the
+# application; this asks two config files what they say, which is what the map
+# is built from in the first place.
+if [ -n "$parent_declares" ]; then
+  # --slug because `map` refuses to resolve without a variant, even though the
+  # slug cannot affect the canonical side, which is the only side compared.
+  declared="$(hostshift map -C "$parent" --slug "$slug" --canonical-hosts \
+    2>/dev/null | sort -u || true)"
+  mapped="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+    --canonical-hosts 2>/dev/null | sort -u || true)"
+  # Only when the parent actually declared something we could read. An empty
+  # answer means the comparison failed, not that the two agree, and silence
+  # there would reintroduce the leak this warning exists for.
+  if [ -n "$declared" ] && [ "$declared" = "$mapped" ]; then
+    parent_declares=""
+    parent_declares_msg=""
+  fi
+fi
+
+# `check` holds it until it has the container state and the probe; everything
+# else says it here, now that the comparison has decided whether it is true.
+if [ -n "$parent_declares" ] && [ "$cmd" != "check" ]; then
+  parent_declares_warn
+fi
 [ -n "$variants" ] || { echo "hostshift produced no map — run 'hostshift check'" >&2; exit 2; }
 
 # Nothing anywhere checks that two projects do not claim the same hostname —
@@ -1341,7 +1408,17 @@ if [ "$cmd" = "check" ]; then
   # Matching the shape rather than a position also skips a column header or a
   # warning line, and `sed -n '…{p;q;}'` is the file's existing way of taking a
   # first match without `head -1` SIGPIPEing the writer under pipefail.
-  dbhome="$(ddev exec -s web wp --skip-plugins --skip-themes --quiet db query \
+  # -d, because `ddev exec -s web` runs in /var/www/html and WordPress is under
+  # the docroot. Without it wp-cli errored, the error was swallowed, and the
+  # gate reported nothing on every project whose root has no wp-cli.yml `path:`.
+  # An `if`, not `[ -n "$dr" ] && …`: under `set -e` a false `&&` chain is the
+  # command's own exit status, so an empty docroot ended the script right here.
+  wproot="/var/www/html"
+  dr="$(ddev_docroot .ddev)"
+  if [ -n "$dr" ]; then
+    wproot="/var/www/html/$dr"
+  fi
+  dbhome="$(ddev exec -s web -d "$wproot" wp --skip-plugins --skip-themes --quiet db query \
     "select option_value from wp_options where option_name='home' limit 1" --skip-column-names \
     2>/dev/null | tr -d '\r' | sed -n '/^https\{0,1\}:\/\//{p;q;}' || true)"
   dbhost=""

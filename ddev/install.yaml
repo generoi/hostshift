@@ -306,9 +306,22 @@ removal_actions:
     # collisions, never for web hostnames.
     # `..` is the project root: these actions run with cwd <project>/.ddev, and
     # a linked worktree's `.git` is a *file* there rather than a directory.
+    #
+    # And only when there is something to inherit. `HOSTSHIFT_WEB_HOSTS` is set
+    # on every configured worktree — on the README's headline single-hostname
+    # case it equals `$DDEV_HOSTNAME`, so removal changes nothing and the
+    # warning described a hazard that could not occur. The short-circuit at the
+    # top of this same file already asks the right question.
     inherited=""
     if [ -f ../.git ] && grep -qs '^HOSTSHIFT_WEB_HOSTS=.' .env; then
-      inherited=1
+      pdir=""
+      p="$(sed -n 's/^gitdir:[[:space:]]*//p' ../.git | head -1)"
+      case "$p" in
+        */.git/worktrees/*) pdir="${p%%/.git/worktrees/*}" ;;
+      esac
+      if [ -n "$pdir" ] && grep -qs '^additional_hostnames:' "$pdir/.ddev/config.yaml"; then
+        inherited=1
+      fi
     fi
 
     echo "hostshift removed."
