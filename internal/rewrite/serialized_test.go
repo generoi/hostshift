@@ -2178,6 +2178,20 @@ func TestTheDetectorReadsEverySpellingTheRepairDoes(t *testing.T) {
 		"rawurlencode":                 pct,
 		"rawurlencode(esc_attr)":       func(s string) string { return pct(escAttrNoDouble(s)) },
 		"rawurlencode(wp_json_encode)": func(s string) string { return pct(jsonEsc(s)) },
+		// JSON_HEX_QUOT, which is what wp_interactivity_data_wp_context()
+		// writes so a single-quoted attribute needs no second escaping pass.
+		"wp_json_encode(JSON_HEX_QUOT)": func(s string) string {
+			return strings.ReplaceAll(jsonEsc(s), `\"`, `\u0022`)
+		},
+		// The mirror of esc_attr(wp_json_encode()): whichever encoder ran last
+		// owns the quotes.
+		"wp_json_encode(esc_attr)": func(s string) string { return jsonEsc(escAttrNoDouble(s)) },
+		// JSON carried as a string inside JSON, which is a nested block
+		// attribute — the same encoder twice, which the product missed because
+		// it was enumerated over *kinds*.
+		"wp_json_encode twice": func(s string) string {
+			return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(jsonEsc(s))
+		},
 	} {
 		if n := BrokenSerialized([]byte(enc(stale(host)))); n == 0 {
 			t.Errorf("%s: a length overrunning its data was reported clean:\n %s",

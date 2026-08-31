@@ -247,7 +247,7 @@ func onlySpaceAfter(b []byte, end int) bool {
 // parse failed immediately, and "a failed candidate declines the buffer" then
 // declined every body containing a link.
 func repairAt(b []byte, i int, rw func([]byte) []byte, fieldOK func(end int) bool) (rep []byte, end int, ok, committed bool) {
-	for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax} {
+	for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax, htmlJSONSyntax, jsonDoubleSyntax} {
 		r, e, o, c, amb := tryBothPicks(b, i, rw, 0, base, fieldOK)
 		if o {
 			return r, e, true, c
@@ -794,15 +794,44 @@ var htmlSyntax = syntax{
 
 // jsonSyntax is the spelling a JSON string value carries: the quotes become
 // `\"`, everything else stays literal.
+// jsonHexWidth is the width of a `\uXXXX` escape at i that decodes to c, or 0.
+//
+// JSON has two spellings for every character, and a delimiter written the long
+// way is still that delimiter. WordPress core takes the long way on purpose:
+// `wp_interactivity_data_wp_context()` encodes with
+// JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_HEX_AMP, which is what lets a
+// `data-wp-context` attribute be single-quoted with no second escaping pass —
+// so every Interactivity API block writes `\u0022` where the walk looked only
+// for `\"`. Reading one and not the other is a hole in the escaping axis, and a
+// value nothing can read is one the host is rewritten in with no length
+// re-emitted.
+func jsonHexWidth(b []byte, i int, c byte) int {
+	if i+6 > len(b) || b[i] != '\\' || b[i+1] != 'u' {
+		return 0
+	}
+	v := 0
+	for _, h := range b[i+2 : i+6] {
+		d, ok := hexDigit(h)
+		if !ok {
+			return 0
+		}
+		v = v<<4 | d
+	}
+	if v != int(c) {
+		return 0
+	}
+	return 6
+}
+
 var jsonSyntax = syntax{
 	match: func(b []byte, i int, c byte) (int, bool) {
-		if c == '"' {
-			if i+1 < len(b) && b[i] == '\\' && b[i+1] == '"' {
-				return 2, true
-			}
-			return 0, false
+		if c == '"' && i+1 < len(b) && b[i] == '\\' && b[i+1] == '"' {
+			return 2, true
 		}
-		if i < len(b) && b[i] == c {
+		if w := jsonHexWidth(b, i, c); w > 0 {
+			return w, true
+		}
+		if c != '"' && i < len(b) && b[i] == c {
 			return 1, true
 		}
 		return 0, false
@@ -939,13 +968,15 @@ func hexDigit(c byte) (int, bool) {
 // the false RED it replaced.
 var jsonHTMLSyntax = syntax{
 	match: func(b []byte, i int, c byte) (int, bool) {
-		if c == '"' {
-			if i+7 <= len(b) && b[i] == '\\' && string(b[i+1:i+7]) == "&quot;" {
-				return 7, true
-			}
-			return 0, false
+		if c == '"' && i+7 <= len(b) && b[i] == '\\' && string(b[i+1:i+7]) == "&quot;" {
+			return 7, true
 		}
-		if i < len(b) && b[i] == c {
+		// The hex spelling passes through esc_attr untouched — it has no byte
+		// esc_attr escapes — so it reaches this spelling as itself.
+		if w := jsonHexWidth(b, i, c); w > 0 {
+			return w, true
+		}
+		if c != '"' && i < len(b) && b[i] == c {
 			return 1, true
 		}
 		return 0, false
@@ -1157,6 +1188,159 @@ func percentJSONUnit(b []byte, i int) (src, dec, alt int) {
 	}
 	if _, w := pctByte(b, i); w > 0 {
 		return w, 1, 0
+	}
+	return 0, 0, 0
+}
+
+// jsonDoubleSyntax is a serialized value JSON-encoded twice: a JSON document
+// carried as a *string* inside another one, which is how a Gutenberg block
+// attribute holds nested JSON.
+//
+// The second pass escapes the first pass's escapes, so every `\"` becomes
+// `\\\"` and every `\/` becomes `\\\/` — four source bytes for one byte the
+// serializer counted. It is the same encoder twice rather than two different
+// ones, which is why it was missed: the product was enumerated over *kinds* of
+// escaping and this cell is a kind crossed with itself.
+var jsonDoubleSyntax = syntax{
+	match: func(b []byte, i int, c byte) (int, bool) {
+		if c == '"' {
+			if i+4 <= len(b) && string(b[i:i+4]) == `\\\"` {
+				return 4, true
+			}
+			return 0, false
+		}
+		if i < len(b) && b[i] == c {
+			return 1, true
+		}
+		return 0, false
+	},
+	emit: func(dst []byte, c byte) []byte {
+		if c == '"' {
+			return append(dst, `\\\"`...)
+		}
+		return append(dst, c)
+	},
+	advance: func(b []byte, i, n int) (int, bool) {
+		if n < 0 {
+			return 0, false
+		}
+		for n > 0 {
+			if i >= len(b) {
+				return 0, false
+			}
+			src, dec, _ := jsonDoubleUnit(b, i)
+			if src == 0 || dec > n {
+				return 0, false
+			}
+			i, n = i+src, n-dec
+		}
+		return i, true
+	},
+	unit: jsonDoubleUnit,
+}
+
+// jsonDoubleUnit reads one decoded byte of the twice-JSON-encoded spelling.
+func jsonDoubleUnit(b []byte, i int) (src, dec, alt int) {
+	if i+1 < len(b) && b[i] == '\\' && b[i+1] == '\\' {
+		// `\\` then the inner pass's escape: `\\\"`, `\\\/`, or `\\u00e4`.
+		if i+2 < len(b) && b[i+2] == '\\' {
+			if i+3 < len(b) {
+				return 4, 1, 0
+			}
+			return 0, 0, 0
+		}
+		if i+2 < len(b) && b[i+2] == 'u' {
+			// The inner `\uXXXX` with its backslash doubled: measure the rune
+			// from the same digits jsonUnicodeRun would read.
+			if s, d, ok := jsonUnicodeRun(b[1:], i); ok {
+				return s + 1, d, 0
+			}
+			return 0, 0, 0
+		}
+		return 2, 1, 0
+	}
+	if i < len(b) {
+		return 1, 1, 0
+	}
+	return 0, 0, 0
+}
+
+// htmlJSONSyntax is a serialized value that was HTML-escaped and then
+// JSON-encoded: `esc_attr` first, so the quotes are `&quot;`, and `json_encode`
+// second, so every `/` is `\/`.
+//
+// It is the mirror of jsonHTMLSyntax, which is the same two encoders the other
+// way round — and the order decides everything, because whichever ran last owns
+// the quotes. A plugin that escapes on save and JSON-encodes on read produces
+// this one; nothing read it, and a value nothing reads has its host rewritten
+// with no length re-emitted.
+var htmlJSONSyntax = syntax{
+	match: func(b []byte, i int, c byte) (int, bool) {
+		if c == '"' {
+			if w := entityRun(b, i); w > 0 {
+				return w, true
+			}
+			return 0, false
+		}
+		if w := jsonHexWidth(b, i, c); w > 0 {
+			return w, true
+		}
+		if i < len(b) && b[i] == c {
+			return 1, true
+		}
+		return 0, false
+	},
+	emit: func(dst []byte, c byte) []byte {
+		if c == '"' {
+			return append(dst, "&quot;"...)
+		}
+		return append(dst, c)
+	},
+	advance: func(b []byte, i, n int) (int, bool) {
+		if n < 0 {
+			return 0, false
+		}
+		for n > 0 {
+			if i >= len(b) {
+				return 0, false
+			}
+			src, dec, _ := htmlJSONUnit(b, i)
+			if src == 0 || dec > n {
+				return 0, false
+			}
+			i, n = i+src, n-dec
+		}
+		return i, true
+	},
+	unit: htmlJSONUnit,
+}
+
+// htmlJSONUnit reads one decoded byte of the entity-then-JSON spelling: the
+// JSON layer is on the outside, so its escapes are undone first.
+func htmlJSONUnit(b []byte, i int) (src, dec, alt int) {
+	if i < len(b) && b[i] == '\\' {
+		if i+1 < len(b) && b[i+1] == 'u' {
+			if s, d, ok := jsonUnicodeRun(b, i); ok {
+				return s, d, 0
+			}
+			return 0, 0, 0
+		}
+		if i+1 < len(b) {
+			return 2, 1, 0
+		}
+		return 0, 0, 0
+	}
+	// The quote spelling is unambiguous, for the reason htmlUnit gives: it is
+	// the delimiter of the layer underneath, so a nested payload is made of
+	// them and offering two readings each explodes the search.
+	if w := entityRun(b, i); w > 0 {
+		return w, 1, 0
+	}
+	if w := refRun(b, i); w > 0 {
+		return w, 1, w
+	}
+	if i < len(b) {
+		return 1, 1, 0
 	}
 	return 0, 0, 0
 }
@@ -1989,7 +2173,7 @@ func BrokenSerialized(b []byte) int {
 		// an `esc_attr` input or a JSON string is not broken, it is escaped —
 		// and a check that is always RED is a check nobody reads, which is the
 		// mechanism that let five rounds of real corruption pass unnoticed.
-		for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax} {
+		for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax, htmlJSONSyntax, jsonDoubleSyntax} {
 			_, e, o, c, amb := tryBothPicks(b, i, id, 0, base, nil)
 			if o {
 				end, ok = e, true
