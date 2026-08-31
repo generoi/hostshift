@@ -560,3 +560,28 @@ func TestAByteIdenticalPageIsCountedEvenWithANote(t *testing.T) {
 		t.Errorf("the note was lost:\n%s", out)
 	}
 }
+
+// A page that both leaks an origin and serves a blob PHP refuses reports both.
+//
+// The note was a switch, so the first arm to match won and the rest were
+// silent. The page most likely to earn two notes is the one carrying a
+// serialized payload full of URLs — exactly the shape this detector exists for
+// — so the arm that lost was the one worth reading.
+func TestAPageReportsEveryNoteItEarned(t *testing.T) {
+	var buf bytes.Buffer
+	WriteReport(&buf, []Result{{
+		Path: "/both", Leaks: 2, BrokenSerialized: 3, ContentType: "text/html",
+	}})
+	out := buf.String()
+	if !strings.Contains(out, "CANONICAL ORIGIN REACHED THE BROWSER") {
+		t.Errorf("the leak was not reported:\n%s", out)
+	}
+	if !strings.Contains(out, "3 serialized value(s)") {
+		t.Errorf("the broken payload was not reported:\n%s", out)
+	}
+	// And the summary names both, so a RED run says what was wrong without
+	// scrolling back up.
+	if !strings.Contains(out, "2 leaks, 3 broken") {
+		t.Errorf("the summary did not count both:\n%s", out)
+	}
+}

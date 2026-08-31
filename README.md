@@ -393,7 +393,15 @@ binary's. DDEV collapses a host command's status to 1, so a script testing
 reality: it crawls N pages canonically, fetches the same N through the proxy,
 runs the canonical bytes through the same engine, and compares. The assertions
 that fail a run are the ones that cannot be innocent — a canonical origin
-reaching the browser, and a page whose line count changed.
+reaching the browser, a page whose line count changed, and a serialized value
+served with a length that does not describe its data, which PHP will refuse or
+silently truncate.
+
+That last one is asserted on the served bytes alone, not by comparing the proxy
+against the engine. Every other check here compares the two, so when both are
+wrong in the same way the run is green — which is how five consecutive rounds of
+silent `wp_options` destruction went unreported by the one check that validates
+against reality.
 
 ## Building and testing
 

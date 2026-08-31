@@ -579,40 +579,48 @@ func countDiffLines(a, b string) int {
 // canonical origin reached the browser, and no page lost or gained lines.
 func WriteReport(w io.Writer, results []Result) bool {
 	green := true
-	var equal, leaks, errs, tier2 int
+	var equal, leaks, errs, tier2, broken int
 
 	fmt.Fprintf(w, "%-46s %-8s %-7s %-7s %s\n", "PATH", "BYTES", "LEAKS", "LINES", "NOTE")
 	for _, r := range results {
-		note := ""
-		switch {
-		case r.Err != nil:
-			note, errs = r.Err.Error(), errs+1
+		// Every note a page has earned, not the first one. This was a switch, so
+		// a page that both leaked an origin *and* served a blob PHP refuses
+		// reported only the leak — and the page most likely to do both is the
+		// one carrying a serialized payload full of URLs, which is the shape
+		// this whole detector exists for.
+		var notes []string
+		if r.Err != nil {
+			notes, errs = append(notes, r.Err.Error()), errs+1
 			green = false
-		case r.Leaks > 0:
-			note = "CANONICAL ORIGIN REACHED THE BROWSER"
+		}
+		if r.Leaks > 0 {
+			notes = append(notes, "CANONICAL ORIGIN REACHED THE BROWSER")
 			leaks += r.Leaks
 			green = false
-		case r.BrokenSerialized > 0:
-			note = fmt.Sprintf("%d serialized value(s) served with a length that "+
-				"does not describe the data — PHP will refuse or truncate them",
-				r.BrokenSerialized)
+		}
+		if r.BrokenSerialized > 0 {
+			notes = append(notes, fmt.Sprintf("%d serialized value(s) served with "+
+				"a length that does not describe the data — PHP will refuse or "+
+				"truncate them", r.BrokenSerialized))
+			broken += r.BrokenSerialized
 			green = false
-		case r.Tier2 > 0:
+		}
+		if r.Tier2 > 0 {
 			// Not a defect: PLAN's fast path excludes these types "per Tier 2,
 			// and added only if the corpus diff shows a leak". This is that
 			// showing. It does not turn the run RED, because the proxy is doing
 			// what it says it does — but it is the trigger, so it is loud.
-			note = fmt.Sprintf("%d origins in a Tier 2 type (%s) — the PLAN's "+
-				"trigger for rewriting it", r.Tier2, r.ContentType)
+			notes = append(notes, fmt.Sprintf("%d origins in a Tier 2 type (%s) — "+
+				"the PLAN's trigger for rewriting it", r.Tier2, r.ContentType))
 			tier2 += r.Tier2
-		case r.LinesCanonical != r.LinesVariant:
-			note = "line count changed — something re-serialised"
-			green = false
-		default:
-			if !r.Equal {
-				note = fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines)
-			}
 		}
+		if r.LinesCanonical != r.LinesVariant {
+			notes = append(notes, "line count changed — something re-serialised")
+			green = false
+		} else if len(notes) == 0 && !r.Equal {
+			notes = append(notes, fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines))
+		}
+		note := strings.Join(notes, "; ")
 		// Counted outside the switch. `equal++` used to sit in its last arm, so
 		// a page that *is* byte-identical but carries a note was never counted:
 		// the BYTES column said `same` while the summary said `0 byte-identical`,
@@ -629,8 +637,12 @@ func WriteReport(w io.Writer, results []Result) bool {
 			fmt.Sprintf("%d/%d", r.LinesCanonical, r.LinesVariant), note)
 	}
 
-	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d errors\n",
-		len(results), equal, leaks, errs)
+	// `broken` belongs on this line. Without it a run could print
+	// "3 pages, 3 byte-identical, 0 leaks, 0 errors" and then "corpus diff RED",
+	// naming nothing that was wrong — and this summary is what a developer
+	// reads before deciding whether to scroll up.
+	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d broken, %d errors\n",
+		len(results), equal, leaks, broken, errs)
 	if tier2 > 0 {
 		fmt.Fprintf(w, "%d origins in Tier 2 types (text/css, JavaScript), which the "+
 			"proxy excludes by design — PLAN's fast path adds them \"only if the "+
