@@ -343,6 +343,12 @@ func (w *HTML) urlLeaks(base int, v []byte) []byte {
 	if out := w.normaliseURLLeak(SurfaceHTMLObfuscated, base, cur, true); !bytes.Equal(out, cur) {
 		return out
 	}
+	// Three paths cover a reference-encoded origin in an attribute, and that is
+	// deliberate rather than accidental: decodeEntityLeak above, this view, and
+	// normaliseURLLeak — which runs on `dec`, the decoded form, so it locates one
+	// too. Disabling any one of the three still rewrites; disabling all three
+	// leaks. The view is the one that survives a value decodeURLRefs declines.
+	//
 	// The reference *view*, which needs no fusing guard because it emits nothing.
 	//
 	// decodeURLRefs declines an entire value whenever any fragment in it would
