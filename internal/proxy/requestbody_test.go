@@ -509,3 +509,55 @@ func TestTheHTMLArmRepairsSerializedLengths(t *testing.T) {
 		})
 	}
 }
+
+// A urlencoded body that carries a serialized value in one field must still read
+// the origin in the field beside it, whatever spelling that origin is written in.
+//
+// RepairSerializedFields splits the body on `&`, and since round 33 fieldBreak
+// exempts a `&` that opens a character reference. It asks refRun what one is:
+// at most twelve bytes, and a `;` required. The decoder that has to find the
+// host, parseURLRef, answers a wider question — a named reference up to
+// thirty-four bytes, which urlobf.go raised its own cap to precisely for the
+// U+200B family it calls "all live production links", and a numeric reference
+// whose trailing `;` browsers make optional. Where the two disagree the split
+// lands inside the hostname and neither field contains it.
+//
+// The whole-buffer pass RepairSerializedFields runs when it finds nothing
+// serialized is what covered that difference. A serialized value in any *other*
+// field disarms it — and options.php posts every option on a settings page in
+// one body, so one serialized option is all it takes. The variant hostname then
+// goes upstream and into the shared database with no event, no WARN and no
+// counter, which is the harm tests 30 and 31 exist for.
+func TestASerializedFieldDoesNotHideAReferenceSpelledHostBesideIt(t *testing.T) {
+	link := "https://" + variantHost + "/a.png"
+	blob := `a:1:{s:1:"u";s:` + strconv.Itoa(len(link)) + `:"` + link + `";}`
+
+	for _, sp := range []struct{ name, spelling string }{
+		{"a numeric reference without its semicolon",
+			"https://wt-a--acmecorp&#46ddev.site/a.png"},
+		{"a named reference longer than twelve bytes",
+			"https://wt-a--acmecorp&ZeroWidthSpace;.ddev.site/a.png"},
+	} {
+		for _, f := range []struct{ name, body string }{
+			{"in a field of its own", "content=" + sp.spelling},
+			{"beside a field holding a serialized value", "blob=" + blob + "&content=" + sp.spelling},
+		} {
+			t.Run(sp.name+"/"+f.name, func(t *testing.T) {
+				h := newHarness(t, acmecorpMap(t), func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(200)
+				})
+				res, rb := h.do(t, "POST", variantHost, "/wp-admin/options.php",
+					"application/x-www-form-urlencoded", []byte(f.body))
+				if h.seen == nil {
+					t.Fatalf("the upstream was never reached: status %d, body %q", res.StatusCode, rb)
+				}
+				up, _ := io.ReadAll(h.seen.Body)
+				if bytes.Contains(up, []byte(variantHost)) ||
+					bytes.Contains(up, []byte("wt-a--acmecorp&")) {
+					t.Errorf("a variant hostname reached the upstream, so it would be "+
+						"written into the shared database:\n sent: %s\n   up: %s", f.body, up)
+				}
+			})
+		}
+	}
+}

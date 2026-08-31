@@ -2029,3 +2029,47 @@ func TestThePercentSpellingKeepsItsHexCase(t *testing.T) {
 		t.Errorf("\n got  %s\n want %s", got, want)
 	}
 }
+
+// PHP writes a large float as `d:1.0E+17;` — anything from 1e17 up, and every
+// integer past PHP_INT_MAX — and a form encoder writes that `+` as `%2B`.
+//
+// scanScalar reads a `d:` value's sign, point and exponent as raw bytes, so in
+// the percent spelling the exponent's sign is invisible: the scalar fails to
+// parse, the array holding it fails with it, and the field declines. `+` is the
+// only byte of that grammar a urlencoder touches, which is why the other two
+// scalars here pass.
+//
+// A decline is not neutral. The generic rewrite still replaces the host and
+// re-emits no length, so `options.php` hands `update_option` the variant's byte
+// count over the canonical's data and `unserialize` returns false — the row is
+// lost. Nothing scores it: `hostshift diff` never looks at a request, and the
+// decline is host-independent, so the detector counts it identically on both
+// sides of the diff.
+func TestAPercentEncodedFloatExponentDoesNotDeclineItsField(t *testing.T) {
+	canon, variant := "mz34a.ddev.site", "wt-a--mz34a.ddev.site"
+	// The bare host: the percent spelling encodes `:` and `/`, so a full origin
+	// never appears literally and a stub matching on one would rewrite nothing.
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}
+	// Every delimiter encoded, as `urlencode` writes them — one left literal is
+	// not a delimiter in this spelling and the value would decline for that
+	// rather than for the reason under test.
+	enc := strings.NewReplacer(
+		":", "%3A", `"`, "%22", ";", "%3B", "{", "%7B", "}", "%7D",
+		"/", "%2F", "+", "%2B").Replace
+	ser := func(host, scalar string) string {
+		v := "https://" + host + "/a.png"
+		return `a:2:{s:1:"n";` + scalar +
+			`s:1:"u";s:` + strconv.Itoa(len(v)) + `:"` + v + `";}`
+	}
+	for _, scalar := range []string{"i:12;", "d:1.0E-5;", "d:1.0E+17;"} {
+		t.Run(scalar, func(t *testing.T) {
+			got := string(RepairSerializedFields([]byte("opt="+enc(ser(variant, scalar))), rw))
+			if want := "opt=" + enc(ser(canon, scalar)); got != want {
+				t.Errorf("the length was not re-emitted, so PHP refuses the whole option:"+
+					"\n got  %s\n want %s", got, want)
+			}
+		})
+	}
+}

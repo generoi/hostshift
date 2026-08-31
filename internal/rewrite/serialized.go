@@ -118,11 +118,24 @@ func RepairSerializedFields(b []byte, rw func([]byte) []byte) []byte {
 // Splitting correctly is better than covering for a bad split. A real separator
 // in a urlencoded body cannot be a reference, because a `&` inside a value is
 // `%26` — so where these two disagree, the reference is what the sender meant.
+//
+// It asks parseURLRef, not refRun. They answer different questions and the
+// difference is a leak: refRun asks what `esc_attr` writes — at most twelve
+// bytes, semicolon required — because that is what a serialized *length* counts.
+// This has to ask what a decoder will read a host through, and that decoder
+// takes a named reference up to thirty-four bytes (the `&ZeroWidthSpace;`
+// family) and a numeric one whose semicolon is optional, because browsers
+// accept it. Splitting on a `&` the decoder would have consumed puts the break
+// inside the hostname, and then no field contains it.
 func fieldBreak(b []byte, start int) int {
 	for i := start; i < len(b); i++ {
-		if b[i] == '&' && refRun(b, i) == 0 {
-			return i
+		if b[i] != '&' {
+			continue
 		}
+		if _, w := parseURLRef(b[i:]); w > 0 {
+			continue
+		}
+		return i
 	}
 	return len(b)
 }
@@ -1031,6 +1044,31 @@ func repairValue(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax)
 	return nil, 0, false
 }
 
+// signWidth is the width of a `+` or `-` at j, in whatever spelling wrote it,
+// or 0.
+//
+// Through syn.match, because `+` is the one byte of the scalar grammar a
+// urlencoder touches. PHP writes any float from 1e17 up — and every integer
+// past PHP_INT_MAX — as `d:1.0E+17;`, and `urlencode` makes that `+` into
+// `%2B`. Read raw, the exponent's sign was invisible in the percent spelling:
+// the scalar failed, its array failed with it, the field declined, and the
+// generic rewrite then replaced the host and re-emitted no length. A settings
+// page with one large number on it lost the option.
+func signWidth(b []byte, j int, syn syntax) int {
+	// Raw first: `-` is not in any urlencoder's escape set, so `d:1.0E-5;`
+	// arrives with it literal even in the percent spelling. Only `+` is
+	// escaped, and only because a form body already spends it on a space.
+	if j < len(b) && (b[j] == '-' || b[j] == '+') {
+		return 1
+	}
+	for _, c := range []byte{'-', '+'} {
+		if w, ok := syn.match(b, j, c); ok {
+			return w
+		}
+	}
+	return 0
+}
+
 // scanScalar matches `b:0;`, `i:-12;` or `d:1.5E+3;` — and nothing else.
 func scanScalar(b []byte, i int, syn syntax) (int, bool) {
 	kind := b[i]
@@ -1046,9 +1084,7 @@ func scanScalar(b []byte, i int, syn syntax) (int, bool) {
 			j++
 		}
 	case 'R', 'r', 'i':
-		if j < len(b) && (b[j] == '-' || b[j] == '+') {
-			j++
-		}
+		j += signWidth(b, j, syn)
 		for j < len(b) && b[j] >= '0' && b[j] <= '9' {
 			j++
 		}
@@ -1057,16 +1093,20 @@ func scanScalar(b []byte, i int, syn syntax) (int, bool) {
 		if j+2 < len(b) && (string(b[j:j+3]) == "INF" || string(b[j:j+3]) == "NAN") {
 			j += 3
 		} else {
-			if j < len(b) && (b[j] == '-' || b[j] == '+') {
-				j++
-			}
+			j += signWidth(b, j, syn)
 			if j+3 < len(b) && string(b[j:j+3]) == "INF" {
 				j += 3
 			} else {
-				for j < len(b) && (b[j] >= '0' && b[j] <= '9' ||
-					b[j] == '.' || b[j] == 'e' || b[j] == 'E' ||
-					b[j] == '-' || b[j] == '+') {
-					j++
+				for j < len(b) {
+					if c := b[j]; c >= '0' && c <= '9' || c == '.' || c == 'e' || c == 'E' {
+						j++
+						continue
+					}
+					if w := signWidth(b, j, syn); w > 0 {
+						j += w
+						continue
+					}
+					break
 				}
 			}
 		}
