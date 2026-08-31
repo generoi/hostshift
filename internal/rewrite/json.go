@@ -226,7 +226,12 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 	// structure. The JSON arm was the one request path the first repair missed.
 	out := RepairSerialized(dec, func(b []byte) []byte {
 		nv, _ := m.Rewrite(b, SurfaceJSONEscape, false)
-		return nv
+		// Inside the walk, not after it. Spliced afterwards, these replaced a
+		// host of a different length inside an `s:NN:"…"` that nothing then
+		// re-emitted — the corruption this file's header is about, at the one
+		// call site that reached for the views after the walk instead of from
+		// within it. Every other surface wraps them.
+		return hostsFor(m).rewriteAllRefs(nv, true, nil)
 	})
 	// The same two catchers the HTML surfaces get. Without them the REST body
 	// was the one surface with neither: `{"u":"https:\\h/x"}` and an NFD host in
@@ -251,7 +256,6 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 	// nil: RewriteJSON records its own events, per span, with an RFC 6901 path
 	// the accumulator cannot produce. This is the one caller for which the old
 	// "the events duplicate what is already recorded" justification was true.
-	out = hostsFor(m).rewriteAllRefs(out, true, nil)
 	if bytes.Equal(out, dec) {
 		return nil, false
 	}
@@ -276,7 +280,16 @@ func serializedJSONValue(m *origin.Matcher, v []byte, explain bool) ([]byte, []o
 	out, found := RepairSerializedFound(dec, func(b []byte) []byte {
 		nv, nev := m.Rewrite(b, SurfaceJSONString, explain)
 		ev = append(ev, nev...)
-		return nv
+		// The same decoder views every other surface gets, from inside the walk
+		// so a length is re-emitted over whatever they change.
+		//
+		// This path used to run the byte matcher alone, and the caller routes
+		// here as soon as a value carries anything serialized — so one origin
+		// the matcher could see disarmed the views for every origin in the same
+		// payload that it could not. `https:\\host` next to an ordinary URL in
+		// one blob went out live, and the detector said nothing, because a value
+		// nobody rewrote still parses.
+		return hostsFor(m).rewriteAllRefs(nv, true, nil)
 	})
 	// Only a value that actually carries a span belongs on this path. Routing
 	// on "did anything change" instead sent every rewritten value here and

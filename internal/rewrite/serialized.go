@@ -73,10 +73,7 @@ func RepairSerializedFields(b []byte, rw func([]byte) []byte) []byte {
 	var out []byte
 	found := false
 	for start := 0; start <= len(b); {
-		end := start + indexByteFrom(b[start:], '&')
-		if end < start {
-			end = len(b)
-		}
+		end := fieldBreak(b, start)
 		rep, ok := repairField(b[start:end], rw)
 		out = append(out, rep...)
 		found = found || ok
@@ -107,14 +104,27 @@ func RepairSerializedFields(b []byte, rw func([]byte) []byte) []byte {
 	return out
 }
 
-// indexByteFrom is bytes.IndexByte, returning -1 when absent.
-func indexByteFrom(b []byte, c byte) int {
-	for i := range b {
-		if b[i] == c {
+// fieldBreak is the offset of the `&` that ends the field beginning at start,
+// or len(b).
+//
+// A `&` that opens a character reference is not one. The split used to take any
+// `&`, so `https:&#47;&#47;host` was cut into three fields and the byte matcher
+// — which needs `//`, `\/` or `%2F` — found the host in none of them. A
+// whole-buffer pass covered that, but only when no field carried a serialized
+// value, and `options.php` posts every option on a settings page in one body:
+// one serialized option disarmed it for the rest, and a variant hostname went
+// into the shared database.
+//
+// Splitting correctly is better than covering for a bad split. A real separator
+// in a urlencoded body cannot be a reference, because a `&` inside a value is
+// `%26` — so where these two disagree, the reference is what the sender meant.
+func fieldBreak(b []byte, start int) int {
+	for i := start; i < len(b); i++ {
+		if b[i] == '&' && refRun(b, i) == 0 {
 			return i
 		}
 	}
-	return -1
+	return len(b)
 }
 
 // repairField repairs one `&`-delimited field.
