@@ -1246,12 +1246,24 @@ if [ "$cmd" = "check" ]; then
     esac
   fi
 
-  # After the probe, not before it.
+  # A warning, never a refusal, and it clears nothing.
   #
-  # The probe is the one hard measurement in this command; the database gate is
-  # a best-effort heuristic whose own comment says it must stay silent when it
-  # cannot tell. Running the heuristic first meant a wrong guess from it hid a
-  # real 502 behind advice to run a search-replace.
+  # This has been wrong in three consecutive audit rounds — it read the wrong
+  # database, then read a value WordPress filters through WP_HOME, then read a
+  # blank line and stopped running at all — and each fix was correct about the
+  # previous failure and introduced the next. PLAN §4.1 says why the ground keeps
+  # moving: "the application self-reports and cannot be interrogated … the map
+  # must be declared, never discovered". Every version of this has been a
+  # discovery mechanism wearing a different hat.
+  #
+  # So it keeps the signal and gives up the authority. It cannot fail a start,
+  # and it can no longer clear the parent-declares warning — the two things that
+  # made a wrong answer expensive. A wrong answer is now a line of noise, which
+  # is the worst a heuristic reading someone else's database should ever cost.
+  #
+  # After the probe, too: the probe is the one hard measurement here, and running
+  # the heuristic first meant a wrong guess from it hid a real 502 behind advice
+  # to run a search-replace.
   # Ask the database which hostnames it actually holds.
   #
   # Everything above compares configuration against configuration, and adopting
@@ -1345,21 +1357,14 @@ if [ "$cmd" = "check" ]; then
       [ "$h" = "$dbhost" ] && { known=1; break; }
     done <<<"$canon_hosts"
     if [ -z "$known" ]; then
-      echo "hostshift: the database says its home is $dbhome, and this map does not" >&2
-      echo "  name that hostname — so nothing on the page would be rewritten and" >&2
-      echo "  every link would point at it. The map covers:" >&2
+      echo "hostshift: warning: the database says its home is $dbhome, which this" >&2
+      echo "  map does not name. If that is right, nothing on the page is being" >&2
+      echo "  rewritten and every link points at it. The map covers:" >&2
       printf '    %s\n' $canon_hosts >&2
       echo "  Either the database has not been moved to the hostnames" >&2
       echo "  hostshift.yaml declares, or the map is built from the wrong" >&2
       echo "  checkout. \`ddev hostshift wp-cli\` and a search-replace move it." >&2
-      exit 2
     fi
-    # The database agrees with the deployed map, so the warning held above — that
-    # this worktree's branch predates a hostshift.yaml — describes a state that
-    # has not arrived yet. Refusing *or printing it* failed the hook, and told
-    # the developer to take the action that breaks the site.
-    parent_declares=""
-    parent_declares_msg=""
   fi
 
   printf '\n  hostshift is serving:\n' >&2

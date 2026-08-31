@@ -843,10 +843,17 @@ FAKEDDEV
 chmod +x "$fakedb/ddev"
 writefake
 # The database still holds a hostname the map does not name.
-out="$(cd "$wt" && HS_FAKE_HOME="https://www.somewhere-else.test" \
-  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check refuses when the database holds hostnames the map does not name" \
-  "the database says its home is" "$out"
+# A warning, never a refusal: this gate has been wrong in three consecutive
+# rounds, and PLAN §4.1 says why — the application cannot be interrogated. It
+# keeps the signal and gives up the authority, so a wrong answer costs a line of
+# noise rather than a failed start.
+if out="$(cd "$wt" && HS_FAKE_HOME="https://www.somewhere-else.test" \
+  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)"; then
+  pass "a database the map does not name does not fail the start"
+else
+  fail "a database the map does not name does not fail the start" "$out"
+fi
+contains "but it does say so" "the database says its home is" "$out"
 # ...and says nothing when it agrees.
 out="$(cd "$wt" && HS_FAKE_HOME="https://acme.ddev.site" \
   PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
