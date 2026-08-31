@@ -41,6 +41,44 @@ func RepairSerialized(b []byte, rw func([]byte) []byte) []byte {
 // serialized value was found — which is not the same question as whether
 // anything changed, and callers that route on it need the first.
 func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
+	// Field by field. A decline used to abandon repair for the *whole buffer*,
+	// so one option whose value merely begins `a:` — `a:hover{color:red}` is
+	// ordinary CSS — left every other option in the same POST with a stale
+	// length. `options.php` posts every option on a settings page in one body,
+	// and the contaminating field need not contain a hostname at all.
+	// Only a form body has fields. Splitting every buffer on `&` cut HTML apart
+	// at its character references — `&#47;` is not a separator — so a host
+	// spelled across one stopped being found.
+	if !looksLikeForm(b) {
+		return repairField(b, rw)
+	}
+	var out []byte
+	found := false
+	for start := 0; start <= len(b); {
+		end := nextFieldBreak(b, start)
+		rep, ok := repairField(b[start:end], rw)
+		out = append(out, rep...)
+		found = found || ok
+		if end < len(b) {
+			out = append(out, '&')
+		}
+		start = end + 1
+	}
+	return out, found
+}
+
+// indexByteFrom is bytes.IndexByte, returning -1 when absent.
+func indexByteFrom(b []byte, c byte) int {
+	for i := range b {
+		if b[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// repairField repairs one `&`-delimited field.
+func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	var out []byte
 	prev, found := 0, false
 	for i := 0; i < len(b); {
@@ -340,11 +378,21 @@ func repairString(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax
 	// A string can hold another serialized payload. Try to parse it *as input*,
 	// where its lengths are still right.
 	var repaired []byte
-	inner, iend, iok := repairValue(data, 0, rw, depth+1, syn)
+	inner, iend, iok, icommitted := repairValueC(data, 0, rw, depth+1, syn)
 	switch {
 	case iok && iend == len(data):
 		repaired = inner
-	case len(data) > 0 && valueStart(data, 0):
+	case icommitted:
+		// Committed — it really is a serialized header — but it does not parse
+		// to the end. That is a nested payload whose own lengths are stale, and
+		// re-emitting only the outer one is the worst outcome available: the
+		// outer parses, so nothing errors, and the failure surfaces on a later
+		// unserialize of the inner value.
+		//
+		// Shape alone is not enough to decide this. Testing `valueStart` instead
+		// declined on `a:hover{color:red}`, `d:\\shares\\logo.png`, `i:12345`
+		// and `O:brien` — ordinary strings that begin with two bytes that happen
+		// to look like a header.
 		// Serialized-shaped but it does not parse to the end. That is the
 		// signature of a stale length: the declared end landed inside the data,
 		// after something that happened to look like a complete value, and the
@@ -581,6 +629,56 @@ func occupiesItsField(b []byte, start, end int) bool {
 		case '&':
 			return true
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// nextFieldBreak finds the `&` that starts the next `key=` pair, or len(b).
+//
+// Not every `&` is a separator: a value can carry `&#47;` — which is exactly
+// what the response direction emits into an href — and splitting there cut the
+// origin in half so nothing could find it. A real separator is followed by a
+// field name and an `=` before the next `&`.
+func nextFieldBreak(b []byte, from int) int {
+	for i := from; i < len(b); i++ {
+		if b[i] != '&' {
+			continue
+		}
+		j := i + 1
+		for j < len(b) && b[j] != '&' && b[j] != '=' {
+			if !isFieldNameByte(b[j]) {
+				break
+			}
+			j++
+		}
+		if j < len(b) && b[j] == '=' && j > i+1 {
+			return i
+		}
+	}
+	return len(b)
+}
+
+func isFieldNameByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+		c == '_' || c == '-' || c == '.' || c == '[' || c == ']' || c == '%'
+}
+
+// looksLikeForm reports whether b is application/x-www-form-urlencoded shaped:
+// `key=value` pairs, which by definition carry no raw whitespace or markup —
+// those are percent-encoded or `+`. Anything else is one field.
+func looksLikeForm(b []byte) bool {
+	if indexByteFrom(b, '=') < 0 {
+		return false
+	}
+	for _, c := range b {
+		switch c {
+		// Whitespace and markup are the discriminators. A quote is not: a form
+		// value carrying serialized data has them unencoded often enough, and
+		// rejecting on one meant the whole body was treated as a single field —
+		// so a neighbour's decline still destroyed it.
+		case ' ', '\t', '\r', '\n', '<', '>':
 			return false
 		}
 	}

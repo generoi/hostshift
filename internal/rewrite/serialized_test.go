@@ -523,3 +523,68 @@ func TestTheResidueRulesBlindSpotComesHome(t *testing.T) {
 		})
 	}
 }
+
+// A string that merely *begins* like a header is an ordinary string.
+//
+// Deciding on shape — `valueStart` — declined on `a:hover{color:red}`,
+// `d:\shares\logo.png`, `i:12345` and `O:brien`, all of which are ordinary
+// values. And because a decline abandoned repair for the whole buffer, one such
+// field left every other option in the same POST with a stale length. What
+// separates them is whether the inner parse *committed*: got past a real length
+// and its opening delimiter. `a:hover` has no length, so it never commits.
+func TestAStringThatMerelyLooksLikeAHeaderIsRepaired(t *testing.T) {
+	canon, variant := "https://hs26.test", "https://wt-a--hs26.test"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	for _, css := range []string{
+		`a:hover{color:red}`, `d:\shares\logo.png`, `i:12345`, `O:brien`,
+		`b:before{content:""}`, `N;not really`, `color:red`,
+	} {
+		t.Run(css, func(t *testing.T) {
+			in := `a:2:{s:4:"logo";` + str(variant+"/logo.png") + `s:3:"css";` + str(css) + `}`
+			want := `a:2:{s:4:"logo";` + str(canon+"/logo.png") + `s:3:"css";` + str(css) + `}`
+			got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), variant, canon))
+			}))
+			if got != want {
+				t.Errorf("a value beginning %q stopped the repair:\n got  %s\n want %s",
+					css[:2], got, want)
+			}
+		})
+	}
+}
+
+// One field must not contaminate its neighbours.
+//
+// `options.php` posts every option on a settings page in one body. A decline
+// abandoned repair buffer-wide, so an option holding `a:hover{color:red}` — no
+// hostname in it at all — destroyed the length of a different option that did.
+func TestOneFieldDoesNotContaminateAnother(t *testing.T) {
+	canon, variant := "https://hs26.test", "https://wt-a--hs26.test"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// Deliberately unparseable, so this field really does decline.
+	bad := `opt_b=a:9:{s:3:"css";` + str(`x`) + `}`
+	good := `opt_a=a:1:{s:4:"logo";` + str(variant+"/logo.png") + `}`
+	wantGood := `opt_a=a:1:{s:4:"logo";` + str(canon+"/logo.png") + `}`
+
+	got := string(RepairSerialized([]byte(good+"&"+bad), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}))
+	if !strings.HasPrefix(got, wantGood) {
+		t.Errorf("a neighbouring field's decline destroyed this one:\n got  %s\n want %s…",
+			got, wantGood)
+	}
+}
+
+// `&` is a field separator only when it introduces a `key=` pair. A value can
+// carry `&#47;` — which is exactly what the response direction emits into an
+// href — and breaking there cut the origin in half so nothing could find it.
+func TestAReferenceIsNotAFieldSeparator(t *testing.T) {
+	canon, variant := "https://hs26.test", "https://wt-a--hs26.test"
+	in := `content=<a href="https:&#47;&#47;` + variant + `/x">t</a>&next=1`
+	got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}))
+	if strings.Contains(got, variant) {
+		t.Errorf("an origin spanning a character reference was not rewritten:\n%s", got)
+	}
+}

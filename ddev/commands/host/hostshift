@@ -228,10 +228,17 @@ if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
     # hostshift.yaml is present. On the README's headline path it is
     # `--from … --to …`, and the deployed slug is the prefix of the first
     # variant — wt-a--acme.ddev.site — which is present in both shapes.
-    slug="$(sed -n '/^HOSTSHIFT_ARGS=--slug /{s///p;q;}' .ddev/.env 2>/dev/null)"
+    # `|| true`, because `sed` exits non-zero when .ddev/.env is absent and
+    # `set -e` then ends the script with no output at all — exit 1, nothing on
+    # stdout or stderr, from the very block whose comment says "Detached HEAD is
+    # ordinary … and it must not stop `check`". The line below it was already
+    # guarded; this one was not.
+    slug="$(sed -n '/^HOSTSHIFT_ARGS=--slug /{s///p;q;}' .ddev/.env 2>/dev/null || true)"
     if [ -z "$slug" ]; then
+      # `|| true` on the whole pipeline, not just `2>/dev/null` on its head:
+      # under `pipefail` the first `sed`'s failure is the pipeline's status.
       slug="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' .ddev/.env 2>/dev/null \
-        | cut -d, -f1 | sed -n 's/--.*//p')"
+        | cut -d, -f1 | sed -n 's/--.*//p' || true)"
     fi
     slug="${slug:-wt}"
   fi

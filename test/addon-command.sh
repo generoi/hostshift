@@ -1175,6 +1175,23 @@ contains "with no database answer the warning still stands" \
 check "and it is still only a warning" "0" "$rc2"
 rm -f "$main/hostshift.yaml"
 
+# `check` on a project with no branch and no .ddev/.env must say something.
+#
+# `sed` exits non-zero when the file is absent, and under `set -e` that ended the
+# script with no output at all — exit 1, nothing on stdout or stderr, from the
+# block whose own comment says a detached HEAD must not stop `check`. On a branch
+# the same state prints "nothing deployed yet" and exits 2, so the failure was
+# invisible except in the states the recovery block exists for.
+mkdir -p "$work/bare/.ddev"
+printf 'name: bare\n' > "$work/bare/.ddev/config.yaml"
+rc=0
+out="$(cd "$work/bare" && "$cmd" check 2>&1)" || rc=$?
+case "$out" in
+  "") fail "check says something when there is no branch and no .ddev/.env" \
+        "exit $rc with no output" ;;
+  *) pass "check says something when there is no branch and no .ddev/.env" ;;
+esac
+
 # A rival whose directory no longer exists under that name.
 #
 # `mv wt-a wt-a-renamed && ddev start` leaves the old project's containers up
