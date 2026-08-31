@@ -362,6 +362,22 @@ func refRun(b []byte, i int) int {
 // So both readings are offered and the parse decides, which is what the rest of
 // this file does with every boundary it cannot settle locally.
 func htmlUnit(b []byte, i int) (src, dec, alt int) {
+	// The quote spellings are not offered both ways. `&quot;` is this spelling's
+	// own delimiter, so a payload nested inside a string is *made of* them —
+	// and offering each one two widths gives a span holding k of them up to 2^k
+	// readings, nearly all spurious. That is not a theoretical cost: at six
+	// array members it declined 34 of 60, in *both* directions, and the
+	// detector runs the same walk, so it also reported a page PHP accepts as
+	// broken. A check that is RED on healthy pages is one nobody reads, which
+	// is the mechanism that hid five rounds of real corruption.
+	//
+	// So a quote counts one, which is what it is wherever this spelling put it.
+	// Data that genuinely held a literal `&quot;` before esc_attr saw it then
+	// fails to close and declines — the same cost that reading carried before,
+	// and the rarer case by far.
+	if w := entityRun(b, i); w > 0 {
+		return w, 1, 0
+	}
 	if w := refRun(b, i); w > 0 {
 		return w, 1, w
 	}
@@ -378,6 +394,13 @@ func jsonHTMLUnit(b []byte, i int) (src, dec, alt int) {
 	if i < len(b) && b[i] == '\\' {
 		return 0, 0, 0
 	}
+	// No quote guard here, unlike htmlUnit. This spelling writes a data quote as
+	// `\&quot;`, which jsonHTMLRun already measured above, so a *bare* `&quot;`
+	// in the data can only be the six literal bytes — content that held `&quot;`
+	// before either escaper saw it. Forcing it to one, as the guard next door
+	// does, would be wrong in the corrupting direction, and the explosion that
+	// guard exists to prevent cannot happen here: the delimiters are seven bytes
+	// wide and unambiguous, so a nested payload adds no readings at all.
 	if w := refRun(b, i); w > 0 {
 		return w, 1, w
 	}

@@ -1627,3 +1627,225 @@ func TestANestedPayloadBehindALabelInAPostedForm(t *testing.T) {
 		}
 	}
 }
+
+// An `esc_attr` value comes home unchanged.
+//
+// "The length one direction broke, the other restores" is the sentence the whole
+// decline path rests on, and in this spelling it is not true. Repair is not an
+// involution here: the forward pass repairs and the reverse pass declines, so
+// the length the forward pass wrote stays on data the reverse pass shortened,
+// and `unserialize()` returns false on a row the browser posted back.
+//
+// The reason is that `spanEnd`'s "exactly one reading closes" rule is a function
+// of the *declared length*, and the declared length is exactly what the two
+// directions disagree about. `&quot;` is six source bytes worth either one
+// decoded byte or six, so a span holding k of them has up to 2^k readings; the
+// value below has one reading that closes at n=66 and two at n=72. One is a
+// repair, two is a decline, and the host sits inside the string, so the outer
+// value is measured at 66 going out and 72 coming back.
+//
+// It needs three things at once, which is why a generator that varies only the
+// data misses it: the host inside the outer string, so its declared length
+// moves between the directions; enough `&quot;` in that string for a second
+// assignment to exist; and the arithmetic to land. Measured over the fixture
+// family below, a one- or two-member array never fails and a six-member one
+// fails 38% of the time.
+func TestAnEscAttrValueComesHomeUnchanged(t *testing.T) {
+	canon, variant := "//canon.test", "//wt-a--canon.test"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// esc_attr: the quotes become `&quot;`, and nothing else here needs escaping.
+	esc := strings.NewReplacer(`"`, "&quot;").Replace
+	// An outer string holding an array of `members` pairs, the last of which
+	// carries the host. Every length computed.
+	blob := func(host string, members, pad int) string {
+		inner := `a:` + strconv.Itoa(members) + `:{`
+		for m := 0; m < members-1; m++ {
+			inner += str("a"+strconv.Itoa(m)) + str("v")
+		}
+		inner += str("a") + str(host+"/"+strings.Repeat("x", pad)) + `}`
+		return str(inner)
+	}
+	fwd := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	rev := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}
+	// Pads chosen so the *forward* pass repairs: the canonical length has one
+	// closing reading and the variant length has two. (Other pads make the
+	// forward pass decline instead, on the same rule — see the note above.)
+	for _, c := range []struct {
+		name         string
+		members, pad int
+	}{
+		{"three members", 3, 0},
+		{"four members", 4, 2},
+		{"five members", 5, 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := esc(blob(canon, c.members, c.pad))
+			out := RepairSerialized([]byte(in), fwd)
+			if string(out) == in {
+				t.Fatalf("the forward pass did not rewrite, so this asserts little:\n%s", in)
+			}
+			// What the forward pass served has to parse, and what comes back has
+			// to be what went out.
+			assertEveryLength(t, strings.ReplaceAll(string(out), "&quot;", `"`))
+			back := string(RepairSerialized(out, rev))
+			if back != in {
+				t.Errorf("the reverse pass declined where the forward pass "+
+					"repaired, so the length the forward pass wrote is now stale "+
+					"on shortened data:\n in   %s\n out  %s\n back %s", in, out, back)
+			}
+			assertEveryLength(t, strings.ReplaceAll(back, "&quot;", `"`))
+		})
+	}
+}
+
+// A serialized payload nested inside an esc_attr'd string, swept over array
+// size and path length, in both directions and through the detector.
+//
+// `&quot;` is this spelling's own delimiter, so a nested payload is *made of*
+// them. Offering each one two readings — escaped, worth one byte, or the six
+// literal bytes it would be if the data already held `&quot;` before esc_attr
+// saw it — gives a span holding k of them up to 2^k readings, and almost all of
+// them are spurious. `spanEnd` then finds two that close and declines.
+//
+// The cost was not theoretical. At six members it declined 34 of 60 paddings,
+// in *both* directions: the browser was served a blob PHP refuses, from a
+// canonical page that was fine. And the detector runs the same walk, so it
+// called the repaired page broken — a false RED on healthy bytes, which is the
+// one failure mode this file's history says is worse than a false GREEN,
+// because a check that is always red is a check nobody reads.
+//
+// The sweep is the test rather than a few fixtures because whether a second
+// reading exists is arithmetic: it depends on the declared length, the number
+// of quotes and the padding all at once, so any single shape passes for
+// uninteresting reasons.
+func TestANestedPayloadUnderEscAttrSurvivesBothDirections(t *testing.T) {
+	canon, variant := "//mz31d.test", "//wt-a--mz31d.test"
+	fwd := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	rev := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), variant, canon))
+	}
+	esc := func(v string) string { return strings.ReplaceAll(v, `"`, "&quot;") }
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// An n-member array whose last value carries the host, all lengths computed.
+	blob := func(host string, members, pad int) string {
+		s := `a:` + strconv.Itoa(members) + `:{`
+		for k := 0; k < members-1; k++ {
+			s += str("a"+strconv.Itoa(k)) + str("v")
+		}
+		return s + str("a") + str(host+"/"+strings.Repeat("x", pad)) + `}`
+	}
+	for members := 2; members <= 7; members++ {
+		for pad := 0; pad <= 60; pad++ {
+			in := esc(str(blob(canon, members, pad)))
+			want := esc(str(blob(variant, members, pad)))
+
+			got := string(RepairSerialized([]byte(in), fwd))
+			if got != want {
+				t.Fatalf("members=%d pad=%d: the response direction did not repair:\n got  %s\n want %s",
+					members, pad, got, want)
+			}
+			if back := string(RepairSerialized([]byte(got), rev)); back != in {
+				t.Fatalf("members=%d pad=%d: the request direction did not restore:\n got  %s\n want %s",
+					members, pad, back, in)
+			}
+			if n := BrokenSerialized([]byte(want)); n != 0 {
+				t.Fatalf("members=%d pad=%d: the detector called %d value(s) broken on a page PHP accepts:\n %s",
+					members, pad, n, want)
+			}
+		}
+	}
+}
+
+// escAttrNoDouble is `esc_attr` as WordPress calls it: htmlspecialchars with
+// $double_encode = false, which leaves a reference already in the data alone
+// and escapes only a bare `&`.
+//
+// A Replacer that rewrites every `&` is not this. It turns `&amp;` into
+// `&amp;amp;`, so a fixture built with one never contains the literal reading
+// at all and tests nothing about it.
+func escAttrNoDouble(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		switch {
+		case s[i] == '&' && refRun([]byte(s), i) > 0:
+			w := refRun([]byte(s), i)
+			b.WriteString(s[i : i+w])
+			i += w
+			continue
+		case s[i] == '&':
+			b.WriteString("&amp;")
+		case s[i] == '"':
+			b.WriteString("&quot;")
+		case s[i] == '\'':
+			b.WriteString("&#039;")
+		case s[i] == '<':
+			b.WriteString("&lt;")
+		case s[i] == '>':
+			b.WriteString("&gt;")
+		default:
+			b.WriteByte(s[i])
+		}
+		i++
+	}
+	return b.String()
+}
+
+// Content that already held `&amp;` before either escaper saw it, in the
+// combined spelling.
+//
+// `esc_attr` runs with `$double_encode = false`, so those five bytes pass
+// through unchanged and the serialized length counts five. The escaped reading
+// — one byte, for content that held a bare `&` — is the other one, and both
+// have to be on offer or a value takes whichever the walk assumes.
+//
+// Unlike the `&quot;` case next door, this one stays ambiguous in the combined
+// spelling: there a data quote is written `\&quot;`, so a bare `&quot;` is
+// literal content too, and the nested-payload explosion that forces `&quot;` to
+// one byte under plain esc_attr cannot arise when the delimiters are seven
+// bytes wide.
+func TestLiteralEntitiesInContentUnderTheCombinedSpelling(t *testing.T) {
+	canon, variant := "https://mz31e.ddev.site", "https://wt-a--mz31e.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	for name, text := range map[string]string{
+		// The five bytes are already in the data; esc_attr leaves them.
+		"literal amp":   "Snellman &amp; Co",
+		"literal lt":    "a &lt; b",
+		"literal quote": "say &quot;hi&quot;",
+		// And the escaped readings, for contrast.
+		"bare amp": "Snellman & Co",
+		"bare lt":  "a < b",
+	} {
+		one := func(h string) string {
+			return `a:2:{s:1:"u";s:` + strconv.Itoa(len(h)) + `:"` + h + `";` +
+				`s:1:"t";s:` + strconv.Itoa(len(text)) + `:"` + text + `";}`
+		}
+		// wp_json_encode, then esc_attr with $double_encode = false.
+		comb := func(h string) string {
+			j, err := json.Marshal(one(h))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Undo Go's HTML escaping, which PHP's json_encode does not do, so
+			// the entities reach esc_attr as themselves.
+			s := strings.NewReplacer(`\u0026`, "&", `\u003c`, "<", `\u003e`, ">").
+				Replace(string(j))
+			return escAttrNoDouble(s)
+		}
+		in := `<div data-settings="` + comb(canon) + `">y</div>`
+		want := `<div data-settings="` + comb(variant) + `">y</div>`
+		if got := string(RepairSerialized([]byte(in), rw)); got != want {
+			t.Errorf("%s:\n got  %s\n want %s", name, got, want)
+		}
+		if n := BrokenSerialized([]byte(want)); n != 0 {
+			t.Errorf("%s: the repaired page counted %d broken values", name, n)
+		}
+	}
+}
