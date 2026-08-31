@@ -377,7 +377,14 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	// while the browser is on a variant host — the cookie is discarded and login
 	// fails outright. Dropping the attribute is always safe; host-scoped is
 	// exactly what a variant host wants.
-	if !p.DryRun {
+	// Not under an identity map. Dropping Domain= makes a cookie host-only,
+	// which is right on a variant host and wrong when the proxy was asked to be
+	// a mirror — under an identity map every variant *is* its own canonical, so
+	// isCanonicalDomain matches every cookie and every one of them changes.
+	// compressBody and finishBody already guard on this; these two reached the
+	// response in front of that guard with none of their own, so test 24 held
+	// for the body and not for the headers beside it.
+	if !p.DryRun && !p.Map.Identity() {
 		if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
 			for i, c := range cookies {
 				if nc := p.dropCookieDomain(c); nc != c {
@@ -401,8 +408,10 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	// proxy_cache_key $uri, a Varnish default with no host in the key — the
 	// deployment §5.5 is written for) then hands variant A's redirect to a
 	// browser sitting on variant B, which is bounced out of its own worktree.
-	// Headers are rewritten for every response, so every response varies.
-	if !p.DryRun {
+	// Headers are rewritten for every response, so every response varies — but
+	// an identity map rewrites nothing, and a header it adds is a header the
+	// upstream did not send.
+	if !p.DryRun && !p.Map.Identity() {
 		addVary(resp.Header, "Host")
 	}
 

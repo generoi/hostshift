@@ -247,7 +247,7 @@ func onlySpaceAfter(b []byte, end int) bool {
 // parse failed immediately, and "a failed candidate declines the buffer" then
 // declined every body containing a link.
 func repairAt(b []byte, i int, rw func([]byte) []byte, fieldOK func(end int) bool) (rep []byte, end int, ok, committed bool) {
-	for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax} {
+	for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax} {
 		r, e, o, c, amb := tryBothPicks(b, i, rw, 0, base, fieldOK)
 		if o {
 			return r, e, true, c
@@ -435,7 +435,7 @@ type syntax struct {
 	pick int
 	// dlen is how many bytes data decodes to, for the spellings where that has
 	// one answer. nil where a character reference makes it ambiguous, and a
-	// re-emitted length is then taken as a delta instead.
+	// re-emitted length is then a delta measured through `unit` instead.
 	dlen func(data []byte) int
 }
 
@@ -470,11 +470,45 @@ func decodedLen(b []byte) int {
 // `http%3A%2F%2Flocalhost%3A8080` → `https%3A%2F%2Fwww.example.fi` is one source
 // byte shorter and one decoded byte longer, and that goes into the shared
 // database on an ordinary options.php save, where nothing scores it.
+// unitLen counts b through a spelling's own unit reader, charging each
+// ambiguous run its escaped reading. See emitLen for why that is exact as a
+// difference even though it is wrong as a total.
+func unitLen(b []byte, unit func([]byte, int) (int, int, int)) int {
+	n := 0
+	for i := 0; i < len(b); {
+		src, dec, _ := unit(b, i)
+		if src == 0 {
+			// Not measurable here; count the byte and move on rather than stop,
+			// since this is only ever used as a difference.
+			i, n = i+1, n+1
+			continue
+		}
+		i, n = i+src, n+dec
+	}
+	return n
+}
+
 func emitLen(syn syntax, n int, data, repaired []byte) int {
 	if syn.dlen != nil {
 		return syn.dlen(repaired)
 	}
-	return n + len(repaired) - len(data)
+	// A delta in *decoded* bytes, not source bytes.
+	//
+	// The source delta was right only where the spelling has no escape whose
+	// width differs from what it decodes to. It is wrong the moment one does:
+	// a percent escape is three source bytes for one decoded byte, so a map
+	// that adds a port adds an escape and the source grows while the data
+	// shrinks. That is what `dlen` was for, and the spellings without one —
+	// the two that carry character references — took the source delta instead
+	// and inherited the bug one spelling over.
+	//
+	// They have no `dlen` because a reference's width is genuinely ambiguous.
+	// It does not need to be resolved here: a rewrite substitutes hostnames,
+	// which contain no references, so both sides of the delta hold the same
+	// ones. Counting each as one byte is wrong by the same amount on both
+	// sides and cancels exactly, while every unambiguous layer is decoded
+	// properly.
+	return n + unitLen(repaired, syn.unit) - unitLen(data, syn.unit)
 }
 
 // refRun is the width of a character reference at i, or 0.
@@ -1009,6 +1043,124 @@ func pctEncodedWidth(b []byte, i int, s string) int {
 	return j - i
 }
 
+// pctByte decodes one byte at i, literal or `%XX`, with its source width.
+func pctByte(b []byte, i int) (byte, int) {
+	if i >= len(b) {
+		return 0, 0
+	}
+	if b[i] == '%' && i+2 < len(b) {
+		if v, ok := unhex(b[i+1], b[i+2]); ok {
+			return v, 3
+		}
+		return 0, 0
+	}
+	return b[i], 1
+}
+
+// percentJSONSyntax is a serialized value that was JSON-escaped and then
+// percent-encoded: `s%3A5%3A%5C%22`.
+//
+// `JSON.parse(decodeURIComponent("…"))` is the shape the decoder view stack was
+// built for — its own comment records fourteen canonical origins on one live
+// /cart/ and eighteen in wp-admin — so the transport was known and the pairing
+// with a serialized payload was not. percentSyntax wants `%22` where the JSON
+// layer put `%5C%22`, and charges the `%5C` of every `\/` a byte `serialize`
+// never counted; neither reads it, so the value was skipped while the percent
+// view rewrote the host inside it.
+//
+// The JSON layer is below the percent layer, so a `\/` is one byte to the
+// serializer and one byte here.
+var percentJSONSyntax = syntax{
+	match: func(b []byte, i int, c byte) (int, bool) {
+		if c == '"' {
+			if w := pctEncodedWidth(b, i, `\"`); w > 0 {
+				return w, true
+			}
+			return 0, false
+		}
+		if v, w := pctByte(b, i); w > 0 && v == c {
+			return w, true
+		}
+		return 0, false
+	},
+	emit: func(dst []byte, c byte) []byte {
+		const hex = "0123456789ABCDEF"
+		if c == '"' {
+			return append(dst, "%5C%22"...)
+		}
+		return append(dst, '%', hex[c>>4], hex[c&0xf])
+	},
+	advance: func(b []byte, i, n int) (int, bool) {
+		if n < 0 {
+			return 0, false
+		}
+		for n > 0 {
+			if i >= len(b) {
+				return 0, false
+			}
+			src, dec, _ := percentJSONUnit(b, i)
+			if src == 0 || dec > n {
+				return 0, false
+			}
+			i, n = i+src, n-dec
+		}
+		return i, true
+	},
+	unit: percentJSONUnit,
+}
+
+// percentJSONUnit reads one decoded byte of the percent-over-JSON spelling.
+func percentJSONUnit(b []byte, i int) (src, dec, alt int) {
+	if w := pctEncodedWidth(b, i, `\u`); w > 0 {
+		j, val := i+w, 0
+		for k := 0; k < 4; k++ {
+			c, cw := pctByte(b, j)
+			d, ok := hexDigit(c)
+			if cw == 0 || !ok {
+				return 0, 0, 0
+			}
+			val, j = val<<4|d, j+cw
+		}
+		switch {
+		case val >= 0xD800 && val <= 0xDBFF:
+			// A surrogate pair: the low half follows in the same spelling.
+			w2 := pctEncodedWidth(b, j, `\u`)
+			if w2 == 0 {
+				return 0, 0, 0
+			}
+			k2, lo := j+w2, 0
+			for k := 0; k < 4; k++ {
+				c, cw := pctByte(b, k2)
+				d, ok := hexDigit(c)
+				if cw == 0 || !ok {
+					return 0, 0, 0
+				}
+				lo, k2 = lo<<4|d, k2+cw
+			}
+			if lo < 0xDC00 || lo > 0xDFFF {
+				return 0, 0, 0
+			}
+			return k2 - i, 4, 0
+		case val >= 0xDC00 && val <= 0xDFFF:
+			return 0, 0, 0
+		}
+		if wl := utf8.RuneLen(rune(val)); wl > 0 {
+			return j - i, wl, 0
+		}
+		return 0, 0, 0
+	}
+	if w := pctEncodedWidth(b, i, `\`); w > 0 {
+		if _, cw := pctByte(b, i+w); cw > 0 {
+			return w + cw, 1, 0
+		}
+		return 0, 0, 0
+	}
+	if _, w := pctByte(b, i); w > 0 {
+		return w, 1, 0
+	}
+	return 0, 0, 0
+}
+
 // percentHTMLSyntax is a serialized value that was HTML-escaped and then
 // percent-encoded: `s%3A5%3A%26%2334%3B`.
 //
@@ -1074,21 +1226,49 @@ func percentHTMLUnit(b []byte, i int) (src, dec, alt int) {
 			return w, 1, 0
 		}
 	}
-	if w := refRun(b, i); w > 0 {
-		return w, 1, w
+	// Any other reference, and it is percent-encoded too: `&amp;` reaches this
+	// spelling as `%26amp%3B`. Asking refRun, which wants a literal `&`, read
+	// those nine bytes as five separate ones — so every payload holding an
+	// ampersand, an angle bracket or an apostrophe mis-measured, which is most
+	// real WordPress content. Round 34 fixed this spelling for the quote and
+	// left every other reference behind.
+	if src, chars := pctRefRun(b, i); src > 0 {
+		return src, 1, chars
 	}
-	if i < len(b) && b[i] == '%' {
-		if i+2 < len(b) {
-			if _, ok := unhex(b[i+1], b[i+2]); ok {
-				return 3, 1, 0
-			}
-		}
-		return 0, 0, 0
-	}
-	if i < len(b) {
-		return 1, 1, 0
+	if c, w := pctByte(b, i); w > 0 {
+		_ = c
+		return w, 1, 0
 	}
 	return 0, 0, 0
+}
+
+// pctRefRun measures a character reference whose own bytes are percent-encoded,
+// returning its source width and how many characters it spells — which is the
+// count if the data already held the reference rather than the character.
+func pctRefRun(b []byte, i int) (src, chars int) {
+	c, w := pctByte(b, i)
+	if w == 0 || c != '&' {
+		return 0, 0
+	}
+	j, n := i+w, 1
+	for n <= 12 {
+		c, w := pctByte(b, j)
+		if w == 0 {
+			return 0, 0
+		}
+		j, n = j+w, n+1
+		if c == ';' {
+			if n == 2 {
+				return 0, 0
+			}
+			return j - i, n
+		}
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+			c >= '0' && c <= '9' || c == '#') {
+			return 0, 0
+		}
+	}
+	return 0, 0
 }
 
 // repairValue parses one serialized value at i and returns its repaired bytes
@@ -1611,6 +1791,7 @@ func occupiesItsField(b []byte, start, end int) bool {
 		escQuote
 		jsonQuote
 		cdata
+		pctQuote
 	)
 	open := ownField
 	for start > 0 {
@@ -1620,6 +1801,20 @@ func occupiesItsField(b []byte, start, end int) bool {
 			continue
 		}
 		switch {
+		// The percent-encoded delimiters, before the raw ones, because the byte
+		// at start-1 is then a hex digit and every raw case below would miss it.
+		// A value that arrived percent-encoded sits inside a field whose quotes
+		// are `%22`, and comparing raw bytes declined every one of them — which
+		// is not neutral, so the whole percent-over-JSON shape was served with
+		// the host rewritten and no length re-emitted.
+		case pctIs(b, start-3, '"'):
+			open = pctQuote
+			start -= 2
+		case pctIs(b, start-3, '\''):
+			open = pctQuote
+			start -= 2
+		case pctIs(b, start-3, '&'), pctIs(b, start-3, '='):
+			start -= 2
 		case c == '&' || c == '=':
 		case c == '"':
 			open = dq
@@ -1659,6 +1854,8 @@ func occupiesItsField(b []byte, start, end int) bool {
 			// Its own field: only the next separator may follow, so a stray
 			// quote is residue rather than a close.
 			return b[i] == '&'
+		case pctQuote:
+			return pctIs(b, i, '"') || pctIs(b, i, '\'')
 		case dq:
 			return b[i] == '"'
 		case sq:
@@ -1792,7 +1989,7 @@ func BrokenSerialized(b []byte) int {
 		// an `esc_attr` input or a JSON string is not broken, it is escaped —
 		// and a check that is always RED is a check nobody reads, which is the
 		// mechanism that let five rounds of real corruption pass unnoticed.
-		for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax} {
+		for _, base := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax} {
 			_, e, o, c, amb := tryBothPicks(b, i, id, 0, base, nil)
 			if o {
 				end, ok = e, true

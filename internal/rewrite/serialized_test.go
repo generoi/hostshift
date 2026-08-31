@@ -2133,3 +2133,99 @@ func TestTheProductOfTransportAndEscaping(t *testing.T) {
 		}
 	}
 }
+
+// The detector reads every spelling the repair does.
+//
+// They walk the same list on purpose, so a spelling added to one and not the
+// other is a page served with a length PHP refuses and reported GREEN — the
+// cancellation is automatic, since a value neither side can read scores zero on
+// the canonical page too. This asserts the list from the detector's end, which
+// no test did: the repair tests all measure served bytes, and a spelling
+// missing only from `BrokenSerialized` leaves those passing.
+func TestTheDetectorReadsEverySpellingTheRepairDoes(t *testing.T) {
+	host := "https://mz35a.ddev.site/x"
+	// A bare string with a length that overruns its data — not wrapped in an
+	// array, because an array's own header commits under the plain percent
+	// spelling whatever the string inside it is written in, and the count would
+	// then be the same with the spelling removed.
+	// Padded, because readLen refuses a length larger than the buffer — without
+	// the padding the header never commits and nothing counts it, for a reason
+	// that has nothing to do with the spelling under test.
+	stale := func(v string) string {
+		return `s:` + strconv.Itoa(len(v)+9) + `:"` + v + `";` + strings.Repeat("z", 32)
+	}
+	pct := func(s string) string {
+		var b strings.Builder
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+				c == '-' || c == '_' || c == '.' || c == '~' {
+				b.WriteByte(c)
+				continue
+			}
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+		return b.String()
+	}
+	jsonEsc := func(s string) string {
+		return strings.NewReplacer(`"`, `\"`, "/", `\/`).Replace(s)
+	}
+	for name, enc := range map[string]func(string) string{
+		"literal":                      func(s string) string { return s },
+		"esc_attr":                     escAttrNoDouble,
+		"wp_json_encode":               jsonEsc,
+		"esc_attr(wp_json_encode)":     func(s string) string { return escAttrNoDouble(jsonEsc(s)) },
+		"rawurlencode":                 pct,
+		"rawurlencode(esc_attr)":       func(s string) string { return pct(escAttrNoDouble(s)) },
+		"rawurlencode(wp_json_encode)": func(s string) string { return pct(jsonEsc(s)) },
+	} {
+		if n := BrokenSerialized([]byte(enc(stale(host)))); n == 0 {
+			t.Errorf("%s: a length overrunning its data was reported clean:\n %s",
+				name, enc(stale(host)))
+		}
+	}
+}
+
+// A character reference other than the quote, in the percent-over-entity
+// spelling.
+//
+// Round 34 taught that spelling to read a percent-encoded `&quot;` and left
+// every other reference falling through to a reader that wants a literal `&`.
+// So `&amp;` — which reaches this spelling as `%26amp%3B` — was read as five
+// separate bytes, the value mis-measured, and the length was not re-emitted
+// while the host was rewritten anyway. `&`, `<`, `>` and `'` are near-universal
+// in real content: a client name, an `esc_textarea`'d fragment, any label with
+// an apostrophe in it.
+func TestANonQuoteReferenceInThePercentEntitySpelling(t *testing.T) {
+	canon, variant := "https://mz35b.example", "https://wt-a--mz35b.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), "mz35b.example", "wt-a--mz35b.ddev.site"))
+	}
+	pct := func(s string) string {
+		var b strings.Builder
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+				c == '-' || c == '_' || c == '.' || c == '~' {
+				b.WriteByte(c)
+				continue
+			}
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+		return b.String()
+	}
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	for _, text := range []string{"x", "&", "<", ">", "'", "Snellman & Söner", "a<b>c"} {
+		blob := func(host string) string {
+			return `a:2:{` + str("u") + str(host) + str("a") + str(text) + `}`
+		}
+		in, want := pct(escAttrNoDouble(blob(canon))), pct(escAttrNoDouble(blob(variant)))
+		got := string(RepairSerialized([]byte(in), rw))
+		if got != want {
+			t.Errorf("%q:\n got  %s\n want %s", text, got, want)
+		}
+		if n := BrokenSerialized([]byte(got)); n != 0 {
+			t.Errorf("%q: served %d value(s) PHP refuses:\n %s", text, n, got)
+		}
+	}
+}
