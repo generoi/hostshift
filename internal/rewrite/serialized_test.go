@@ -127,13 +127,57 @@ func TestAnIdentityRewriteChangesNothing(t *testing.T) {
 	}
 }
 
-// Prose that merely resembles a span must not be treated as one, or everything
-// after it is copied out without being rewritten.
-func TestProseIsNotASpan(t *testing.T) {
-	in := `The value is s:6:"a.test"; and see https://a.test/x`
-	out := string(RepairSerialized([]byte(in), lengthen))
-	if strings.Contains(out, "//a.test/") {
-		t.Errorf("an origin after a span-shaped quotation was not rewritten:\n%s", out)
+// Prose that merely resembles a span must not stop the rest of the body being
+// rewritten.
+//
+// The previous version of this asserted that an origin after a span-shaped
+// quotation was rewritten — which is true whether the span is believed or not,
+// because the gaps are rewritten either way. It passed under a mutation that
+// removed the very guard it named. This uses a quotation that cannot parse, so
+// the decline path is the one under test.
+func TestProseThatCannotParseStillRewritesAroundIt(t *testing.T) {
+	canon, variant := "https://a.test", "https://a.test.local"
+	for _, in := range []string{
+		`The value is s:6:"a.test and see ` + canon + `/x`, // no closing quote
+		`Example: s:99:"short"; and see ` + canon + `/x`,   // length far past the data
+		`Try s:abc:"x"; and see ` + canon + `/x`,           // not a number
+	} {
+		t.Run(in, func(t *testing.T) {
+			got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), canon, variant))
+			}))
+			if strings.Contains(got, canon+"/x") {
+				t.Errorf("an origin after an unparseable quotation was not rewritten:\n%s", got)
+			}
+		})
+	}
+}
+
+// Past the depth limit the repair declines cleanly — it falls back to rewriting
+// without repair, rather than repairing the outer levels and leaving the inner
+// ones stale. Repairing part of a structure is the failure this file exists to
+// prevent: the outer parses, so nothing errors, and only a later unserialize of
+// the inner value returns false.
+func TestPastTheDepthLimitDeclinesRatherThanPartlyRepairing(t *testing.T) {
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	canon, variant := "https://a.test/", "https://a.test.local/"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	for _, depth := range []int{1, 8, 32, 33, 40} {
+		in := str(canon)
+		for i := 0; i < depth; i++ {
+			in = str(in)
+		}
+		out := string(RepairSerialized([]byte(in), rw))
+		if depth <= maxSerializedDepth {
+			assertEveryLength(t, out)
+			continue
+		}
+		// Beyond the limit: no repair at all, not a partial one.
+		if out != string(rw([]byte(in))) {
+			t.Errorf("depth %d was partly repaired instead of declined", depth)
+		}
 	}
 }
 
