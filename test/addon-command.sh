@@ -702,6 +702,8 @@ case "$1" in
       *)           exit 1 ;;
     esac ;;
   logs) cat "${HS_FAKE_DIR}/logs" 2>/dev/null || true ;;
+  # The running proxies, which is the only place a renamed project still exists.
+  ps) cat "${HS_FAKE_DIR}/ps" 2>/dev/null || true ;;
 esac
 exit 0
 FAKE
@@ -911,6 +913,29 @@ case "$out" in
   *"the database says its home is"*) fail "and passes when the database agrees with the map" "$out" ;;
   *) pass "and passes when the database agrees with the map" ;;
 esac
+
+# A rival whose directory no longer exists under that name.
+#
+# `mv wt-a wt-a-renamed && ddev start` leaves the old project's containers up
+# with the same VIRTUAL_HOST, and every scan above enumerates *directories* —
+# so the rival's registered approot is gone and skipped, and its `.ddev/.env`
+# travelled with the directory and reads as self. Measured: DDEV itself warned
+# "Router count mismatch", traefik had four routers on one hostname, and check
+# printed "hostshift is serving" and exited 0. A running container carries its
+# own identity, so asking Docker needs no directory to exist.
+printf 'ddev-acme-wt-renamed-hostshift\n' > "$HS_FAKE_DIR/ps"
+out="$(cd "$wt" && PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a renamed project's containers still claiming the variant are caught" \
+  "no longer exists under that name" "$out"
+# And the project must not find *itself*, or every healthy check refuses.
+printf 'ddev-acme-wt-a-hostshift\n' > "$HS_FAKE_DIR/ps"
+out="$(cd "$wt" && PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"no longer exists under that name"*)
+    fail "a project does not mistake its own container for a rival" "$out" ;;
+  *) pass "a project does not mistake its own container for a rival" ;;
+esac
+rm -f "$HS_FAKE_DIR/ps"
 unset HS_FAKE_DIR
 
 rm -f "$wt/hostshift.yaml"

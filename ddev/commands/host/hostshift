@@ -748,6 +748,50 @@ while IFS= read -r other_dir; do
   done
 done <<<"$scan_dirs"
 
+# The same question asked of Docker, which is the only place a renamed project
+# still exists.
+#
+# Everything above enumerates *directories* — siblings, plus the approots the
+# registry knows. `mv wt-a wt-a-renamed && ddev start` leaves the old project's
+# containers up with the same VIRTUAL_HOST, and the scan cannot see it by
+# construction: the rival's registered approot no longer exists so it is
+# skipped, and its `.ddev/.env` travelled with the directory, so it reads as
+# self. DDEV itself said "Router count mismatch: 122 loaded, 130 expected" and
+# traefik had four routers on one hostname while `check` printed "hostshift is
+# serving" and exited 0.
+#
+# A running container carries its own identity, so this needs no directory to
+# exist. It is the last thing tried because it is the slowest, and it is skipped
+# entirely when a directory-based claim was already found.
+if [ -z "$claimed" ] && command -v docker >/dev/null 2>&1; then
+  self="ddev-$(ddev_name .ddev/config.yaml)-hostshift"
+  for oc in .ddev/config.*.yaml; do
+    [ -f "$oc" ] || continue
+    n="$(ddev_name "$oc")"
+    if [ -n "$n" ]; then self="ddev-$n-hostshift"; fi
+  done
+  running="$(docker ps --filter 'name=-hostshift' --format '{{.Names}}' 2>/dev/null || true)"
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    [ "$c" = "$self" ] && continue
+    ov="$(docker inspect "$c" --format \
+      '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+      | sed -n 's/^VIRTUAL_HOST=//p' | head -1 || true)"
+    [ -n "$ov" ] || continue
+    while IFS= read -r v; do
+      [ -n "$v" ] || continue
+      case ",$ov," in
+        *",$v,"*)
+          claimed="$v"
+          echo "  (claimed by the running container $c, whose project directory" >&2
+          echo "  no longer exists under that name — a rename leaves the old" >&2
+          echo "  containers up. \`docker stop $c\` or \`ddev stop\` it.)" >&2
+          break 2 ;;
+      esac
+    done <<<"$(printf '%s' "$variants" | tr ',' '\n')"
+  done <<<"$running"
+fi
+
 
 # web keeps this project's own hostnames, minus the variants and minus the
 # parent's. DDEV puts every additional hostname on web's VIRTUAL_HOST, so
