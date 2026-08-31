@@ -1449,3 +1449,181 @@ func TestANestedPayloadBehindALabel(t *testing.T) {
 		}
 	}
 }
+
+// A nested payload behind a label is found in the percent spelling too.
+//
+// `valueStart` gates the scan on what precedes a value and accepts the
+// percent-encoded separators alongside the literal ones — `pctIs(b, i-1, '{')`,
+// `pctIs(b, i-1, ';')`, `pctIs(b, i-1, '"')`, and since round 30 the
+// percent-encoded whitespace as well. None of those seven cases can ever fire.
+// A percent escape is three bytes wide and its `%` sits at `i-3`; what stands at
+// `i-1` is the second hex digit. `pctIs` checks for a `%` at the offset it is
+// handed, so every one of these asks whether `B` is a `%` and is told no.
+//
+// So in the one spelling `options.php` posts every option in, a payload inside a
+// string is invisible unless it starts at offset zero — which is the case
+// `repairNested` was written to stop relying on, and the case a textarea, an ACF
+// default or a line of prose in front of a blob all break.
+//
+// What it costs is this file's own failure mode in its quietest form. The outer
+// string still parses, so its length is faithfully re-emitted over the new
+// bytes. The inner one is never looked for, so the host inside it is rewritten
+// and its `s:NN:` is left describing the byte count it had before —
+// `unserialize()` returns false on the inner value. And `BrokenSerialized` gates
+// on the same `valueStart`, so it reports zero on the served bytes and zero on
+// the canonical ones, which the corpus diff subtracts to zero: GREEN, on a body
+// PHP refuses. That is the shape rounds 28 to 30 each turned out to be.
+//
+// The literal spelling is here as the control: same payload, same prefixes, and
+// it repairs.
+func TestANestedPayloadBehindALabelInAFormBody(t *testing.T) {
+	canon, variant := "https://mz31a.ddev.site", "https://wt-a--mz31a.ddev.site"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// An outer array whose first field holds a prefix and then another payload —
+	// the blob a real options row carries.
+	blob := func(host, prefix string) string {
+		inner := prefix + `a:1:{s:4:"link";` + str(host+"/inner/x") + `}`
+		return `a:2:{s:1:"f";` + str(inner) + `s:4:"home";` + str(host) + `}`
+	}
+	// rawurlencode / encodeURIComponent: everything but the unreserved set, and
+	// no `+` for a space, which is what a REST or admin-ajax client posts.
+	rawEnc := func(s string) string {
+		const hex = "0123456789ABCDEF"
+		var b strings.Builder
+		for i := 0; i < len(s); i++ {
+			if c := s[i]; c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+				c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '~' {
+				b.WriteByte(c)
+				continue
+			}
+			b.WriteByte('%')
+			b.WriteByte(hex[s[i]>>4])
+			b.WriteByte(hex[s[i]&0xf])
+		}
+		return b.String()
+	}
+	rawDec := func(t *testing.T, s string) string {
+		out, err := url.PathUnescape(s)
+		if err != nil {
+			t.Fatalf("the body no longer decodes: %v", err)
+		}
+		return out
+	}
+	rw := func(b []byte) []byte {
+		s := strings.ReplaceAll(string(b), canon, variant)
+		return []byte(strings.ReplaceAll(s, rawEnc(canon), rawEnc(variant)))
+	}
+	spellings := map[string]func(string) string{
+		"literal": func(s string) string { return s },
+		"percent": rawEnc,
+	}
+	// "none" is the control: at offset zero `valueStart` returns true before it
+	// ever looks at what precedes the value, so that one repairs in both.
+	prefixes := map[string]string{
+		"none": "", "space": " ", "newline": "\n", "tab": "\t", "label": "Obs: ",
+	}
+	for sname, enc := range spellings {
+		for pname, prefix := range prefixes {
+			t.Run(sname+"/"+pname, func(t *testing.T) {
+				in := "opt=" + enc(blob(canon, prefix))
+				want := "opt=" + enc(blob(variant, prefix))
+				got := string(RepairSerialized([]byte(in), rw))
+				if got != want {
+					t.Errorf("the nested length was not re-emitted; "+
+						"BrokenSerialized calls the served bytes clean (%d) and the "+
+						"canonical ones clean (%d), so the corpus diff subtracts it "+
+						"to zero:\n got  %s\n want %s",
+						BrokenSerialized([]byte(got)), BrokenSerialized([]byte(in)),
+						got, want)
+				}
+				// What PHP is handed, in the spelling PHP is handed it in.
+				body := strings.TrimPrefix(got, "opt=")
+				if sname == "percent" {
+					body = rawDec(t, body)
+				}
+				assertEveryLength(t, body)
+			})
+		}
+	}
+}
+
+// A `C:` payload carrying a character reference is repaired, not declined.
+//
+// WooCommerce stores custom-serialized blobs, and their payload is arbitrary
+// bytes — a URL with a query string is ordinary content there. The payload was
+// measured with syn.advance, which knows one reading, so an `&amp;` under
+// esc_attr declined the whole field. A decline still rewrites the host and
+// re-emits nothing, which leaves a length describing the bytes from before.
+func TestACustomPayloadWithAnAmpersand(t *testing.T) {
+	canon, variant := "https://mz31b.ddev.site", "https://wt-a--mz31b.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	blob := func(host string) string {
+		p := host + "/p?q=1&r=2"
+		return `C:7:"WC_Data":` + strconv.Itoa(len(p)) + `:{` + p + `}`
+	}
+	escAttr := strings.NewReplacer(`"`, "&quot;", "&", "&amp;")
+	for name, enc := range map[string]func(string) string{
+		"literal": func(s string) string { return s },
+		"attr":    escAttr.Replace,
+	} {
+		in := `<div>` + enc(blob(canon)) + `</div>`
+		want := `<div>` + enc(blob(variant)) + `</div>`
+		if got := string(RepairSerialized([]byte(in), rw)); got != want {
+			t.Errorf("%s:\n got  %s\n want %s", name, got, want)
+		}
+		if n := BrokenSerialized([]byte(want)); n != 0 {
+			t.Errorf("%s: the repaired page counted %d broken values", name, n)
+		}
+	}
+}
+
+// A nested payload behind a label in a form body, in the spelling a browser
+// actually posts.
+//
+// `application/x-www-form-urlencoded` writes a space as `+`, not `%20`, so a
+// field label ending in a space — which is what a label ends with — puts a `+`
+// immediately before the payload. Every prefix here reaches the scan as a
+// different byte: `+` for the space, `%3A` for the colon, `%0A` for the
+// newline, a raw hex digit for the `ä`.
+//
+// The percent openers were all off by two and had never fired, so this whole
+// column was invisible: the payload was rewritten, its length left behind, and
+// the row went into the database on an options.php save. The detector gates on
+// the same function, so both sides of the diff read zero and it printed GREEN.
+func TestANestedPayloadBehindALabelInAPostedForm(t *testing.T) {
+	canon, variant := "https://mz31c.ddev.site", "https://wt-a--mz31c.ddev.site"
+	// The host, not the whole origin: QueryEscape encodes `://` but leaves the
+	// hostname literal, and it is the hostname the engine's decoder view
+	// matches. Substituting the full origin would never fire here and the test
+	// would pass on bytes nobody rewrote.
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b),
+			"mz31c.ddev.site", "wt-a--mz31c.ddev.site"))
+	}
+	ser := func(k, v string) string {
+		return `a:1:{s:` + strconv.Itoa(len(k)) + `:"` + k + `";` +
+			`s:` + strconv.Itoa(len(v)) + `:"` + v + `";}`
+	}
+	blob := func(host, prefix string) string {
+		inner := prefix + ser("link", host+"/inner/x")
+		return `a:2:{s:1:"f";s:` + strconv.Itoa(len(inner)) + `:"` + inner + `";` +
+			`s:4:"home";s:` + strconv.Itoa(len(host)) + `:"` + host + `";}`
+	}
+	for name, prefix := range map[string]string{
+		"none": "", "space": " ", "newline": "\n", "tab": "\t",
+		"label": "Obs: ", "nordic": "Läs ", "amp": "A & B ",
+	} {
+		// url.QueryEscape is what a browser does: space becomes `+`.
+		in := "opt=" + url.QueryEscape(blob(canon, prefix))
+		want := "opt=" + url.QueryEscape(blob(variant, prefix))
+		got := string(RepairSerializedFields([]byte(in), rw))
+		if got != want {
+			t.Errorf("%s:\n got  %s\n want %s", name, got, want)
+		}
+		if n := BrokenSerialized([]byte(got)); n != 0 {
+			t.Errorf("%s: posted %d value(s) PHP refuses:\n %s", name, n, got)
+		}
+	}
+}

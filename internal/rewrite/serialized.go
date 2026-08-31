@@ -229,24 +229,41 @@ func valueStart(b []byte, i int) bool {
 	}
 	switch b[i-1] {
 	// Whitespace and `>`, because a `<textarea>` WordPress indents and a text
-	// node both put a value there. occupiesItsField still decides whether the
-	// value fills its field; this gate only decides whether to look.
-	case '{', ';', '"', '=', '&', ':', ',', '\'', '>', '[', ' ', '\t', '\r', '\n':
+	// node both put a value there. `+` because that is how a form body spells a
+	// space, which is what a field label ends with. occupiesItsField and
+	// runsToTheEnd still decide whether the value fills its field; this gate
+	// only decides whether to look, so being too permissive costs a parse
+	// attempt and being too strict costs a repair.
+	case '{', ';', '"', '=', '&', ':', ',', '\'', '>', '[', '+', ' ', '\t', '\r', '\n':
 		return true
 	}
-	// The same separators as the escapes a spelling writes them with. Without
-	// the whitespace ones, a payload after a newline was invisible in every
-	// spelling that escapes it — JSON writes `\n` as two bytes, so the byte
-	// before the value is an ordinary `n`. The scan then missed the payload's
-	// own header, found the fields *inside* it instead, and declined the whole
-	// string because a field does not run to the end. Correct, and for the
-	// wrong reason: the structure was fine and only the gate could not see it.
-	return pctIs(b, i-1, '{') || pctIs(b, i-1, ';') || pctIs(b, i-1, '"') ||
-		(i >= 6 && string(b[i-6:i]) == "&quot;") ||
+	// The same separators as the escapes a spelling writes them with.
+	//
+	// Two ways this was blind. JSON writes `\n` as two bytes, so the byte before
+	// a payload on its own line is an ordinary `n`. And a percent escape is
+	// three bytes wide, so the one that *ends* at i-1 starts at i-3 — asking
+	// pctIs about i-1 asks whether the second hex digit is a `%`, which it never
+	// is. Every percent opener here was dead from the day the first was written,
+	// in the one spelling `options.php` and every urlencoded POST use, and the
+	// detector gates on this same function: a body PHP refuses was reported
+	// GREEN because neither side of the diff could see into it.
+	//
+	// The percent set is the raw set, rather than a few of them chosen by hand.
+	// Choosing by hand is what left `%3A` out while `%20` was in, so a label
+	// ending in a colon was invisible and one ending in a space was not.
+	for _, c := range separators {
+		if pctIs(b, i-3, c) {
+			return true
+		}
+	}
+	return (i >= 6 && string(b[i-6:i]) == "&quot;") ||
 		(i >= 2 && b[i-2] == '\\' &&
-			(b[i-1] == '"' || b[i-1] == 'n' || b[i-1] == 't' || b[i-1] == 'r')) ||
-		pctIs(b, i-1, ' ') || pctIs(b, i-1, '\t') ||
-		pctIs(b, i-1, '\r') || pctIs(b, i-1, '\n')
+			(b[i-1] == '"' || b[i-1] == 'n' || b[i-1] == 't' || b[i-1] == 'r'))
+}
+
+// separators is the raw set above, for the spellings that escape them.
+var separators = []byte{
+	'{', ';', '"', '=', '&', ':', ',', '\'', '>', '[', '+', ' ', '\t', '\r', '\n',
 }
 
 // maxSerializedDepth bounds the recursion. Exceeding it *declines* — it must
@@ -448,38 +465,51 @@ func advanceReadings(b []byte, i, n int, unit func([]byte, int) (int, int, int))
 // picks: exactly one reading that closes is the answer, and two are an
 // ambiguity this must not resolve by preference.
 func stringEnd(b []byte, dataAt, n int, syn syntax) (dataEnd, cw, tw int, ok bool) {
-	closes := func(e int) (int, int, bool) {
-		cw, ok := syn.match(b, e, '"')
+	e, ok := spanEnd(b, dataAt, n, syn, func(e int) bool {
+		w, ok := syn.match(b, e, '"')
 		if !ok {
-			return 0, 0, false
+			return false
 		}
-		tw, ok := syn.match(b, e+cw, ';')
-		if !ok {
-			return 0, 0, false
-		}
-		return cw, tw, true
+		_, ok = syn.match(b, e+w, ';')
+		return ok
+	})
+	if !ok {
+		return 0, 0, 0, false
 	}
-	if e, ok := syn.advance(b, dataAt, n); ok {
-		if cw, tw, ok := closes(e); ok {
-			if syn.unit == nil || bytes.IndexByte(b[dataAt:e], '&') < 0 {
-				return e, cw, tw, true
-			}
+	cw, _ = syn.match(b, e, '"')
+	tw, _ = syn.match(b, e+cw, ';')
+	return e, cw, tw, true
+}
+
+// spanEnd finds where a span of n decoded bytes ends, given a test for what
+// must follow it. stringEnd is this with `";`, and a `C:` payload is this with
+// `}`.
+//
+// The `C:` payload used syn.advance alone, and advance knows one reading. So a
+// WooCommerce blob like `C:7:"WC_Data":28:{http://a.test/p?q=1&r=2}` under
+// esc_attr declined on the ampersand — and a decline still rewrites the host and
+// re-emits nothing, which is the whole reason this file stopped treating one as
+// safe.
+func spanEnd(b []byte, at, n int, syn syntax, closes func(int) bool) (int, bool) {
+	if e, ok := syn.advance(b, at, n); ok && closes(e) {
+		if syn.unit == nil || bytes.IndexByte(b[at:e], '&') < 0 {
+			return e, true
 		}
 	}
 	if syn.unit == nil {
-		return 0, 0, 0, false
+		return 0, false
 	}
-	found := 0
-	for _, e := range advanceReadings(b, dataAt, n, syn.unit) {
-		if c, t, ok := closes(e); ok {
+	end, found := 0, 0
+	for _, e := range advanceReadings(b, at, n, syn.unit) {
+		if closes(e) {
 			found++
-			dataEnd, cw, tw = e, c, t
+			end = e
 		}
 	}
 	if found != 1 {
-		return 0, 0, 0, false
+		return 0, false
 	}
-	return dataEnd, cw, tw, true
+	return end, true
 }
 
 var literalSyntax = syntax{
@@ -1327,15 +1357,7 @@ func repairOpaqueString(b []byte, i int, syn syntax) ([]byte, int, bool) {
 	if !ok {
 		return nil, 0, false
 	}
-	end, ok := syn.advance(b, j+qw, n)
-	if !ok {
-		return nil, 0, false
-	}
-	cw, ok := syn.match(b, end, '"')
-	if !ok {
-		return nil, 0, false
-	}
-	tw, ok := syn.match(b, end+cw, ';')
+	end, cw, tw, ok := stringEnd(b, j+qw, n, syn)
 	if !ok {
 		return nil, 0, false
 	}
@@ -1381,14 +1403,14 @@ func repairCustom(b []byte, i int, rw func([]byte) []byte, syn syntax) ([]byte, 
 		return nil, 0, false
 	}
 	dataAt := k + ow
-	dataEnd, ok := syn.advance(b, dataAt, dataLen)
+	dataEnd, ok := spanEnd(b, dataAt, dataLen, syn, func(e int) bool {
+		_, ok := syn.match(b, e, '}')
+		return ok
+	})
 	if !ok {
 		return nil, 0, false
 	}
-	clw, ok := syn.match(b, dataEnd, '}')
-	if !ok {
-		return nil, 0, false
-	}
+	clw, _ := syn.match(b, dataEnd, '}')
 	data := b[dataAt:dataEnd]
 	repaired := rw(data)
 	if string(repaired) == string(data) {
