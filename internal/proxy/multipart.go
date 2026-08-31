@@ -99,7 +99,7 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 		// database. Every other request-direction call site was moved; this one
 		// was missed, and a multipart POST is what any form with a file field
 		// sends: the media library, an editor with an attachment, Gravity Forms.
-		nv = rewrite.HostLeaksBack(m, nv)
+		nv = rewrite.HostLeaksBackCounted(m, nv, st, rewrite.SurfaceRequestBody, bodyStart)
 		st.Record(rewrite.SurfaceRequestBody, bodyStart, ev)
 		if bytes.Equal(nv, body[bodyStart:end]) {
 			continue

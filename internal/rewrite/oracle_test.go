@@ -323,7 +323,13 @@ func TestOracleShapesRoundTrip(t *testing.T) {
 			served := rewriteHTML(t, fwd, w.wrap(sh.candidate), NewStats(false))
 			// What the browser would send back: the rewritten value, through the
 			// request direction.
-			back := string(HostLeaks(rev, []byte(served), true))
+			// HostLeaksBack, which is what the proxy calls on a request body.
+			// This said HostLeaks — the narrower entry point — while its own
+			// comment claimed "the request direction has to reverse every one
+			// of them". Conservative rather than blind, since passing under
+			// rewriteAll implies passing under rewriteAllRefs, but the same
+			// mislabelling is what hid the multipart bug for a round.
+			back := string(HostLeaksBack(rev, []byte(served)))
 			if strings.Contains(back, oracleVariant) {
 				bad++
 				if bad <= 10 {

@@ -438,3 +438,47 @@ func TestTheCensusCountsSplicesNotValues(t *testing.T) {
 		}
 	}
 }
+
+// A character reference spelling TAB, LF or CR *inside* an origin, on the
+// surfaces where the consumer decodes references.
+//
+// stripForRefs deliberately leaves these alone — parseURLRef must never emit a
+// control character, which was one of the XSS holes this file sits next to.
+// stripForCSS falls through to stripForURL when there is no backslash, and
+// stripForURL is what removes them. So composeView(stripForRefs, stripForCSS)
+// is the engine's only refs-then-URL-strip view, and an allocation
+// optimisation that skipped it "when the references do not spell a backslash"
+// turned every shape here into a byte-identical pass-through with the census
+// reporting a clean page.
+//
+// Chrome preserves a reference to LF through XML attribute-value normalisation
+// and ada then strips it: `new URL("https:/\n/www.example.fi/x")` resolves to
+// host www.example.fi. Under production-canonical that is a live fetch to the
+// client's site carrying the developer's session — test 28.
+func TestRemovableReferencesInsideAnOrigin(t *testing.T) {
+	m := viewMap(t)
+	for _, sp := range []string{
+		`https:&#47;&#10;&#47;www.example.fi/x`,
+		`https:&#47;&#9;&#47;www.example.fi/x`,
+		`https:&#47;&#13;&#47;www.example.fi/x`,
+		`https:&#47;&#47;www.exam&#9;ple.fi/x`,
+		`&#47;&#9;&#47;www.example.fi/x`,
+		`https:&#47;&Tab;&#47;www.example.fi/x`,
+		`https:&#47;&NewLine;&#47;www.example.fi/x`,
+	} {
+		t.Run(sp, func(t *testing.T) {
+			// A standalone SVG or XML body, which has no HTML parser above it.
+			svg := `<svg xmlns="http://www.w3.org/2000/svg"><image href="` + sp + `"/></svg>`
+			if out := string(HostLeaksXML(m, []byte(svg), false)); strings.Contains(out, "www.example.fi") {
+				t.Errorf("standalone XML: a canonical origin survives:\n%s", out)
+			}
+			// And a style element inside foreign content, where the HTML
+			// tokenizer never enters a raw-text state so references decode.
+			html := `<svg><style>a{background:url(` + sp + `)}</style></svg>`
+			st := NewStats(false)
+			if out := rewriteHTML(t, m, html, st); strings.Contains(out, "www.example.fi") {
+				t.Errorf("svg style: a canonical origin survives:\n%s", out)
+			}
+		})
+	}
+}

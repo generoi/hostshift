@@ -964,13 +964,13 @@ func hostsFor(m *origin.Matcher) *hostReplacer {
 // rewriteAll applies both catchers to a standalone buffer — the JSON path, which
 // has no HTML tokenizer around it. Counters are the caller's business; the
 // events this would emit duplicate the ones RewriteJSON already records.
-func (h *hostReplacer) rewriteAll(v []byte, value bool) []byte {
+func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []byte {
 	if h == nil || len(h.to) == 0 {
 		return v
 	}
-	v = h.spliceHosts(v, urlTokenStarts, value)
+	v = h.spliceHosts(v, urlTokenStarts, value, ev)
 	if hasNonASCII(v) {
-		v = h.spliceHosts(v, slashRunStarts, value)
+		v = h.spliceHosts(v, slashRunStarts, value, ev)
 	}
 	// The CSS view too, because the *forward* direction emits it.
 	//
@@ -985,23 +985,23 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool) []byte {
 	// The rule this is an instance of: every spelling the forward direction can
 	// *emit*, the reverse direction must be able to *read*.
 	if bytes.IndexByte(v, '\\') >= 0 {
-		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value)
+		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value, ev)
 	}
 	// And the percent view, for an encoding composed with another one.
 	if bytes.IndexByte(v, '%') >= 0 {
-		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value)
+		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value, ev)
 	}
 	return v
 }
 
 // rewriteAllRefs is rewriteAll for a consumer that decodes character references
 // — the XML family, XHTML's script and style, and every request body.
-func (h *hostReplacer) rewriteAllRefs(v []byte, value bool) []byte {
-	v = h.refsOnly(h.rewriteAll(v, value), value)
+func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, ev *[]origin.Event) []byte {
+	v = h.refsOnly(h.rewriteAll(v, value, ev), value, ev)
 	// And references spelling CSS escapes, which needs both decodes composed.
 	if h != nil && len(h.to) > 0 && bytes.IndexByte(v, '&') >= 0 {
 		if n, ok := refsThenCSS(v); ok {
-			v = h.spliceHostsIn(n, v, urlTokenStarts, value)
+			v = h.spliceHostsIn(n, v, urlTokenStarts, value, ev)
 		}
 	}
 	return v
@@ -1010,11 +1010,11 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool) []byte {
 // refsOnly is the reference view alone, for callers where the other views would
 // be wrong — an HTML attribute, where the browser decodes references but not CSS
 // escapes.
-func (h *hostReplacer) refsOnly(v []byte, value bool) []byte {
+func (h *hostReplacer) refsOnly(v []byte, value bool, ev *[]origin.Event) []byte {
 	if h == nil || len(h.to) == 0 || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
-	return h.spliceHostsIn(stripForRefs(v), v, urlTokenStarts, value)
+	return h.spliceHostsIn(stripForRefs(v), v, urlTokenStarts, value, ev)
 }
 
 // slashRunStarts yields the first byte of each run of two or more slashes, which
@@ -1037,12 +1037,28 @@ func slashRunStarts(b []byte) []int {
 	return out
 }
 
-func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bool) []byte {
-	return h.spliceHostsIn(stripForURL(v), v, starts, value)
+func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bool, ev *[]origin.Event) []byte {
+	return h.spliceHostsIn(stripForURL(v), v, starts, value, ev)
 }
 
-func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte) []int, value bool) []byte {
-	out, _ := h.spliceHostsLog(n, v, starts, value)
+// spliceHostsIn splices, and appends what it did to ev when the caller has a
+// census to report to.
+//
+// It discarded events unconditionally, and the justification — "the events this
+// would emit duplicate the ones RewriteJSON already records" — was true of the
+// JSON path and of no other caller. So every standalone entry point rewrote
+// silently: the request line, the query, Referer/Origin, every request body,
+// every response header, and every text/plain and XML response body. A sitemap
+// with five CSS-escaped origins came out rewritten with `--json` reporting
+// none, and `--dry-run` — which §5.8 makes the tool you point at a canonical
+// checkout to decide whether a site needs hostshift — answered "nothing to do"
+// on the very shapes these views exist for. Third recurrence of the
+// instrument-lies class, at the entry points the earlier fix did not enumerate.
+func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte) []int, value bool, ev *[]origin.Event) []byte {
+	out, events := h.spliceHostsLog(n, v, starts, value)
+	if ev != nil {
+		*ev = append(*ev, events...)
+	}
 	return out
 }
 
@@ -1140,24 +1156,26 @@ func stripForRefsCSS(v []byte) normalised {
 	return composeView(stripForRefs(v), stripForCSS)
 }
 
-// refsThenCSS is stripForRefsCSS with the reference decode shared and the CSS
-// layer skipped when the references do not actually spell a backslash.
+// refsThenCSS is stripForRefsCSS for the two callers that skip on no match.
 //
-// Both call sites were gated on `&` alone and then decoded twice — once inside
-// refsOnly and again inside stripForRefsCSS — and built the CSS layer over
-// every value containing an ampersand, which is most of them. Transient
-// allocation had reached 186x the body: 1.5 GB churned and a 541 MB heap
-// high-water mark for one 8 MiB request. The decode that decides is the same
-// one the reference view needs anyway, so sharing it costs nothing.
+// It used to skip the composed view when the reference-decoded buffer held no
+// backslash, on the reasoning that the CSS layer only unescapes backslashes.
+// That reasoning was wrong and the skip was a leak. stripForCSS *falls through
+// to stripForURL* when there is no backslash, and stripForURL is what removes
+// tab, LF and CR — including their character-reference spellings, which
+// stripForRefs deliberately leaves alone because parseURLRef must never emit a
+// control character. So this composition was quietly the engine's only
+// refs-then-URL-strip view, and `https:&#47;&#10;&#47;host` went out
+// byte-identical on every standalone XML and SVG body, on `<style>` and text
+// inside foreign content, and in XHTML — with the census reporting a clean
+// page. Chrome preserves a reference to LF through XML attribute-value
+// normalisation and ada then strips it, so that is a live production fetch.
 //
-// ok=false means there is no backslash to unescape and the caller should skip
-// the composed view entirely.
+// The allocation this bought back (118x to 85x on ampersand-only shapes) is not
+// worth a leak, and the remaining cost is tracked by TestAllocationStaysBounded
+// rather than traded against correctness.
 func refsThenCSS(v []byte) (normalised, bool) {
-	n := stripForRefs(v)
-	if bytes.IndexByte(n.b, '\\') < 0 {
-		return normalised{}, false
-	}
-	return composeView(n, stripForCSS), true
+	return composeView(stripForRefs(v), stripForCSS), true
 }
 
 // percentLeak is the percent-decoded view, for an encoding composed with
@@ -1241,7 +1259,7 @@ func HostLeaks(m *origin.Matcher, b []byte, value bool) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAll(b, value)
+	return hostsFor(m).rewriteAll(b, value, nil)
 }
 
 // HostLeaksXML is HostLeaks for a body whose parser decodes character
@@ -1265,12 +1283,54 @@ func HostLeaksBack(m *origin.Matcher, b []byte) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAllRefs(b, true)
+	return hostsFor(m).rewriteAllRefs(b, true, nil)
 }
 
 func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAllRefs(b, value)
+	return hostsFor(m).rewriteAllRefs(b, value, nil)
+}
+
+// Counted returns HostLeaks, HostLeaksBack and HostLeaksXML with the census
+// wired up, which is what the proxy uses.
+//
+// The plain forms above rewrite silently, and every one of the proxy's eleven
+// call sites used them — so a body the engine rewrote forty origins in reported
+// zero, and `--dry-run` said a site needed no hostshift. Anything with a Stats
+// to report to should call these; the plain forms remain for the filter, where
+// there is no census, and for tests.
+func HostLeaksCounted(m *origin.Matcher, b []byte, value bool, st *Stats, surface string, base int) []byte {
+	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
+		return hostsFor(m).rewriteAll(b, value, ev)
+	})
+}
+
+// HostLeaksBackCounted is HostLeaksBack with the census wired up.
+func HostLeaksBackCounted(m *origin.Matcher, b []byte, st *Stats, surface string, base int) []byte {
+	if m == nil || len(b) == 0 {
+		return b
+	}
+	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
+		return hostsFor(m).rewriteAllRefs(b, true, ev)
+	})
+}
+
+// HostLeaksXMLCounted is HostLeaksXML with the census wired up.
+func HostLeaksXMLCounted(m *origin.Matcher, b []byte, value bool, st *Stats, surface string, base int) []byte {
+	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
+		return hostsFor(m).rewriteAllRefs(b, value, ev)
+	})
+}
+
+// counted runs f with an accumulator and reports what it did.
+func counted(st *Stats, surface string, base int, f func(*[]origin.Event) []byte) []byte {
+	var ev []origin.Event
+	out := f(&ev)
+	for i := range ev {
+		ev[i].Surface = surface
+	}
+	st.Record(surface, base, ev)
+	return out
 }

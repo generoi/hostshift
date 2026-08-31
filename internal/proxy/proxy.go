@@ -225,7 +225,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// which is what makes redirect_to=https%3A%2F%2F… work.
 	if q := r.Out.URL.RawQuery; q != "" {
 		out, ev := rev.Rewrite([]byte(q), rewrite.SurfaceRequestLine, explain)
-		out = rewrite.HostLeaksBack(rev, out)
+		out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceRequestLine, 0)
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun {
 			r.Out.URL.RawQuery = string(out)
@@ -237,7 +237,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// — URL.String() percent-encodes, which would break test 24's spirit.
 	if esc := r.Out.URL.EscapedPath(); esc != "" {
 		out, ev := rev.Rewrite([]byte(esc), rewrite.SurfaceRequestLine, explain)
-		out = rewrite.HostLeaksBack(rev, out)
+		out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceRequestLine, 0)
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun && string(out) != esc {
 			if dec, err := url.PathUnescape(string(out)); err == nil {
@@ -251,7 +251,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 		vs := r.Out.Header.Values(h)
 		for i, v := range vs {
 			out, ev := rev.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
-			out = rewrite.HostLeaksBack(rev, out)
+			out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceHeader, 0)
 			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun {
 				vs[i] = string(out)
@@ -303,7 +303,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	if st != nil && isRedirect(resp.StatusCode) && safeMethod(resp.Request) {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceHeader, false)
-			rewritten = rewrite.HostLeaks(fwd, rewritten, true)
+			rewritten = rewrite.HostLeaksCounted(fwd, rewritten, true, p.Stats, rewrite.SurfaceHeader, 0)
 			if sameURL(string(rewritten), st.url) {
 				if p.StrictOrigins {
 					p.log().Warn("self-redirect suppressed by --strict-origins", "url", st.url)
@@ -332,7 +332,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 			// Location, Link, Refresh and CSP had the byte matcher alone, so
 			// every obfuscated and folded spelling passed straight through — and
 			// a Location is followed by the browser through the URL parser.
-			out = rewrite.HostLeaks(fwd, out, true)
+			out = rewrite.HostLeaksCounted(fwd, out, true, p.Stats, rewrite.SurfaceHeader, 0)
 			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun && string(out) != v {
 				vs[i] = string(out)
@@ -530,9 +530,9 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		// keeps HostLeaks: nothing parses references in plain text, so leaving
 		// them is correct there.
 		if strings.HasSuffix(strings.ToLower(mediaType(ct)), "xml") {
-			out = rewrite.HostLeaksXML(p.Map.Forward(), out, false)
+			out = rewrite.HostLeaksXMLCounted(p.Map.Forward(), out, false, p.Stats, rewrite.SurfaceText, 0)
 		} else {
-			out = rewrite.HostLeaks(p.Map.Forward(), out, false)
+			out = rewrite.HostLeaksCounted(p.Map.Forward(), out, false, p.Stats, rewrite.SurfaceText, 0)
 		}
 		if !p.NoSweep {
 			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
@@ -645,7 +645,7 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 	default:
 		var ev []origin.Event
 		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
-		out = rewrite.HostLeaksBack(rev, out)
+		out = rewrite.HostLeaksBackCounted(rev, out, p.Stats, rewrite.SurfaceRequestBody, 0)
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
 	}
 	if p.DryRun {
@@ -794,7 +794,17 @@ func bodyKind(ct string) bodyClass {
 	// flat path is not used for JSON in the first place.
 	case mt == "application/json", mt == "text/json", strings.HasSuffix(mt, "+json"):
 		return bodyJSON
+	// The XML family, for the same reason text/json is above: the two directions
+	// must not disagree about the same body. rewritableText rewrites every
+	// `+xml` type on the way out and rewritableHTML claims
+	// application/xhtml+xml, while this arm listed only the `text/` prefix — so
+	// text/xml was mapped back and application/xml, image/svg+xml,
+	// application/rss+xml, application/atom+xml and application/xhtml+xml were
+	// not mapped back at all, not even a plain variant origin. Same shape as the
+	// multipart finding a round earlier: an arm nobody enumerated.
 	case mt == "application/x-www-form-urlencoded",
+		mt == "application/xml", mt == "application/xhtml+xml",
+		strings.HasSuffix(mt, "+xml"),
 		strings.HasPrefix(mt, "text/"):
 		return bodyFlat
 	case mt == "multipart/form-data":

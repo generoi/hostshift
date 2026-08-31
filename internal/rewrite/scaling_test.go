@@ -172,18 +172,24 @@ func TestHostLeaksStaysLinear(t *testing.T) {
 // Each view allocates a decoded copy plus two position maps — 17 bytes per
 // input byte — and composeView adds two more maps on top of an intermediate.
 // Round nineteen measured 186x the body on a shape that fires every view: 1.5 GB
-// churned and a 541 MB heap high-water mark for one 8 MiB request, against ~37x
-// recorded in earlier rounds. Sharing the reference decode between the reference
-// view and the composed one, and skipping the CSS layer when the references do
-// not spell a backslash, took the ampersand-only shapes from 118x to 85x and
-// from 104x to 80x. The worst case is unchanged, correctly: that shape really
-// does need all six views.
+// churned and a 447 MB heap high-water mark for one 8 MiB request, against ~37x
+// recorded in earlier rounds. Timing extrapolates linearly: one 8 MiB request
+// pins a core for about 0.4 s. It is a memory ceiling problem, not a latency
+// one.
 //
-// The remaining structural halving would be `pos`/`end` as []int32 — safe,
+// These ceilings went *up* in round twenty. An attempt to skip the composed
+// view when the references did not spell a backslash took the ampersand-only
+// shapes to 85x and 80x — and was a leak, because stripForCSS falls through to
+// stripForURL and that is the layer removing reference-spelled tab, LF and CR.
+// The allocation is not worth a leak; the numbers here record what correctness
+// actually costs.
+//
+// The structural halving that remains would be `pos`/`end` as []int32 — safe,
 // since DefaultMaxBody is 8 MiB and well under 2^31, and worth about 47%. It is
-// 141 index sites in the most delicate arithmetic in this package, so it is
-// recorded here as a measured, deliberate deferral rather than done in the same
-// pass as a leak fix. This test is what makes it a tracked number.
+// 141 index sites in the most delicate arithmetic in this package, so it is a
+// measured, deliberate deferral rather than something done in the same pass as
+// a leak fix. This test is what makes it a tracked number instead of a
+// forgotten one.
 func TestAllocationStaysBounded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("allocation")
@@ -200,8 +206,8 @@ func TestAllocationStaysBounded(t *testing.T) {
 		ceiling    float64
 	}{
 		{"every view fires", `&#92;3a %5C\3a [http:`, 200},
-		{"ampersands alone", `&`, 95},
-		{"references and brackets", `&#91;http:`, 90},
+		{"ampersands alone", `&`, 128},
+		{"references and brackets", `&#91;http:`, 115},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			b := []byte(strings.Repeat(c.unit, (1<<20)/len(c.unit)))

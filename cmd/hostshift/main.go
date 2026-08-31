@@ -291,10 +291,13 @@ func cmdRewrite(args []string) (int, error) {
 		st.Record(rewrite.SurfaceText, 0, ev)
 		// The XML family's parser decodes character references; plain text has no
 		// parser, so leaving them is correct there.
+		// The counted forms: --json and --dry-run are this command's whole
+		// output, and the plain forms rewrite silently. A sitemap whose origins
+		// were CSS-escaped came out rewritten with "rewrites": {} beside it.
 		if strings.HasSuffix(mt, "xml") {
-			out = rewrite.HostLeaksXML(m, out, false)
+			out = rewrite.HostLeaksXMLCounted(m, out, false, st, rewrite.SurfaceText, 0)
 		} else {
-			out = rewrite.HostLeaks(m, out, false)
+			out = rewrite.HostLeaksCounted(m, out, false, st, rewrite.SurfaceText, 0)
 		}
 		if !*noSweep {
 			out = rewrite.SweepBytes(out, m, st, log)

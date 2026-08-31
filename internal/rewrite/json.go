@@ -224,7 +224,10 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 	// path that declines. `content.rendered` is injected into the page as HTML,
 	// so that href was a live production link — the asymmetry this function's
 	// own header calls out, in the surface it was written to fix.
-	out = hostsFor(m).rewriteAllRefs(out, true)
+	// nil: RewriteJSON records its own events, per span, with an RFC 6901 path
+	// the accumulator cannot produce. This is the one caller for which the old
+	// "the events duplicate what is already recorded" justification was true.
+	out = hostsFor(m).rewriteAllRefs(out, true, nil)
 	if bytes.Equal(out, dec) {
 		return nil, false
 	}
