@@ -43,6 +43,7 @@ type HTML struct {
 	attrs   []Attr // scratch for scanAttrsInto, reused across tags
 	hosts   *hostReplacer
 	xmlEnt  bool
+	foreign int // depth inside <svg>/<math>, where references are decoded
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -275,8 +276,9 @@ func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []b
 	out = w.foldedHostLeak(surface, base, out, value)
 	// An XML parser decodes references inside script and style; an HTML parser
 	// does not. Attribute values are already handled by decodeEntityLeak on both.
-	if w.xmlEnt && (surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
-		surface == SurfaceRawText || surface == SurfaceText) {
+	if (w.xmlEnt || w.foreign > 0) &&
+		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
+			surface == SurfaceRawText || surface == SurfaceText) {
 		if w.hosts != nil {
 			out = w.hosts.rewriteAllRefs(out, false)
 		}
@@ -340,6 +342,23 @@ func (w *HTML) urlLeaks(base int, v []byte) []byte {
 	}
 	if out := w.normaliseURLLeak(SurfaceHTMLObfuscated, base, cur, true); !bytes.Equal(out, cur) {
 		return out
+	}
+	// The reference *view*, which needs no fusing guard because it emits nothing.
+	//
+	// decodeURLRefs declines an entire value whenever any fragment in it would
+	// fuse into a new reference — and that fragment can be anywhere, so a
+	// `&#6`+`&#48;`+`;` sequence in a query string disabled decoding for an
+	// ordinary `https:&#47;&#47;canonical/` in the same attribute, which then went
+	// out live. The guard is right about *splicing* a decoded value back; it has
+	// nothing to say about locating a host and replacing its byte range, where
+	// the decoded bytes never leave the view.
+	if w.hosts != nil {
+		if out := w.hosts.refsOnly(cur, true); !bytes.Equal(out, cur) {
+			w.stats.Record(SurfaceHTMLEntity, base, []origin.Event{{
+				Offset: base, Surface: SurfaceHTMLEntity, Action: origin.ActionRewrote,
+			}})
+			return out
+		}
 	}
 	if !bytes.Equal(cur, dec) {
 		return cur
@@ -506,9 +525,29 @@ func (w *HTML) Read(p []byte) (int, error) {
 			if name := rawTextElement(tagNameOf(raw)); name != "" {
 				w.rawText = name
 			}
+			// Foreign content: inside <svg> and <math> the HTML tokenizer never
+			// enters the raw-text states, so a browser decodes character
+			// references in <style>, <script> and <title> there — verified in
+			// Chrome, where an inline `<svg><script>` with a reference-encoded
+			// origin *ran*, and an `<svg><style>` fetched one. x/net/html's
+			// tokenizer is context-free and hands those back as raw text either
+			// way, so nothing downstream could tell the difference. The scoping
+			// was by content type where it belongs on whether the element is in
+			// foreign content: the same SVG served standalone was rewritten and
+			// inlined in a page was not.
+			if tt == html.StartTagToken {
+				if n := string(bytes.ToLower(tagNameOf(raw))); n == "svg" || n == "math" {
+					w.foreign++
+				}
+			}
 			w.write(off, len(raw), w.rewriteTag(raw, off))
 		case html.EndTagToken:
 			w.rawText = ""
+			if n := string(bytes.ToLower(endTagNameOf(raw))); n == "svg" || n == "math" {
+				if w.foreign > 0 {
+					w.foreign--
+				}
+			}
 			w.write(off, len(raw), raw)
 		case html.TextToken:
 			// A raw-text element's content arrives as a single token — a 700 KB

@@ -1083,7 +1083,7 @@ if [ "$cmd" = "check" ]; then
   # copy-db thirty lines up already asks the web container for DB_HOST for this
   # exact reason. Running the query inside the container with its own environment
   # inherits that knowledge instead of duplicating it.
-  # wp-cli, which reads wp-config.php — the application's own answer.
+  # `wp db query`, which reads the *row*, not the application's opinion of it.
   #
   # Reading DB_HOST from the container's shell environment was not the same
   # question. The README's "Share the parent's" section sets DATABASE_URL, not
@@ -1097,11 +1097,30 @@ if [ "$cmd" = "check" ]; then
   # different database and calling it proof is the failure; asking the
   # application removes the question.
   #
+  # `wp option get home` was the wrong question, and PLAN §4.1 says why:
+  # "the application self-reports and cannot be interrogated — the map must be
+  # declared, never discovered". get_option('home') runs through
+  # `add_filter('option_home', '_config_wp_home')`, which WordPress registers
+  # unconditionally and which returns WP_HOME whenever it is defined — and
+  # Bedrock always defines it, from HTTP_HOST or DDEV_PRIMARY_URL. So under
+  # `ddev exec`, with no HTTP_HOST, the answer was the worktree's own project
+  # hostname, which is by construction neither canonical nor variant: a refusal
+  # on every start of a healthy site. And where a repo has wp-cli.local.yml, its
+  # `url:` sets HTTP_HOST, so the answer always equalled a canonical host and the
+  # check cleared the parent-declares warning by echoing generated config back at
+  # itself.
+  #
+  # The row is not an opinion. wp-cli resolves the connection from wp-config.php,
+  # so Bedrock's dotenv and the README's DATABASE_URL are both handled — the
+  # thing the shell-environment version got wrong — while `db query` bypasses
+  # every filter.
+  #
   # Best-effort, and silence is the only safe failure. No wp-cli, no WordPress,
   # a stopped container or an unusual layout all yield nothing — and nothing
   # neither clears a warning nor raises one, because an answer we cannot trust
   # must not be treated as evidence in either direction.
-  dbhome="$(ddev exec -s web wp --skip-plugins --skip-themes --quiet option get home \
+  dbhome="$(ddev exec -s web wp --skip-plugins --skip-themes --quiet db query \
+    "select option_value from wp_options where option_name='home' limit 1" --skip-column-names \
     2>/dev/null | tail -1 | tr -d '\r' || true)"
   dbhost=""
   case "$dbhome" in

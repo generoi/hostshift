@@ -319,3 +319,50 @@ func TestReferencesDecodeWhereTheParserDoes(t *testing.T) {
 		})
 	}
 }
+
+// wp-admin/async-upload.php sets `text/plain` before wp_send_json can set
+// application/json — the endpoint this arm was added for — so the body is
+// exactly what wp_json_encode produced, `\uXXXX` escapes included. PLAN M4 lists
+// that spelling as a test-28 leak because wp_json_encode does not pass
+// JSON_UNESCAPED_UNICODE. The raw-UTF-8 IDN host was caught; the escaped form
+// PHP actually emits was not.
+func TestEscapedIDNUnderATextLabel(t *testing.T) {
+	mp, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://xn--hmeen-gra.fi"),
+		Variant:   origin.MustParse("https://wt-a--hameen.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = `{"url":"https:\/\/h\u00e4meen.fi\/a.png"}`
+
+	for _, ct := range []string{"application/json", "text/plain; charset=UTF-8"} {
+		t.Run(ct, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", ct)
+				w.Write([]byte(body))
+			}))
+			defer up.Close()
+			upURL, err := url.Parse(up.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := &Proxy{Map: mp, Upstream: upURL, Stats: rewrite.NewStats(false)}
+			srv := httptest.NewServer(p.Handler())
+			defer srv.Close()
+
+			req, _ := http.NewRequest("GET", srv.URL+"/x", nil)
+			req.Host = "wt-a--hameen.ddev.site"
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			got, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(got), "wt-a--hameen.ddev.site") {
+				t.Errorf("an escaped IDN canonical reached the browser as %s:\n%s", ct, got)
+			}
+		})
+	}
+}

@@ -34,6 +34,11 @@ type Options struct {
 	Paths     []string      // explicit paths; when empty, crawl from "/"
 	Client    *http.Client
 
+	// StrictOrigins mirrors the proxy flag of the same name: with the
+	// self-redirect carve-out turned off there, an unchanged Location is a
+	// mismatch here too.
+	StrictOrigins bool
+
 	// CanonicalHeaders are added to the canonical fetch only.
 	//
 	// When the canonical base is resolved past the TLS-terminating router
@@ -152,7 +157,19 @@ func compare(ctx context.Context, o Options, path string) Result {
 	}
 	if canon.location != "" || variant.location != "" {
 		wantLoc, _ := o.Map.Forward().Rewrite([]byte(canon.location), "header", false)
-		if string(wantLoc) != variant.location {
+		// The self-redirect carve-out is not a mismatch. PLAN §4.4 and test 32
+		// enumerate it as correct: an asset the worktree does not have is
+		// redirected to the canonical origin *on purpose*, which is what
+		// redirect-uploads.conf does in 87% of the fleet with 95.2% of referenced
+		// uploads absent locally. Flagging it made a RED verdict the ordinary
+		// outcome on any page linking a PDF or an attachment, which is how a
+		// verdict stops being read.
+		//
+		// Under --strict-origins the guard is off in the proxy too, so the
+		// exemption goes with it.
+		unchangedSelfRedirect := !o.StrictOrigins &&
+			variant.location == canon.location && canon.location != ""
+		if string(wantLoc) != variant.location && !unchangedSelfRedirect {
 			r.Err = fmt.Errorf("Location %q, want %q", variant.location, wantLoc)
 			return r
 		}
@@ -196,15 +213,36 @@ func compare(ctx context.Context, o Options, path string) Result {
 
 // countLeaks reports how many canonical origins the matcher still finds in a
 // body that has already been through the proxy.
+// countLeaks asks the whole engine, not the byte matcher alone.
+//
+// It used to run `m.Rewrite` and justify that with "the matcher is by definition
+// exactly the set of origins the proxy claims to rewrite". That stopped being
+// true the moment urlobf.go existed: the proxy also runs the URL-parser view,
+// the IDNA fold, the CSS view and the reference views, and this ran none of
+// them. So every leak class found since — obfuscated separators, folded hosts,
+// CSS escapes, character references — was invisible by construction to the one
+// test §7 calls the only one that validates against reality, and it printed
+// GREEN on a page whose `<a href>` a real browser resolved to production.
+//
+// Pushing the served bytes back through the same pipeline the proxy runs answers
+// the actual question: anything it still finds to rewrite is an origin that
+// should already have been rewritten and was not.
 func countLeaks(m *origin.Matcher, body []byte) int {
-	_, events := m.Rewrite(body, "leak-check", true)
-	n := 0
-	for _, e := range events {
-		if e.Action == origin.ActionRewrote {
-			n++
-		}
+	st := rewrite.NewStats(false)
+	out, err := io.ReadAll(rewrite.NewResponseBody(
+		strings.NewReader(string(body)), m, nil, rewrite.Options{Stats: st}))
+	if err != nil {
+		return 0
 	}
-	return n
+	if n := st.Total(); n > 0 {
+		return n
+	}
+	// A pass that splices without recording — and one that changes bytes has
+	// found an origin whatever it counted.
+	if string(out) != string(body) {
+		return 1
+	}
+	return 0
 }
 
 // response is what a comparison needs: the body, and the parts of the response

@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/generoi/hostshift/internal/origin"
@@ -32,21 +33,48 @@ func TestRedirectsAreNotSilentlyGreen(t *testing.T) {
 		wantErr        string
 	}{
 		{
-			// No proxy in the path: the variant's Location still names the
-			// canonical, which is precisely what diff exists to notice.
-			"an unrewritten Location", "https://acme.ddev.site/wp-signup.php",
-			"Location",
+			// A genuine mismatch: the two sides redirect somewhere different, so
+			// the rewritten canonical Location is not what the variant sent.
+			// Distinct from the carve-out below, where both sides send the same
+			// canonical Location and the guard is letting it through on purpose.
+			"a mismatched Location", "MISMATCH", "Location",
 		},
 		{
 			// Nothing to verify at all.
 			"an empty body and no Location", "",
 			"nothing was verified",
 		},
+		{
+			// The self-redirect carve-out PLAN §4.4 and test 32 enumerate as
+			// correct: an asset the worktree does not have is redirected to the
+			// canonical origin on purpose. 87% of the fleet ships
+			// redirect-uploads.conf and 95.2% of referenced uploads are absent
+			// locally, so flagging this made RED the ordinary outcome.
+			"an unchanged self-redirect", "SELF", "",
+		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			var reqs atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if c.location != "" {
-					w.Header().Set("Location", c.location)
+				loc := c.location
+				if loc == "MISMATCH" {
+					// The canonical fetch comes first; the variant then gets a
+					// different target, which is what a broken deployment looks
+					// like.
+					n := reqs.Add(1)
+					if n == 1 {
+						loc = "https://acme.ddev.site/one"
+					} else {
+						loc = "https://acme.ddev.site/two"
+					}
+				}
+				if loc == "SELF" {
+					// Both sides return the canonical origin verbatim, which is
+					// what the guard lets through.
+					loc = "https://acme.ddev.site/app/uploads/2025/07/x.jpg"
+				}
+				if loc != "" {
+					w.Header().Set("Location", loc)
 					w.WriteHeader(http.StatusFound)
 					return
 				}
@@ -71,6 +99,12 @@ func TestRedirectsAreNotSilentlyGreen(t *testing.T) {
 				Client:    cl,
 			}
 			r := compare(t.Context(), o, "/a")
+			if c.wantErr == "" {
+				if r.Err != nil {
+					t.Fatalf("a documented carve-out was reported as an error: %v", r.Err)
+				}
+				return
+			}
 			if r.Err == nil {
 				t.Fatalf("reported no error, so a crawl of these would be GREEN: %+v", r)
 			}

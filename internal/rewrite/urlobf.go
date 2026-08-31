@@ -874,7 +874,13 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool) []byte {
 // rewriteAllRefs is rewriteAll for a consumer that decodes character references
 // — the XML family, and XHTML's script and style.
 func (h *hostReplacer) rewriteAllRefs(v []byte, value bool) []byte {
-	v = h.rewriteAll(v, value)
+	return h.refsOnly(h.rewriteAll(v, value), value)
+}
+
+// refsOnly is the reference view alone, for callers where the other views would
+// be wrong — an HTML attribute, where the browser decodes references but not CSS
+// escapes.
+func (h *hostReplacer) refsOnly(v []byte, value bool) []byte {
 	if h == nil || len(h.to) == 0 || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}

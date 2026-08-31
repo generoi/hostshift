@@ -48,6 +48,21 @@ func tagNameOf(raw []byte) []byte {
 	return raw[1:i]
 }
 
+// endTagNameOf is tagNameOf for `</name>`. tagNameOf stops at the first `/`, so
+// on an end tag it returns nothing — which silently left a foreign-content depth
+// counter never decrementing.
+func endTagNameOf(raw []byte) []byte {
+	i := 1
+	if i < len(raw) && raw[i] == '/' {
+		i++
+	}
+	j := i
+	for j < len(raw) && !isSpace(raw[j]) && raw[j] != '>' && raw[j] != '/' {
+		j++
+	}
+	return raw[i:j]
+}
+
 // scanAttrs returns the attribute spans of a start or self-closing tag.
 // raw must be exactly what Tokenizer.Raw() returned.
 func scanAttrs(raw []byte) []Attr { return scanAttrsInto(nil, raw) }

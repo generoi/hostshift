@@ -820,10 +820,11 @@ fakedb="$work/fakedb"
 mkdir -p "$fakedb"
 cat > "$fakedb/ddev" <<'FAKEDDEV'
 #!/usr/bin/env bash
-# `wp option get home` — the application's own answer, which is what check
-# asks for now rather than reading DB_HOST out of the container's environment.
+# `wp db query` — the stored row, not get_option('home'), which WordPress
+# filters through WP_HOME and which therefore answers with generated config
+# rather than with what the database holds.
 case "$*" in
-  *"option get home"*) printf '%s\n' "${HS_FAKE_HOME:-}" ;;
+  *"option_name='home'"*) printf '%s\n' "${HS_FAKE_HOME:-}" ;;
 esac
 exit 0
 FAKEDDEV

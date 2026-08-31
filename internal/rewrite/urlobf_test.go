@@ -203,6 +203,56 @@ func TestBoundariesAreNotAnAllowlist(t *testing.T) {
 	}
 }
 
+// Inside <svg> and <math> the HTML tokenizer never enters the raw-text states,
+// so a browser decodes character references in <style>, <script> and <title>
+// there — verified in Chrome, where an inline `<svg><script>` with a
+// reference-encoded origin *ran*. x/net/html is context-free and hands those
+// back as raw text either way, so nothing downstream could tell the difference,
+// and the same SVG served standalone was rewritten while inlined in a page it
+// was not.
+func TestForeignContentDecodesReferences(t *testing.T) {
+	m := obfMatcher(t)
+	for _, c := range []struct {
+		name, in string
+		want     bool
+	}{
+		{"svg style", `<svg><style>a{background:url(https:&#47;&#47;www.example.fi/a.png)}</style></svg>`, true},
+		{"svg script", `<svg><script>var u="https:&#47;&#47;www.example.fi/api";</script></svg>`, true},
+		{"svg title", `<svg><title>https:&#47;&#47;www.example.fi/t</title></svg>`, true},
+		{"math", `<math><style>a{background:url(https:&#47;&#47;www.example.fi/m.png)}</style></math>`, true},
+		// An HTML parser does not decode inside script, so a reference there is
+		// not a URL — and the depth must go back down when the svg closes.
+		{"html script after an svg", `<svg><title>a</title></svg><script>var z="https:&#47;&#47;www.example.fi/h";</script>`, false},
+		{"html script alone", `<script>var z="https:&#47;&#47;www.example.fi/h";</script>`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := rewriteHTML(t, m, c.in, NewStats(false))
+			got := strings.Contains(out, "wt-a--example.ddev.site")
+			if got != c.want {
+				t.Errorf("rewritten=%v, want %v:\n%s", got, c.want, out)
+			}
+		})
+	}
+}
+
+// A reference fragment that would fuse disables decodeURLRefs for the whole
+// value — and the fragment can be anywhere, so one in a query string used to
+// leave an ordinary origin in the same attribute undecoded and live. The
+// reference *view* needs no such guard: it emits nothing, it only locates a host
+// whose byte range is then replaced.
+func TestAFusingFragmentDoesNotShieldAnOrigin(t *testing.T) {
+	m := obfMatcher(t)
+	in := `<a href="&#6&#48;;https:&#47;&#47;www.example.fi/x">y</a>`
+	out := rewriteHTML(t, m, in, NewStats(false))
+	if strings.Contains(out, "www.example.fi") {
+		t.Errorf("a production origin a browser dereferences was left:\n%s", out)
+	}
+	// And the fragment itself is untouched, because nothing is re-serialised.
+	if !strings.Contains(out, "&#6&#48;;") {
+		t.Errorf("the declined fragment was altered:\n%s", out)
+	}
+}
+
 // The census has to see them too. A leak the counters call zero is a leak
 // nobody goes looking for, and --json reporting a clean page is what made this
 // survive three audit rounds.

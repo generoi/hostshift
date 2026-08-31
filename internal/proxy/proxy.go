@@ -501,6 +501,27 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			resp.Body = readCloser{io.MultiReader(bytes.NewReader(body), over), resp.Body}
 			return nil
 		}
+		// JSON under a text label is still JSON, and the arm exists because of
+		// one such endpoint. wp-admin/async-upload.php sets `text/plain` before
+		// wp_send_json can set application/json — so the body is exactly what
+		// wp_json_encode produced, `\uXXXX` escapes and all, and PLAN M4 lists
+		// that spelling as a test-28 leak because wp_json_encode does not pass
+		// JSON_UNESCAPED_UNICODE. The raw-UTF-8 IDN host was caught here; the
+		// escaped form PHP actually emits was not.
+		if t := bytes.TrimLeft(body, " \t\r\n"); len(t) > 0 && (t[0] == '{' || t[0] == '[') {
+			out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.log(), p.Stats.Explain())
+			if !p.NoSweep {
+				out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+			}
+			if p.DryRun {
+				out = body
+			}
+			resp.Body = readCloser{bytes.NewReader(out), resp.Body}
+			if bytes.Equal(out, body) && !changed {
+				return nil
+			}
+			break
+		}
 		out, ev := p.Map.Forward().RewriteText(body, rewrite.SurfaceText, p.Stats.Explain())
 		p.Stats.Record(rewrite.SurfaceText, 0, ev)
 		// References too, when the consumer decodes them. An SVG's `href` and a
