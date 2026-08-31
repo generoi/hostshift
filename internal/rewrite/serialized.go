@@ -182,7 +182,7 @@ func valueStart(b []byte, i int) bool {
 	switch b[i] {
 	case 'N':
 		return i+1 < len(b) && (b[i+1] == ';' || pctIs(b, i+1, ';'))
-	case 'b', 'i', 'd', 's', 'a', 'O':
+	case 'b', 'i', 'd', 's', 'a', 'O', 'R', 'r', 'E', 'C':
 		return i+1 < len(b) && (b[i+1] == ':' || pctIs(b, i+1, ':'))
 	}
 	return false
@@ -250,6 +250,22 @@ func repairValue(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax)
 		}
 		return nil, 0, false
 
+	case 'R', 'r':
+		// References and repeated object instances. `serialize()` emits these
+		// routinely, and having no case for them made an array holding one fail
+		// to parse — which cost the repair for that whole field.
+		j, ok := scanScalar(b, i, syn)
+		if !ok {
+			return nil, 0, false
+		}
+		return b[i:j], j, true
+
+	case 'E':
+		// Enums, PHP 8.1+: E:len:"Enum:Case"; — length-prefixed like a string,
+		// but the payload is an identifier, never a URL, so it is copied
+		// verbatim rather than rewritten.
+		return repairOpaqueString(b, i, syn)
+
 	case 'b', 'i', 'd':
 		// Each scalar matched against its real grammar. Accepting "anything up
 		// to a `;`" made `background:url(https:&#47;` parse as a float — the
@@ -266,6 +282,13 @@ func repairValue(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax)
 
 	case 'a':
 		return repairArray(b, i, rw, depth, syn)
+
+	case 'C':
+		// Custom serialization: C:len:"Class":datalen:{opaque}. The payload is
+		// whatever the class wrote, with no grammar we can walk, so the value is
+		// copied verbatim — rewriting inside it could not have its length
+		// re-emitted safely.
+		return repairCustom(b, i, syn)
 
 	case 'O':
 		return repairObject(b, i, rw, depth, syn)
@@ -287,7 +310,7 @@ func scanScalar(b []byte, i int, syn syntax) (int, bool) {
 		if j < len(b) && (b[j] == '0' || b[j] == '1') {
 			j++
 		}
-	case 'i':
+	case 'R', 'r', 'i':
 		if j < len(b) && (b[j] == '-' || b[j] == '+') {
 			j++
 		}
@@ -683,4 +706,120 @@ func looksLikeForm(b []byte) bool {
 		}
 	}
 	return true
+}
+
+// repairOpaqueString parses `X:len:"data";` and copies it verbatim.
+func repairOpaqueString(b []byte, i int, syn syntax) ([]byte, int, bool) {
+	n, j, ok := readLen(b, i+1, syn)
+	if !ok {
+		return nil, 0, false
+	}
+	qw, ok := syn.match(b, j, '"')
+	if !ok {
+		return nil, 0, false
+	}
+	end, ok := syn.advance(b, j+qw, n)
+	if !ok {
+		return nil, 0, false
+	}
+	cw, ok := syn.match(b, end, '"')
+	if !ok {
+		return nil, 0, false
+	}
+	tw, ok := syn.match(b, end+cw, ';')
+	if !ok {
+		return nil, 0, false
+	}
+	return b[i : end+cw+tw], end + cw + tw, true
+}
+
+// repairCustom parses `C:len:"Class":datalen:{opaque}` and copies it verbatim.
+func repairCustom(b []byte, i int, syn syntax) ([]byte, int, bool) {
+	nameLen, j, ok := readLen(b, i+1, syn)
+	if !ok {
+		return nil, 0, false
+	}
+	qw, ok := syn.match(b, j, '"')
+	if !ok {
+		return nil, 0, false
+	}
+	nameEnd, ok := syn.advance(b, j+qw, nameLen)
+	if !ok {
+		return nil, 0, false
+	}
+	cw, ok := syn.match(b, nameEnd, '"')
+	if !ok {
+		return nil, 0, false
+	}
+	dataLen, k, ok := readLen(b, nameEnd+cw, syn)
+	if !ok {
+		return nil, 0, false
+	}
+	ow, ok := syn.match(b, k, '{')
+	if !ok {
+		return nil, 0, false
+	}
+	dataEnd, ok := syn.advance(b, k+ow, dataLen)
+	if !ok {
+		return nil, 0, false
+	}
+	clw, ok := syn.match(b, dataEnd, '}')
+	if !ok {
+		return nil, 0, false
+	}
+	return b[i : dataEnd+clw], dataEnd + clw, true
+}
+
+// BrokenSerialized reports how many serialized headers in b commit and then fail
+// to parse — a length that does not describe its data — the corruption this file exists to prevent,
+// measured on bytes rather than argued about.
+//
+// It exists because nothing could see that class. `hostshift diff` compares the
+// proxy's output against its own engine's output, so when both were wrong the
+// run was GREEN — and five consecutive rounds of silent row destruction went
+// unreported by the one check PLAN §7 calls "the only test that validates
+// against reality". A parse assertion on the served bytes would have caught
+// every one of them on the first run.
+//
+// A value that parses is not counted, and neither is text that merely resembles
+// one: only a header that *commits* — past a real length and its opening
+// delimiter — and then fails to parse.
+//
+// One broken value can raise the count more than once, because a container
+// fails when its child does. The number is a detector, not a census: zero means
+// every serialized value served will parse, and anything else names a page to
+// look at.
+func BrokenSerialized(b []byte) int {
+	n := 0
+	for i := 0; i < len(b); {
+		if !valueStart(b, i) {
+			i++
+			continue
+		}
+		id := func(x []byte) []byte { return x }
+		var end int
+		var ok, committed bool
+		for _, syn := range []syntax{literalSyntax, percentSyntax} {
+			_, e, o, c := repairValueC(b, i, id, 0, syn)
+			if o {
+				end, ok = e, true
+				break
+			}
+			if c {
+				committed = true
+			}
+		}
+		if ok {
+			i = end
+			continue
+		}
+		if committed {
+			n++
+			// Past this header, so one broken value is counted once.
+			i += 2
+			continue
+		}
+		i++
+	}
+	return n
 }

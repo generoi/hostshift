@@ -588,3 +588,35 @@ func TestAReferenceIsNotAFieldSeparator(t *testing.T) {
 		t.Errorf("an origin spanning a character reference was not rewritten:\n%s", got)
 	}
 }
+
+// The types `serialize()` emits that had no case: references, repeated object
+// instances, enums, and custom serialization.
+//
+// Without them an array holding one failed to parse, which cost the repair for
+// that whole field — and `R:` in particular is emitted routinely, whenever the
+// same value appears twice in a structure.
+func TestTheOtherSerializedTypesParse(t *testing.T) {
+	canon, variant := "https://hs27.test", "https://wt-a--hs27.test"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	for _, c := range []struct{ name, extra string }{
+		{"a reference", `i:1;R:2;`},
+		{"a repeated object", `i:1;r:2;`},
+		{"an enum", `i:1;E:11:"Suit:Hearts";`},
+		{"custom serialization", `i:1;C:3:"Foo":4:{abcd}`},
+		{"a float", `i:1;d:1.5E+3;`},
+		{"INF", `i:1;d:INF;`},
+		{"null", `i:1;N;`},
+		{"a bool", `i:1;b:1;`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := `a:2:{i:0;` + str(variant+"/x") + c.extra + `}`
+			want := `a:2:{i:0;` + str(canon+"/x") + c.extra + `}`
+			got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+				return []byte(strings.ReplaceAll(string(b), variant, canon))
+			}))
+			if got != want {
+				t.Errorf("%s stopped the repair:\n got  %s\n want %s", c.name, got, want)
+			}
+		})
+	}
+}

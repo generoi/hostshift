@@ -80,6 +80,11 @@ type Result struct {
 	// pipeline that never ran.
 	ContentType string
 
+	// BrokenSerialized counts PHP-serialized values in the variant response
+	// whose declared length does not describe their data. PHP refuses those, or
+	// worse, truncates them silently and keeps parsing.
+	BrokenSerialized int
+
 	// Leaks counts canonical origins in the variant response. Any non-zero
 	// value is a test 28 failure and is what this whole exercise is for.
 	Leaks int
@@ -221,6 +226,14 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// definition exactly the set of origins the proxy claims to rewrite, which
 	// makes this assertion say what it means: anything it still finds in the
 	// variant body is one the proxy should have caught and did not.
+	// Serialized payloads the browser is served must still parse. This is the
+	// only assertion here that does not compare the two sides: when the proxy
+	// and the scorer are wrong in the same way, comparison says nothing, and
+	// that is exactly how five rounds of silent wp_options destruction went
+	// unreported by the run PLAN §7 calls the only test that validates against
+	// reality.
+	r.BrokenSerialized = rewrite.BrokenSerialized(variant.body)
+
 	r.ContentType = variant.contentType
 	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
 	return r
@@ -569,6 +582,11 @@ func WriteReport(w io.Writer, results []Result) bool {
 		case r.Leaks > 0:
 			note = "CANONICAL ORIGIN REACHED THE BROWSER"
 			leaks += r.Leaks
+			green = false
+		case r.BrokenSerialized > 0:
+			note = fmt.Sprintf("%d serialized value(s) served with a length that "+
+				"does not describe the data — PHP will refuse or truncate them",
+				r.BrokenSerialized)
 			green = false
 		case r.Tier2 > 0:
 			// Not a defect: PLAN's fast path excludes these types "per Tier 2,

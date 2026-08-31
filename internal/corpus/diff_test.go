@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -392,4 +393,92 @@ func TestTheScorerRunsTheArmTheProxyWouldRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The assertion that would have caught rounds twenty-two through twenty-six on
+// their first run.
+//
+// Every other check here compares the proxy's output against the scorer's, so
+// when both are wrong in the same way the run is GREEN. Five consecutive rounds
+// of silent wp_options destruction went unreported by the run PLAN §7 calls
+// "the only test that validates against reality". A serialized value either
+// parses or it does not; that is a fact about the served bytes alone.
+func TestServedSerializedPayloadsMustParse(t *testing.T) {
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	good := `a:1:{s:3:"css";` + str(`.a{color:red}`) + `}`
+	// The measured shape: a length six bytes short of its data.
+	bad := `a:1:{s:3:"css";s:` + strconv.Itoa(len(".a{color:red}")-6) +
+		`:"` + `.a{color:red}` + `";}`
+
+	// The count is a detector, not a census — a container fails when its child
+	// does, so one broken value can raise it more than once. What has to be
+	// exact is zero versus not-zero.
+	for _, c := range []struct {
+		name, body string
+		broken     bool
+	}{
+		{"a valid payload", good, false},
+		{"a stale length", bad, true},
+		{"prose that merely resembles one", `The value is s:6:"a.test"; ok`, false},
+		{"no serialized data at all", `<a href="https://x/">t</a>`, false},
+		{"a bare URL, which is most bodies", `see https://x/a and https://x/b`, false},
+		{"percent-encoded and stale", `o=s%3A5%3A%22abcdefgh%22%3B`, true},
+		{"every other serialized type", `a:2:{i:0;N;i:1;R:2;}`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := rewrite.BrokenSerialized([]byte(c.body))
+			if (got > 0) != c.broken {
+				t.Errorf("counted %d, want broken=%v:\n%s", got, c.broken, c.body)
+			}
+		})
+	}
+}
+
+// And the same assertion where it actually runs: a full compare over a variant
+// that serves a stale length must not be GREEN.
+//
+// This is the shape that five rounds could not see. Both sides of the byte
+// comparison agreed, no canonical origin was present, and the run reported
+// "no canonical origin reached the browser, no page re-serialised".
+func TestAStaleLengthIsNotAGreenRun(t *testing.T) {
+	css := ".a{color:red}"
+	stale := `a:1:{s:3:"css";s:` + strconv.Itoa(len(css)-6) + `:"` + css + `";}`
+
+	r := compareBodies(t, stale, stale)
+	if r.BrokenSerialized == 0 {
+		t.Fatalf("a served stale length was not detected:\n%s", stale)
+	}
+	var buf bytes.Buffer
+	if WriteReport(&buf, []Result{r}) {
+		t.Errorf("the run was GREEN with a broken payload on the page:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "does not describe the data") {
+		t.Errorf("the report does not say what is wrong:\n%s", buf.String())
+	}
+}
+
+// compareBodies runs one comparison against two httptest servers.
+func compareBodies(t *testing.T, canonBody, variantBody string) Result {
+	t.Helper()
+	m, err := origin.NewMap([]origin.Site{{
+		Name: "main", Canonical: origin.MustParse("https://www.canon.test"),
+		Variant: origin.MustParse("https://v.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve := func(body string) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	cs, vs := serve(canonBody), serve(variantBody)
+	cu, _ := url.Parse(cs.URL)
+	vu, _ := url.Parse(vs.URL)
+	return compare(context.Background(), Options{
+		Canonical: cu, Variant: vu, Map: m, Client: cs.Client(),
+	}, "/")
 }
