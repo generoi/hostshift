@@ -764,12 +764,23 @@ done <<<"$scan_dirs"
 # exist. It is the last thing tried because it is the slowest, and it is skipped
 # entirely when a directory-based claim was already found.
 if [ -z "$claimed" ] && command -v docker >/dev/null 2>&1; then
-  self="ddev-$(ddev_name .ddev/config.yaml)-hostshift"
-  for oc in .ddev/config.*.yaml; do
-    [ -f "$oc" ] || continue
-    n="$(ddev_name "$oc")"
-    if [ -n "$n" ]; then self="ddev-$n-hostshift"; fi
-  done
+  # DDEV_SITENAME, for the reason the block below already gives: DDEV merges
+  # config.*.yaml and config.*.local.yaml is where a worktree names itself, so
+  # re-deriving the name from config.yaml alone gets it wrong on exactly the
+  # projects this command exists for. I made that mistake here on the first
+  # attempt and the project reported *itself* as a rival, refusing every healthy
+  # worktree — the same bug, in the same file, two hundred lines apart.
+  self_name="${DDEV_SITENAME:-}"
+  if [ -z "$self_name" ]; then
+    self_name="$(ddev_name .ddev/config.yaml)"
+    for oc in .ddev/config.*.yaml; do
+      [ -f "$oc" ] || continue
+      n="$(ddev_name "$oc")"
+      if [ -n "$n" ]; then self_name="$n"; fi
+    done
+  fi
+  if [ -z "$self_name" ]; then self_name="$(basename "$(pwd -P)")"; fi
+  self="ddev-$self_name-hostshift"
   running="$(docker ps --filter 'name=-hostshift' --format '{{.Names}}' 2>/dev/null || true)"
   while IFS= read -r c; do
     [ -n "$c" ] || continue

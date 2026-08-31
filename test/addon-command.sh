@@ -935,6 +935,23 @@ case "$out" in
     fail "a project does not mistake its own container for a rival" "$out" ;;
   *) pass "a project does not mistake its own container for a rival" ;;
 esac
+# And with DDEV_SITENAME set, which is how the command is actually invoked.
+#
+# The first version of the self-check re-derived the name from
+# .ddev/config.yaml. This suite passed, because with no DDEV_SITENAME it
+# exercised the fallback — and the integration suite then found the project
+# reporting *itself* as a rival and refusing every healthy worktree. DDEV merges
+# config.*.yaml and a worktree names itself in config.*.local.yaml; two hundred
+# lines down, this same file already carries a comment about making exactly that
+# mistake. A test that only drives the fallback is not testing the real path.
+printf 'ddev-acme-wt-real-hostshift\n' > "$HS_FAKE_DIR/ps"
+out="$(cd "$wt" && DDEV_SITENAME=acme-wt-real PATH="$fakedb:$fakebin:$PATH" \
+  "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"no longer exists under that name"*)
+    fail "self-exclusion uses the name DDEV itself gives the project" "$out" ;;
+  *) pass "self-exclusion uses the name DDEV itself gives the project" ;;
+esac
 rm -f "$HS_FAKE_DIR/ps"
 unset HS_FAKE_DIR
 
