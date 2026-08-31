@@ -268,7 +268,7 @@ func isTier2(ct string) bool {
 	}
 	switch mt {
 	case "text/css", "application/javascript", "text/javascript",
-		"application/x-javascript":
+		"application/x-javascript", "application/ecmascript", "text/ecmascript":
 		return true
 	}
 	return false

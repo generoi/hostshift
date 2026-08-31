@@ -629,6 +629,19 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// JSON rather than leaving it alone — three ways for a write to differ
 		// from the read that produced it.
 		out = rewrite.RewriteJSON(buf, rev, p.Stats, p.log(), explain)
+		// And the straggler sweep the response side has had all along.
+		//
+		// RewriteJSON returns the document untouched whenever jsontext rejects
+		// it — invalid UTF-8 from a Windows-1252 paste, a duplicate member, a
+		// body truncated by a dropped connection — and logs a WARN. On the
+		// response side SweepBytes catches what the structured pass could not
+		// reach; on the request side the WARN was the only thing that happened,
+		// so the variant hostname went upstream into the shared database. The
+		// asymmetry is backwards: a leak into a response is one page view, a
+		// leak into a request is written down.
+		if !p.NoSweep {
+			out = rewrite.SweepBytes(out, rev, p.Stats, p.log())
+		}
 	default:
 		var ev []origin.Event
 		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)

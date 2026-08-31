@@ -337,3 +337,104 @@ func TestValidatedMapsAreFixedPointsThroughEveryView(t *testing.T) {
 		})
 	}
 }
+
+// --explain has to point at the byte that leaked, and every view has to agree
+// about where that is.
+//
+// w.record added `base` to each event's offset and then handed the events to
+// Stats.Record, which adds `base` itself — so all five newer views reported
+// every event at twice the value's offset in the document, while the byte
+// matcher, which goes through Record alone, stayed correct. A real page showed
+// a mixture of right and wrong offsets, which is worse than uniformly wrong
+// because it looks credible. §5.8 makes this the tool you point at a leak.
+//
+// The padding exists so the value's own base is large enough that a doubled
+// offset cannot coincide with the right one.
+func TestExplainOffsetsPointAtTheHost(t *testing.T) {
+	m := viewMap(t)
+	pad := strings.Repeat("Z", 40)
+
+	for _, c := range []struct{ name, in string }{
+		{"the css view in a style attribute",
+			`<div style="` + pad + `background:url(https\3a \2f \2f www.example.fi/x)">t</div>`},
+		{"the composed view in a style attribute",
+			`<div style="` + pad + `background:url(https&#92;3a &#92;2f &#92;2f www.example.fi/x)">t</div>`},
+		{"the css view in a style element",
+			`<style>` + pad + `a{background:url(https\3a \2f \2f www.example.fi/x)}</style>`},
+		{"the percent view in a script",
+			`<script>` + pad + `f("https%3A%5C%2F%5C%2Fwww.example.fi%2Fx")</script>`},
+		{"the reference view in foreign content",
+			`<svg><style>` + pad + `a{background:url(https:&#47;&#47;www.example.fi/x)}</style></svg>`},
+		// The byte matcher, which was always correct — it is here so the test
+		// fails if a "fix" breaks the path that never had the bug.
+		{"the byte matcher in an attribute",
+			`<a href="https://www.example.fi/x" data-x="` + pad + `">t</a>`},
+		{"the byte matcher in prose",
+			`<p>` + pad + ` see https://www.example.fi/x</p>`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			st := NewStats(true)
+			if out := rewriteHTML(t, m, c.in, st); out == c.in {
+				t.Fatalf("nothing was rewritten, so this asserts nothing:\n%s", out)
+			}
+			ev := st.Events()
+			if len(ev) == 0 {
+				t.Fatal("no events recorded")
+			}
+			// The offset must point at the text the event names. The byte
+			// matcher names the whole origin and the views name the host, so
+			// comparing against a fixed index would assert a convention rather
+			// than a property — this holds for both.
+			for _, e := range ev {
+				if e.Action != origin.ActionRewrote || e.Text == "" {
+					continue
+				}
+				end := e.Offset + len(e.Text)
+				if e.Offset < 0 || end > len(c.in) || c.in[e.Offset:end] != e.Text {
+					got := "out of range"
+					if e.Offset >= 0 && end <= len(c.in) {
+						got = c.in[e.Offset:end]
+					}
+					t.Errorf("%s says %q is at offset %d, where the document has %q"+
+						" (the host is at %d)",
+						e.Surface, e.Text, e.Offset, got,
+						strings.Index(c.in, e.Text))
+				}
+			}
+		})
+	}
+}
+
+// The census counts splices, not values — on every path.
+//
+// The reference view in an attribute was the last one still reporting a single
+// synthetic event per value, with no text: a `srcset` holding three
+// reference-encoded origins plus a fusing fragment counted 1 where every other
+// view counts 3, and --explain pointed at the start of the value rather than at
+// any origin. Same class as the bug spliceHostsLog was added to fix, one path
+// left behind.
+//
+// The fusing fragment is what forces this path: decodeURLRefs declines the
+// whole value when any fragment in it would fuse into a new reference, so the
+// other two paths that cover an attribute both bow out and only the view runs.
+func TestTheCensusCountsSplicesNotValues(t *testing.T) {
+	m := viewMap(t)
+	in := `<img srcset="https:&#47;&#47;www.example.fi/a.png 1x, ` +
+		`https:&#47;&#47;www.example.fi/b.png 2x, ` +
+		`https:&#47;&#47;www.example.fi/c.png 3x?q=&#6&#48;;">`
+
+	st := NewStats(true)
+	out := rewriteHTML(t, m, in, st)
+	if strings.Contains(out, "www.example.fi") {
+		t.Fatalf("a canonical origin survives:\n%s", out)
+	}
+	if got := st.Total(); got != 3 {
+		t.Errorf("the census counted %d splices, want 3:\n%s", got, out)
+	}
+	for _, e := range st.Events() {
+		if e.Action == origin.ActionRewrote && e.Text == "" {
+			t.Errorf("%s recorded an event naming no bytes, so --explain has "+
+				"nothing to point at", e.Surface)
+		}
+	}
+}

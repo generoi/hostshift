@@ -80,6 +80,15 @@ func TestPassesStayLinear(t *testing.T) {
 			func(n int) string { return "<p>" + strings.Repeat("[http:a", n) + "</p>" },
 		},
 		{
+			// The reference views, which the guard had no shape for at all —
+			// every case here was reference-free, so the three newest and most
+			// expensive decoders were never timed. `&` is the whole gate.
+			"character references, which gate three views",
+			func(n int) string {
+				return `<div style="` + strings.Repeat(`&#92;3a `, n) + `">x</div>`
+			},
+		},
+		{
 			// CSS escapes, the newest decoder.
 			"css escapes",
 			func(n int) string {
@@ -133,13 +142,17 @@ func TestHostLeaksStaysLinear(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// HostLeaksBack, not HostLeaks: the request direction runs strictly more
+	// views — the reference one and the composed refs-then-CSS one — so timing
+	// HostLeaks left the expensive half of the request path unmeasured, on the
+	// side where the 8 MiB body cap makes the worst case biggest.
 	build := func(n int) []byte {
-		return []byte(`{"u":"` + strings.Repeat("[http:", n) + `"}`)
+		return []byte(`{"u":"` + strings.Repeat("[http:&#92;3a ", n) + `"}`)
 	}
 	run := func(n int) time.Duration {
 		b := build(n)
 		start := time.Now()
-		HostLeaks(m, b, true)
+		HostLeaksBack(m, b)
 		return time.Since(start)
 	}
 	run(5000)

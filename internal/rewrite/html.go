@@ -374,11 +374,14 @@ func (w *HTML) urlLeaks(base int, v []byte) []byte {
 	// out live. The guard is right about *splicing* a decoded value back; it has
 	// nothing to say about locating a host and replacing its byte range, where
 	// the decoded bytes never leave the view.
+	//
+	// Recorded per splice, not once per value. This was the last path still
+	// reporting a single synthetic event with no text — a `srcset` holding three
+	// reference-encoded origins plus a fusing fragment counted 1 where every
+	// other view now counts 3, and the one event it did emit named no bytes, so
+	// --explain pointed at the start of the value rather than at any origin.
 	if w.hosts != nil {
-		if out := w.hosts.refsOnly(cur, true); !bytes.Equal(out, cur) {
-			w.stats.Record(SurfaceHTMLEntity, base, []origin.Event{{
-				Offset: base, Surface: SurfaceHTMLEntity, Action: origin.ActionRewrote,
-			}})
+		if out := w.refsLeak(SurfaceHTMLEntity, base, cur, true); !bytes.Equal(out, cur) {
 			return out
 		}
 	}

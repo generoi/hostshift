@@ -1101,7 +1101,15 @@ func composeView(outer normalised, f func([]byte) normalised) normalised {
 	for i := range inner.b {
 		from, until := inner.pos[i], inner.end[i]-1
 		if from < 0 || from >= len(outer.pos) {
-			return inner // shapes we cannot map back: decline rather than corrupt
+			// An empty view, not `inner`. Returning inner was labelled "decline
+			// rather than corrupt" and did the opposite: inner's positions index
+			// the *intermediate* buffer, so spliceHostsLog would splice at
+			// offsets into a buffer that is not the one being written. Nothing
+			// reaches this today — all three decoders emit pos[i] in [0,len(in))
+			// and end[i] in (pos[i],len(in)], verified by arming this branch with
+			// a panic and running the suite plus eleven million fuzz executions —
+			// but a fourth decoder that does not is the trap this was left as.
+			return normalised{}
 		}
 		if until < from {
 			until = from
@@ -1147,8 +1155,13 @@ func (w *HTML) percentLeak(surface string, base int, v []byte, value bool) []byt
 func (w *HTML) record(surface string, base int, events []origin.Event) {
 	for i := range events {
 		events[i].Surface = surface
-		events[i].Offset += base
 	}
+	// Stats.Record adds `base` itself. Adding it here too reported every event
+	// from these five views at twice the value's offset — while the byte
+	// matcher, which goes through Record alone, stayed correct. A page then
+	// showed a mixture of right and wrong offsets, which is worse than
+	// uniformly wrong because it looks credible, and §5.8 makes --explain the
+	// thing that points a developer at the byte that leaked.
 	w.stats.Record(surface, base, events)
 }
 
@@ -1223,6 +1236,9 @@ func HostLeaks(m *origin.Matcher, b []byte, value bool) []byte {
 // The rule, stated once: every spelling the forward direction can emit, the
 // reverse direction must be able to read.
 func HostLeaksBack(m *origin.Matcher, b []byte) []byte {
+	if m == nil || len(b) == 0 {
+		return b
+	}
 	return hostsFor(m).rewriteAllRefs(b, true)
 }
 

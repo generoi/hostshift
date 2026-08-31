@@ -90,7 +90,16 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 		}
 
 		nv, ev := m.Rewrite(body[bodyStart:end], rewrite.SurfaceRequestBody, explain)
-		nv = rewrite.HostLeaks(m, nv, true)
+		// HostLeaksBack, not HostLeaks: this is a *request* body, and the two
+		// directions are not symmetric surfaces. HostLeaks has no reference view
+		// and no composed refs→CSS view, so a part carrying
+		// `style="background:url(https&#92;3a &#92;2f &#92;2f<variant>/a.png)"` —
+		// which is exactly what the forward pass emits into a style attribute —
+		// went upstream with the variant hostname in it and into the shared
+		// database. Every other request-direction call site was moved; this one
+		// was missed, and a multipart POST is what any form with a file field
+		// sends: the media library, an editor with an attachment, Gravity Forms.
+		nv = rewrite.HostLeaksBack(m, nv)
 		st.Record(rewrite.SurfaceRequestBody, bodyStart, ev)
 		if bytes.Equal(nv, body[bodyStart:end]) {
 			continue
