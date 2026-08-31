@@ -1208,3 +1208,177 @@ func TestPHPJSONEscapedContent(t *testing.T) {
 		}
 	}
 }
+
+// One ambiguous reference in a value of ordinary size, which is all it takes.
+//
+// advanceReadings explores states of (offset, remaining), and a single
+// ambiguous `&amp;` gives every offset after it two of them — so the state
+// count is about twice the length of the value, and maxStringReadings = 2048 is
+// reached at roughly a kilobyte of data with *one* ampersand in it. Past that
+// the search returns nothing, stringEnd reads that as "no reading closes", and
+// the field declines: the host is rewritten and the length is not re-emitted,
+// which is the corruption this file exists to prevent. `unserialize()` on the
+// served bytes returns false.
+//
+// A kilobyte is nothing. A widget's text, an ACF field, a theme mod, a
+// wp_localize_script blob — and "Snellman & Co" is the very example the reading
+// search was added for. Below the cap it repairs; above it, silently, it does
+// not.
+//
+// And nothing sees it. How many readings a value has does not depend on which
+// host is in it, so the cap trips on the canonical page too and
+// BrokenSerialized scores both sides alike — which the corpus diff's baseline
+// subtraction then cancels to zero. A blind spot that fires on both sides has
+// been the root cause twice.
+func TestALongValueWithOneAmpersandIsStillRepaired(t *testing.T) {
+	canon, variant := "https://www.canon.test", "https://v.ddev.site"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// esc_attr, with $double_encode = false: the data holds a bare `&`, so five
+	// bytes reach the attribute where the declared length counts one.
+	esc := strings.NewReplacer(`"`, "&quot;", "&", "&amp;").Replace
+	blob := func(h, text string) string {
+		return `a:1:{s:4:"text";` + str(text+" "+h+"/x") + `}`
+	}
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	for _, c := range []struct {
+		name string
+		text string
+	}{
+		{"under a kilobyte", "Snellman & Co. " + strings.Repeat("lorem ipsum dolor sit amet, ", 20)},
+		{"over a kilobyte", "Snellman & Co. " + strings.Repeat("lorem ipsum dolor sit amet, ", 40)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := `<input value="` + esc(blob(canon, c.text)) + `">`
+			want := `<input value="` + esc(blob(variant, c.text)) + `">`
+			if got := string(RepairSerialized([]byte(in), rw)); got != want {
+				t.Errorf("a %d-byte value was not repaired:\n got  %s\n want %s",
+					len(c.text), got, want)
+			}
+			// The detector has to see the same thing PHP does. It scores the
+			// canonical page identically, so the corpus diff subtracts this
+			// away and reports GREEN on a page unserialize() refuses.
+			if n := BrokenSerialized([]byte(in)); n != 0 {
+				t.Errorf("the canonical page counted %d broken values; a blind spot "+
+					"here credits the baseline and silences the variant side", n)
+			}
+		})
+	}
+}
+
+// The percent spelling counts *decoded* bytes, and the re-emitted length is a
+// delta in *source* bytes. Those are the same number only while the rewrite
+// stays clear of the escapes — and it does not.
+//
+// `options.php` posts every option in one `application/x-www-form-urlencoded`
+// body, so a URL in a serialized value arrives as `http%3A%2F%2Flocalhost%3A8080%2Fx`:
+// three source bytes for each of the delimiters, one decoded byte each. When
+// the variant and the canonical differ in scheme or port the splice covers
+// those delimiters — it has to, or the variant's scheme and port are dropped —
+// and it hands back `https%3A%2F%2Fwww.example.fi%2Fx`, one source byte shorter
+// and one decoded byte longer. `n + len(repaired) - len(data)` is then two
+// short of the truth, `unserialize()` returns false, and it is a request: the
+// row goes into the shared database PLAN §4.3 says stays byte-identical to
+// production.
+//
+// Both maps below are ordinary. `hostshift diff` never sees this, because it
+// scores responses.
+func TestAFormBodyLengthCountsDecodedBytesNotSourceBytes(t *testing.T) {
+	for _, mp := range []struct{ name, canonical, variant string }{
+		{"a variant with a port", "https://www.example.fi", "http://localhost:8080"},
+		{"a canonical with a port", "https://www.example.fi:8443", "https://v.ddev.site"},
+		{"portless, one scheme", "https://www.example.fi", "https://v.ddev.site"},
+	} {
+		t.Run(mp.name, func(t *testing.T) {
+			// The request direction: the browser posts the variant host back.
+			rev := pairMatcher(t, mp.variant, mp.canonical)
+			data := mp.variant + "/wp-admin/options.php?x=1"
+			payload := `a:1:{s:1:"u";s:` + strconv.Itoa(len(data)) + `:"` + data + `";}`
+			body := "opt=" + url.QueryEscape(payload)
+
+			out := string(RepairSerializedFields([]byte(body), func(b []byte) []byte {
+				nv, _ := rev.Rewrite(b, SurfaceRequestBody, false)
+				return HostLeaksBackCounted(rev, nv, NewStats(false), SurfaceRequestBody, 0)
+			}))
+			got, err := url.QueryUnescape(strings.TrimPrefix(out, "opt="))
+			if err != nil {
+				t.Fatalf("the body no longer decodes: %v", err)
+			}
+			if strings.Contains(got, mp.variant) {
+				t.Fatalf("the variant host was not rewritten, so this asserts little:\n%s", got)
+			}
+			assertEveryLength(t, got)
+		})
+	}
+}
+
+// A declared length that lands in the middle of a character is not believed.
+//
+// The readings walk carries a shared counter and retires a reading when the
+// counter reaches it exactly. A multi-byte unit can step the counter *past* a
+// reading, which means that length stops inside a character — something a count
+// of whole characters cannot do. Recording it anyway accepts the offset after
+// the character, and where the closing quote sits exactly there the value
+// parses perfectly with a length one short of the truth.
+//
+// `\u00e4` is the shape that can do it: six source bytes worth two decoded
+// ones, so the counter can go from one short to one over in a single step. A
+// raw `ä` cannot — it is two ordinary bytes and the counter passes through
+// every value.
+func TestALengthLandingMidCharacterIsDeclined(t *testing.T) {
+	canon, variant := "https://mz30a.ddev.site", "https://wt-a--mz30a.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	// The combined spelling: the blob's own quotes are `\&quot;`. Declare one
+	// byte less than the truth, with the escape last, so the step lands on the
+	// closing quote.
+	q := `\&quot;`
+	short := strconv.Itoa(len(canon) + 1) // the truth is len(canon)+2
+	blob := `a:1:{s:1:` + q + `u` + q + `;s:` + short + `:` + q + canon + `\u00e4` + q + `;}`
+	in := `<div data-x="&quot;` + blob + `&quot;">y</div>`
+
+	got := string(RepairSerialized([]byte(in), rw))
+	if strings.Contains(got, canon) {
+		t.Errorf("the origin was not rewritten:\n%s", got)
+	}
+	if !strings.Contains(got, `s:`+short+`:`) {
+		t.Errorf("a length landing mid-character was believed:\n%s", got)
+	}
+	// And it is a page the detector names, rather than one it certifies.
+	if n := BrokenSerialized([]byte(got)); n == 0 {
+		t.Errorf("the served bytes were reported clean:\n%s", got)
+	}
+}
+
+// A value holding both an escaped character and the host is re-emitted, so the
+// length it gets is measured rather than assumed.
+//
+// The matrix tests keep the text and the host in separate fields, and a field
+// the rewrite does not touch returns its original bytes without re-emitting
+// anything — so nothing there exercises the measurement of a `\uXXXX` at all.
+// Putting them in one string is what makes the number get computed.
+func TestAnEscapedCharacterInTheSameStringAsTheHost(t *testing.T) {
+	canon, variant := "https://mz30b.ddev.site", "https://wt-a--mz30b.ddev.site"
+	esc := func(v string) string { return strings.ReplaceAll(v, "/", `\/`) }
+	rw := func(b []byte) []byte {
+		s := strings.ReplaceAll(string(b), canon, variant)
+		return []byte(strings.ReplaceAll(s, esc(canon), esc(variant)))
+	}
+	for name, text := range map[string]string{
+		"two-byte":   "Läs mer",
+		"three-byte": "日本語",
+		"surrogate":  "\U0001F389",
+	} {
+		one := func(h string) string {
+			v := h + "/x?t=" + text
+			return `a:1:{s:1:"u";s:` + strconv.Itoa(len(v)) + `:"` + v + `";}`
+		}
+		in := `{"s":` + phpJSONEncode(one(canon)) + `}`
+		want := `{"s":` + phpJSONEncode(one(variant)) + `}`
+		if got := string(RepairSerialized([]byte(in), rw)); got != want {
+			t.Errorf("%s:\n got  %s\n want %s", name, got, want)
+		}
+	}
+}

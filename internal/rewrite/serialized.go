@@ -2,6 +2,7 @@ package rewrite
 
 import (
 	"bytes"
+	"sort"
 	"strconv"
 	"unicode/utf8"
 )
@@ -255,6 +256,48 @@ type syntax struct {
 	// bytes, how many decoded bytes they count for, and a second count when the
 	// source is ambiguous — 0 when it is not. Only the escaped spellings set it.
 	unit func(b []byte, i int) (src, dec, alt int)
+	// dlen is how many bytes data decodes to, for the spellings where that has
+	// one answer. nil where a character reference makes it ambiguous, and a
+	// re-emitted length is then taken as a delta instead.
+	dlen func(data []byte) int
+}
+
+// decodedLen is how many bytes b decodes to in the percent spelling. `+` counts
+// as one byte, which is what it decodes to — treating it as an escape would be
+// the bug.
+func decodedLen(b []byte) int {
+	n := 0
+	for i := 0; i < len(b); n++ {
+		if b[i] == '%' && i+2 < len(b) {
+			if _, ok := unhex(b[i+1], b[i+2]); ok {
+				i += 3
+				continue
+			}
+		}
+		i++
+	}
+	return n
+}
+
+// emitLen is the length to re-emit for data that was declared n and came back
+// as repaired.
+//
+// A delta in *source* bytes wherever the spelling cannot measure — which is
+// only the two that carry character references, and there a rewrite adds and
+// removes plain bytes, so a byte added to the source is a byte added to the
+// data.
+//
+// It was the delta everywhere, and in the percent spelling that is false: a
+// separator is three source bytes for one decoded one, so a map that changes
+// the scheme or drops a port changes the two counts in *opposite directions*.
+// `http%3A%2F%2Flocalhost%3A8080` → `https%3A%2F%2Fwww.example.fi` is one source
+// byte shorter and one decoded byte longer, and that goes into the shared
+// database on an ordinary options.php save, where nothing scores it.
+func emitLen(syn syntax, n int, data, repaired []byte) int {
+	if syn.dlen != nil {
+		return syn.dlen(repaired)
+	}
+	return n + len(repaired) - len(data)
 }
 
 // refRun is the width of a character reference at i, or 0.
@@ -314,55 +357,77 @@ func jsonHTMLUnit(b []byte, i int) (src, dec, alt int) {
 	return 1, 1, 0
 }
 
-// maxStringReadings bounds the search. Every ambiguous reference in the span
-// can double the number of live readings, so a value carrying a great many of
-// them is declined rather than explored — which is what the code did with all
-// of them until now.
+// maxStringReadings bounds the search: how many *distinct* readings of the same
+// span may be alive at once. A value that branches past it is declined rather
+// than explored, which is what the code did with every ambiguous value before
+// the readings existed at all.
 const maxStringReadings = 2048
 
 // advanceReadings returns every offset at which exactly n decoded bytes have
 // passed from i. More than one means the source is genuinely ambiguous and the
 // caller must not choose.
+//
+// The readings only ever diverge at an ambiguous unit. Between two of them
+// every live reading walks the identical bytes and consumes the identical
+// number of decoded ones, so the run between branches needs no state at all: it
+// is one walk, and a shared counter shifts every reading down together.
+//
+// Carrying a state per (offset, remaining) instead made the count grow with the
+// *length* of the value rather than with its ambiguity. After a single `&amp;`
+// every later offset had two live remainders, so the cap was reached at about a
+// kilobyte and a 1 KB option with one ampersand in it declined — and a decline
+// is host-independent, so it fired identically on the canonical page and
+// cancelled under the corpus diff's baseline subtraction. Silent, again.
 func advanceReadings(b []byte, i, n int, unit func([]byte, int) (int, int, int)) []int {
 	if n < 0 {
 		return nil
 	}
-	type st struct{ i, n int }
-	seen := map[st]bool{{i, n}: true}
-	work := []st{{i, n}}
+	// Remaining decoded bytes for each live reading, as of the last branch, and
+	// what has been consumed since. Sorted ascending, so only the smallest can
+	// be the next to finish.
+	live, spent := []int{n}, 0
 	var ends []int
-	for len(work) > 0 {
-		s := work[len(work)-1]
-		work = work[:len(work)-1]
-		if s.n == 0 {
-			ends = append(ends, s.i)
-			continue
+	for {
+		for len(live) > 0 && live[0] <= spent {
+			if live[0] == spent {
+				ends = append(ends, i)
+			}
+			// A reading below the counter ended inside a unit, which a length
+			// counting whole characters cannot do. It is dropped, not recorded.
+			live = live[1:]
 		}
-		if s.i >= len(b) {
-			continue
+		if len(live) == 0 || i >= len(b) {
+			return ends
 		}
-		src, dec, alt := unit(b, s.i)
+		src, dec, alt := unit(b, i)
 		if src == 0 {
+			return ends
+		}
+		if alt <= 0 || alt == dec {
+			spent += dec
+			i += src
 			continue
 		}
-		for _, d := range [2]int{dec, alt} {
-			// A unit wider than what is left would straddle the declared end,
-			// which valid data does not do: a length counts whole characters.
-			if d <= 0 || d > s.n {
-				continue
+		next := make([]int, 0, 2*len(live))
+		for _, r := range live {
+			for _, d := range [2]int{dec, alt} {
+				if r-spent-d >= 0 {
+					next = append(next, r-spent-d)
+				}
 			}
-			k := st{s.i + src, s.n - d}
-			if seen[k] {
-				continue
-			}
-			if len(seen) >= maxStringReadings {
-				return nil
-			}
-			seen[k] = true
-			work = append(work, k)
 		}
+		sort.Ints(next)
+		live = next[:0]
+		for k, v := range next {
+			if k == 0 || v != next[k-1] {
+				live = append(live, v)
+			}
+		}
+		if len(live) > maxStringReadings {
+			return nil
+		}
+		spent, i = 0, i+src
 	}
-	return ends
 }
 
 // stringEnd finds where the data of a string of n decoded bytes ends, given
@@ -421,6 +486,7 @@ var literalSyntax = syntax{
 		}
 		return i + n, true
 	},
+	dlen: func(data []byte) int { return len(data) },
 }
 
 // htmlSyntax is the spelling `esc_attr` and `esc_textarea` produce: the quotes
@@ -512,6 +578,23 @@ var jsonSyntax = syntax{
 			i, n = i+1, n-1
 		}
 		return i, true
+	},
+	dlen: func(b []byte) int {
+		n := 0
+		for i := 0; i < len(b); {
+			if b[i] == '\\' && i+1 < len(b) {
+				if b[i+1] == 'u' {
+					if src, dec, ok := jsonUnicodeRun(b, i); ok {
+						i, n = i+src, n+dec
+						continue
+					}
+				}
+				i, n = i+2, n+1
+				continue
+			}
+			i, n = i+1, n+1
+		}
+		return n
 	},
 }
 
@@ -667,6 +750,7 @@ var percentSyntax = syntax{
 		return append(dst, '%', hex[c>>4], hex[c&0xf])
 	},
 	advance: advanceDecoded,
+	dlen:    decodedLen,
 }
 
 // repairValue parses one serialized value at i and returns its repaired bytes
@@ -820,9 +904,11 @@ func readLen(b []byte, i int, syn syntax) (int, int, bool) {
 // fixed by the string that encloses it, and it inherits both of that walk's
 // refusals. A header that commits and does not parse declines. So does a value
 // that does not fill the data it sits in — which is what separates a payload
-// merely indented inside its string, repaired, from one introduced by prose or
-// wrapped in markup, declined, where the bytes around it are unconstrained and
-// a false boundary cannot be told from a real one.
+// whose surroundings pair, repaired, from one whose surroundings do not,
+// declined, where the bytes around it are unconstrained and a false boundary
+// cannot be told from a real one. Indentation pairs, and so does markup: `>`
+// opens a text node and `<` closes it, so a blob inside a `<p>` is repaired.
+// A line of prose ending in `:` does not pair, and declines.
 func repairNested(b []byte, rw func([]byte) []byte, depth int, syn syntax) (rep []byte, ok, decline bool) {
 	var out []byte
 	prev, found := 0, false
@@ -911,19 +997,12 @@ func repairString(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax
 	if string(repaired) == string(data) {
 		return b[i:end], end, true
 	}
-	// The new length is the declared one plus the change in source bytes, not a
-	// fresh measurement of the result.
-	//
-	// Measuring again asks dlen to reproduce whatever reading the parse settled
-	// on, and where a reference was ambiguous it cannot: the walk may have read
-	// `&amp;` as one byte and dlen would count five, putting a wrong number on a
-	// value that parsed perfectly. The delta needs no reading at all. A rewrite
-	// substitutes hostnames, which are plain in every spelling here, so a byte
-	// added to the source is a byte added to the data.
+	// See emitLen: measured where the spelling has one reading, and a delta in
+	// source bytes where a character reference means it does not.
 	var out []byte
 	out = append(out, 's')
 	out = syn.emit(out, ':')
-	out = append(out, strconv.Itoa(n+len(repaired)-len(data))...)
+	out = append(out, strconv.Itoa(emitLen(syn, n, data, repaired))...)
 	out = syn.emit(out, ':')
 	out = syn.emit(out, '"')
 	out = append(out, repaired...)
@@ -1268,12 +1347,9 @@ func repairCustom(b []byte, i int, rw func([]byte) []byte, syn syntax) ([]byte, 
 	if string(repaired) == string(data) {
 		return b[i : dataEnd+clw], dataEnd + clw, true
 	}
-	// By delta, for the reason repairString re-emits that way: a fresh
-	// measurement has to reproduce whatever reading the walk settled on, and
-	// where a character reference was ambiguous it cannot.
 	out := append([]byte{}, b[i:nameEnd+cw]...)
 	out = syn.emit(out, ':')
-	out = append(out, strconv.Itoa(dataLen+len(repaired)-len(data))...)
+	out = append(out, strconv.Itoa(emitLen(syn, dataLen, data, repaired))...)
 	out = syn.emit(out, ':')
 	out = syn.emit(out, '{')
 	out = append(out, repaired...)
