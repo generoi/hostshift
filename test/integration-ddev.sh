@@ -380,7 +380,19 @@ mkdir -p "$rmwt/.ddev"
 printf 'name: %s-rm\ntype: php\n' "$tag" > "$rmwt/.ddev/config.yaml"
 (cd "$rmwt" && ddev add-on get "$repo/ddev" >/dev/null 2>&1) || true
 projects+=("$rmwt")
+# `additional_hostnames: []` is what `ddev config` writes into every project by
+# default, and the removal note matched the key alone — so it told a developer
+# their worktree may hijack the parent's hostnames at the moment they were
+# tearing it down, on every ordinary parent, when nothing is inherited at all.
+cp "$m4/.ddev/config.yaml" "$work/m4cfg.hold"
+printf 'additional_hostnames: []\n' >> "$m4/.ddev/config.yaml"
 rm_out="$(cd "$rmwt" && ddev add-on remove hostshift 2>&1)" || true
+cp "$work/m4cfg.hold" "$m4/.ddev/config.yaml"
+case "$rm_out" in
+  *"may reach this worktree instead"*)
+    fail "an empty additional_hostnames is not an inherited hostname" "$rm_out" ;;
+  *) pass "an empty additional_hostnames is not an inherited hostname" ;;
+esac
 if git -C "$m4" check-ignore -q .ddev/.env; then
   pass "removing it from one worktree leaves the others ignored"
 else

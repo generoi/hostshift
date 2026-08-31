@@ -606,16 +606,51 @@ variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --var
 # application; this asks two config files what they say, which is what the map
 # is built from in the first place.
 if [ -n "$parent_declares" ]; then
+  # The canonical *origins*, from --pairs, not --canonical-hosts.
+  #
+  # --canonical-hosts is documented as "aliases included", and an alias is one
+  # of exactly two things the README says a hostshift.yaml exists for. So the
+  # parent's set always carried hostnames the worktree's map does not name, the
+  # sets were never equal, and the refusal still stood on the configuration the
+  # comparison was written to clear — while the deployment served every page
+  # with zero canonical origins remaining. The other shape, the one without
+  # aliases, is the hostshift.yaml nobody would write.
+  #
+  # It also drops the port, so a parent declaring `https://h:8443` compared
+  # equal to a map naming `https://h` and the warning was *cleared* — while the
+  # engine, which matches on exact origin equality, correctly served content
+  # holding `:8443` straight through. Wrong in both directions from one flag.
+  #
+  # --pairs emits `canonical=variant` per site, so the left-hand side is the
+  # canonical origin with its scheme and port and without aliases. Whether the
+  # map covers every alias the parent declares is a different question, and it
+  # belongs to the database gate below: this one asks only whether the map is on
+  # the right *side*, which is what the warning's own text claims.
+  #
   # --slug because `map` refuses to resolve without a variant, even though the
   # slug cannot affect the canonical side, which is the only side compared.
-  declared="$(hostshift map -C "$parent" --slug "$slug" --canonical-hosts \
-    2>/dev/null | sort -u || true)"
+  declared="$(hostshift map -C "$parent" --slug "$slug" --pairs 2>/dev/null \
+    | sed 's/=.*$//' | sort -u || true)"
   mapped="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
-    --canonical-hosts 2>/dev/null | sort -u || true)"
+    --pairs 2>/dev/null | sed 's/=.*$//' | sort -u || true)"
+  # Overlap, not equality.
+  #
+  # Equality was wrong in both directions. The warning's own text is "the map
+  # was built from that checkout's DDEV hostnames instead, and would rewrite
+  # nothing" — and "would rewrite nothing" is true exactly when the two sets are
+  # *disjoint*, which is the production-canonical case this exists for: the
+  # parent declares https://www.client.fi and the map names acme.ddev.site.
+  #
+  # Anything short of disjoint means the map is on the right side. A parent
+  # declaring one site with an alias, against a worktree mapping two sites
+  # because DDEV lists the alias as an additional hostname, is the same
+  # arrangement written two ways — and demanding equality refused it.
+  #
   # Only when the parent actually declared something we could read. An empty
   # answer means the comparison failed, not that the two agree, and silence
   # there would reintroduce the leak this warning exists for.
-  if [ -n "$declared" ] && [ "$declared" = "$mapped" ]; then
+  if [ -n "$declared" ] && [ -n "$mapped" ] &&
+     [ -n "$(comm -12 <(printf '%s\n' "$declared") <(printf '%s\n' "$mapped"))" ]; then
     parent_declares=""
     parent_declares_msg=""
   fi
@@ -670,7 +705,14 @@ scan_dirs="$(
     if [ -f "$reg" ]; then
       sed -n 's/^[[:space:]]*approot:[[:space:]]*//p' "$reg"
     fi
-  } 2>/dev/null | LC_ALL=C sort -u || true
+  } 2>/dev/null | while IFS= read -r d; do
+    # Resolved, then deduped. `../foo` from the glob and the absolute approot
+    # from the registry are the same directory spelled two ways, and sorting the
+    # raw strings deduped neither — so every sibling that was also registered
+    # warned twice, with the same text, about the same project.
+    [ -d "$d" ] || continue
+    (cd "$d" 2>/dev/null && pwd -P) || true
+  done | LC_ALL=C sort -u || true
 )"
 
 while IFS= read -r other_dir; do
@@ -784,7 +826,18 @@ if [ -z "$claimed" ] && command -v docker >/dev/null 2>&1; then
   running="$(docker ps --filter 'name=-hostshift' --format '{{.Names}}' 2>/dev/null || true)"
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    [ "$c" = "$self" ] && continue
+    if [ "$c" = "$self" ]; then continue; fi
+    # And by approot, which identifies a project whatever it is called.
+    #
+    # Editing `name:` and running check before restarting made the running
+    # container's name stop matching $DDEV_SITENAME, so the project reported its
+    # own live proxy as a rival whose directory no longer exists — and the
+    # remedy it printed would stop the very proxy serving the page. DDEV refuses
+    # to complete such a rename, so the state is transient, but the advice was
+    # wrong while it lasted.
+    oa="$(docker inspect "$c" --format '{{index .Config.Labels "com.ddev.approot"}}' \
+      2>/dev/null || true)"
+    if [ -n "$oa" ] && [ "$oa" = "$here" ]; then continue; fi
     ov="$(docker inspect "$c" --format \
       '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
       | sed -n 's/^VIRTUAL_HOST=//p' | head -1 || true)"

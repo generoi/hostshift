@@ -261,6 +261,44 @@ case "$out" in
     fail "a parent declaring what the map already names is not called out" "$out" ;;
   *) pass "a parent declaring what the map already names is not called out" ;;
 esac
+# An alias, which is one of exactly two things the README says a hostshift.yaml
+# is for — and the shape the comparison was written to clear, which it did not.
+#
+# --canonical-hosts is documented "aliases included", so the parent's set always
+# carried a hostname the worktree's map does not name, the sets were never
+# equal, and the refusal stood on every start of a worktree of any repo that had
+# adopted aliases. Measured against a live deployment: every page 200, zero
+# canonical origins remaining, `ddev start` reporting Task failed.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://acme.ddev.site, aliases: [https://acme.staging.example.net]}\n' \
+  > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"declares the hostnames its database"*)
+    fail "a parent declaring an alias is not called out" "$out" ;;
+  *) pass "a parent declaring an alias is not called out" ;;
+esac
+
+# But a differing *port* is a differing origin, and must still be called out.
+#
+# --canonical-hosts emits hostnames, so it dropped the port and the two sides
+# compared equal — the warning was *cleared* while the engine, which matches on
+# exact origin equality, correctly served content holding `:8443` straight
+# through. Wrong in both directions from the one flag.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://acme.ddev.site:8443, base: https://acme.ddev.site:8443}\n' \
+  > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "a parent declaring a different port is still called out" \
+  "declares the hostnames its database" "$out"
+
+# And the case the warning exists for: a production canonical, where the map
+# really was built from the wrong side and would rewrite nothing.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
+  > "$main/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" env --slug wt-a 2>&1 || true)"
+contains "a production canonical the map does not name is still called out" \
+  "declares the hostnames its database" "$out"
+rm -f "$main/hostshift.yaml"
+
 # A declaration the comparison cannot read is not agreement. Silence here would
 # reintroduce the leak the warning exists for, so a parent whose hostshift.yaml
 # does not parse must still be called out.
@@ -696,6 +734,11 @@ cat > "$fakebin/docker" <<'FAKE'
 case "$1" in
   inspect)
     name="$2"
+    # The approot label identifies a project whatever it is called, and the
+    # scan uses it to recognise its own container after a `name:` edit.
+    case "$*" in
+      *com.ddev.approot*) cat "${HS_FAKE_DIR}/approot" 2>/dev/null || true; exit 0 ;;
+    esac
     case "$name" in
       *-hostshift) cat "${HS_FAKE_DIR}/hostshift-state" 2>/dev/null || true ;;
       *-web)       cat "${HS_FAKE_DIR}/web-env" 2>/dev/null || true ;;
@@ -952,6 +995,22 @@ case "$out" in
     fail "self-exclusion uses the name DDEV itself gives the project" "$out" ;;
   *) pass "self-exclusion uses the name DDEV itself gives the project" ;;
 esac
+# A container whose *name* no longer matches, because `name:` was edited and
+# the project has not restarted — but whose approot is this very directory.
+#
+# The scan then reported the project's own live proxy as a rival whose directory
+# no longer exists, and the remedy it printed would stop the proxy serving the
+# page. DDEV refuses to complete such a rename, so the state is transient, but
+# the advice was wrong while it lasted.
+printf 'ddev-acme-wt-renamed-hostshift\n' > "$HS_FAKE_DIR/ps"
+printf '%s\n' "$(cd "$wt" && pwd -P)" > "$HS_FAKE_DIR/approot"
+out="$(cd "$wt" && PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"no longer exists under that name"*)
+    fail "a container sharing this project's approot is not a rival" "$out" ;;
+  *) pass "a container sharing this project's approot is not a rival" ;;
+esac
+rm -f "$HS_FAKE_DIR/approot"
 rm -f "$HS_FAKE_DIR/ps"
 unset HS_FAKE_DIR
 

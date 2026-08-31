@@ -319,7 +319,20 @@ removal_actions:
       case "$p" in
         */.git/worktrees/*) pdir="${p%%/.git/worktrees/*}" ;;
       esac
-      if [ -n "$pdir" ] && grep -qs '^additional_hostnames:' "$pdir/.ddev/config.yaml"; then
+      # A *non-empty* list. `additional_hostnames: []` is what `ddev config`
+      # writes into every project by default, so matching the key alone brought
+      # the note back on every ordinary parent — telling a developer their
+      # worktree may hijack the parent's hostnames at the moment they are
+      # tearing it down, when HOSTSHIFT_WEB_HOSTS equals $DDEV_HOSTNAME and
+      # removal restores nothing.
+      if [ -n "$pdir" ] && awk '
+        /^additional_hostnames:[[:space:]]*\[[[:space:]]*\][[:space:]]*$/ { next }
+        /^additional_hostnames:[[:space:]]*\[/ { found = 1; exit }
+        /^additional_hostnames:/ { inlist = 1; next }
+        inlist && /^[[:space:]]*-[[:space:]]*[^[:space:]]/ { found = 1; exit }
+        inlist && /^[^[:space:]#-]/ { inlist = 0 }
+        END { exit !found }
+      ' "$pdir/.ddev/config.yaml" 2>/dev/null; then
         inherited=1
       fi
     fi
