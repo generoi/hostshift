@@ -1,6 +1,7 @@
 package rewrite
 
 import (
+	"encoding/json"
 	"net/url"
 	"strconv"
 	"strings"
@@ -793,4 +794,75 @@ func TestAnAmpersandUnderEscAttr(t *testing.T) {
 			t.Errorf("an ambiguous ampersand was measured rather than declined:\n%s", got)
 		}
 	})
+}
+
+// `esc_attr(wp_json_encode(…))` — the spelling neither of its halves can read.
+//
+// The JSON escaping runs first, turning `"` into `\"`; `esc_attr` then escapes
+// that quote, giving `\&quot;`. Elementor's `data-settings`, WooCommerce block
+// attributes and ACF all emit it. Unread, the value was rewritten without
+// repair — and the *canonical* page counted as broken too, so the corpus diff's
+// baseline subtraction cancelled a real defect against its own blind spot and
+// reported a page PHP refuses as GREEN. A false GREEN hides the class the check
+// exists for; it is worse than the false RED it replaced.
+func TestTheCombinedJSONAndHTMLSpelling(t *testing.T) {
+	canon, variant := "https://mz28a.ddev.site", "https://wt-a--mz28a.ddev.site"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	blob := func(h string) string { return `a:1:{s:4:"home";` + str(h) + `}` }
+	// json.Marshal then esc_attr, exactly as WordPress composes them.
+	comb := func(v string) string {
+		j, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.ReplaceAll(string(j[1:len(j)-1]), `"`, "&quot;")
+	}
+	in := `<div data-settings="` + comb(blob(canon)) + `"></div>`
+	want := `<div data-settings="` + comb(blob(variant)) + `"></div>`
+
+	got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}))
+	if got != want {
+		t.Errorf("\n got  %s\n want %s", got, want)
+	}
+	// And the detector must not call either side broken.
+	if n := BrokenSerialized([]byte(in)); n != 0 {
+		t.Errorf("the canonical page counted %d broken values; a blind spot here "+
+			"credits the baseline and silences the variant side", n)
+	}
+	if n := BrokenSerialized([]byte(want)); n != 0 {
+		t.Errorf("the repaired page counted %d broken values", n)
+	}
+}
+
+// The cheap gate must never say no to something the walk would repair.
+func TestTheSerializedGateNeverMissesAValue(t *testing.T) {
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	for _, in := range []string{
+		str("x"),
+		`a:1:{i:0;` + str("x") + `}`,
+		`s%3A1%3A%22x%22%3B`,
+		strings.ReplaceAll(str("x"), `"`, "&quot;"),
+		strings.ReplaceAll(str("x"), `"`, `\"`),
+		strings.ReplaceAll(str("x"), `"`, `\&quot;`),
+		`N;`,
+		`C:3:"Foo":1:{x}`,
+	} {
+		t.Run(in, func(t *testing.T) {
+			if !mayHoldSerialized([]byte(in)) {
+				t.Errorf("the gate refused a value the walk repairs: %s", in)
+			}
+		})
+	}
+	// And it should say no to ordinary content, or it buys nothing.
+	for _, in := range []string{
+		`<a href="https://x/a">t</a>`,
+		`.hero{background:url(https://x/a.png)}`,
+		`{"url":"https://x/a"}`,
+	} {
+		if mayHoldSerialized([]byte(in)) {
+			t.Errorf("the gate admitted ordinary content, so it saves nothing: %s", in)
+		}
+	}
 }

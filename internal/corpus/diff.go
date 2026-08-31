@@ -608,10 +608,17 @@ func WriteReport(w io.Writer, results []Result) bool {
 		case r.LinesCanonical != r.LinesVariant:
 			note = "line count changed — something re-serialised"
 			green = false
-		case r.Equal:
-			equal++
 		default:
-			note = fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines)
+			if !r.Equal {
+				note = fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines)
+			}
+		}
+		// Counted outside the switch. `equal++` used to sit in its last arm, so
+		// a page that *is* byte-identical but carries a note was never counted:
+		// the BYTES column said `same` while the summary said `0 byte-identical`,
+		// which is the line a developer reads.
+		if r.Equal {
+			equal++
 		}
 		state := "differ"
 		if r.Equal {

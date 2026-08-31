@@ -536,3 +536,27 @@ func TestEscapedSerializedContentIsNotBroken(t *testing.T) {
 		})
 	}
 }
+
+// A byte-identical page is counted as byte-identical even when it carries a
+// note.
+//
+// `equal++` sat in the last arm of a switch whose earlier arms match on errors,
+// leaks, broken payloads and Tier 2 — so a page whose BYTES column said `same`
+// was reported in the summary as `0 byte-identical`. That summary line is what
+// a developer reads.
+func TestAByteIdenticalPageIsCountedEvenWithANote(t *testing.T) {
+	// A page that is byte-identical *and* carries a note: a Tier 2 type holding
+	// an origin, which is reported loudly and deliberately does not fail the
+	// run. Built directly, because the point is what WriteReport does with it.
+	var buf bytes.Buffer
+	WriteReport(&buf, []Result{{
+		Path: "/style.css", Equal: true, Tier2: 3, ContentType: "text/css",
+	}})
+	out := buf.String()
+	if !strings.Contains(out, "1 byte-identical") {
+		t.Errorf("a page the table calls `same` was not counted:\n%s", out)
+	}
+	if !strings.Contains(out, "Tier 2") {
+		t.Errorf("the note was lost:\n%s", out)
+	}
+}

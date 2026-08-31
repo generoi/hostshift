@@ -255,6 +255,14 @@ func structuredAttr(name []byte) []byte {
 // had to guess whether to believe it. With both directions repairing there is
 // nothing to guess.
 func (w *HTML) rewriteValue(surface string, name []byte, base int, v []byte) []byte {
+	// A cheap gate first. Wrapping every attribute value and text node in the
+	// walk cost 45% of the identity map's throughput — four syntaxes tried at
+	// every candidate on every value — and almost no value on a page carries a
+	// serialized header at all. A header is a letter, a colon and a digit; if
+	// that never occurs there is nothing to repair.
+	if !mayHoldSerialized(v) {
+		return w.rewriteValueInner(surface, name, base, v)
+	}
 	return RepairSerialized(v, func(b []byte) []byte {
 		return w.rewriteValueInner(surface, name, base, b)
 	})

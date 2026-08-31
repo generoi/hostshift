@@ -1,6 +1,9 @@
 package rewrite
 
-import "strconv"
+import (
+	"bytes"
+	"strconv"
+)
 
 // RepairSerialized rewrites a PHP-serialized payload and re-emits its length
 // prefixes, so the result still parses.
@@ -160,7 +163,7 @@ func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 // parse failed immediately, and "a failed candidate declines the buffer" then
 // declined every body containing a link.
 func repairAt(b []byte, i int, rw func([]byte) []byte) (rep []byte, end int, ok, committed bool) {
-	for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax} {
+	for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
 		r, e, o, c := repairValueC(b, i, rw, 0, syn)
 		if o {
 			return r, e, true, c
@@ -353,6 +356,79 @@ var jsonSyntax = syntax{
 		}
 		return n
 	},
+}
+
+// jsonHTMLSyntax is `esc_attr(wp_json_encode(…))`: the JSON escaping runs first,
+// turning `"` into `\"`, and `esc_attr` then escapes that quote, giving
+// `\&quot;`. Elementor's `data-settings`, WooCommerce block attributes and ACF
+// all emit it.
+//
+// It is a spelling neither of its two halves can read, so the value was
+// rewritten without repair — and, worse, the *canonical* page counted as broken
+// too. The corpus diff subtracts the canonical count from the variant's, so a
+// blind spot on both sides cancelled exactly and a page PHP refuses was reported
+// GREEN. A false GREEN hides the class the check exists for, which is worse than
+// the false RED it replaced.
+var jsonHTMLSyntax = syntax{
+	match: func(b []byte, i int, c byte) (int, bool) {
+		if c == '"' {
+			if i+7 <= len(b) && b[i] == '\\' && string(b[i+1:i+7]) == "&quot;" {
+				return 7, true
+			}
+			return 0, false
+		}
+		if i < len(b) && b[i] == c {
+			return 1, true
+		}
+		return 0, false
+	},
+	emit: func(dst []byte, c byte) []byte {
+		if c == '"' {
+			return append(dst, `\&quot;`...)
+		}
+		return append(dst, c)
+	},
+	advance: func(b []byte, i, n int) (int, bool) {
+		if n < 0 {
+			return 0, false
+		}
+		for ; n > 0; n-- {
+			if i >= len(b) {
+				return 0, false
+			}
+			if w := jsonHTMLRun(b, i); w > 0 {
+				i += w
+				continue
+			}
+			i++
+		}
+		return i, true
+	},
+	dlen: func(b []byte) int {
+		n := 0
+		for i := 0; i < len(b); n++ {
+			if w := jsonHTMLRun(b, i); w > 0 {
+				i += w
+				continue
+			}
+			i++
+		}
+		return n
+	},
+}
+
+// jsonHTMLRun is the width of one source byte in the combined spelling.
+func jsonHTMLRun(b []byte, i int) int {
+	if i >= len(b) || b[i] != '\\' {
+		return 0
+	}
+	if i+7 <= len(b) && string(b[i+1:i+7]) == "&quot;" {
+		return 7
+	}
+	if i+2 <= len(b) && b[i+1] != 'u' {
+		return 2
+	}
+	return 0
 }
 
 var percentSyntax = syntax{
@@ -784,6 +860,7 @@ func occupiesItsField(b []byte, start, end int) bool {
 		textNode
 		escQuote
 		jsonQuote
+		jsonHTMLQuote
 		cdata
 	)
 	open := ownField
@@ -811,6 +888,8 @@ func occupiesItsField(b []byte, start, end int) bool {
 			open = escQuote
 		case start >= 2 && b[start-2] == '\\' && c == '"':
 			open = jsonQuote
+		case start >= 7 && string(b[start-7:start]) == `\&quot;`:
+			open = jsonHTMLQuote
 		default:
 			return false
 		}
@@ -966,7 +1045,7 @@ func BrokenSerialized(b []byte) int {
 		// an `esc_attr` input or a JSON string is not broken, it is escaped —
 		// and a check that is always RED is a check nobody reads, which is the
 		// mechanism that let five rounds of real corruption pass unnoticed.
-		for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax} {
+		for _, syn := range []syntax{literalSyntax, percentSyntax, htmlSyntax, jsonSyntax, jsonHTMLSyntax} {
 			_, e, o, c := repairValueC(b, i, id, 0, syn)
 			if o {
 				end, ok = e, true
@@ -1046,4 +1125,45 @@ func entityLen(b []byte) int {
 		i++
 	}
 	return n
+}
+
+// mayHoldSerialized is the cheap gate before the walk: a serialized header is a
+// type letter, a colon and then a digit or a quote. One pass, no allocation.
+//
+// It must never say no to something the walk would have repaired, so it accepts
+// the percent-encoded colon too.
+func mayHoldSerialized(b []byte) bool {
+	// Pivot on the colon with IndexByte, which is vectorised, rather than
+	// walking every byte in Go. Scanning byte by byte cost a third of the
+	// identity map's throughput on real pages, which is most of what the gate
+	// was added to recover.
+	//
+	// A digit has to follow the colon. Without that check every `https://`
+	// matched on its own `s:`, so the gate admitted every page carrying a link
+	// and saved nothing.
+	for off := 0; off < len(b); {
+		k := bytes.IndexByte(b[off:], ':')
+		if k < 0 {
+			break
+		}
+		i := off + k
+		if i > 0 && i+1 < len(b) && b[i+1] >= '0' && b[i+1] <= '9' {
+			switch b[i-1] {
+			case 'b', 'i', 'd', 's', 'a', 'O', 'R', 'r', 'E', 'C':
+				return true
+			}
+		}
+		off = i + 1
+	}
+	// `N;` has no colon, and the percent spelling encodes both.
+	for i := 0; i+1 < len(b); i++ {
+		if b[i] == 'N' && (b[i+1] == ';' || pctIs(b, i+1, ';')) {
+			return true
+		}
+		if b[i] == '%' && pctIs(b, i, ':') && i+3 < len(b) &&
+			b[i+3] >= '0' && b[i+3] <= '9' {
+			return true
+		}
+	}
+	return false
 }
