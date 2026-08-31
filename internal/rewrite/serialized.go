@@ -177,10 +177,16 @@ func repairAt(b []byte, i int, rw func([]byte) []byte) (rep []byte, end int, ok,
 
 // repairValueC is repairValue, also reporting whether the candidate committed.
 func repairValueC(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax) ([]byte, int, bool, bool) {
-	if i < len(b) && (b[i] == 's' || b[i] == 'a' || b[i] == 'O') {
+	// Every type that declares a length. `C` and `E` were missing, so a custom
+	// or enum header whose length did not describe its data neither declined its
+	// field nor raised the broken count — `C:3:"Foo":27:{…}` over a 24-byte
+	// payload scored zero where the same mistake in an `s:` scored two. Worse,
+	// not declining let the scan carry on at i+1 and repair spans *inside* an
+	// opaque payload, which is the one thing repairCustom exists to avoid.
+	if i < len(b) && (b[i] == 's' || b[i] == 'a' || b[i] == 'O' || b[i] == 'C' || b[i] == 'E') {
 		if _, j, ok := readLen(b, i+1, syn); ok {
 			d := byte('{')
-			if b[i] == 's' || b[i] == 'O' {
+			if b[i] != 'a' {
 				d = '"'
 			}
 			if _, ok := syn.match(b, j, d); ok {
@@ -579,6 +585,59 @@ func readLen(b []byte, i int, syn syntax) (int, int, bool) {
 	return n, j + w, true
 }
 
+// repairNested repairs a serialized payload sitting inside a string's data, at
+// whatever offset it starts. decline reports that the data holds something
+// serialized which could not be accounted for, and that the enclosing string
+// must therefore not re-emit its own length either.
+//
+// The single parse at offset zero this replaces only ever saw a payload written
+// tight against the opening quote. One leading newline — an option edited in a
+// textarea, an ACF field with an indented default, a line of prose introducing
+// a blob — and that parse failed, control fell through to rewriting the data in
+// place, and the *inner* length was left stale while the outer was faithfully
+// re-emitted from the new bytes. Nothing could see it: the outer parses, so the
+// detector reads its length, skips to the end of the string and never looks in.
+// A 4000-case fuzz put it at 37 invisible regressions.
+//
+// It is the walk `repairField` runs over a buffer, with the spelling and depth
+// fixed by the string that encloses it, and it inherits both of that walk's
+// refusals. A header that commits and does not parse declines. So does a value
+// that does not fill the data it sits in — which is what separates a payload
+// merely indented inside its string, repaired, from one introduced by prose or
+// wrapped in markup, declined, where the bytes around it are unconstrained and
+// a false boundary cannot be told from a real one.
+func repairNested(b []byte, rw func([]byte) []byte, depth int, syn syntax) (rep []byte, ok, decline bool) {
+	var out []byte
+	prev, found := 0, false
+	for i := 0; i < len(b); {
+		if !valueStart(b, i) {
+			i++
+			continue
+		}
+		r, end, parsed, committed := repairValueC(b, i, rw, depth, syn)
+		if !committed {
+			// Only a value with a length prefix has anything at stake here. A
+			// bare scalar cannot hold a host and has no number to re-emit, so
+			// finding one mid-string says nothing about the rest — and treating
+			// it as a payload declined `s:12:"N;not really"`, an ordinary
+			// twelve-byte string, taking the whole option down with it.
+			i++
+			continue
+		}
+		if !parsed || !occupiesItsField(b, i, end) {
+			return nil, false, true
+		}
+		out = append(out, rw(b[prev:i])...)
+		out = append(out, r...)
+		prev, i = end, end
+		found = true
+	}
+	if !found {
+		return nil, false, false
+	}
+	return append(out, rw(b[prev:])...), true, false
+}
+
 func repairString(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax) ([]byte, int, bool) {
 	n, j, ok := readLen(b, i+1, syn)
 	if !ok {
@@ -604,31 +663,32 @@ func repairString(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax
 	end := dataEnd + cw + tw
 
 	data := b[dataAt:dataEnd]
-	// A string can hold another serialized payload. Try to parse it *as input*,
-	// where its lengths are still right.
+	// A string can hold another serialized payload. Look for it *as input*,
+	// where its lengths are still right — at whatever offset it starts.
 	var repaired []byte
-	inner, iend, iok, icommitted := repairValueC(data, 0, rw, depth+1, syn)
+	inner, iok, idecline := repairNested(data, rw, depth+1, syn)
 	switch {
-	case iok && iend == len(data):
+	case iok:
 		repaired = inner
-	case icommitted:
-		// Committed — it really is a serialized header — but it does not parse
-		// to the end. That is a nested payload whose own lengths are stale, and
-		// re-emitting only the outer one is the worst outcome available: the
+	case idecline:
+		// The nested walk found a serialized header it could not account for.
+		// Re-emitting only the outer length is the worst outcome available: the
 		// outer parses, so nothing errors, and the failure surfaces on a later
-		// unserialize of the inner value.
+		// unserialize of the inner value — silently, because a detector that
+		// reads the outer length and skips to the end of the string never looks
+		// inside.
 		//
 		// Shape alone is not enough to decide this. Testing `valueStart` instead
 		// declined on `a:hover{color:red}`, `d:\\shares\\logo.png`, `i:12345`
 		// and `O:brien` — ordinary strings that begin with two bytes that happen
-		// to look like a header.
-		// Serialized-shaped but it does not parse to the end. That is the
-		// signature of a stale length: the declared end landed inside the data,
-		// after something that happened to look like a complete value, and the
-		// remainder is the rest of the string rather than the container's next
-		// element. Believing it is how a valid row was destroyed. Declining the
-		// whole span leaves both lengths alone, so the rewrite the response
-		// direction made without repair is undone exactly.
+		// to look like a header. What decides it is the same pair of questions
+		// the top-level walk asks: did the value parse, and did it account for
+		// the field it sits in.
+		//
+		// Declining the whole span leaves both lengths alone, so the rewrite the
+		// response direction made without repair is undone exactly — and the
+		// outer length is then stale on the wire, which is what makes it
+		// visible.
 		return nil, 0, false
 	default:
 		repaired = rw(data)
@@ -860,7 +920,6 @@ func occupiesItsField(b []byte, start, end int) bool {
 		textNode
 		escQuote
 		jsonQuote
-		jsonHTMLQuote
 		cdata
 	)
 	open := ownField
@@ -884,12 +943,18 @@ func occupiesItsField(b []byte, start, end int) bool {
 			// taken through the preview and imported elsewhere kept the host it
 			// was rewritten to and the length it had before.
 			open = cdata
+		// The combined spelling has no opener of its own, and round 28 was wrong
+		// to give it one. In `esc_attr(wp_json_encode(…))` the `\&quot;` are the
+		// value's *internal* quotes — what jsonHTMLSyntax reads — while the
+		// quote that opens the field is the structural one, `&quot;`, in every
+		// shape WordPress can produce: a bare string, an object value, an array
+		// element, a nested object. So the case below is the one that fires, and
+		// the `\&quot;` case that used to sit here was unreachable anyway: its
+		// six trailing bytes are `&quot;`, which this case matches first.
 		case start >= 6 && string(b[start-6:start]) == "&quot;":
 			open = escQuote
 		case start >= 2 && b[start-2] == '\\' && c == '"':
 			open = jsonQuote
-		case start >= 7 && string(b[start-7:start]) == `\&quot;`:
-			open = jsonHTMLQuote
 		default:
 			return false
 		}

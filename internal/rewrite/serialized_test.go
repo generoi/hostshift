@@ -866,3 +866,187 @@ func TestTheSerializedGateNeverMissesAValue(t *testing.T) {
 		}
 	}
 }
+
+// A serialized payload nested inside a string does not have to start at byte
+// zero of that string, and when it does not, its length is left stale while the
+// string around it is re-measured.
+//
+// repairString tries the nested parse at offset 0 of the data and nowhere else.
+// One byte of prefix — a newline, a space, the `<div data-x="` of an Elementor
+// fragment stored in an option — and the parse fails without committing, so the
+// data falls to the plain `rw` and the nested `s:N:` keeps the number it had
+// while its bytes change underneath it. The outer length is then re-emitted
+// correctly, which is what makes this the exact outcome repairString's own
+// comment names as "the worst available": the outer parses, so nothing errors,
+// and the failure surfaces on a later unserialize of the inner value.
+//
+// Verified against PHP 8.4: the input's inner value unserializes to an array,
+// the served output's returns false.
+//
+// The assertion is fix-agnostic. Repairing the nested value passes; so does
+// declining the whole field, because a decline leaves the outer length stale
+// too and BrokenSerialized then reports it. What must not happen is the third
+// outcome — corrupt bytes that the detector calls clean.
+func TestANestedPayloadThatDoesNotStartTheStringKeepsItsLength(t *testing.T) {
+	canon, variant := "https://www.canon.test/a", "https://v.ddev.site/a"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	inner := func(h string) string { return `a:1:{s:3:"url";` + str(h) + `}` }
+	outer := func(data string) string { return `a:1:{s:3:"raw";` + str(data) + `}` }
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+
+	for _, c := range []struct{ name, prefix, suffix string }{
+		{"a leading newline", "\n", ""},
+		{"a leading space", " ", ""},
+		{"an attribute around it", `<div data-x="`, `"></div>`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := outer(c.prefix + inner(canon) + c.suffix)
+			want := outer(c.prefix + inner(variant) + c.suffix)
+			got := string(RepairSerialized([]byte(in), rw))
+			if got == want {
+				return
+			}
+			if n := BrokenSerialized([]byte(got)); n == 0 {
+				t.Errorf("the nested length was not re-emitted and the detector "+
+					"calls the served bytes clean:\n in   %s\n got  %s\n want %s",
+					in, got, want)
+			}
+		})
+	}
+}
+
+// BrokenSerialized stops at the top-level value, so a stale length inside a
+// string is invisible to it.
+//
+// The detector exists because `hostshift diff` compared the proxy's output
+// against the scorer's reimplementation of it, so a defect in both scored GREEN.
+// It asserts on the served bytes — but only on the outermost value: once that
+// parses, the walk skips to its end and never looks at what the strings hold.
+// A nested payload is where WordPress keeps most of its serialized data, and
+// where the repair above leaves a stale number.
+//
+// The fixture is hostshift's own output for the case above, with every length
+// computed rather than written down: the outer describes its data exactly, and
+// the inner declares the canonical host's byte count over the variant's.
+func TestTheDetectorSeesAStaleLengthInsideAString(t *testing.T) {
+	canon, variant := "https://www.canon.test/a", "https://v.ddev.site/a"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// The inner value as the repair leaves it: the variant host under the
+	// canonical host's length. PHP returns false for this.
+	stale := `a:1:{s:3:"url";s:` + strconv.Itoa(len(canon)) + `:"` + variant + `";}`
+	if len(canon) == len(variant) {
+		t.Fatal("the two hosts are the same length, so this fixture proves nothing")
+	}
+	data := "\n" + stale
+	in := `a:1:{s:3:"raw";` + str(data) + `}`
+
+	if n := BrokenSerialized([]byte(in)); n == 0 {
+		t.Errorf("a value PHP refuses counted as clean, so the corpus diff "+
+			"reports GREEN on it:\n%s", in)
+	}
+}
+
+// A blob written by esc_attr(wp_json_encode(...)) as a JSON object *value* is
+// repaired.
+//
+// It pins which delimiter opens the field in the combined spelling, which is
+// not the one it looks like: the `\&quot;` are the value's own quotes, and the
+// quote that opens the field is the structural `&quot;`. Round 28 assumed
+// otherwise and gave the spelling an opener of its own; it was unreachable, and
+// removing it is what this test holds in place. Checked against every shape
+// wp_json_encode can put a string in — bare, object value, array element,
+// nested object — the preceding bytes are `&quot;` in all four.
+func TestASerializedBlobInsideAJSONStringAttribute(t *testing.T) {
+	canon, variant := "https://mz29a.ddev.site", "https://wt-a--mz29a.ddev.site"
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// esc_attr(wp_json_encode(["url" => 's:NN:"…";'])), so the blob is a JSON
+	// string value and its quotes are opened and closed by `\&quot;`.
+	comb := func(v string) string {
+		j, err := json.Marshal(map[string]string{"url": v})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.ReplaceAll(string(j), `"`, "&quot;")
+	}
+	in := `<div data-settings="` + comb(str(canon)) + `"></div>`
+	want := `<div data-settings="` + comb(str(variant)) + `"></div>`
+
+	got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}))
+	if got != want {
+		t.Errorf("\n got  %s\n want %s", got, want)
+	}
+	if n := BrokenSerialized([]byte(want)); n != 0 {
+		t.Errorf("the repaired page counted %d broken values", n)
+	}
+}
+
+// A nested payload that parses short and leaves residue is declined, so the
+// page is reported rather than quietly certified.
+//
+// This is the shape the file's opening comment describes, one level down: the
+// declared length lands on a `"`, the `;` after it closes the string and the
+// next `}` closes the array with its arity met, so the walk finishes cleanly
+// having read a prefix. What gives it away is the residue — the rest of the
+// true string.
+//
+// Believing it re-emits the *outer* length over the truncated reading, which
+// makes the outer correct and leaves the inner stale. That is worse than
+// useless: the bytes PHP refuses are unchanged, and the one number that would
+// have shown it is now right. `BrokenSerialized` then reads the outer length,
+// skips to the end of the string and reports zero.
+func TestAStalePayloadInsideAStringIsNotQuietlyCertified(t *testing.T) {
+	canon := "https://mz29b.ddev.site/a"
+	// s:3: over a string that is longer than three bytes — stale on arrival,
+	// exactly as a previous rewrite would have left it.
+	trueData := `AAA";}` + canon
+	nested := `a:1:{s:1:"c";s:3:"` + trueData + `";}`
+	body := `a:1:{s:3:"raw";s:` + strconv.Itoa(len(nested)) + `:"` + nested + `";}`
+
+	if n := BrokenSerialized([]byte(body)); n == 0 {
+		t.Errorf("a stale length inside a string was reported clean:\n %s", body)
+	}
+
+	// And the decline round-trips: the response direction rewrites without
+	// re-emitting either length, so the request direction restores the bytes.
+	fwd := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, "https://wt-a--mz29b.ddev.site/a"))
+	}
+	rev := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), "https://wt-a--mz29b.ddev.site/a", canon))
+	}
+	out := RepairSerialized([]byte(body), fwd)
+	if strings.Contains(string(out), canon) {
+		t.Errorf("the origin survived the rewrite:\n %s", out)
+	}
+	if back := string(RepairSerialized(out, rev)); back != body {
+		t.Errorf("a decline did not round-trip:\n got  %s\n want %s", back, body)
+	}
+}
+
+// A length-declaring header of any type raises the broken count and declines
+// its field.
+//
+// The commit gate listed `s`, `a` and `O` only, so a custom-serialized or enum
+// header whose length did not describe its data was invisible to the detector
+// and, worse, did not stop the scan: it carried on at the next byte and could
+// repair spans *inside* the opaque payload, which is what repairCustom exists
+// to avoid. The count is compared against the same defect written as a string,
+// because the point is that the type must not change the answer.
+func TestEveryLengthPrefixedTypeCommits(t *testing.T) {
+	host := "https://mz29c.ddev.site/a"
+	over := strconv.Itoa(len(host) + 3) // a length that overruns its data
+	cases := map[string]string{
+		"custom": `C:3:"Foo":` + over + `:{` + host + `}`,
+		"enum":   `E:` + over + `:"` + host + `";`,
+		"string": `a:1:{s:1:"x";s:` + over + `:"` + host + `";}`,
+	}
+	for name, body := range cases {
+		if n := BrokenSerialized([]byte(body)); n == 0 {
+			t.Errorf("%s: a length that overruns its data was reported clean:\n %s", name, body)
+		}
+	}
+}
