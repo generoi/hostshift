@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -67,6 +68,17 @@ type Result struct {
 	// Equal reports byte equality between the rewritten canonical page and the
 	// page the proxy served.
 	Equal bool
+	// Tier2 counts canonical origins in a body the proxy is documented not to
+	// rewrite — `text/css` and the JavaScript types. PLAN's fast path says they
+	// are "added only if the corpus diff shows a leak", so a non-zero count here
+	// is this tool's designed trigger for adding them rather than a defect.
+	Tier2 int
+
+	// ContentType is what the variant response was labelled, because the proxy
+	// dispatches on it and a verdict that ignores it is scoring a body against a
+	// pipeline that never ran.
+	ContentType string
+
 	// Leaks counts canonical origins in the variant response. Any non-zero
 	// value is a test 28 failure and is what this whole exercise is for.
 	Leaks int
@@ -207,7 +219,8 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// definition exactly the set of origins the proxy claims to rewrite, which
 	// makes this assertion say what it means: anything it still finds in the
 	// variant body is one the proxy should have caught and did not.
-	r.Leaks = countLeaks(o.Map.Forward(), variant.body)
+	r.ContentType = variant.contentType
+	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
 	return r
 }
 
@@ -227,7 +240,51 @@ func compare(ctx context.Context, o Options, path string) Result {
 // Pushing the served bytes back through the same pipeline the proxy runs answers
 // the actual question: anything it still finds to rewrite is an origin that
 // should already have been rewritten and was not.
-func countLeaks(m *origin.Matcher, body []byte) int {
+// The second return is the Tier 2 count: origins in a body the proxy is
+// *documented* not to rewrite. PLAN's fast-path section excludes `text/css` and
+// the JavaScript types "per Tier 2, and added only if the corpus diff shows a
+// leak" — so finding one there is this tool doing its job, and reporting it as
+// a proxy defect would be reporting the wrong thing. An attachment is different
+// again: §5 skips it by design, whatever it contains, so it is not counted at
+// all. Scoring every body through the HTML pipeline made a PDF or a WooCommerce
+// download link — which the `<a href>` crawler reaches routinely — read as
+// CANONICAL ORIGIN REACHED THE BROWSER.
+func countLeaks(m *origin.Matcher, r response) (leaks, tier2 int) {
+	if r.attachment {
+		return 0, 0
+	}
+	n := originsIn(m, r.body)
+	if isTier2(r.contentType) {
+		return 0, n
+	}
+	return n, 0
+}
+
+// isTier2 reports whether the proxy deliberately leaves this type alone.
+func isTier2(ct string) bool {
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		mt = strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
+	}
+	switch mt {
+	case "text/css", "application/javascript", "text/javascript",
+		"application/x-javascript":
+		return true
+	}
+	return false
+}
+
+// originsIn asks the whole engine, not the byte matcher alone.
+//
+// It used to run `m.Rewrite` and justify that with "the matcher is by definition
+// exactly the set of origins the proxy claims to rewrite". That stopped being
+// true the moment urlobf.go existed: the proxy also runs the URL-parser view,
+// the IDNA fold, the CSS view and the reference views, and this ran none of
+// them. So every leak class found since — obfuscated separators, folded hosts,
+// CSS escapes, character references — was invisible by construction to the one
+// test §7 calls the only one that validates against reality, and it printed
+// GREEN on a page whose `<a href>` a real browser resolved to production.
+func originsIn(m *origin.Matcher, body []byte) int {
 	st := rewrite.NewStats(false)
 	out, err := io.ReadAll(rewrite.NewResponseBody(
 		strings.NewReader(string(body)), m, nil, rewrite.Options{Stats: st}))
@@ -251,6 +308,11 @@ type response struct {
 	body     []byte
 	status   int
 	location string
+	// The proxy dispatches on Content-Type and Content-Disposition, so a
+	// verdict that ignores them is scoring a body against a pipeline that never
+	// ran on it.
+	contentType string
+	attachment  bool
 }
 
 func fetch(ctx context.Context, o Options, base *url.URL, path string) (response, error) {
@@ -278,7 +340,13 @@ func fetch(ctx context.Context, o Options, base *url.URL, path string) (response
 	}
 	defer res.Body.Close()
 	b, err := io.ReadAll(res.Body)
-	return response{body: b, status: res.StatusCode, location: res.Header.Get("Location")}, err
+	return response{
+		body:        b,
+		status:      res.StatusCode,
+		location:    res.Header.Get("Location"),
+		contentType: res.Header.Get("Content-Type"),
+		attachment:  strings.HasPrefix(strings.ToLower(strings.TrimSpace(res.Header.Get("Content-Disposition"))), "attachment"),
+	}, err
 }
 
 // crawl collects same-host paths from the canonical site, breadth first.
@@ -381,7 +449,7 @@ func countDiffLines(a, b string) int {
 // canonical origin reached the browser, and no page lost or gained lines.
 func WriteReport(w io.Writer, results []Result) bool {
 	green := true
-	var equal, leaks, errs int
+	var equal, leaks, errs, tier2 int
 
 	fmt.Fprintf(w, "%-46s %-8s %-7s %-7s %s\n", "PATH", "BYTES", "LEAKS", "LINES", "NOTE")
 	for _, r := range results {
@@ -394,6 +462,14 @@ func WriteReport(w io.Writer, results []Result) bool {
 			note = "CANONICAL ORIGIN REACHED THE BROWSER"
 			leaks += r.Leaks
 			green = false
+		case r.Tier2 > 0:
+			// Not a defect: PLAN's fast path excludes these types "per Tier 2,
+			// and added only if the corpus diff shows a leak". This is that
+			// showing. It does not turn the run RED, because the proxy is doing
+			// what it says it does — but it is the trigger, so it is loud.
+			note = fmt.Sprintf("%d origins in a Tier 2 type (%s) — the PLAN's "+
+				"trigger for rewriting it", r.Tier2, r.ContentType)
+			tier2 += r.Tier2
 		case r.LinesCanonical != r.LinesVariant:
 			note = "line count changed — something re-serialised"
 			green = false
@@ -413,6 +489,11 @@ func WriteReport(w io.Writer, results []Result) bool {
 
 	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d errors\n",
 		len(results), equal, leaks, errs)
+	if tier2 > 0 {
+		fmt.Fprintf(w, "%d origins in Tier 2 types (text/css, JavaScript), which the "+
+			"proxy excludes by design — PLAN's fast path adds them \"only if the "+
+			"corpus diff shows a leak\", and this is that\n", tier2)
+	}
 	if green {
 		fmt.Fprintln(w, "corpus diff GREEN: no canonical origin reached the browser, no page re-serialised")
 	} else {

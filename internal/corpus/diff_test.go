@@ -297,3 +297,51 @@ func TestCanonicalHeadersAppliedToCanonicalOnly(t *testing.T) {
 		t.Errorf("the variant fetch carried the canonical-only header: %q", variantSaw)
 	}
 }
+
+// countLeaks ran every body through the HTML pipeline regardless of what the
+// proxy would have done with it, so three different situations all scored the
+// same RED.
+//
+// An attachment is skipped by design whatever it contains, and the `<a href>`
+// crawler reaches download URLs routinely on a WooCommerce store — that was a
+// RED verdict for correct behaviour. A Tier 2 type is different: PLAN's fast
+// path excludes `text/css` and the JavaScript types "and added only if the
+// corpus diff shows a leak", so an origin there is this tool's designed trigger
+// and has to be reported as one rather than as a proxy defect. Everything else
+// is a real leak.
+func TestVerdictFollowsWhatTheProxyActuallyDoes(t *testing.T) {
+	m, err := origin.NewMatcher([]origin.Pair{{
+		Canonical: origin.MustParse("https://www.canon.test"),
+		Variant:   origin.MustParse("https://v.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const body = `<a href="https://www.canon.test/x">t</a>`
+	const css = `@font-face{src:url(https://www.canon.test/f.woff2)}`
+
+	for _, c := range []struct {
+		name         string
+		r            response
+		leaks, tier2 int
+	}{
+		{"html carrying an origin is a leak",
+			response{body: []byte(body), contentType: "text/html; charset=utf-8"}, 1, 0},
+		{"a stylesheet is the PLAN's trigger, not a defect",
+			response{body: []byte(css), contentType: "text/css"}, 0, 1},
+		{"so is JavaScript, under either spelling",
+			response{body: []byte(body), contentType: "text/javascript"}, 0, 1},
+		{"an attachment is skipped by design, whatever it holds",
+			response{body: []byte(body), contentType: "text/html", attachment: true}, 0, 0},
+		{"a clean page is clean",
+			response{body: []byte(`<a href="/x">t</a>`), contentType: "text/html"}, 0, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			leaks, tier2 := countLeaks(m, c.r)
+			if leaks != c.leaks || tier2 != c.tier2 {
+				t.Errorf("got leaks=%d tier2=%d, want leaks=%d tier2=%d",
+					leaks, tier2, c.leaks, c.tier2)
+			}
+		})
+	}
+}

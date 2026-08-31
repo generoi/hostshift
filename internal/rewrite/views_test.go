@@ -1,6 +1,8 @@
 package rewrite
 
 import (
+	"bytes"
+	"os"
 	"strings"
 	"testing"
 
@@ -169,5 +171,110 @@ func TestJSONReadsReferencesTheBrowserDecodes(t *testing.T) {
 				t.Errorf("a canonical origin survives the REST body:\n%s", out)
 			}
 		})
+	}
+}
+
+// The shapes the byte-identity corpus cannot hold, pinned by exact expectation
+// instead.
+//
+// A root dot, uppercase letters, U+3002, a differing scheme and a default port
+// are all rewritten to a canonical spelling rather than back to their original
+// bytes. That is inside the host/port byte range §4.3 permits to change, and it
+// is why these cannot sit in spike/adv with the round-trip fixtures — but it
+// still has to be *stated*, because "the round trip is lossy here" is exactly
+// the kind of claim that quietly becomes "the round trip is broken here".
+//
+// What must hold: the browser is served the plain variant, nothing carries a
+// canonical origin, and a second round trip changes nothing more.
+func TestNormalisingShapesReachAFixedPoint(t *testing.T) {
+	fwd := pairMatcher(t, "https://www.acmecorp.fi", "https://wt-a--acmecorp.ddev.site")
+	rev := pairMatcher(t, "https://wt-a--acmecorp.ddev.site", "https://www.acmecorp.fi")
+
+	for _, c := range []struct{ in, served, back string }{
+		{`<a href="https://www.acmecorp.fi./x">t</a>`,
+			`<a href="https://wt-a--acmecorp.ddev.site/x">t</a>`,
+			`<a href="https://www.acmecorp.fi/x">t</a>`},
+		{`<a href="https://WWW.ACMECORP.FI/x">t</a>`,
+			`<a href="https://wt-a--acmecorp.ddev.site/x">t</a>`,
+			`<a href="https://www.acmecorp.fi/x">t</a>`},
+		{`<a href="https://www.acmecorp.fi。/x">t</a>`,
+			`<a href="https://wt-a--acmecorp.ddev.site/x">t</a>`,
+			`<a href="https://www.acmecorp.fi/x">t</a>`},
+		{`<a href="http:www.acmecorp.fi/x">t</a>`,
+			`<a href="https://wt-a--acmecorp.ddev.site/x">t</a>`,
+			`<a href="https://www.acmecorp.fi/x">t</a>`},
+		{`<a href="https://www.acmecorp.fi:443/x">t</a>`,
+			`<a href="https://wt-a--acmecorp.ddev.site/x">t</a>`,
+			`<a href="https://www.acmecorp.fi/x">t</a>`},
+	} {
+		t.Run(c.in, func(t *testing.T) {
+			served := rewriteHTML(t, fwd, c.in, NewStats(false))
+			if served != c.served {
+				t.Errorf("served:\n got  %s\n want %s", served, c.served)
+			}
+			back := rewriteHTML(t, rev, served, NewStats(false))
+			if back != c.back {
+				t.Errorf("back:\n got  %s\n want %s", back, c.back)
+			}
+			// Lossy once is a normalisation; lossy every time is a leak of a
+			// different kind — the value would drift on each save.
+			again := rewriteHTML(t, rev, rewriteHTML(t, fwd, back, NewStats(false)), NewStats(false))
+			if again != back {
+				t.Errorf("not a fixed point — the value drifts on every round trip:"+
+					"\n once  %s\n twice %s", back, again)
+			}
+		})
+	}
+}
+
+// How much of the corpus actually exercises the splice, asserted rather than
+// assumed.
+//
+// "identity map byte-identical over 52 files, 5,945,950 bytes" reads as six
+// megabytes of coverage. Under the real map 35 of 51 files were byte-identical:
+// 69% of those bytes contain no canonical origin at all, the largest page in the
+// corpus (925 KB) has none, and two thirds of the *adversarial* fixtures assert
+// only that the tokenizer round-trips bytes. The splice was exercised over
+// roughly 1.8 MB, not 5.9.
+//
+// That is not wrong to have — real pages that contain no origin are a fair
+// sample — but it must not be silently diluted, and the number should be
+// visible next to the one that overstates it.
+func TestCorpusExercisesTheSplice(t *testing.T) {
+	fwd := pairMatcher(t, "https://www.acmecorp.fi", "https://wt-a--acmecorp.ddev.site")
+
+	var files, exercised, exercisedBytes, totalBytes int
+	var advExercised, advTotal int
+	for _, f := range corpusFiles(t) {
+		in, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files++
+		totalBytes += len(in)
+		adv := strings.Contains(f, "adv")
+		if adv {
+			advTotal++
+		}
+		if !bytes.Equal(in, runHTML(t, in, fwd, Options{})) {
+			exercised++
+			exercisedBytes += len(in)
+			if adv {
+				advExercised++
+			}
+		}
+	}
+	t.Logf("the splice runs on %d of %d files, %d of %d bytes (%.0f%%); "+
+		"%d of %d adversarial fixtures contain an origin",
+		exercised, files, exercisedBytes, totalBytes,
+		100*float64(exercisedBytes)/float64(totalBytes), advExercised, advTotal)
+
+	// Floors, not targets: they exist so that adding fixtures that contain no
+	// origin cannot quietly lower the real coverage while the file count climbs.
+	if exercised < 17 {
+		t.Errorf("only %d files exercise the splice, was 17", exercised)
+	}
+	if advExercised < 13 {
+		t.Errorf("only %d adversarial fixtures contain an origin, was 13", advExercised)
 	}
 }

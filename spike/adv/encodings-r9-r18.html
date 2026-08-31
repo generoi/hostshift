@@ -1,0 +1,71 @@
+<!doctype html>
+<!-- Every encoding class an audit round found reaching a browser, in one page,
+     spelled with the corpus's own canonical origin so the real-map tests splice
+     it rather than only tokenising it.
+
+     Two thirds of spike/adv contains no origin at all, so it asserted that the
+     tokenizer round-trips bytes and nothing about the splice. Each block below
+     is a shape that was live in production output at some point between rounds
+     nine and eighteen; the round-trip and fixed-point tests now cover them. -->
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<title>encodings</title>
+
+<!-- r9: the URL parser accepts separators the byte matcher never modelled. -->
+<link rel="canonical" href="https:\\www.acmecorp.fi/sivu">
+<link rel="alternate" href="https:///www.acmecorp.fi/sivu">
+<link rel="alternate" href="https:&#9;//www.acmecorp.fi/sivu">
+
+<!-- r10: CSS escapes sit above the URL parser, and userinfo hides a host. -->
+<style>
+#hero { background: url(https\3a \2f \2f www.acmecorp.fi/hero.jpg); }
+#hero2 { background: url("https\3a\2f\2fwww.acmecorp.fi/hero2.jpg"); }
+</style>
+
+</head>
+<body>
+
+<!-- r13: the request direction has to reverse everything above, and r16 added
+     the rule that whatever the forward pass emits, the reverse must read. -->
+<a href="https://u@www.acmecorp.fi/userinfo">userinfo</a>
+
+<!-- A bracket is both an authority byte and a token boundary — the shape that
+     made hostRange quadratic. Same-scheme here, so the splice is host-only and
+     the round trip stays byte-identical. -->
+<p>[https://www.acmecorp.fi/bracket] and [http:a] and [::1]</p>
+
+<!-- r16/r17: references decode where the *consumer* decodes them, not where
+     HTML says. Inside svg the tokenizer never enters a raw-text state. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">
+  <style>#s{background:url(https&#92;3a &#92;2f &#92;2f www.acmecorp.fi/svg-style.png)}</style>
+  <title>https:&#47;&#47;www.acmecorp.fi/svg-title</title>
+</svg>
+
+<!-- r17: percent-encoded JSON escapes, which is what WooCommerce hands to
+     decodeURIComponent on /cart/ and throughout wp-admin. -->
+<script>
+var settings = JSON.parse(decodeURIComponent("%7B%22root%22%3A%22https%3A%5C%2F%5C%2Fwww.acmecorp.fi%5C%2Fwp-json%5C%2F%22%7D"));
+var plain = {"root":"https:\/\/www.acmecorp.fi\/wp-json\/"};
+</script>
+
+<!-- r18: character references spelling CSS escapes — two decodes, and neither
+     view alone can see it. Chrome fetches this one. -->
+<div style="background:url(https&#92;3a &#92;2f &#92;2f www.acmecorp.fi&#92;2f entity-css.png)">x</div>
+
+
+<!-- The negative controls. None of these may ever be rewritten. -->
+<p>See https://www.acmecorp.fi. Thanks — the full stop is punctuation.</p>
+<a href="https://www.acmecorp.fi.evil.example/near-miss">near miss</a>
+<a href="https://awww.acmecorp.fi/near-miss">near miss</a>
+<style>#raw{background:url(https&#92;3a &#92;2f &#92;2f www.acmecorp.fi/not-decoded.png)}</style>
+<a href="https://www.acmecorp.fi%2523/double-encoded">double encoded</a>
+</body>
+</html>
+
+<!-- The spellings this page deliberately leaves out are the *normalising* ones —
+     a root dot, uppercase, U+3002, a differing scheme, a default port. Each is
+     rewritten to a canonical spelling rather than back to its original bytes,
+     which is inside the host/port byte range §4.3 permits to change, so they
+     cannot live in a byte-identity round-trip corpus. They are pinned by exact
+     expectation in TestNormalisingShapesReachAFixedPoint instead. -->
