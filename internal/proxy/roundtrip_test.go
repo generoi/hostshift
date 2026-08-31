@@ -454,3 +454,67 @@ func TestASerializedBlobSurvivesTheRequestLineAndHeaders(t *testing.T) {
 		}
 	}
 }
+
+// A Set-Cookie has its Domain= mapped and nothing else touched.
+//
+// PLAN's Tier 1 table scopes Set-Cookie to `Domain=`; PLAN's test 28 said
+// "every URL-valued position — … header values". Those disagree, and the audit
+// that found the disagreement found a production origin sitting readable in a
+// non-HttpOnly cookie value on a served page.
+//
+// The table wins, and the reason is worth holding in place: a session cookie is
+// signed over its contents, so rewriting a host inside `wordpress_logged_in_…`
+// invalidates the signature and logs the developer out. This asserts both
+// halves — Domain= is handled, the value is not — so the boundary stays a
+// decision someone made rather than something nobody noticed.
+func TestSetCookieHasItsDomainMappedAndItsValueLeftAlone(t *testing.T) {
+	canon, variant := "https://www.example.fi", "https://wt-a--example.ddev.site"
+	mp, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse(canon),
+		Variant:   origin.MustParse(variant),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Set-Cookie", "hs_pref="+url.QueryEscape(canon+"/sv/")+"; Path=/")
+		w.Header().Add("Set-Cookie", "sess=abc; Domain=.www.example.fi; Path=/; HttpOnly")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer up.Close()
+	upURL, err := url.Parse(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Proxy{Map: mp, Upstream: upURL, Stats: rewrite.NewStats(false)}
+	srv := httptest.NewServer(p.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/", nil)
+	req.Host = "wt-a--example.ddev.site"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+
+	var value, domain string
+	for _, c := range resp.Header.Values("Set-Cookie") {
+		if strings.HasPrefix(c, "hs_pref=") {
+			value = c
+		}
+		if strings.HasPrefix(c, "sess=") {
+			domain = c
+		}
+	}
+	// The Domain= is not left naming a host the browser is not on.
+	if strings.Contains(domain, "www.example.fi") {
+		t.Errorf("Domain= still names the canonical host: %s", domain)
+	}
+	// And the value is untouched, signature and all.
+	if !strings.Contains(value, url.QueryEscape(canon+"/sv/")) {
+		t.Errorf("the cookie value was rewritten, which breaks a signed cookie: %s", value)
+	}
+}

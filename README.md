@@ -391,8 +391,15 @@ binary's. DDEV collapses a host command's status to 1, so a script testing
 
 `hostshift diff -n 20` is the check that validates a deployment against
 reality: it crawls N pages canonically, fetches the same N through the proxy,
-runs the canonical bytes through the same engine, and compares. The assertions
-that fail a run are the ones that cannot be innocent — a canonical origin
+runs the canonical bytes through the same engine, and compares. In a worktree
+it needs `--canonical-base` to say what the canonical side is, since the
+production hostname is not routed locally:
+
+```
+hostshift diff -n 20 --canonical-base https://<project>.ddev.site
+```
+
+The assertions that fail a run are the ones that cannot be innocent — a canonical origin
 reaching the browser, a page whose line count changed, and a serialized value
 served with a length that does not describe its data, which PHP will refuse or
 silently truncate.
