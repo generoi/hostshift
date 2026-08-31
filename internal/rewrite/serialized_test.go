@@ -472,7 +472,6 @@ func TestAnEmbeddedValueIsNotRepaired(t *testing.T) {
 	for _, c := range []struct{ name, in string }{
 		{"beside prose", `see ` + canon + `/b and ` + str(canon+"/x")},
 		{"with a second value after it", str(canon+"/x") + ` ` + str(canon+"/y")},
-		{"after unrelated content in the same attribute", `v1|` + str(canon+"/x")},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := string(RepairSerialized([]byte(c.in), func(b []byte) []byte {
@@ -489,6 +488,51 @@ func TestAnEmbeddedValueIsNotRepaired(t *testing.T) {
 			}
 		})
 	}
+
+	// And the case that moved out of that list: a value glued to the text in
+	// front of it, with nothing after it. `v1|` is not one of the separators a
+	// value may follow, so the position gate skipped it and the length went out
+	// stale — the same shape as an ACF label written without punctuation.
+	//
+	// It is repaired now, by an arm that only ever accepts a value parsing
+	// completely with nothing but whitespace behind it. That is why it belongs
+	// here rather than in the list above: the boundary is *not* unknowable when
+	// the value runs to the end of what it sits in.
+	t.Run("glued to unrelated content, with nothing after it", func(t *testing.T) {
+		in := `v1|` + str(canon+"/x")
+		want := `v1|` + str(variant+"/x")
+		rw := func(b []byte) []byte {
+			return []byte(strings.ReplaceAll(string(b), canon, variant))
+		}
+		got := string(RepairSerialized([]byte(in), rw))
+		if got != want {
+			t.Errorf("\n got  %s\n want %s", got, want)
+		}
+		// And it round-trips, which is what makes repairing it safe.
+		back := string(RepairSerialized([]byte(got), func(b []byte) []byte {
+			return []byte(strings.ReplaceAll(string(b), variant, canon))
+		}))
+		if back != in {
+			t.Errorf("did not round-trip:\n got  %s\n want %s", back, in)
+		}
+	})
+
+	// The other half of that arm: with something after the value, the boundary
+	// is unknowable again and it must decline. Accepting a glued value with
+	// residue is what would make the arm dangerous rather than additive —
+	// the parse can stop at a false close, and there is nothing in front of the
+	// value to say where it really began.
+	t.Run("glued to unrelated content, with more after it", func(t *testing.T) {
+		in := `v1|` + str(canon+"/x") + ` (cachad)`
+		want := strings.ReplaceAll(in, canon, variant)
+		got := string(RepairSerialized([]byte(in), func(b []byte) []byte {
+			return []byte(strings.ReplaceAll(string(b), canon, variant))
+		}))
+		if got != want {
+			t.Errorf("a glued value with residue had its length re-emitted:"+
+				"\n got  %s\n want %s", got, want)
+		}
+	})
 }
 
 // The shapes round twenty-six measured as still corrupting, in both spellings.

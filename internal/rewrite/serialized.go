@@ -85,6 +85,22 @@ func RepairSerializedFields(b []byte, rw func([]byte) []byte) []byte {
 		}
 		start = end + 1
 	}
+	// Over the whole buffer, not the fields joined back together, even though
+	// they hold the same bytes when nothing was repaired.
+	//
+	// The split is on a raw `&`, which in a properly encoded body is always a
+	// separator — but a *character reference* is also written with one, so
+	// `https:&#47;&#47;host` is cut into three fields and the host is not in any
+	// of them. Rewriting the assembled buffer is what catches it, and dropping
+	// this to stop double-counting events sent a variant hostname to the
+	// upstream in two of the request-body spellings.
+	//
+	// The cost is that every event and leak counter in a payload-free body is
+	// recorded twice, which since round 31 wrapped the query string means every
+	// ordinary `?redirect_to=…&x=1`. Served bytes are right; `--explain` and the
+	// census are double. That is the cheaper of the two errors — and it is not
+	// the only inflation here, since repairAt tries five spellings and each may
+	// call rw before one succeeds.
 	if !found {
 		return rw(b)
 	}
@@ -106,7 +122,28 @@ func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	var out []byte
 	prev, found := 0, false
 	for i := 0; i < len(b); {
-		if !valueStart(b, i) {
+		if !valueShape(b, i) {
+			i++
+			continue
+		}
+		if !valuePosition(b, i) {
+			// Glued to the text in front of it — a label with no trailing
+			// punctuation, `Åtgärd` or `v2` or `]`. The position gate exists to
+			// keep `https://x/s:3:"a"` in a URL path from committing and then
+			// declining the buffer, and it cannot tell that apart from a real
+			// value behind a label: both are a header after a non-separator.
+			//
+			// So this arm is strictly additive. It looks, and it accepts only a
+			// value that parses completely with nothing but whitespace after it.
+			// Anything else is skipped exactly as before — never a decline,
+			// never a count — so a page that worked cannot start failing here.
+			if rep, end, ok, _ := repairAt(b, i, rw); ok && onlySpaceAfter(b, end) {
+				out = append(out, rw(b[prev:i])...)
+				out = append(out, rep...)
+				prev, i = end, end
+				found = true
+				continue
+			}
 			i++
 			continue
 		}
@@ -157,6 +194,24 @@ func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	return append(out, rw(b[prev:])...), true
 }
 
+// onlySpaceAfter reports whether nothing but whitespace follows end.
+func onlySpaceAfter(b []byte, end int) bool {
+	for i := end; i < len(b); i++ {
+		switch b[i] {
+		case ' ', '\t', '\r', '\n':
+		case '\\':
+			if i+1 < len(b) && (b[i+1] == 't' || b[i+1] == 'r' || b[i+1] == 'n') {
+				i++
+				continue
+			}
+			return false
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // repairAt tries each spelling at i. committed reports whether the candidate got
 // past its length and opening delimiter — far enough that it really is a
 // serialized header and a failure to parse means the buffer is untrustworthy.
@@ -205,10 +260,17 @@ func repairValueC(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax
 // only after something that can precede one. Without the second half the scan
 // would try to parse at every byte of a large body.
 func valueStart(b []byte, i int) bool {
-	// The *shape* of a header, not just its first byte. Matching on the letter
-	// alone made `a.test` inside an ordinary string look like the start of an
-	// array, and made the word "see" a candidate — which matters because a
-	// candidate that fails to parse now declines the whole buffer.
+	return valueShape(b, i) && valuePosition(b, i)
+}
+
+// valueShape is the header test: a serialized value begins with one of these
+// letters followed by its delimiter.
+//
+// The *shape*, not just the first byte. Matching on the letter alone made
+// `a.test` inside an ordinary string look like the start of an array, and made
+// the word "see" a candidate — which matters because a candidate that fails to
+// parse declines the whole buffer.
+func valueShape(b []byte, i int) bool {
 	switch b[i] {
 	case 'N':
 		if i+1 >= len(b) || !(b[i+1] == ';' || pctIs(b, i+1, ';')) {
@@ -221,9 +283,17 @@ func valueStart(b []byte, i int) bool {
 	default:
 		return false
 	}
-	// And it must sit where a value can begin. Without this a URL path holding
-	// `s:3:"a"` was a candidate: it commits, fails to close, and the detector
-	// reported a healthy page as carrying broken serialized data.
+	return true
+}
+
+// valuePosition is the other half: the value must sit where one can begin.
+// Without it a URL path holding `s:3:"a"` was a candidate — it commits, fails
+// to close, and the detector reported a healthy page as carrying broken data.
+//
+// It does not apply inside a string, where the bytes in front of a payload are
+// the field's own label. `Obs: ` ends in a separator; `v2`, `Åtgärd` and `]` do
+// not, and that difference decided whether the value was seen at all.
+func valuePosition(b []byte, i int) bool {
 	if i == 0 {
 		return true
 	}
@@ -231,7 +301,7 @@ func valueStart(b []byte, i int) bool {
 	// Whitespace and `>`, because a `<textarea>` WordPress indents and a text
 	// node both put a value there. `+` because that is how a form body spells a
 	// space, which is what a field label ends with. occupiesItsField and
-	// runsToTheEnd still decide whether the value fills its field; this gate
+	// the nested walk still decide whether the value fills its field; this gate
 	// only decides whether to look, so being too permissive costs a parse
 	// attempt and being too strict costs a repair.
 	case '{', ';', '"', '=', '&', ':', ',', '\'', '>', '[', '+', ' ', '\t', '\r', '\n':
@@ -964,20 +1034,33 @@ func readLen(b []byte, i int, syn syntax) (int, int, bool) {
 // A 4000-case fuzz put it at 37 invisible regressions.
 //
 // It is the walk `repairField` runs over a buffer, with the spelling and depth
-// fixed by the string that encloses it, and it inherits both of that walk's
-// refusals. A header that commits and does not parse declines. So does a value
-// that does not fill the data it sits in — which is what separates a payload
-// whose surroundings pair, repaired, from one whose surroundings do not,
-// declined, where the bytes around it are unconstrained and a false boundary
-// cannot be told from a real one. Indentation pairs, and so does markup: `>`
-// opens a text node and `<` closes it, so a blob inside a `<p>` is repaired.
-// A line of prose ending in `:` does not pair, and declines.
+// fixed by the string that encloses it, and it keeps that walk's one refusal: a
+// header that commits and does not parse declines the field.
+//
+// It drops the two questions that only make sense at the top level. What
+// *precedes* a value there says whether the value is the whole field; inside a
+// string it is the field's own label, and `Obs: ` ending in a separator while
+// `Åtgärd` does not decided whether the payload was seen at all. What *follows*
+// a value there is residue; inside a string PHP has already answered it —
+// unserialize stops at the first complete value and ignores the rest, so a blob
+// with " (cachad)" after it is ordinary content, and declining on it made this
+// walk disagree with the parser it exists to satisfy.
 
 func repairNested(b []byte, rw func([]byte) []byte, depth int, syn syntax) (rep []byte, ok, decline bool) {
 	var out []byte
 	prev, found := 0, false
 	for i := 0; i < len(b); {
-		if !valueStart(b, i) {
+		// Shape only. The position half asks what precedes the value, which
+		// inside a string is the field's own label — and a label carries no
+		// information about whether the payload after it is real.
+		//
+		// This was measured against a fuzz of *array* payloads once and looked
+		// inert, so it was reverted. An array declares an arity, not a byte
+		// count: skip its header and its members are still found, still
+		// repaired, and the number that was never re-emitted was never wrong.
+		// A string declares a byte count and has no child to fall back on, so
+		// for `s:` this is the difference between a repair and a stale length.
+		if !valueShape(b, i) {
 			i++
 			continue
 		}
