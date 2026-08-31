@@ -1961,3 +1961,71 @@ func TestAPayloadNestedInsideASerializedString(t *testing.T) {
 		}
 	}
 }
+
+// Every spelling of the quote delimiter, re-emitted as it arrived.
+//
+// Two faults, one test. `&#x22;` was in neither the matcher nor entityRun, so a
+// value delimited with it was not a value at all — it declined, and a decline
+// rewrites the host and re-emits nothing. And `&#34;` was matched but re-emitted
+// as `&quot;`, one byte wider with the same decoded content: the length in this
+// spelling is a *source* delta, so it counted the extra byte and overshot by one
+// per quote.
+//
+// The fix for the second is general — every delimiter now comes back exactly as
+// it arrived and only the digits are replaced. That also stops the percent
+// spelling normalising `%3a` to `%3A`, which changed a client's bytes for no
+// reason at all.
+func TestEverySpellingOfTheQuoteDelimiter(t *testing.T) {
+	canon, variant := "https://mz33a.ddev.site", "https://wt-a--mz33a.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	str := func(v string) string { return `s:` + strconv.Itoa(len(v)) + `:"` + v + `";` }
+	// A nested payload, because that is where a per-quote error accumulates.
+	blob := func(host string) string {
+		inner := `a:1:{` + str("u") + str(host+"/x/") + `}`
+		return `a:1:{` + str("a") + str(inner) + `}`
+	}
+	for _, q := range []string{"&quot;", "&#34;", "&#034;", "&#x22;", "&#X22;", "&#x022;"} {
+		enc := func(s string) string { return strings.ReplaceAll(s, `"`, q) }
+		in, want := `<div data-x="`+enc(blob(canon))+`">y</div>`,
+			`<div data-x="`+enc(blob(variant))+`">y</div>`
+		got := string(RepairSerialized([]byte(in), rw))
+		if got != want {
+			t.Errorf("%s:\n got  %s\n want %s", q, got, want)
+		}
+		if n := BrokenSerialized([]byte(got)); n != 0 {
+			t.Errorf("%s: served %d value(s) PHP refuses:\n %s", q, n, got)
+		}
+	}
+}
+
+// The percent spelling keeps the client's hex case.
+//
+// syn.emit wrote `%3A` whatever arrived, so a client encoding in lowercase had
+// its body altered by a proxy asked only to map an origin — and in the identity
+// map that is test 24 outright. The early return for unchanged data hid it;
+// this asserts the path where the value *is* rewritten.
+func TestThePercentSpellingKeepsItsHexCase(t *testing.T) {
+	canon, variant := "https://mz33b.ddev.site", "https://wt-a--mz33b.ddev.site"
+	// The bare host: the percent spelling encodes `:` so a full origin never
+	// appears literally, and a stub matching on one would fire on nothing and
+	// let this pass on untouched bytes.
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b),
+			"mz33b.ddev.site", "wt-a--mz33b.ddev.site"))
+	}
+	enc := func(host string) string {
+		v := host + "/x"
+		s := `s:` + strconv.Itoa(len(v)) + `:"` + v + `";`
+		// Lowercase hex, and every delimiter encoded — a terminator left
+		// literal is not a terminator in this spelling, and the value would
+		// decline for that rather than for the reason under test.
+		return strings.NewReplacer(
+			":", "%3a", `"`, "%22", ";", "%3b", "/", "%2f").Replace(s)
+	}
+	got := string(RepairSerializedFields([]byte("opt="+enc(canon)), rw))
+	if want := "opt=" + enc(variant); got != want {
+		t.Errorf("\n got  %s\n want %s", got, want)
+	}
+}

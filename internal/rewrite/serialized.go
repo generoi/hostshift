@@ -725,10 +725,8 @@ var literalSyntax = syntax{
 var htmlSyntax = syntax{
 	match: func(b []byte, i int, c byte) (int, bool) {
 		if c == '"' {
-			for _, e := range []string{"&quot;", "&#34;", "&#034;"} {
-				if i+len(e) <= len(b) && string(b[i:i+len(e)]) == e {
-					return len(e), true
-				}
+			if w := entityRun(b, i); w > 0 {
+				return w, true
 			}
 			return 0, false
 		}
@@ -1169,6 +1167,23 @@ func repairNested(b []byte, rw func([]byte) []byte, depth int, syn syntax) (rep 
 			continue
 		}
 		if !parsed {
+			// Declined, and this is a real cost, measured: a *legacy* nested
+			// payload whose own length an earlier naive search-replace broke is
+			// a value PHP accepts, because it only ever reads the outer length —
+			// and declining leaves the outer stale too, so PHP then refuses the
+			// whole option. An opaque broken string becomes a lost row.
+			//
+			// Skipping it instead was tried and is worse. It turns a decline
+			// into repairing the *pieces* of a structure this walk does not
+			// understand, which is what the file header describes destroying a
+			// valid row: the inner spans still parse on their own, and their
+			// numbers were already right for the original. It also makes the
+			// depth limit unenforceable, since past it every value fails to
+			// parse and would be skipped one level at a time.
+			//
+			// So the cost stands. It round-trips — the other direction declines
+			// the same way — and `hostshift diff` reports it, because the outer
+			// length is stale against bytes that grew.
 			return nil, false, true
 		}
 		out = append(out, rw(b[prev:i])...)
@@ -1240,15 +1255,25 @@ func repairString(b []byte, i int, rw func([]byte) []byte, depth int, syn syntax
 	}
 	// See emitLen: measured where the spelling has one reading, and a delta in
 	// source bytes where a character reference means it does not.
+	// Every delimiter comes back exactly as it arrived, and only the digits are
+	// replaced. syn.emit writes one canonical spelling of each, which changed
+	// bytes it had no reason to: a value delimited with `&#34;` came back
+	// `&quot;`, one byte wider per quote with the same decoded content — and the
+	// length here is a *source* delta in this spelling, so it counted every one
+	// of those bytes and overshot by one per quote. Normalising `%3a` to `%3A`
+	// in the percent spelling was the same thing, one surface over.
+	c1w, _ := syn.match(b, i+1, ':')
+	dstart := i + 1 + c1w
+	dend := dstart
+	for dend < len(b) && b[dend] >= '0' && b[dend] <= '9' {
+		dend++
+	}
 	var out []byte
-	out = append(out, 's')
-	out = syn.emit(out, ':')
+	out = append(out, b[i:dstart]...) // the type letter and its colon
 	out = append(out, strconv.Itoa(emitLen(syn, n, data, repaired))...)
-	out = syn.emit(out, ':')
-	out = syn.emit(out, '"')
+	out = append(out, b[dend:j+qw]...) // the second colon and the opening quote
 	out = append(out, repaired...)
-	out = syn.emit(out, '"')
-	out = syn.emit(out, ';')
+	out = append(out, b[dataEnd:end]...) // the closing quote and the terminator
 	return out, end, true
 }
 
@@ -1677,13 +1702,20 @@ func entityRun(b []byte, i int) int {
 	if i >= len(b) || b[i] != '&' {
 		return 0
 	}
-	for _, e := range []string{"&quot;", "&#34;", "&#034;"} {
+	for _, e := range quoteEntities {
 		if i+len(e) <= len(b) && string(b[i:i+len(e)]) == e {
 			return len(e)
 		}
 	}
 	return 0
 }
+
+// quoteEntities is every spelling of `"` a serialiser or a template engine
+// writes. The hex forms were missing, so a value delimited with `&#x22;` was
+// not a value at all to this walk: it declined, and a decline rewrites the host
+// and re-emits nothing. WordPress core writes `&quot;`, but a theme or a
+// JS-side escaper reaching for `&#x22;` is not exotic.
+var quoteEntities = []string{"&quot;", "&#34;", "&#034;", "&#x22;", "&#X22;", "&#x022;"}
 
 // advanceEntities walks n decoded bytes from i, counting a character reference
 // as the one byte it decodes to.
