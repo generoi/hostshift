@@ -2090,7 +2090,24 @@ func unhex(a, b byte) (byte, bool) {
 // What that costs: a serialized value embedded in a larger document — inside
 // CDATA in a WXR export, or mid-paragraph — no longer has its length re-emitted.
 // It is still rewritten, and the response direction declines for the same
-// reason, so the two directions stay consistent and the round trip is exact.
+// reason, so the two directions stay consistent.
+//
+// **The round trip is exact only when the substitution is byte-symmetric**, and
+// one ordinary case is not. The matcher deliberately matches *both* schemes for
+// every canonical host and replaces with the variant's declared origin — M0
+// measured one fleet host appearing 165 times over http and zero over https —
+// so `http://canonical` goes out as `https://variant` and comes back as
+// `https://canonical`, one byte longer than it left. A declined value then
+// returns to the database under a length that no longer describes it, and PHP
+// refuses it. The served page is RED in the detector, but the request direction
+// is scored by nothing.
+//
+// Removing the decline fixes that case and reintroduces the one this check
+// exists for: with it off, `TestAnOrdinaryCustomCSSOptionSurvivesARoundTrip`
+// and `TestTheResidueRulesBlindSpotComesHome` both fail — the destroyed
+// `wp_options` row of §4.3. Measured, not assumed: every PHP corpus sweep
+// scores identically either way, and those two tests are the whole difference.
+// So the cost stands, and it is stated here rather than promised away.
 func occupiesItsField(b []byte, start, end int) bool {
 	// Matched delimiters. A trailing `"` is both a legitimate close — the JSON
 	// string in `wp_localize_script`'s `{"opt":"…"}` — and the residue of a
