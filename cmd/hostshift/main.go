@@ -609,7 +609,9 @@ func cmdDiff(args []string) (int, error) {
 		if len(parts) != 4 {
 			return exitConfig, fmt.Errorf("--resolve %q: want host:port:addr:port", r)
 		}
-		resolveMap[parts[0]+":"+parts[1]] = parts[2] + ":" + parts[3]
+		// Keyed through the same fold the dialer looks up with, so what the
+		// developer typed and what net/http asks for are the same string.
+		resolveMap[corpus.ResolveKey(parts[0]+":"+parts[1])] = parts[2] + ":" + parts[3]
 	}
 	res, err := c.load()
 	if err != nil {
@@ -649,18 +651,13 @@ func cmdDiff(args []string) (int, error) {
 	if port == "" {
 		port = map[string]string{"https": "443", "http": "80"}[cb.Scheme]
 	}
-	covered := false
-	for hp := range resolveMap {
-		h, p, ok := strings.Cut(hp, ":")
-		// Host *and* port. The map is keyed on both, so a right host on the
-		// wrong port resolves nothing — and that is the mistake curl's own
-		// syntax invites, which is the whole reason to check rather than to
-		// take the flag's presence as an answer.
-		if ok && strings.EqualFold(h, cb.Hostname()) && p == port {
-			covered = true
-			break
-		}
-	}
+	// The same key the dialer will look up, built by the same function. Asking
+	// this question a second way is what made the guardrail disagree with the
+	// dialer: it folded case where the dialer did not, and did not fold IDNA
+	// where the dialer did, so `--resolve www.hämeenlinna.fi:443:…` connected to
+	// the live site with no warning while the punycode spelling that worked
+	// warned anyway.
+	_, covered := resolveMap[corpus.ResolveKey(net.JoinHostPort(cb.Hostname(), port))]
 	if !covered && !isLoopbackHost(cb.Hostname()) {
 		fmt.Fprintf(os.Stderr,
 			"hostshift: crawling %d page(s) from %s, which is not pointed anywhere local.\n"+

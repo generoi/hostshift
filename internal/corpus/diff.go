@@ -112,6 +112,11 @@ func Run(ctx context.Context, o Options) ([]Result, error) {
 		if len(o.Resolve) > 0 {
 			base := &net.Dialer{Timeout: timeout}
 			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// The keys are folded where they are built, by ResolveKey, and
+				// net/http hands this the punycode host lowercased — so folding
+				// again here is unmeasurable, and an unmeasurable guard is one
+				// nobody can tell has stopped working. Keying both sides through
+				// one function is the fix; doing it twice is not more of it.
 				if to, ok := o.Resolve[addr]; ok {
 					addr = to
 				}
@@ -205,7 +210,7 @@ func compare(ctx context.Context, o Options, path string) Result {
 		// one the guard must not cover.
 		unchangedSelfRedirect := !o.StrictOrigins &&
 			variant.location == canon.location && canon.location != "" &&
-			redirectsToItself(string(wantLoc), o.Map, path)
+			redirectsToItself(string(wantLoc), o, path)
 		if string(wantLoc) != variant.location && !unchangedSelfRedirect {
 			r.Err = fmt.Errorf("Location %q, want %q", variant.location, wantLoc)
 			return r
@@ -334,7 +339,7 @@ func compare(ctx context.Context, o Options, path string) Result {
 // Host comparison is case-insensitive and ignores the scheme, like the proxy's:
 // a router that terminates TLS turns an https request into an http one
 // upstream, and the guard has to recognise its own redirect through that.
-func redirectsToItself(loc string, m *origin.Map, path string) bool {
+func redirectsToItself(loc string, o Options, path string) bool {
 	u, err := url.Parse(loc)
 	if err != nil || u.Host == "" {
 		return false
@@ -346,12 +351,47 @@ func redirectsToItself(loc string, m *origin.Map, path string) bool {
 	if u.EscapedPath() != want.EscapedPath() || u.RawQuery != want.RawQuery {
 		return false
 	}
-	for _, site := range m.Sites {
-		if strings.EqualFold(u.Host, site.Variant.Host) {
-			return true
+	// *The* variant being crawled, not any variant in the map.
+	//
+	// Accepting any of them exempted a redirect from one site in a multisite
+	// map to another — `www.b.fi` 301ing every path to `www.a.fi` is an
+	// ordinary consolidation redirect, and the browser follows it to production.
+	// The proxy's guard is `sameURL(rewritten, st.url)` against the single URL
+	// the browser asked for; there is only ever one.
+	//
+	// HostPort, not Host: an Origin keeps its port in a separate field, and the
+	// map is origin→origin — scheme, host *and* port. Comparing the host alone
+	// meant a variant on a non-default port could never match its own
+	// self-redirect, so every page linking an upload went RED on a deployment
+	// doing exactly what §4.4 prescribes.
+	crawled := o.Variant
+	for _, site := range o.Map.Sites {
+		if crawled != nil && strings.EqualFold(crawled.Host, site.Variant.HostPort()) {
+			return strings.EqualFold(u.Host, site.Variant.HostPort())
 		}
 	}
+	// The crawl is pointed somewhere that is not a variant in the map — a
+	// `--variant-base` override, or a test harness. Fall back to the primary,
+	// which is what both bases default to.
+	if len(o.Map.Sites) > 0 {
+		return strings.EqualFold(u.Host, o.Map.Sites[0].Variant.HostPort())
+	}
 	return false
+}
+
+// ResolveKey normalises a host:port for the --resolve map, so the guardrail that
+// decides whether to warn and the dialer that decides where to connect cannot
+// disagree about what host they are looking at.
+func ResolveKey(hostPort string) string {
+	h, p, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return hostPort
+	}
+	n, err := origin.NormaliseHost(h)
+	if err != nil {
+		n = strings.ToLower(h)
+	}
+	return net.JoinHostPort(n, p)
 }
 
 func countLeaks(m *origin.Matcher, r response) (leaks, tier2 int) {

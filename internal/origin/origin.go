@@ -110,6 +110,16 @@ var hostFold = idna.New(
 	idna.Transitional(false),
 )
 
+// NormaliseHost is normaliseHost, for callers outside this package that must
+// key on a hostname the same way the matcher does.
+//
+// `--resolve` is the one that needs it: the crawl's dialer is handed the
+// punycode host with its case preserved, so a map keyed on what the developer
+// typed misses `www.hämeenlinna.fi` and `WWW.EXAMPLE.COM` alike — silently,
+// because a miss falls through to real DNS. Two places asking "is this the same
+// host" with different answers is the shape of half this project's bugs.
+func NormaliseHost(h string) (string, error) { return normaliseHost(h) }
+
 func normaliseHost(h string) (string, error) {
 	// Lowercased here, root dot trimmed *after* the fold: UTS46 produces an
 	// ASCII root dot from U+3002, U+FF0E and U+FF61, so trimming first left one

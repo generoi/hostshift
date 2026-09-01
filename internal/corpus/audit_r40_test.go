@@ -176,7 +176,10 @@ func TestTheSelfRedirectExemptionNeedsPathAndHost(t *testing.T) {
 		"a third-party host":              {"https://cdn.example.net/a", false},
 		"the canonical host":              {"https://acme.ddev.site/a", false},
 	} {
-		if got := redirectsToItself(tc.loc, mp, "/a"); got != tc.want {
+		// Options rather than the bare map: the exemption is about *the* variant
+		// being crawled, so it needs to know which one that is.
+		o := Options{Map: mp, Variant: &url.URL{Scheme: "https", Host: "wt-a--acme.ddev.site"}}
+		if got := redirectsToItself(tc.loc, o, "/a"); got != tc.want {
 			t.Errorf("%s: redirectsToItself(%q) = %v, want %v", name, tc.loc, got, tc.want)
 		}
 	}
