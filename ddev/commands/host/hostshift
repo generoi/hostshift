@@ -905,9 +905,20 @@ if [ -z "$claimed" ] && command -v docker >/dev/null 2>&1; then
       case ",$ov," in
         *",$v,"*)
           claimed="$v"
-          echo "  (claimed by the running container $c, whose project directory" >&2
-          echo "  no longer exists under that name — a rename leaves the old" >&2
-          echo "  containers up. \`docker stop $c\` or \`ddev stop\` it.)" >&2
+          # Naming the hostname, because nothing above this does. The
+          # directory-scan branch prints "warning: <dir> already claims <host>"
+          # first and this parenthetical elaborates on it; the docker branch has
+          # no such line, so the message opened mid-sentence with no antecedent —
+          # a parenthesis about a claim the reader had not been told about.
+          echo "hostshift: $v is claimed by the running container $c, whose" >&2
+          echo "  project directory no longer exists under that name — a rename" >&2
+          echo "  leaves the old containers up. \`docker stop $c\` or \`ddev stop\` it." >&2
+          # And the route it leaves behind. Stopping the container makes `check`
+          # go green while the stale traefik file still holds the hostname, so
+          # the variant starts 502ing minutes later — two discoveries where the
+          # first remedy can name both.
+          echo "  If the variant then 502s, remove the stale route too:" >&2
+          echo "    .ddev/traefik/config/$(printf '%s' "$c" | sed 's/^ddev-//; s/-hostshift$//').yaml" >&2
           break 2 ;;
       esac
     done <<<"$(printf '%s' "$variants" | tr ',' '\n')"
@@ -1315,6 +1326,44 @@ if [ "$cmd" = "check" ]; then
     echo "  Anything there that also belongs to the parent is served by this" >&2
     echo "  worktree instead, and the router decides which. Run \`ddev restart\`." >&2
     exit 2
+  fi
+
+  # Is loopback containment actually in place?
+  #
+  # Under production-canonical the add-on ships a whole compose file to point
+  # every canonical hostname at 127.0.0.1 *inside* web, because otherwise
+  # wp-cron, Site Health and any plugin that calls `wp_remote_post` reach the
+  # client's live site from the developer's machine — with `sslverify => false`,
+  # against a database that believes it is production. PLAN §4.4 and the README
+  # both call it required.
+  #
+  # Nothing checked it. `ddev/docker-compose.hostshift-loopback.yaml` ships with
+  # `www.example.com` in it as a placeholder, and a project that never edited
+  # that file passed every guardrail here and reported "hostshift is serving".
+  # The file being present is not the question; what web resolves is.
+  #
+  # Only the canonicals that are not this project's own hostnames — under
+  # DDEV-canonical everything is local already and there is nothing to contain.
+  # `hostshift map` answers that so this does not re-derive it.
+  external="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+    --external-canonical-hosts 2>/dev/null || true)"
+  if [ -n "$external" ] && [ -n "$webenv" ]; then
+    extra="$(docker inspect "ddev-$name-web" \
+      --format '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' 2>/dev/null || true)"
+    uncontained=""
+    for h in $external; do
+      case "$extra" in
+        *"$h:127.0.0.1"*) ;;
+        *) uncontained="$uncontained $h" ;;
+      esac
+    done
+    if [ -n "$uncontained" ]; then
+      echo "hostshift: warning: web can reach these canonical hostnames for real:" >&2
+      for h in $uncontained; do echo "    $h" >&2; done
+      echo "  wp-cron, Site Health and any \`wp_remote_post\` will hit the live site" >&2
+      echo "  from here. Run \`ddev hostshift loopback\` to regenerate" >&2
+      echo "  .ddev/docker-compose.hostshift-loopback.yaml, then \`ddev restart\`." >&2
+    fi
   fi
 
   # The parent-declares verdict is deferred to after the database gate, which is

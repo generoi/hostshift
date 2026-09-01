@@ -305,6 +305,31 @@ out3="$(cd "$wt3" && ddev start -y 2>&1)" || fail "the hostshift.yaml worktree s
 # variable was renamed out of existence. What must be true is that the proxy
 # gets a slug and nothing else: a `--from/--to` pair here beats the mounted
 # file, and the file's aliases then silently never rewrite.
+# This map has an alias on a domain that is not a DDEV hostname, and nothing
+# has generated a loopback file — so web can reach it for real. That is what
+# wp-cron and Site Health do under production-canonical, with sslverify off,
+# against a database that believes it is production. The shipped
+# docker-compose.hostshift-loopback.yaml carries `www.example.com` as a
+# placeholder, so a project that never edited it passed every guardrail here
+# and reported "hostshift is serving".
+out="$(cd "$wt3" && ddev hostshift check 2>&1 || true)"
+contains "check notices that loopback containment is not in place" \
+  "can reach these canonical hostnames for real" "$out"
+contains "and names the hostname that is not contained" "${tag}3.staging.example" "$out"
+
+# And it stops once containment is real. Without this the check could warn
+# unconditionally and the assertion above would still pass — which is the shape
+# of every guardrail in this file that turned out not to guard.
+(cd "$wt3" && ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml) \
+  || fail "loopback emits a compose file" ""
+out="$(cd "$wt3" && ddev restart -y 2>&1)" || fail "restart with containment" "$out"
+out="$(cd "$wt3" && ddev hostshift check 2>&1 || true)"
+case "$out" in
+  *"can reach these canonical hostnames for real"*)
+    fail "and goes quiet once containment is in place" "$out" ;;
+  *) pass "and goes quiet once containment is in place" ;;
+esac
+
 args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt3/.ddev/.env")"
 [ "$args" = "--slug wt-c" ] \
   && pass "no flat map is handed over, so the container reads the mounted file" \

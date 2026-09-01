@@ -108,3 +108,125 @@ func TestAVariantIsNotDirectlyServed(t *testing.T) {
 		t.Errorf("the note should still name the project's own hostname:\n%s", errOut)
 	}
 }
+
+// TestDiffPairsTheBasesBySite: on a multisite, --canonical-base names one site
+// and the variant side has to follow it. It used to override the canonical
+// alone, so `--canonical-base <site 2>` was crawled against site 1's variant —
+// two different sites, every page differing for the obvious reason, and the run
+// printed GREEN. `diff` is the command the README calls the check that validates
+// a deployment against reality.
+//
+// The crawl itself cannot reach anything here; the announced pair is what this
+// asserts, and it is printed before the first fetch.
+func TestDiffPairsTheBasesBySite(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme\n")
+	writeFile(t, dir, "hostshift.yaml", ""+
+		"sites:\n"+
+		"  - canonical: https://www.acme.fi\n    variant: https://wt-a--acme.ddev.site\n"+
+		"  - canonical: https://shop.acme.fi\n    variant: https://wt-a--shop.ddev.site\n")
+
+	_, _, errOut := run(t, "", cmdDiff, "-C", dir, "--slug", "wt-a", "-n", "1",
+		"--canonical-base", "https://shop.acme.fi")
+	if !strings.Contains(errOut, "corpus diff: https://shop.acme.fi vs https://wt-a--shop.ddev.site") {
+		t.Errorf("the second site's base was not paired with its own variant:\n%s", errOut)
+	}
+}
+
+// TestDiffSaysWhenABaseBelongsToNoSite: the production-canonical baseline is the
+// project's own `<project>.ddev.site`, which is deliberately not a canonical of
+// the map, so an unmatched base cannot be an error. On a multisite it is still
+// ambiguous — there is no site for it to pair with — and the pair being compared
+// has to be visible rather than "whichever site was written first".
+func TestDiffSaysWhenABaseBelongsToNoSite(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme\n")
+	writeFile(t, dir, "hostshift.yaml", ""+
+		"sites:\n"+
+		"  - canonical: https://www.acme.fi\n    variant: https://wt-a--acme.ddev.site\n"+
+		"  - canonical: https://shop.acme.fi\n    variant: https://wt-a--shop.ddev.site\n")
+
+	_, _, errOut := run(t, "", cmdDiff, "-C", dir, "--slug", "wt-a", "-n", "1",
+		"--canonical-base", "https://acme-wt-b.ddev.site")
+	if !strings.Contains(errOut, "is not a canonical of this 2-site") {
+		t.Errorf("an unrelated base was accepted in silence:\n%s", errOut)
+	}
+}
+
+// TestExternalCanonicalHostsIsTheContainmentSet: loopback containment exists for
+// the canonical hostnames that leave the machine. Under DDEV-canonical there are
+// none and the add-on must not ask for a containment file; under
+// production-canonical it is exactly the client's domains, aliases included.
+// The add-on asks this rather than deriving it, so the two cannot drift.
+func TestExternalCanonicalHostsIsTheContainmentSet(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme\n")
+	writeFile(t, dir, "hostshift.yaml", ""+
+		"sites:\n"+
+		"  - canonical: https://www.acme.fi\n"+
+		"    aliases:\n      - https://acme.staging.example\n"+
+		"    variant: https://wt-a--acme.ddev.site\n")
+	_, out, _ := run(t, "", cmdMap, "-C", dir, "--slug", "wt-a", "--external-canonical-hosts")
+	for _, want := range []string{"www.acme.fi", "acme.staging.example"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the containment set omits %q:\n%s", want, out)
+		}
+	}
+
+	stock := t.TempDir()
+	writeFile(t, stock, ".ddev/config.yaml", "name: stock\nadditional_hostnames:\n  - nat\n")
+	_, out, _ = run(t, "", cmdMap, "-C", stock, "--slug", "wt-a", "--external-canonical-hosts")
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("a stock project has nothing to contain, got:\n%s", out)
+	}
+}
+
+// TestAFlatMapGetsTheSameDiagnostics: `--from/--to` returned before the DDEV
+// project was loaded, on the reasoning that an explicit map needs no files. True
+// of the map; false of everything that describes how the map sits against the
+// project. A production-canonical map handed over as flags — which is how the
+// add-on hands one over whenever it is not mounting a hostshift.yaml — got no
+// note about the hostname DDEV advertises and no containment set, so both
+// guardrails were switched off by how the map was spelled.
+func TestAFlatMapGetsTheSameDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme-wt-a\n")
+	flags := []string{"-C", dir,
+		"--from", "https://www.acme.fi", "--to", "https://wt-a--acme.ddev.site"}
+
+	_, _, errOut := run(t, "", cmdCheck, flags...)
+	if !strings.Contains(errOut, "canonical-on-production") {
+		t.Errorf("a flat production-canonical map got no note:\n%s", errOut)
+	}
+	if !strings.Contains(errOut, "https://acme-wt-a.ddev.site") {
+		t.Errorf("the note does not name the directly-served hostname:\n%s", errOut)
+	}
+
+	_, out, _ := run(t, "", cmdMap, append(flags, "--external-canonical-hosts")...)
+	if !strings.Contains(out, "www.acme.fi") {
+		t.Errorf("a flat map has an empty containment set:\n%s", out)
+	}
+}
+
+// TestAnOrdinaryWorktreeIsNotCanonicalOnProduction: the canonicals of a
+// DDEV-canonical worktree are the *parent project's* `.ddev.site` hostnames.
+// They are not this project's own, and the first version of the condition
+// tested exactly that — so every ordinary worktree was told its links pointed at
+// a live site. `*.ddev.site` is a public record pointing at the loopback; what
+// decides whether a name can leave the machine is the TLD, which is also the
+// test `ddev hostshift loopback` applies when it writes the containment file.
+func TestAnOrdinaryWorktreeIsNotCanonicalOnProduction(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme-wt-a\n")
+	flags := []string{"-C", dir,
+		"--from", "https://acme.ddev.site", "--to", "https://wt-a--acme.ddev.site"}
+
+	_, _, errOut := run(t, "", cmdCheck, flags...)
+	if strings.Contains(errOut, "canonical-on-production") {
+		t.Errorf("a DDEV-canonical worktree is not canonical-on-production:\n%s", errOut)
+	}
+	_, out, _ := run(t, "", cmdMap, append(flags, "--external-canonical-hosts")...)
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("a local hostname needs no containment, got:\n%s", out)
+	}
+}

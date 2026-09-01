@@ -132,7 +132,13 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Resolved{Map: m, Upstream: f.Upstream, Source: "--from/--to"}, nil
+		res := &Resolved{Map: m, Upstream: f.Upstream, Source: "--from/--to"}
+		// Best-effort: outside a DDEV project there is nothing to compare the
+		// map against, and that is not an error — `hostshift` runs anywhere.
+		if proj, err := ddev.Load(dir); err == nil {
+			annotate(res, proj, m.Sites)
+		}
+		return res, nil
 	}
 
 	var (
@@ -195,54 +201,75 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 	// project whose .ddev/config.yaml registers nine hostnames and whose
 	// hostshift.yaml declares three will 421 the other six with no explanation,
 	// which is a plausible fsi or bravoinc shape. Say so.
-	if proj != nil && len(sites) > 0 {
-		covered := map[string]bool{}
-		for _, st := range sites {
-			for _, o := range st.CanonicalSet() {
-				covered[o.Host] = true
-			}
-			covered[st.Variant.Host] = true
-		}
-		// The project's own primary hostname is exempt. In a worktree it is
-		// supposed to be absent from the map — acmecorp-wt-a.ddev.site is what
-		// web answers to, and web is where mailpit and `ddev launch` live — so
-		// warning about it fires on every correctly configured worktree, which
-		// is how people learn to skip warnings. In a canonical project it is a
-		// canonical host anyway and never reaches here.
-		own := proj.Name + "." + proj.TLD
-		for _, h := range proj.Hosts {
-			if !covered[h] && h != own {
-				res.Uncovered = append(res.Uncovered, h)
-			}
-		}
+	annotate(res, proj, sites)
+	return res, nil
+}
 
-		// The exemption above is why this exists. `own` is skipped there because
-		// in a worktree it belongs to web by design — true, and under
-		// production-canonical that design is the hazard, because what web
-		// serves on it is the shared production database, unrewritten.
-		variant := map[string]bool{}
-		for _, st := range sites {
-			variant[st.Variant.Host] = true
+// annotate fills in the diagnostic fields — the ones that describe how the map
+// sits against the DDEV project, rather than the map itself.
+//
+// Called from both places a map can come from. `--from/--to` used to return
+// before the project was ever loaded, on the reasoning that an explicit map
+// needs no files; true of the map, false of the diagnostics. A
+// production-canonical map handed over as flags therefore got no uncovered-host
+// warning, no note about the hostname DDEV advertises, and no loopback
+// containment check — three guardrails switched off by how the map was spelled.
+func annotate(res *Resolved, proj *ddev.Project, sites []origin.Site) {
+	if proj == nil || len(sites) == 0 {
+		return
+	}
+	covered := map[string]bool{}
+	for _, st := range sites {
+		for _, o := range st.CanonicalSet() {
+			covered[o.Host] = true
 		}
-		mine := map[string]bool{}
-		for _, h := range proj.Hosts {
-			mine[h] = true
+		covered[st.Variant.Host] = true
+	}
+	// The project's own primary hostname is exempt. In a worktree it is
+	// supposed to be absent from the map — acmecorp-wt-a.ddev.site is what
+	// web answers to, and web is where mailpit and `ddev launch` live — so
+	// warning about it fires on every correctly configured worktree, which
+	// is how people learn to skip warnings. In a canonical project it is a
+	// canonical host anyway and never reaches here.
+	own := proj.Name + "." + proj.TLD
+	for _, h := range proj.Hosts {
+		if !covered[h] && h != own {
+			res.Uncovered = append(res.Uncovered, h)
 		}
-		mine[own] = true
-		for _, h := range proj.Hosts {
-			if !variant[h] {
-				res.DirectlyServed = append(res.DirectlyServed, h)
-			}
+	}
+
+	// The exemption above is why this exists. `own` is skipped there because
+	// in a worktree it belongs to web by design — true, and under
+	// production-canonical that design is the hazard, because what web
+	// serves on it is the shared production database, unrewritten.
+	variant := map[string]bool{}
+	for _, st := range sites {
+		variant[st.Variant.Host] = true
+	}
+	for _, h := range proj.Hosts {
+		if !variant[h] {
+			res.DirectlyServed = append(res.DirectlyServed, h)
 		}
-		for _, st := range sites {
-			for _, o := range st.CanonicalSet() {
-				if !mine[o.Host] {
-					res.ExternalCanonicals = append(res.ExternalCanonicals, o.Host)
-				}
+	}
+	// Under the project's TLD or not, which is the question that decides how a
+	// name resolves — and the same test `ddev hostshift loopback` applies when it
+	// writes the containment file, so the check and the fix agree on one set.
+	//
+	// "not one of this project's own hostnames" was the first attempt and is
+	// wrong: in an ordinary DDEV-canonical worktree the canonicals are the
+	// *parent's* `.ddev.site` hostnames, which are not this project's and are
+	// perfectly local. That called every worktree canonical-on-production.
+	// `*.ddev.site` is a real public record pointing at the loopback, so
+	// everything under the TLD stays on the machine with nothing registered
+	// anywhere; a name outside it is one the application can actually reach.
+	for _, st := range sites {
+		for _, o := range st.CanonicalSet() {
+			if !strings.HasSuffix(o.Host, "."+proj.TLD) {
+				res.ExternalCanonicals = append(res.ExternalCanonicals, o.Host)
 			}
 		}
 	}
-	return res, nil
+
 }
 
 func mapFromFlags(f Flags) (*origin.Map, error) {

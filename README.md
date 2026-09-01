@@ -115,7 +115,7 @@ $ cd ../acme-wt-a
 $ ddev add-on get ~/src/hostshift/ddev
 $ ddev hostshift init
 hostshift: slug "wt-a", from the git branch wt-a
-hostshift: canonical hostnames from /Users/you/Projects/acme, whose database this shares
+hostshift: canonical hostnames from /Users/you/Projects/acme, the checkout this was made from
 hostshift: wrote .ddev/.env
 map from --from/--to
 site1  https://acme.ddev.site  ->  https://wt-a--acme.ddev.site
@@ -176,9 +176,16 @@ After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
   nginx snippet that 302-redirects a missing `/app/uploads/` request to a
   hardcoded production origin. Rewriting that `Location` would send the browser
   back to the request it just made, so hostshift passes it through unmodified
-  and counts it as `self-redirect`. That is the single enumerated exception to
-  "no canonical origin reaches the browser"; `--strict-origins` returns 404
-  instead.
+  and counts it as `self-redirect`. `--strict-origins` returns 404 instead.
+
+  It is not the only exception. Tier 2 content types — `text/css` and
+  JavaScript — are excluded by design (PLAN §5.2), so an absolute canonical URL
+  inside a stylesheet reaches the browser unrewritten. That is a deliberate
+  decision on evidence from theme sources, and generated CSS under `uploads/`
+  (Elementor, WPBakery, the Customizer) is the case that evidence did not
+  survey; those files do carry absolute upload URLs. `hostshift diff` reports
+  them on its `Tier 2` line rather than failing the run, which is the trigger
+  PLAN's fast path names for rewriting them.
 
 [ddev/ddev#5486]: https://github.com/ddev/ddev/issues/5486
 
@@ -328,11 +335,15 @@ hostname and a database that was never search-replaced at all can be browsed
 locally. Opt-in per repo, and it is where the hazards live — see
 [`PLAN.md`](PLAN.md) §4.4. Two things become required with it:
 
-- **Loopback containment.** List the site's production hostnames in
-  `.ddev/docker-compose.hostshift-loopback.yaml`, or WordPress's internal
-  requests (wp-cron, Site Health) leave the machine for live production. That
-  file carries no generated-file marker, so your edit survives the next
-  `ddev add-on get`.
+- **Loopback containment.** `ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml`
+  writes the site's production hostnames into web's `extra_hosts`, pointed at
+  127.0.0.1. Without it WordPress's internal requests (wp-cron, Site Health)
+  leave the machine for live production — with `sslverify => false`, against a
+  database that believes it is production. The file ships with `www.example.com`
+  in it as a placeholder, so generate it rather than assuming its presence means
+  anything; `ddev hostshift check` warns when web can still reach a canonical
+  hostname for real. It carries no generated-file marker, so a hand edit
+  survives the next `ddev add-on get`.
 - **WP-CLI.** `ddev hostshift wp-cli > wp-cli.local.yml`, gitignored. WP-CLI
   resolves a site by URL, so without it every `ddev wp` on a multisite fails
   with "Site not found". It emits the project's existing `wp-cli.yml` back
@@ -400,9 +411,13 @@ hostshift diff -n 20 --canonical-base https://<project>.ddev.site
 ```
 
 The assertions that fail a run are the ones that cannot be innocent — a canonical origin
-reaching the browser, a page whose line count changed, and a serialized value
-served with a length that does not describe its data, which PHP will refuse or
-silently truncate.
+reaching the browser, a serialized value served with a length that does not
+describe its data, which PHP will refuse or silently truncate, and a page whose
+line count moved by more than a Host-dependent line could explain (over eight
+lines, or over a quarter of the page). A one-line difference is reported and
+does not fail the run: the two fetches carry different `Host` headers, so
+WordPress emits one extra `<link rel="dns-prefetch">` on every page of a
+healthy production-canonical site.
 
 That last one is asserted on the served bytes alone, not by comparing the proxy
 against the engine. Every other check here compares the two, so when both are

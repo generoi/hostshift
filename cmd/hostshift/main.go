@@ -456,6 +456,8 @@ func cmdMap(args []string) (int, error) {
 	pairs := fs.Bool("pairs", false, "emit canonical=variant, one per line, for --map")
 	hosts := fs.Bool("variant-hosts", false, "emit the variant hostnames, one per line")
 	canon := fs.Bool("canonical-hosts", false, "emit every canonical-side hostname, aliases included, one per line")
+	ext := fs.Bool("external-canonical-hosts", false,
+		"emit the canonical hostnames that are not this project's own, one per line")
 	if describe(fs, args, "print the resolved map, and where it came from") {
 		return exitOK, nil
 	}
@@ -480,6 +482,16 @@ func cmdMap(args []string) (int, error) {
 			for _, o := range s.CanonicalSet() {
 				fmt.Println(o.Host)
 			}
+		}
+		return exitOK, nil
+	}
+	// The subset that leaves the machine, which is the set loopback containment
+	// exists for. Under DDEV-canonical it is empty and there is nothing to
+	// contain; the add-on asks for it rather than deciding for itself, so the
+	// two do not drift.
+	if *ext {
+		for _, h := range res.ExternalCanonicals {
+			fmt.Println(h)
 		}
 		return exitOK, nil
 	}
@@ -653,6 +665,41 @@ func cmdDiff(args []string) (int, error) {
 		return exitConfig, err
 	}
 	site := res.Map.Sites[0]
+
+	// Which site the bases belong to, when --canonical-base names one.
+	//
+	// --canonical-base used to override the canonical side alone, leaving the
+	// variant side at site 1's. On a multisite that compares two different
+	// sites: `--canonical-base https://shop.acme.ddev.site` was crawled against
+	// the *main* site's variant, every page differing for the obvious reason,
+	// and the run printed GREEN. The command the README calls "the check that
+	// validates a deployment against reality" was handing out an all-clear for
+	// a comparison of unrelated pages.
+	//
+	// Pairing by site fixes that. Refusing when nothing matches would not be
+	// right, because the documented production-canonical baseline is the
+	// project's own `<project>.ddev.site` — deliberately not a hostname the map
+	// knows. So an unmatched base is allowed and named: the pair it is actually
+	// comparing is the thing a reader has to be able to check.
+	if *canonicalBase != "" && *variantBase == "" {
+		if u, err := url.Parse(*canonicalBase); err == nil && u.Host != "" {
+			matched := false
+			for _, st := range res.Map.Sites {
+				for _, o := range st.CanonicalSet() {
+					if strings.EqualFold(o.Host, u.Host) {
+						site, matched = st, true
+					}
+				}
+			}
+			if !matched && len(res.Map.Sites) > 1 {
+				fmt.Fprintf(os.Stderr,
+					"hostshift: warning: --canonical-base %s is not a canonical of this %d-site\n"+
+						"  map, so there is nothing to pair it with; comparing against %s.\n"+
+						"  Pass --variant-base to say which site you mean.\n",
+					u.Host, len(res.Map.Sites), site.Variant.String())
+			}
+		}
+	}
 
 	base := func(flagVal string, def origin.Origin) (*url.URL, error) {
 		if flagVal == "" {
