@@ -1468,7 +1468,28 @@ hostshift: listening on"*) logs_has_banner=1 ;;
     running_ver="(older than v0.2.0)"
   fi
   host_ver="$(hostshift --version 2>/dev/null | tail -1 | tr -d '\r' || true)"
-  if [ -n "$running_ver" ] && [ -n "$host_ver" ] && [ "$running_ver" != "$host_ver" ] &&
+  # A bannerless proxy warns on its own evidence, whatever this command reports.
+  #
+  # The comparison below is suppressed when either side says `dev`, so that a
+  # source build does not warn against every released image — and that
+  # suppression silenced the one skew that exists today, because a developer
+  # running a source build in front of the published image has `host_ver=dev`.
+  # Measured: options.php through that pair wrote `s:54:` over a 44-byte string
+  # and PHP refused the row, while `check` exited 0.
+  #
+  # The sentinel needs no comparison. A proxy whose banner predates the version
+  # being on it is older than every serialized-repair change there has been, and
+  # that is true however this command was built.
+  if [ "$running_ver" = "(older than v0.2.0)" ]; then
+    echo "hostshift: warning: the proxy image predates v0.2.0 — its banner carries" >&2
+    echo "  no version at all. Everything the engine learned since then is absent" >&2
+    echo "  here, silently, because the map and the hostnames still check out." >&2
+    echo "  That includes re-emitting serialized length prefixes: this proxy" >&2
+    echo "  rewrites hosts inside serialized values and leaves the old lengths," >&2
+    echo "  which PHP refuses or truncates — in the request direction that is a" >&2
+    echo "  write to the shared database with no undo." >&2
+    echo "  Pull it: \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
+  elif [ -n "$running_ver" ] && [ -n "$host_ver" ] && [ "$running_ver" != "$host_ver" ] &&
      [ "$running_ver" != "dev" ] && [ "$host_ver" != "dev" ]; then
     echo "hostshift: warning: the proxy image is $running_ver and this command is" >&2
     echo "  $host_ver. The add-on installs the command from the repository and the" >&2

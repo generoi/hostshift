@@ -214,7 +214,7 @@ canonical hostname, the one the database holds, stops resolving.
 ```console
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
-$ printf 'name: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
+$ printf '#ddev-silent-no-warn\nname: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
 $ ddev add-on get ~/src/hostshift/ddev
 $ ddev hostshift init
 ```
@@ -347,9 +347,16 @@ locally. Opt-in per repo, and it is where the hazards live — see
   leave the machine for live production — with `sslverify => false`, against a
   database that believes it is production. The file ships with `www.example.com`
   in it as a placeholder, so generate it rather than assuming its presence means
-  anything; `ddev hostshift check` warns when web can still reach a canonical
-  hostname for real. It carries no generated-file marker, so a hand edit
-  survives the next `ddev add-on get`.
+  anything; `ddev hostshift check` warns when a canonical hostname is not pinned
+  to the loopback in web's `extra_hosts` — a comparison against the container's
+  configuration, not a reachability probe. It carries no generated-file marker,
+  so a hand edit survives the next `ddev add-on get`.
+
+  Note the redirect **replaces** the file. If you have added hosts of your own —
+  a CDN origin, a legacy domain, an apex sibling that is not in `hostshift.yaml`
+  — regenerating discards them along with the file's own explanatory header.
+  Keep those additions somewhere you can re-apply, or edit the file by hand
+  instead and use the generated output as a reference.
 - **WP-CLI.** `ddev hostshift wp-cli > wp-cli.local.yml`, gitignored. WP-CLI
   resolves a site by URL, so without it every `ddev wp` on a multisite fails
   with "Site not found". It emits the project's existing `wp-cli.yml` back

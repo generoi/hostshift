@@ -87,8 +87,11 @@ func TestGreenRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 3 {
-		t.Fatalf("crawled %d pages, want 3 (/, /a, /b — /nolink is unreachable)", len(results))
+	// Four: the crawl follows subresources as well as links, because the Tier 2
+	// count it exists to produce comes from a *response* body — so `/x.png` is
+	// fetched too, and only `/nolink`, which nothing points at, is missed.
+	if len(results) != 4 {
+		t.Fatalf("crawled %d pages, want 4 (/, /a, /b, /x.png — /nolink is unreachable)", len(results))
 	}
 	var buf bytes.Buffer
 	if !WriteReport(&buf, results) {

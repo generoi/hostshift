@@ -664,6 +664,19 @@ func crawl(ctx context.Context, o Options) ([]string, error) {
 	return out, nil
 }
 
+// links collects what the crawl should fetch next: the pages a reader can reach,
+// and the subresources the browser fetches whether or not anyone clicks.
+//
+// `<a href>` alone meant the crawl never fetched a stylesheet, and the Tier 2
+// line — the one PLAN's fast path names as its trigger for rewriting CSS — could
+// not fire from a default run. Measured: a page linking its own
+// `<link rel=stylesheet>` whose file carried a live production origin scored
+// "3 pages, 0 leaks" and GREEN, while `curl` on that stylesheet through the
+// proxy returned the canonical URL. The README points at this command for
+// exactly that case, so the evidence it asks for was unreachable by it.
+//
+// Subresources are followed, not just noted, because the point is to *fetch*
+// them: `Result.Tier2` is counted from a response body, which requires a request.
 func links(body []byte) []string {
 	var out []string
 	z := html.NewTokenizer(strings.NewReader(string(body)))
@@ -672,17 +685,26 @@ func links(body []byte) []string {
 		if tt == html.ErrorToken {
 			return out
 		}
-		if tt != html.StartTagToken {
+		if tt != html.StartTagToken && tt != html.SelfClosingTagToken {
 			continue
 		}
 		name, hasAttr := z.TagName()
-		if string(name) != "a" {
+		// The attribute carrying a URL differs by element, and taking `href`
+		// from everything would pull in `<base href>` — which is not a
+		// document — and every `<link rel=alternate>` to another site.
+		var want string
+		switch string(name) {
+		case "a", "link":
+			want = "href"
+		case "script", "img", "iframe":
+			want = "src"
+		default:
 			continue
 		}
 		for hasAttr {
 			var k, v []byte
 			k, v, hasAttr = z.TagAttr()
-			if string(k) == "href" {
+			if string(k) == want {
 				out = append(out, string(v))
 			}
 		}
@@ -719,7 +741,12 @@ func countDiffLines(a, b string) int {
 const hostDependentLines = 8
 
 func WriteReport(w io.Writer, results []Result) bool {
-	green := true
+	// A run that compared nothing is not a run that found nothing. `green` is
+	// only ever cleared by a result, so an empty slice — a negative `-n`, a
+	// `--paths` file of comments — walked no rows, cleared nothing, and printed
+	// the invariant-28 verdict with exit 0. The same class as the two verdicts
+	// round 43 rescoped: a report asserting what it skipped.
+	green := len(results) > 0
 	var equal, leaks, errs, tier2, broken, unread int
 
 	fmt.Fprintf(w, "%-46s %-8s %-7s %-7s %s\n", "PATH", "BYTES", "LEAKS", "LINES", "NOTE")

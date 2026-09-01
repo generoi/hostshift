@@ -192,3 +192,34 @@ func TestTheVerdictDoesNotClaimWhatTier2SkipsWasChecked(t *testing.T) {
 		t.Errorf("the verdict does not say origins reached the browser:\n%s", out)
 	}
 }
+
+// TestTheCrawlFetchesTheStylesheetsThePageLinks: `links` collected `<a href>`
+// only, so a default run never fetched a stylesheet — and the Tier 2 line, which
+// PLAN's fast path names as its trigger for rewriting CSS, could not fire from
+// the command the README points at for exactly that evidence.
+//
+// Measured before the fix: a page linking its own `<link rel=stylesheet>`, whose
+// file carried a live production origin, scored "3 pages, 0 leaks" and GREEN
+// while curl on that stylesheet through the proxy returned the canonical URL.
+func TestTheCrawlFetchesTheStylesheetsThePageLinks(t *testing.T) {
+	pages := map[string]string{
+		"/":      `<link rel="stylesheet" href="/s.css"><script src="/j.js"></script>`,
+		"/s.css": `body{background:url(` + canonicalOrigin + `/bg.png)}`,
+		"/j.js":  `var u = "` + canonicalOrigin + `/x";`,
+	}
+	results, err := Run(context.Background(), Options{
+		Canonical: site(t, pages), Variant: site(t, pages), Map: testMap(t), N: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range results {
+		got[r.Path] = true
+	}
+	for _, want := range []string{"/s.css", "/j.js"} {
+		if !got[want] {
+			t.Errorf("the crawl never fetched %s; it saw %v", want, got)
+		}
+	}
+}

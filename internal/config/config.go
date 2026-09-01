@@ -262,10 +262,6 @@ func annotate(res *Resolved, proj *ddev.Project, sites []origin.Site) {
 	// `*.ddev.site` is a real public record pointing at the loopback, so
 	// everything under the TLD stays on the machine with nothing registered
 	// anywhere; a name outside it is one the application can actually reach.
-	mine := map[string]bool{own: true}
-	for _, h := range proj.Hosts {
-		mine[h] = true
-	}
 	for _, st := range sites {
 		for _, o := range st.CanonicalSet() {
 			// Three ways a name cannot reach another machine, and the map has to
@@ -281,7 +277,7 @@ func annotate(res *Resolved, proj *ddev.Project, sites []origin.Site) {
 			// on every start of a project that had none. Third wrong answer to
 			// the same question; the first two flagged every stock project and
 			// every ordinary worktree.
-			if strings.HasSuffix(o.Host, "."+proj.TLD) || mine[o.Host] ||
+			if strings.HasSuffix(o.Host, "."+proj.TLD) ||
 				origin.ResolvesLocally(o.Host) {
 				continue
 			}

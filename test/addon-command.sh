@@ -938,8 +938,34 @@ writefake
 printf 'hostshift: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
-  *"the proxy image is"*) pass "and one whose banner predates the version" ;;
+  *"predates v0.2.0"*) pass "and one whose banner predates the version" ;;
   *) fail "and one whose banner predates the version" "$out" ;;
+esac
+contains "and says what that costs" "serialized length prefixes" "$out"
+
+# …including when this command is a source build.
+#
+# The version comparison is suppressed when either side says `dev`, so a source
+# build does not warn against every released image. That suppression silenced
+# the one skew that exists: a developer running a source build in front of the
+# published image, which is v0.1.0. Measured on that pair — options.php wrote
+# `s:54:` over a 44-byte string, PHP refused the row, and check exited 0.
+#
+# A bannerless proxy is evidence on its own and needs no comparison.
+writefake
+printf 'hostshift: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
+cat > "$fakebin/hostshift" <<'DEVVER'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo dev; exit 0; fi
+exec "$HS_REAL_BIN" "$@"
+DEVVER
+chmod +x "$fakebin/hostshift"
+out="$(cd "$wt" && HS_REAL_BIN="$(command -v hostshift)" PATH="$fakebin:$PATH" \
+  "$cmd" check --slug wt-a 2>&1 || true)"
+rm -f "$fakebin/hostshift"
+case "$out" in
+  *"predates v0.2.0"*) pass "a source build does not silence the bannerless warning" ;;
+  *) fail "a source build does not silence the bannerless warning" "$out" ;;
 esac
 # The HTTP probe: a hard routing failure is fatal, an application answering is
 # not, and a cold start is retried rather than refused.

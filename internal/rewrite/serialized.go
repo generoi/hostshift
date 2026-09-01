@@ -2236,9 +2236,19 @@ func occupiesItsField(b []byte, start, end int) bool {
 		// `%0A`, and reading that as "something else follows" made this return
 		// false — so the repair declined, the generic rewriter replaced the host
 		// anyway, and the field went to the database with a length describing
-		// the string it used to be. Only in the two encoded contexts: `+` is a
-		// space in a form and a literal plus everywhere else.
-		if open == ownField || open == pctQuote {
+		// the string it used to be.
+		//
+		// `ownField` only, and the exclusion of `pctQuote` is the whole point.
+		// Inside a `%22`-quoted field the value's own quotes are `%22` too, and
+		// the residue of a parse that stopped short inside a string is the tail
+		// of the true string — for `custom_css` that tail is `%0A%0A%0A%22%3B%7D`.
+		// Skipping those newlines as whitespace walks the scan onto the `%22`
+		// and lets the `pctQuote` arm accept it as the field's closing quote,
+		// which is §4.3's custom_css truncation exactly: `s:89:` describing 89
+		// bytes of a 95-byte option, correct by its own length and so invisible
+		// to `broken`, with the Customizer re-serialising the loss back into the
+		// shared database. The defect this skip exists for was `ownField` alone.
+		if open == ownField {
 			if b[i] == '+' {
 				continue
 			}
