@@ -175,3 +175,58 @@ func TestVersionIsStamped(t *testing.T) {
 		t.Fatal("main.version is empty; -X has nothing to write to")
 	}
 }
+
+// A crawl of a host that is not pointed anywhere local says so first.
+//
+// Under production-canonical the canonical base *is* the client's live site,
+// and `diff` fetches `-n` pages from it — on the host, outside the loopback
+// containment the add-on ships a whole compose file to provide. `--resolve`'s
+// help names the hazard; nothing said it at the moment it happens, which is the
+// only moment it can be acted on.
+//
+// The two silent cases matter as much as the loud one: a `.ddev.site` crawl is
+// the ordinary worktree case and resolves to 127.0.0.1 by wildcard, and
+// `--resolve` is the developer having already answered.
+func TestIsLoopbackHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"localhost":              true,
+		"foo.localhost":          true,
+		"127.0.0.1":              true,
+		"::1":                    true,
+		"client.ddev.site":       true,
+		"wt-a--client.ddev.site": true,
+		"acme.test":              true,
+		"www.client.fi":          false,
+		"client.example.com":     false,
+		"192.168.1.10":           false,
+		"ddev.site.evil.example": false,
+	} {
+		if got := isLoopbackHost(host); got != want {
+			t.Errorf("isLoopbackHost(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+// The warning is silent once the developer has answered it.
+//
+// `--resolve` is that answer: it says where the canonical fetches go. Warning
+// anyway would make this the message a developer learns to scroll past, which
+// is the failure mode three separate checks in this project have had.
+func TestTheLiveCrawlWarningRespectsResolve(t *testing.T) {
+	const canon, variant = "https://www.client.fi", "https://wt-a--client.ddev.site"
+	// A port nothing listens on: the crawl fails immediately, which is fine —
+	// the warning is emitted before any fetch and is what is under test.
+	for name, args := range map[string][]string{
+		"without --resolve": {"--from", canon, "--to", variant, "-n", "1"},
+		"with --resolve": {"--from", canon, "--to", variant, "-n", "1",
+			"--resolve", "www.client.fi:443:127.0.0.1:9"},
+		"a ddev canonical": {"--from", "https://client.ddev.site", "--to", variant, "-n", "1"},
+	} {
+		_, _, errOut := run(t, "", cmdDiff, args...)
+		warned := strings.Contains(errOut, "not pointed anywhere local")
+		want := name == "without --resolve"
+		if warned != want {
+			t.Errorf("%s: warned=%v, want %v\n%s", name, warned, want, errOut)
+		}
+	}
+}

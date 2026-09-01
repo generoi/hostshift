@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -559,6 +560,19 @@ func cmdCheck(args []string) (int, error) {
 
 // cmdDiff is the corpus diff — PLAN §7's only test that validates against
 // reality. Fixtures would not have caught the double-port bug; this would.
+// isLoopbackHost reports whether a crawl of this host stays on the machine.
+func isLoopbackHost(h string) bool {
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	// `.ddev.site` resolves to 127.0.0.1 by wildcard, which is what a worktree
+	// crawl uses and is exactly the case that must not warn.
+	return strings.HasSuffix(h, ".ddev.site") || strings.HasSuffix(h, ".test")
+}
+
 func cmdDiff(args []string) (int, error) {
 	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
 	var c common
@@ -616,6 +630,21 @@ func cmdDiff(args []string) (int, error) {
 	vb, err := base(*variantBase, site.Variant)
 	if err != nil {
 		return exitConfig, fmt.Errorf("--variant-base: %w", err)
+	}
+
+	// Say so before crawling the client's live site.
+	//
+	// Under production-canonical the canonical base *is* the production
+	// hostname, and this fetches `-n` pages from it — on the host, outside the
+	// loopback containment the add-on ships a whole compose file to provide.
+	// `--resolve`'s help text names the hazard; nothing said it at the moment it
+	// happens, which is the only moment it can be acted on.
+	if len(resolveMap) == 0 && !isLoopbackHost(cb.Hostname()) {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: crawling %d page(s) from %s, which is not pointed anywhere local.\n"+
+				"  Under production-canonical that is the client's live site. Pass --resolve\n"+
+				"  to send these fetches somewhere else, as the loopback containment does for\n"+
+				"  the application's own requests.\n", *n, cb.Host)
 	}
 
 	var paths []string
