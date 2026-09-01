@@ -632,6 +632,18 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		}
 
 	default:
+		if strings.EqualFold(mediaType(ct), "text/event-stream") {
+			// PLAN §5.8 accepts this one: an event stream is unbounded and
+			// must not be buffered, so its origins go out as written. Recorded
+			// rather than returned silently — every other exclusion here
+			// (attachment, size cap, undecodable encoding, range) records a
+			// skip, and `--explain` printed nothing whatever for this one, so
+			// the accepted gap was also an invisible one.
+			p.Stats.Record(rewrite.SurfaceText, 0, []origin.Event{{
+				Surface: rewrite.SurfaceText, Action: origin.ActionSkipped,
+				Reason: origin.ReasonEventStream,
+			}})
+		}
 		return nil
 	}
 	// An identity map cannot change a byte, so the upstream's length and
@@ -791,6 +803,14 @@ func (p *Proxy) dropCookieDomain(c string) string {
 func (p *Proxy) isCanonicalDomain(d string) bool {
 	if d == "" {
 		return false
+	}
+	// Through the same fold the map was built with. This was the one host
+	// comparison in the codebase done on raw bytes: `c.Host` is punycode and `d`
+	// is whatever the attribute said, so an IDN cookie matched in exactly one of
+	// its two spellings — and the U-label, the one a developer declares and the
+	// one WordPress derives when COOKIE_DOMAIN is unset, was the one that failed.
+	if f, err := origin.NormaliseHost(strings.TrimPrefix(d, ".")); err == nil {
+		d = f
 	}
 	for _, s := range p.Map.Sites {
 		for _, c := range s.CanonicalSet() {

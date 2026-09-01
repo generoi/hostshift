@@ -28,6 +28,22 @@ type Origin struct {
 	Scheme string // "http" or "https"
 	Host   string // lowercase, punycode, no trailing dot
 	Port   string // "" when it is the scheme's default port
+	// Display is the host as it was declared, folded and lowercased but not
+	// punycoded — empty when that is the same string as Host.
+	//
+	// §5.5 asks for both halves: "compare on normalised punycode, preserve the
+	// original form on output". Only the first half existed. Every replacement
+	// the engine spliced was the ACE form, which is invisible in the forward
+	// direction (a variant is ASCII by construction) and is not in the reverse
+	// one — so a block-editor save on a `hämeenlinna.fi` site wrote
+	// `xn--hmeenlinna-q5a.fi` into the shared production database. The links
+	// still resolve, but the bytes are not the bytes, which is test 24 under an
+	// identity map, and a later `wp search-replace` on the name the client uses
+	// will not find those rows.
+	//
+	// Output only. The upstream `Host` header is built from Host and stays
+	// punycode, because a Host header must be ASCII.
+	Display string
 }
 
 // Parse normalises a declared origin. A trailing "/" is accepted and ignored —
@@ -67,7 +83,16 @@ func Parse(s string) (Origin, error) {
 	if err != nil {
 		return Origin{}, fmt.Errorf("parse origin %q: %w", s, err)
 	}
-	return Origin{Scheme: scheme, Host: host, Port: NormalisePort(scheme, u.Port())}, nil
+	// The declared spelling, folded the same way but left in Unicode. Compared
+	// against Host so the common all-ASCII case carries nothing extra.
+	display, derr := foldHost(u.Hostname())
+	if derr != nil || display == host {
+		display = ""
+	}
+	return Origin{
+		Scheme: scheme, Host: host, Port: NormalisePort(scheme, u.Port()),
+		Display: display,
+	}, nil
 }
 
 // MustParse is Parse for tests and literals.
@@ -120,6 +145,21 @@ var hostFold = idna.New(
 // host" with different answers is the shape of half this project's bugs.
 func NormaliseHost(h string) (string, error) { return normaliseHost(h) }
 
+// foldHost is normaliseHost stopping one step short: the same UTS46 mapping and
+// the same root-dot trim, but left in Unicode instead of encoded to ACE.
+//
+// The two have to fold identically or the display form would be a *different*
+// host from the one that was matched — the pair is "same host, two spellings",
+// not "two hosts".
+func foldHost(h string) (string, error) {
+	h = strings.ToLower(h)
+	u, err := hostFold.ToUnicode(h)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(u, "."), nil
+}
+
 func normaliseHost(h string) (string, error) {
 	// Lowercased here, root dot trimmed *after* the fold: UTS46 produces an
 	// ASCII root dot from U+3002, U+FF0E and U+FF61, so trimming first left one
@@ -163,6 +203,20 @@ func NormalisePort(scheme, port string) string {
 // origin parsed from `http://[::1]:8080` stored the host as `::1` and rendered
 // `http://::1:8080` — which ada rejects outright, so every rewritten link on the
 // page became unparseable while `check` called the map injective and anchored.
+// DisplayHostPort is HostPort in the spelling the origin was declared with. It
+// is what gets spliced into content; HostPort is what gets compared and what
+// goes in a Host header.
+func (o Origin) DisplayHostPort() string {
+	if o.Display == "" {
+		return o.HostPort()
+	}
+	h := o.Display
+	if o.Port == "" {
+		return h
+	}
+	return h + ":" + o.Port
+}
+
 func (o Origin) HostPort() string {
 	h := o.Host
 	if strings.ContainsRune(h, ':') {

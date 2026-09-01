@@ -1801,6 +1801,35 @@ git -C "$wcw" checkout -- wp-cli.yml
 ( cd "$wcw" && "$cmd" wp-cli --slug wt-w > wp-cli.local.yml ) 2>/dev/null
 contains "and the documented form still emits path:" "path: web" "$(cat "$wcw/wp-cli.local.yml")"
 
+# init answers with the restart's status, not with the negation's.
+#
+# `if ! ddev restart; then rc=$?` captures the status of the *negation*, which
+# is always 0 — so a failed restart exited 0 with `.ddev/.env` written and the
+# containers still on the old map. That is exactly what the comment block above
+# that call exists to prevent: "an agent that checks $? was told everything was
+# fine". Second time this class has bitten, so it gets a test.
+ex="$work/exitcode"; newproject "$ex"
+git -C "$ex" worktree add -q "$work/exitcode-wt" -b wt-x
+exw="$work/exitcode-wt"
+mkdir -p "$work/failddev"
+cat > "$work/failddev/ddev" <<'FAILDDEV'
+#!/usr/bin/env bash
+case "$1" in
+  restart) echo "Failed to restart: router did not come up" >&2; exit 7 ;;
+esac
+exit 0
+FAILDDEV
+chmod +x "$work/failddev/ddev"
+(cd "$exw" && DDEV_APPROOT="$exw" PATH="$work/failddev:$PATH" \
+  "$cmd" init --slug wt-x >/dev/null 2>&1) && rc=0 || rc=$?
+[ "$rc" = 7 ] && pass "init exits with the failed restart's status" \
+  || fail "init exits with the failed restart's status" "exit $rc, want 7"
+out="$(cd "$exw" && DDEV_APPROOT="$exw" PATH="$work/failddev:$PATH" \
+  "$cmd" init --slug wt-x 2>&1 || true)"
+contains "and says the env is written and the restart is what failed" \
+  "the restart is what failed" "$out"
+rm -rf "$work/failddev"
+
 echo "== a proxy flag in HOSTSHIFT_ARGS survives check and init"
 
 # --max-body, --strict-origins, --compress and --no-sweep are real proxy flags

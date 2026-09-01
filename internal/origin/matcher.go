@@ -54,10 +54,17 @@ func (e encoding) relSep() string {
 
 // hostPort renders host[:port] for this encoding. Only the port colon needs
 // encoding; hosts are ASCII after punycode.
+// hostPort renders an origin as replacement text, in the spelling it was
+// declared with. §5.5: compare on punycode, preserve the original form on
+// output — this is the output side, and the patterns above are the comparison
+// side, which stays on Host.
 func (e encoding) hostPort(o Origin) string {
 	// Brackets for an IPv6 literal — url.Hostname() strips them on the way in,
 	// and without them the replacement is a URL ada refuses to parse at all.
 	h := o.Host
+	if o.Display != "" {
+		h = o.Display
+	}
 	if strings.ContainsRune(h, ':') {
 		h = "[" + h + "]"
 	}
@@ -319,6 +326,11 @@ const (
 	ReasonSelfRedirect = "self-redirect"   // PLAN §4.4 / test 32, used by the proxy
 	ReasonSizeCap      = "size-cap-exceeded"
 	ReasonAttachment   = "attachment" // a download: its hostnames outlive this machine
+	// ReasonEventStream: an event stream is unbounded, so buffering it to
+	// rewrite it is the one thing it must not do (PLAN §5.8). The origins in it
+	// go out as written; this makes that visible to --explain instead of leaving
+	// the response with no record at all.
+	ReasonEventStream = "event-stream"
 	// ReasonSerialized: a PHP-serialized payload is length-prefixed, so a
 	// rewrite that changes a byte count leaves `s:33:` over a 24-byte string and
 	// PHP refuses the whole structure.

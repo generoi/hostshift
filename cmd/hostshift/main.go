@@ -796,7 +796,7 @@ func cmdDiff(args []string) (int, error) {
 	// a `--paths` file of two lines warned about crawling twenty pages of the
 	// client's live site — in the one sentence written to make a developer stop.
 	want := *n
-	if len(paths) > 0 {
+	if len(paths) > 0 && (want == 0 || len(paths) < want) {
 		want = len(paths)
 	}
 	_, covered := resolveMap[corpus.ResolveKey(net.JoinHostPort(cb.Hostname(), port))]

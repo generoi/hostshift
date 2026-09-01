@@ -2186,8 +2186,8 @@ if [ -n "${DDEV_APPROOT:-}" ] && command -v ddev >/dev/null; then
   #
   # So run the check again afterwards and answer with it. The hook has already
   # printed the diagnosis by then, so this stays quiet and only sets the status.
-  if ! ddev restart; then
-    rc=$?
+  ddev restart && rc=0 || rc=$?
+  if [ "$rc" != 0 ]; then
     echo "hostshift: .ddev/.env is written; the restart is what failed." >&2
     echo "  DDEV keeps global router state under ~/.ddev, so two projects" >&2
     echo "  restarting at the same moment can collide there — the error may even" >&2

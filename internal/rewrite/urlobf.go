@@ -259,6 +259,31 @@ func stripForJSONEsc(v []byte) normalised {
 				i += 2
 				continue
 			}
+			// `\xNN` and `\u{...}` are the other two spellings of the same byte
+			// that a *JavaScript* string may carry, and an inline `<script>` is
+			// Tier 1. `\xe4` in particular is what a minifier run with
+			// `ascii_only` writes for every byte above 0x7E — the same IDN
+			// authority the `\u00e4` case was widened for, one member over.
+			// Line continuation: `\` then a newline is *removed* by the JS
+			// parser, joining the two halves of the string. Removing is not
+			// emitting, which is the rule this family is bound by.
+			if v[i+1] == '\n' || v[i+1] == '\r' {
+				w := 2
+				if v[i+1] == '\r' && i+2 < len(v) && v[i+2] == '\n' {
+					w = 3
+				}
+				i += w
+				continue
+			}
+			if r, w, ok := jsEscAt(v[i:]); ok {
+				for k := 0; k < len(r); k++ {
+					dec = append(dec, r[k])
+					pos = append(pos, i)
+					end = append(end, i+w)
+				}
+				i += w
+				continue
+			}
 			if v[i+1] == 'u' && i+6 <= len(v) {
 				if r, ok := jsonEscRune(v[i+2 : i+6]); ok {
 					// Every byte of the rune points at the whole escape, the way
@@ -291,7 +316,21 @@ func stripForJSONEsc(v []byte) normalised {
 // this fire on every CSS escape in the document and took the composite from 200x
 // the body to 304x. `\\/` is left to the CSS view, which decodes it already.
 func hasJSONEsc(v []byte) bool {
-	return bytes.Contains(v, []byte(`\u`))
+	if bytes.Contains(v, []byte(`\u`)) || bytes.Contains(v, []byte(`\x`)) {
+		return true
+	}
+	// Octal and line continuation, which have no two-byte literal to search for.
+	// Scanned rather than matched, which allocates nothing; the view behind this
+	// is what costs, and it is only built when one of these is actually present.
+	for i := 0; i+1 < len(v); i++ {
+		if v[i] != '\\' {
+			continue
+		}
+		if c := v[i+1]; (c >= '0' && c <= '7') || c == '\n' || c == '\r' {
+			return true
+		}
+	}
+	return false
 }
 
 // hasRefJSONEsc reports whether the buffer could hold a JSON escape once
@@ -322,11 +361,85 @@ func hasRefJSONEsc(v []byte) bool {
 		if n == 0 || len(c) != 1 || c[0] != '\\' {
 			continue
 		}
-		if i+n < len(v) && v[i+n] == 'u' {
+		if i+n >= len(v) {
+			continue
+		}
+		if v[i+n] == 'u' {
 			return true
+		}
+		if v[i+n] == '&' {
+			if c2, n2 := parseURLRef(v[i+n:]); n2 > 0 && len(c2) == 1 && c2[0] == 'u' {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// jsEscAt decodes `\xNN` or `\u{...}` at the start of b, returning the bytes and
+// the width consumed.
+//
+// Two of JavaScript's four string escapes. The other two are left, with a
+// reason: legacy octal is `\` followed by a digit, and line continuation is `\`
+// followed by a newline, so gating on either means gating on a backslash before
+// something ordinary — a regex backreference, a Windows path — and every view in
+// this family builds three slices the length of the body. That took the
+// allocation composite from 200x to 304x once already. These two are two-byte
+// needles and cost nothing when absent; those two are not, and no producer has
+// been named for them.
+func jsEscAt(b []byte) ([]byte, int, bool) {
+	if len(b) < 4 || b[0] != '\\' {
+		return nil, 0, false
+	}
+	if b[1] == 'x' {
+		r, ok := jsonEscRune(append([]byte("00"), b[2:4]...))
+		if !ok {
+			return nil, 0, false
+		}
+		return r, 4, true
+	}
+	// Legacy octal, `\NNN`, one to three digits 0-7. `\170` is `x`, and a
+	// minifier that predates `\x` writes bytes this way.
+	if b[1] >= '0' && b[1] <= '7' {
+		w, val := 1, 0
+		for w < 4 && w < len(b) && b[w] >= '0' && b[w] <= '7' {
+			val = val<<3 | int(b[w]-'0')
+			w++
+		}
+		if val < 0x20 || val > 0x7E {
+			// The same rule as everywhere else in this family: never emit a
+			// control byte into the view, and an octal escape cannot reach
+			// beyond 0xFF anyway, so there is no IDN case above it to lose.
+			return nil, 0, false
+		}
+		return []byte{byte(val)}, w, true
+	}
+	if b[1] != 'u' || b[2] != '{' {
+		return nil, 0, false
+	}
+	// `\u{...}`: up to six hex digits, then a closing brace.
+	for w := 4; w < len(b) && w <= 10; w++ {
+		if b[w] != '}' {
+			continue
+		}
+		h := b[3:w]
+		if len(h) == 0 || len(h) > 6 {
+			return nil, 0, false
+		}
+		padded := append(make([]byte, 0, 4), h...)
+		for len(padded) < 4 {
+			padded = append([]byte{'0'}, padded...)
+		}
+		if len(padded) > 4 {
+			return nil, 0, false
+		}
+		r, ok := jsonEscRune(padded)
+		if !ok {
+			return nil, 0, false
+		}
+		return r, w + 1, true
+	}
+	return nil, 0, false
 }
 
 // jsonEscRune decodes the four hex digits of a `\uXXXX` escape into the bytes
@@ -958,12 +1071,12 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 		// From the scheme through the port: the whole origin, written plainly.
 		return n.pos[at], authorityEnd(n, he, end), to.String(), true
 	case hasPort:
-		return from, authorityEnd(n, he, end), to.HostPort(), true
+		return from, authorityEnd(n, he, end), to.DisplayHostPort(), true
 	}
 	// to.HostPort() rather than to.Host: it brackets an IPv6 literal, and the
 	// bare host produced `https://2001:db8::1/x`, which the parser rejects. The
 	// other two arms already went through String()/HostPort(); this one did not.
-	return from, until, to.HostPort(), true
+	return from, until, to.DisplayHostPort(), true
 }
 
 // authorityEnd is one past the port, or one past the host when there is none.
