@@ -428,6 +428,21 @@ to derive — `hostshift diff` exits 2 with *no variant — pass --slug, or decl
 `variant:` on the site* — and there is no `ddev hostshift diff` wrapper to supply
 it for you.
 
+**On a worktree whose map comes from DDEV config alone**, add `--variant-base`
+too. The variant is derived from the project the command is run in, so in
+`acme-wt-a` it comes out `wt-a--acme-wt-a.ddev.site` — a hostname nothing serves,
+and every row a 404:
+
+```
+hostshift diff -n 20 --slug wt-a \
+  --canonical-base https://acme.ddev.site \
+  --variant-base   https://wt-a--acme.ddev.site
+```
+
+Under production-canonical the map names both sides itself and neither flag is
+needed beyond `--canonical-base`. `diff` warns when the base you passed is not a
+hostname its map knows, and says what it fell back to.
+
 The assertions that fail a run are the ones that cannot be innocent — a canonical origin
 reaching the browser, a serialized value served with a length that does not
 describe its data, which PHP will refuse or silently truncate, a page whose byte

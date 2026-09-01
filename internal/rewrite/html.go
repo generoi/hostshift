@@ -330,6 +330,10 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	// host — `See https%3A%2F%2Fwww.example.fi. Thanks` lost the dot — while the
 	// plain and JSON spellings of the same sentence correctly kept it.
 	out = w.percentLeak(surface, base, out, value)
+	// And JSON's `\uXXXX`, on every surface for the same reason: a block
+	// delimiter is an HTML comment, a `data-wp-*` attribute is an attribute, and
+	// an inline `<script>` carries the same blob.
+	out = w.jsonEscLeak(surface, base, out, value)
 	// CSS unescapes before the URL parser runs, so a style surface needs that
 	// view too — see stripForCSS.
 	if surface == SurfaceInlineStyle || (surface == SurfaceHTMLAttr && len(name) == 5 && bytes.EqualFold(name, []byte("style"))) {

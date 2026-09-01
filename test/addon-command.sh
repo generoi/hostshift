@@ -217,6 +217,7 @@ mv "$wt/.ddev/.env" "$work/env.hold" 2>/dev/null || true
 out="$(cd "$wt" && HOSTSHIFT_HOOK=1 "$cmd" check 2>&1 || true)"
 contains "an unconfigured worktree of a multi-hostname parent is warned" \
   "not configured" "$out"
+contains "and names the hostnames at stake" "nat.acme.ddev.site" "$out"
 # ...and a project whose parent declares nothing extra stays silent.
 cp "$main/.ddev/config.yaml" "$work/pcfg.hold"
 printf 'name: acme\n' > "$main/.ddev/config.yaml"
@@ -224,6 +225,26 @@ out="$(cd "$wt" && HOSTSHIFT_HOOK=1 "$cmd" check 2>&1 || true)"
 case "$out" in
   "") pass "and one whose parent declares nothing extra stays silent" ;;
   *) fail "and one whose parent declares nothing extra stays silent" "$out" ;;
+esac
+# ...including the empty list `ddev config` writes into every project.
+#
+# `grep '^additional_hostnames:'` matches `additional_hostnames: []`, so this
+# fired on every unconfigured worktree of every ordinary parent — telling a
+# developer their worktree was hijacking hostnames the two projects did not
+# share. install.yaml's removal path carries 25 lines of awk written for exactly
+# this case; the check path had a bare grep and was only ever tested against a
+# config with no key at all.
+printf 'name: acme\nadditional_hostnames: []\n' > "$main/.ddev/config.yaml"
+out="$(cd "$wt" && HOSTSHIFT_HOOK=1 "$cmd" check 2>&1 || true)"
+case "$out" in
+  "") pass "an empty additional_hostnames list is not a declaration" ;;
+  *) fail "an empty additional_hostnames list is not a declaration" "$out" ;;
+esac
+printf 'name: acme\nadditional_hostnames: [] # none\n' > "$main/.ddev/config.yaml"
+out="$(cd "$wt" && HOSTSHIFT_HOOK=1 "$cmd" check 2>&1 || true)"
+case "$out" in
+  "") pass "and neither is one with a trailing comment" ;;
+  *) fail "and neither is one with a trailing comment" "$out" ;;
 esac
 cp "$work/pcfg.hold" "$main/.ddev/config.yaml"
 mv "$work/env.hold" "$wt/.ddev/.env" 2>/dev/null || true
@@ -1109,6 +1130,29 @@ out="$(cd "$wt" && HS_CURL_CODES="502 502 200" PATH="$fakecurl:$fakebin:$PATH" \
 out="$(cd "$wt" && HS_CURL_CODES="502" PATH="$fakecurl:$fakebin:$PATH" \
   "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a persistent 502 is refused" "so something between the router" "$out"
+
+# A 502 whose body says who failed is not a router fault.
+#
+# The proxy answers a failed upstream dial with `hostshift: upstream request
+# failed: …` in the body, and this command already captures that body. The 502
+# branch did not read it, so a stopped `web` — the commonest failure the compose
+# file names — was reported as a stale router, with an escalation path ending at
+# `ddev poweroff`, a fleet-wide action, for something `ddev start` fixes.
+: > "$HS_CURL_STATE"
+out="$(cd "$wt" && HS_CURL_CODES="502" \
+  HS_CURL_BODY="hostshift: upstream request failed: dial tcp: lookup ddev-acme-wt-a-web: no such host" \
+  PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a 502 from a dead upstream names the upstream" "cannot reach" "$out"
+contains "and sends the developer to ddev start" "ddev start" "$out"
+case "$out" in
+  *"so something between the router"*)
+    fail "and does not blame the router" "$out" ;;
+  *) pass "and does not blame the router" ;;
+esac
+case "$out" in
+  *"poweroff"*) fail "and does not escalate to poweroff" "$out" ;;
+  *) pass "and does not escalate to poweroff" ;;
+esac
 
 # A timeout on the first attempt must not mask a 502 on the later ones. `rc` was
 # set once outside the loop, so a cold-start timeout left it sticky and the

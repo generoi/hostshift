@@ -326,6 +326,23 @@ func cmdRewrite(args []string) (int, error) {
 			out = body
 		}
 		src = bytes.NewReader(out)
+
+	case mt == "application/x-www-form-urlencoded" || mt == "multipart/form-data":
+		// Refused, not passed through.
+		//
+		// Everything outside the rewritable set streams past untouched, which is
+		// right for the Tier 2 types: §5.2 excludes them by design, and piping a
+		// stylesheet through to see it unchanged is a real question with a true
+		// answer. It is not right for a *request* type. Those are rewritten —
+		// in the other direction, by the proxy — so printing the input back with
+		// an empty counter block reads as "the engine found nothing in your
+		// body" when it means "this command never looked".
+		fmt.Fprintf(os.Stderr,
+			"hostshift: --type %s is a request body, and this command rewrites\n"+
+				"  responses. Request bodies are mapped variant→canonical by the proxy,\n"+
+				"  on the way in; there is no filter mode for them. Passing it through\n"+
+				"  here would print an empty counter block and read like a clean result.\n", mt)
+		return exitConfig, nil
 	}
 	// Anything else streams through untouched and never enters a rewriter —
 	// which is what test 25's per-surface counter of zero proves.
@@ -707,7 +724,7 @@ func cmdDiff(args []string) (int, error) {
 					}
 				}
 			}
-			if !matched && len(res.Map.Sites) > 1 {
+			if !matched && (len(res.Map.Sites) > 1 || len(res.ExternalCanonicals) == 0) {
 				flag, side, fell := "--canonical-base", "canonical", site.Variant.String()
 				if !fromCanonical {
 					flag, side, fell = "--variant-base", "variant", site.Canonical.String()

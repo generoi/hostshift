@@ -51,3 +51,74 @@ func TestADiffThatComparedNothingIsNotGreen(t *testing.T) {
 		t.Errorf("exit 0 from a run that compared no pages — a CI job reads this")
 	}
 }
+
+// TestR45ASingleSiteWorktreeIsWarnedAboutAnUnmatchedBase.
+//
+// README's worktree recipe is `diff --slug <slug> --canonical-base
+// https://<parent>.ddev.site`. On a worktree whose map comes from its *own* DDEV
+// config, the variant is derived from the worktree's name — so that command
+// compared the parent against `wt-a--acme-wt-a.ddev.site`, a hostname nothing
+// serves, and every row was a 404.
+//
+// The pairing warning existed but was gated on multisite. The reason for
+// tolerating an unmatched canonical base is production-canonical, where the
+// documented baseline is deliberately not a canonical of the map; that reason
+// does not apply to a map with no external canonical at all.
+func TestR45ASingleSiteWorktreeIsWarnedAboutAnUnmatchedBase(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme-wt-a\n")
+	args := append([]string{"-C", dir, "--slug", "wt-a", "-n", "1",
+		"--canonical-base", "https://acme.ddev.site"},
+		noNetwork("acme.ddev.site", "wt-a--acme-wt-a.ddev.site")...)
+	_, _, errOut := run(t, "", cmdDiff, args...)
+	if !strings.Contains(errOut, "is not a canonical of this") {
+		t.Errorf("a single-site worktree got no warning about an unmatched base:\n%s", errOut)
+	}
+
+	// And production-canonical still does not warn: there the baseline is the
+	// project's own hostname by design.
+	pc := t.TempDir()
+	writeFile(t, pc, ".ddev/config.yaml", "name: acme-wt-a\n")
+	writeFile(t, pc, "hostshift.yaml",
+		"sites:\n  - canonical: https://www.acme.fi\n    variant: https://wt-a--acme.ddev.site\n")
+	args = append([]string{"-C", pc, "--slug", "wt-a", "-n", "1",
+		"--canonical-base", "https://acme-wt-a.ddev.site"},
+		noNetwork("acme-wt-a.ddev.site", "wt-a--acme.ddev.site")...)
+	_, _, errOut = run(t, "", cmdDiff, args...)
+	if strings.Contains(errOut, "is not a canonical of this") {
+		t.Errorf("the documented production-canonical baseline must not warn:\n%s", errOut)
+	}
+}
+
+// TestR45ARequestTypeIsRefusedRatherThanPassedThrough.
+//
+// `rewrite --type application/x-www-form-urlencoded` printed the input back with
+// an empty counter block and no diagnostic, which reads as "the engine found
+// nothing in your body" when it means "this command never looked" — request
+// bodies are rewritten by the proxy, in the other direction.
+//
+// Only the request types. Tier 2 pass-through is deliberate (§5.2), and piping a
+// stylesheet through to see it unchanged is a real question with a true answer.
+func TestR45ARequestTypeIsRefusedRatherThanPassedThrough(t *testing.T) {
+	in := "url=https%3A%2F%2Fwww.acme.fi%2Fx"
+	for _, ct := range []string{"application/x-www-form-urlencoded", "multipart/form-data"} {
+		code, out, errOut := run(t, in, cmdRewrite,
+			"--map", "https://www.acme.fi=https://wt-a--acme.ddev.site", "--type", ct)
+		if code != exitConfig {
+			t.Errorf("%s: exit %d, want %d", ct, code, exitConfig)
+		}
+		if strings.Contains(out, "url=") {
+			t.Errorf("%s: the body was passed through: %q", ct, out)
+		}
+		if !strings.Contains(errOut, "rewrites") {
+			t.Errorf("%s: no diagnostic: %q", ct, errOut)
+		}
+	}
+	// And a Tier 2 type still passes through untouched, which is documented.
+	css := "body{background:url(https://www.acme.fi/bg.png)}"
+	code, out, _ := run(t, css, cmdRewrite,
+		"--map", "https://www.acme.fi=https://wt-a--acme.ddev.site", "--type", "text/css", "--quiet")
+	if code != exitOK || out != css {
+		t.Errorf("text/css must stream through untouched: exit %d, %q", code, out)
+	}
+}

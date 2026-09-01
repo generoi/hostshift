@@ -628,36 +628,73 @@ func crawl(ctx context.Context, o Options) ([]string, error) {
 		}
 	}
 
-	for len(queue) > 0 && (o.N == 0 || len(out) < o.N) {
-		p := queue[0]
-		queue = queue[1:]
+	// Pages before subresources.
+	//
+	// `-n` is a number of pages, and one FIFO made it a number of *fetches*. A
+	// `<head>` is emitted before the `<body>`, so every stylesheet and script
+	// enqueued ahead of the first `<a href>`: measured on a page with 15
+	// stylesheets, 15 scripts and 10 links, `-n 20` fetched the homepage and
+	// nineteen files from its head, and not one other page. The trade is not
+	// neutral — Tier 2 is a note and never fails a run, so that spent nineteen
+	// slots of the only check in the tool that goes RED for invariant 28 to make
+	// one note louder.
+	//
+	// They are still fetched — the Tier 2 count they exist for is read off a
+	// response body, so it needs a request — but they go behind every page the
+	// budget can reach, not in front of them. Ordering is the whole defect:
+	// nothing about reaching a stylesheet requires reaching it first.
+	var subQueue []string
+	enqueue := func(link, from string, isDoc bool) {
+		u, err := url.Parse(link)
+		if err != nil || u.Path == "" {
+			return
+		}
+		// Same site only: a crawl that wanders onto a third-party host is
+		// measuring nothing.
+		if u.Host != "" && !sameSite[strings.ToLower(u.Hostname())] {
+			return
+		}
+		if u.Fragment != "" && u.Path == from {
+			return
+		}
+		key := u.Path
+		if u.RawQuery != "" {
+			key += "?" + u.RawQuery
+		}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if isDoc {
+			queue = append(queue, key)
+			return
+		}
+		subQueue = append(subQueue, key)
+	}
+
+	for (len(queue) > 0 || len(subQueue) > 0) && (o.N == 0 || len(out) < o.N) {
+		// Drain every page first, and only then the subresources they named. A
+		// single FIFO put them in document order, and a `<head>` comes before a
+		// `<body>` — so every stylesheet and script was enqueued ahead of the
+		// first `<a href>`.
+		var p string
+		if len(queue) > 0 {
+			p, queue = queue[0], queue[1:]
+		} else {
+			p, subQueue = subQueue[0], subQueue[1:]
+		}
 		out = append(out, p)
 
 		res, err := fetch(ctx, o, o.Canonical, p)
 		if err != nil {
 			continue
 		}
-		for _, link := range links(res.body) {
-			u, err := url.Parse(link)
-			if err != nil || u.Path == "" {
-				continue
-			}
-			// Same site only: a crawl that wanders onto a third-party host is
-			// measuring nothing.
-			if u.Host != "" && !sameSite[strings.ToLower(u.Hostname())] {
-				continue
-			}
-			if u.Fragment != "" && u.Path == p {
-				continue
-			}
-			key := u.Path
-			if u.RawQuery != "" {
-				key += "?" + u.RawQuery
-			}
-			if !seen[key] {
-				seen[key] = true
-				queue = append(queue, key)
-			}
+		docs, subs := links(res.body)
+		for _, link := range docs {
+			enqueue(link, p, true)
+		}
+		for _, link := range subs {
+			enqueue(link, p, false)
 		}
 	}
 	sort.Strings(out)
@@ -677,13 +714,12 @@ func crawl(ctx context.Context, o Options) ([]string, error) {
 //
 // Subresources are followed, not just noted, because the point is to *fetch*
 // them: `Result.Tier2` is counted from a response body, which requires a request.
-func links(body []byte) []string {
-	var out []string
+func links(body []byte) (docs, subs []string) {
 	z := html.NewTokenizer(strings.NewReader(string(body)))
 	for {
 		tt := z.Next()
 		if tt == html.ErrorToken {
-			return out
+			return docs, subs
 		}
 		if tt != html.StartTagToken && tt != html.SelfClosingTagToken {
 			continue
@@ -693,8 +729,11 @@ func links(body []byte) []string {
 		// from everything would pull in `<base href>` — which is not a
 		// document — and every `<link rel=alternate>` to another site.
 		var want string
+		doc := false
 		switch string(name) {
-		case "a", "link":
+		case "a":
+			want, doc = "href", true
+		case "link":
 			want = "href"
 		case "script", "img", "iframe":
 			want = "src"
@@ -704,8 +743,13 @@ func links(body []byte) []string {
 		for hasAttr {
 			var k, v []byte
 			k, v, hasAttr = z.TagAttr()
-			if string(k) == want {
-				out = append(out, string(v))
+			if string(k) != want {
+				continue
+			}
+			if doc {
+				docs = append(docs, string(v))
+			} else {
+				subs = append(subs, string(v))
 			}
 		}
 	}
@@ -905,7 +949,25 @@ func WriteReport(w io.Writer, results []Result) bool {
 			"proxy excludes by design — PLAN's fast path adds them \"only if the "+
 			"corpus diff shows a leak\", and this is that\n", tier2)
 	}
+	// Whether anything in this run is a type the leak scan actually reads. "At
+	// least one row" is weaker than the verdict's sentence: a table of nothing
+	// but Tier 2 rows has had no scan run on it, so twenty byte-identical
+	// stylesheets printed "no canonical origin reached the browser" over bytes
+	// nobody looked at. Not a reason to fail the run — Tier 2 must not, and
+	// TestATier2BodyTheProxyNeverRewritesIsNotAnUnreadRewrite holds that — but a
+	// reason not to claim the invariant was tested.
+	scanned := false
+	for _, r := range results {
+		if !isTier2(r.ContentType) {
+			scanned = true
+			break
+		}
+	}
 	switch {
+	case green && !scanned:
+		fmt.Fprintf(w, "corpus diff GREEN, but nothing in this run is a type the proxy "+
+			"rewrites:\n  no canonical origin was looked for, and %d did reach it in Tier 2 "+
+			"types.\n  Crawl a page, not only its assets.\n", tier2)
 	case green && tier2 > 0:
 		// The verdict has to be scoped to what was actually asked.
 		//

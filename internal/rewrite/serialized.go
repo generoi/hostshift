@@ -2182,6 +2182,29 @@ func occupiesItsField(b []byte, start, end int) bool {
 			start--
 			continue
 		}
+		// The same whitespace in the spelling a form sends, which is the mirror
+		// of the trailing scan below.
+		//
+		// Only the raw bytes were skipped here, and no browser sends those: a
+		// `application/x-www-form-urlencoded` body spells a leading newline
+		// `%0D%0A` and a leading space `+` or `%20`. So an option whose value
+		// begins with a newline — one edited in a `<textarea>`, which this file
+		// already notes is how they get there — failed the "occupies its field"
+		// gate on the way back in, the repair declined, and the generic rewriter
+		// replaced the host and left the old length. `s:35:` over 30 bytes,
+		// written to the shared database, and PHP returns false for the row.
+		//
+		// The trailing side of this same function was widened for exactly these
+		// spellings two rounds ago; the leading side was not, and the two have to
+		// agree about what whitespace is.
+		if c == '+' {
+			start--
+			continue
+		}
+		if start >= 3 && b[start-3] == '%' && pctWhitespace(b[start-2], b[start-1]) {
+			start -= 3
+			continue
+		}
 		switch {
 		// The percent-encoded delimiters, before the raw ones, because the byte
 		// at start-1 is then a hex digit and every raw case below would miss it.

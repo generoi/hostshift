@@ -214,6 +214,105 @@ func stripForRefs(v []byte) normalised {
 	return n
 }
 
+// stripForJSONEsc is stripForURL with JSON string escapes decoded into the view.
+//
+// The producer that makes this necessary is WordPress core, and what it escapes
+// is not the slash. Gutenberg's block serializer — `serialize_block_attributes()`
+// in wp-includes/blocks.php, and `serializeAttributes()` in @wordpress/blocks —
+// puts every block's attributes through
+//
+//	.replace(/--/g, '\\u002d\\u002d')   // "Don't break HTML comments."
+//
+// before writing them into the `<!-- wp:… -->` delimiter. **Every variant
+// hostname this tool can generate contains `--` by construction**, because
+// DefaultVariantPattern is `{slug}--{leftmost-label}`. So the editor re-saves a
+// block whose URL we rewrote, emits `wt-a\u002d\u002dacme.ddev.site`, and the
+// reverse pass cannot read its own hostname back: the variant goes upstream into
+// the shared production database, where `parse_blocks` decodes it and production
+// serves a `.ddev.site` URL to real visitors. §4.3's failure, on ordinary use of
+// the block editor, with no undo.
+//
+// The forward direction has the same shape whenever the canonical is an IDN,
+// because punycode's ACE prefix is literally `xn--`: `xn\u002d\u002dhmeen-gra.fi`
+// went out byte-identical, which is test 28.
+//
+// Only escapes landing in printable ASCII are decoded. The rule stripForURL's
+// comment sets — a decoder must never *emit* a control character — applies here
+// exactly, and it also keeps the view from inventing a byte the authority
+// scanner would read as a separator. Surrogate pairs and everything above 0x7E
+// are left as written, because no authority byte lives there.
+func stripForJSONEsc(v []byte) normalised {
+	if !hasJSONEsc(v) {
+		return stripForURL(v)
+	}
+	dec := make([]byte, 0, len(v))
+	pos := make([]int, 0, len(v))
+	end := make([]int, 0, len(v))
+	for i := 0; i < len(v); {
+		if v[i] == '\\' && i+1 < len(v) {
+			// `\/` is already handled by the JSON surface, but it reaches here
+			// too on the composed views, and decoding it costs nothing.
+			if v[i+1] == '/' {
+				dec = append(dec, '/')
+				pos = append(pos, i)
+				end = append(end, i+2)
+				i += 2
+				continue
+			}
+			if v[i+1] == 'u' && i+6 <= len(v) {
+				if c, ok := jsonEscByte(v[i+2 : i+6]); ok {
+					dec = append(dec, c)
+					pos = append(pos, i)
+					end = append(end, i+6)
+					i += 6
+					continue
+				}
+			}
+		}
+		dec = append(dec, v[i])
+		pos = append(pos, i)
+		end = append(end, i+1)
+		i++
+	}
+	return stripRemovals(dec, pos, end)
+}
+
+// hasJSONEsc reports whether the buffer holds an escape this view decodes.
+//
+// A two-byte needle, not "contains a backslash". Every view in this family
+// builds three slices the length of the body, and TestAllocationStaysBounded
+// measures the peak for one 8 MiB request — gating on the backslash alone made
+// this fire on every CSS escape in the document and took the composite from 200x
+// the body to 304x. `\\/` is left to the CSS view, which decodes it already.
+func hasJSONEsc(v []byte) bool {
+	return bytes.Contains(v, []byte(`\u`))
+}
+
+// jsonEscByte decodes the four hex digits of a `\uXXXX` escape, and reports
+// whether they spell a printable ASCII byte.
+func jsonEscByte(h []byte) (byte, bool) {
+	if len(h) != 4 {
+		return 0, false
+	}
+	n := 0
+	for _, c := range h {
+		switch {
+		case c >= '0' && c <= '9':
+			n = n<<4 | int(c-'0')
+		case c >= 'a' && c <= 'f':
+			n = n<<4 | int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			n = n<<4 | int(c-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	if n < 0x20 || n > 0x7E {
+		return 0, false
+	}
+	return byte(n), true
+}
+
 // stripForPercent is stripForURL with percent-escapes decoded into the view.
 //
 // The engine models three encodings and handles each in isolation; it did not
@@ -1017,6 +1116,23 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	if bytes.IndexByte(v, '%') >= 0 {
 		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value, ev)
 	}
+	// And JSON's own escape, which is the same rule again and the sharpest case
+	// of it: Gutenberg escapes `--` to `\u002d\u002d` in every block delimiter,
+	// and every variant hostname contains `--` by construction. Here rather than
+	// in a forward-only surface precisely so the reverse direction gets it —
+	// this spelling is emitted by *WordPress*, not by us, and the failure it
+	// causes is the variant hostname landing in the shared database.
+	if hasJSONEsc(v) {
+		v = h.spliceHostsIn(stripForJSONEsc(v), v, urlTokenStarts, value, ev)
+	}
+	// And the two composed, because that is how the classic editor posts it.
+	// `post.php` sends the whole `content` field urlencoded, so the backslash
+	// Gutenberg wrote is `%5C` and the escape reads `%5Cu002d%5Cu002d` — no
+	// literal backslash anywhere for the view above to find. Same shape as
+	// WooCommerce's percent-encoded `\/`, one layer further out.
+	if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
+		v = h.spliceHostsIn(composeView(stripForPercent(v), stripForJSONEsc), v, urlTokenStarts, value, ev)
+	}
 	return v
 }
 
@@ -1220,6 +1336,17 @@ func (w *HTML) percentLeak(surface string, base int, v []byte, value bool) []byt
 		return v
 	}
 	out, events := w.hosts.spliceHostsLog(stripForPercent(v), v, urlTokenStarts, value)
+	w.record(surface, base, events)
+	return out
+}
+
+// jsonEscLeak is the JSON-escape view as a recorded HTML-surface catcher, for
+// the spelling WordPress's own block serializer emits.
+func (w *HTML) jsonEscLeak(surface string, base int, v []byte, value bool) []byte {
+	if w.hosts == nil || len(w.hosts.to) == 0 || !hasJSONEsc(v) {
+		return v
+	}
+	out, events := w.hosts.spliceHostsLog(stripForJSONEsc(v), v, urlTokenStarts, value)
 	w.record(surface, base, events)
 	return out
 }

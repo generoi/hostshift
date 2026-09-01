@@ -62,3 +62,53 @@ func TestATrailingEncodedNewlineDoesNotDefeatTheRepair(t *testing.T) {
 		}
 	}
 }
+
+// TestALeadingEncodedNewlineDoesNotDefeatTheRepair: the mirror of the test
+// above, and the same defect on the other side of the same function.
+//
+// `occupiesItsField` scans backwards for the delimiter that opened the value and
+// skipped leading whitespace — the raw bytes only. No browser sends those: a
+// urlencoded body spells a leading newline `%0D%0A` and a leading space `+` or
+// `%20`. So an option whose value begins with a newline, which is what a
+// `<textarea>` produces, failed the gate on the way *in*: the repair declined,
+// the generic rewriter replaced the host and left the old length, and the row
+// went to the shared database with `s:35:` over 30 bytes. PHP returns false.
+//
+// The response direction repaired the same value correctly on the way out, so a
+// developer sees valid data in the browser and posts back a broken row.
+func TestALeadingEncodedNewlineDoesNotDefeatTheRepair(t *testing.T) {
+	const variant = "https://wt-a--acme.ddev.site/x"
+	const canonical = "https://www.acme.fi/x"
+	pct := func(u string) string {
+		return strings.NewReplacer(":", "%3A", "/", "%2F").Replace(u)
+	}
+	rw := func(b []byte) []byte {
+		s := strings.ReplaceAll(string(b), pct(variant), pct(canonical))
+		return []byte(strings.ReplaceAll(s, variant, canonical))
+	}
+	value := `a:1:{s:3:"url";s:` + strconv.Itoa(len(variant)) + `:"` + variant + `";}`
+	want := `s:` + strconv.Itoa(len(canonical)) + `:"` + canonical + `"`
+
+	for _, lead := range []string{"", " ", "+", "%20", "%09", "%0A", "%0D%0A"} {
+		body := "data=" + lead + url.QueryEscape(value)
+		out := string(RepairSerializedFields([]byte(body), rw))
+
+		field := strings.TrimPrefix(out, "data=")
+		if i := strings.IndexAny(field, "&"); i >= 0 {
+			field = field[:i]
+		}
+		got, err := url.QueryUnescape(field)
+		if err != nil {
+			t.Errorf("lead %q: field is not decodable: %v", lead, err)
+			continue
+		}
+		if !strings.Contains(got, canonical) {
+			t.Errorf("lead %q: the host was not mapped back at all:\n%s", lead, got)
+			continue
+		}
+		if !strings.Contains(got, want) {
+			t.Errorf("lead %q: length not re-emitted\n got: %s\nwant substring: %s",
+				lead, got, want)
+		}
+	}
+}
