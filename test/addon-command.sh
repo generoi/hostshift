@@ -930,7 +930,7 @@ printf '<a href="https://acme.ddev.site/a">a</a><link href="https://acme.ddev.si
   > "$HS_FAKE_DIR/page"
 
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-contains "a canonical origin in the served page is reported" "canonical hostname" "$out"
+contains "a canonical origin in the served page is reported" "canonical origin" "$out"
 contains "and the cause is named" "--dry-run" "$out"
 if (cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
   fail "check fails when the page carries one" "it exited 0"
@@ -943,9 +943,63 @@ fi
 printf '<a href="https://wt-a--acme.ddev.site/a">a</a>\n' > "$HS_FAKE_DIR/page"
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
-  *"canonical hostname"*) fail "a clean page is not reported" "$out" ;;
+  *"canonical origin"*) fail "a clean page is not reported" "$out" ;;
   *) pass "a clean page is not reported" ;;
 esac
+
+# The verdict above is an accident, and the accident is the only thing making
+# the exit code non-zero.
+#
+# `fails=$((fails + 1))` at ddev/commands/host/hostshift:1758 is the whole of
+# the scan's bookkeeping: `fails` is never initialised and never read, and the
+# check block ends in an unconditional `exit 0` a few lines further down. Under
+# this file's `set -u` the increment therefore aborts the script with
+# "fails: unbound variable" — which is why it exits non-zero, and which also
+# skips the parent-declares verdict and the "hostshift is serving" summary that
+# were supposed to follow, ending the run on an internal bash error naming a
+# variable no developer has heard of.
+#
+# And where anything at all defines `fails` — a wrapper script, an exported
+# shell variable — the increment succeeds, the block falls through to `exit 0`,
+# and check prints "the one thing this tool exists to prevent" followed by
+# "hostshift is serving:" and reports success. That is exactly the false GREEN
+# the scan was added to close, one line to the side of it.
+printf '<a href="https://acme.ddev.site/a">a</a><link href="https://acme.ddev.site/b">\n' \
+  > "$HS_FAKE_DIR/page"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"unbound variable"*)
+    fail "check does not abort on its own bookkeeping" "$out" ;;
+  *) pass "check does not abort on its own bookkeeping" ;;
+esac
+if (cd "$wt" && fails=0 PATH="$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
+  fail "check fails on a canonical origin however \$fails arrives" "it exited 0"
+else
+  pass "check fails on a canonical origin however \$fails arrives"
+fi
+
+# And the scan sees one spelling of an origin: a literal `//host`.
+#
+# Every other spelling this project exists to handle is invisible to it. A
+# WordPress page carries its origins JSON-escaped in `<script type=
+# "application/json">` and every `wp_json_encode` block attribute, and
+# percent-encoded in the `redirect_to=` of every wp-login link. Both are
+# dereferenceable — the browser decodes them — and both are what a hole in one
+# encoder leaves behind after the HTML surface has been rewritten correctly,
+# which is the shape of every leak this repository has found. The comma case is
+# an ordinary two-origin `content=` attribute: `,` is simply not in the
+# boundary class beside `/"'<> ?#:`.
+for spelling in json pct refs comma; do
+  case "$spelling" in
+    json)  printf '<script type="application/json">{"home":"https:\\/\\/acme.ddev.site\\/wp-json\\/"}</script>\n' ;;
+    pct)   printf '<a href="/wp-login.php?redirect_to=https%%3A%%2F%%2Facme.ddev.site%%2Fwp-admin%%2F">in</a>\n' ;;
+    refs)  printf '<a href="https&#58;&#47;&#47;acme.ddev.site&#47;a">a</a>\n' ;;
+    comma) printf '<meta name="x" content="https://acme.ddev.site,https://other.test">\n' ;;
+  esac > "$HS_FAKE_DIR/page"
+  out="$(cd "$wt" && fails=0 PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+  contains "a $spelling-encoded canonical origin is reported" "canonical origin" "$out"
+done
+
 rm -f "$fakebin/curl"
 writefake
 
@@ -1160,7 +1214,7 @@ out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
   HS_CURL_BODY='<a href="https://wt-a--acme.ddev.site/x">t</a>' \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
-  *"neither a canonical hostname nor a"*)
+  *"neither a canonical origin nor a"*)
     fail "a page naming only the variant is not called out" "$out" ;;
   *) pass "a page naming only the variant is not called out" ;;
 esac

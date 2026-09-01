@@ -2299,3 +2299,48 @@ func TestASpellingTheWalkCannotReadIsReportedWhenRewritten(t *testing.T) {
 		}
 	}
 }
+
+// A change elsewhere on the page is not this value's change.
+//
+// The signal is "a serialized value *here* was rewritten in an encoding this
+// build cannot read". That is one claim about one value, and the first two
+// versions of it were two independent facts glued together: the page changed
+// somewhere, and a header exists somewhere. Every WordPress page carries a
+// `<link rel="canonical">` to supply the first, so any page holding a value
+// outside the known spellings was permanently red — and a check red on every
+// page is the failure the version before it was written to close.
+//
+// Both orders matter: the link before the blob, and the link after it. The
+// second is why a value's reach is bounded by its own declared length rather
+// than by "the next header, or the rest of the page".
+func TestAChangeElsewhereIsNotThisValuesChange(t *testing.T) {
+	canon, variant := "www.mz38b.test", "v.ddev.site"
+	rw := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), canon, variant))
+	}
+	// Genuinely unreadable: literal colons, so readLen parses the header, and
+	// percent-encoded quotes, so no spelling completes the parse. A plain
+	// serialized blob would not do — the walk reads that one and skips it
+	// before any of this applies, which is how the first version of this test
+	// passed while the bound it was written for did nothing.
+	blob := `a:2:{s:5:%22label%22;s:5:%22Hello%22;s:4:%22size%22;s:5:%22large%22;}`
+	link := `<link rel="canonical" href="https://` + canon + `/x/">`
+
+	for name, page := range map[string]string{
+		"the link above the value": link + `<div data-wp-context="` + blob + `">x</div>`,
+		"the link below the value": `<div data-wp-context="` + blob + `">x</div>` + link,
+	} {
+		if UnreadSerialized([]byte(page), rw) {
+			t.Errorf("%s: a value the rewrite never touched reddened the page:\n %s",
+				name, page)
+		}
+	}
+
+	// And the value the rewrite *does* touch is still reported, so this is not
+	// a blanket disable.
+	live := strings.ReplaceAll(blob, `Hello`, `https://`+canon)
+	live = strings.ReplaceAll(live, `s:5:%22https`, `s:26:%22https`)
+	if !UnreadSerialized([]byte(link+`<div data-wp-context="`+live+`">x</div>`), rw) {
+		t.Errorf("an unreadable value the rewrite did touch was not reported")
+	}
+}

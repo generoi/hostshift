@@ -100,33 +100,92 @@ func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 // serialized string put the header and the host in different halves and hid
 // them from each other.
 func UnreadSerialized(b []byte, rw func([]byte) []byte) bool {
-	if bytes.Equal(rw(b), b) {
+	// Where the rewrite actually landed, as a range in the original buffer: the
+	// common prefix and the common suffix bound it from both ends, which works
+	// even though the rewrite changes the length.
+	out := rw(b)
+	if bytes.Equal(out, b) {
 		return false // nothing was touched, so nothing was touched unread
 	}
+	lo := 0
+	for lo < len(b) && lo < len(out) && b[lo] == out[lo] {
+		lo++
+	}
+	tail := 0
+	for tail < len(b)-lo && tail < len(out)-lo && b[len(b)-1-tail] == out[len(out)-1-tail] {
+		tail++
+	}
+	hi := len(b) - tail
+
+	// The headers, so each one can be asked about its own bytes.
+	//
+	// The first version tested `rw(b) != b` over the whole page and then looked
+	// for a header anywhere in it. Those are two independent facts, and the note
+	// it raised — "a serialized value *here* was rewritten" — claimed they were
+	// one: a `<link rel="canonical">` at the top of the page supplied the change
+	// and any unreadable blob below it supplied the header, so a value the
+	// rewrite never touched reddened the page. Every WordPress page has that
+	// link.
+	type head struct{ at, reach int }
+	var heads []head
 	for i := 0; i < len(b); i++ {
 		if !valueShape(b, i) {
 			continue
 		}
-		header := false
 		for _, syn := range []syntax{
 			literalSyntax, percentSyntax, htmlSyntax, jsonSyntax,
 			jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax,
 			htmlJSONSyntax, jsonDoubleSyntax,
 		} {
-			if _, _, ok := readLen(b, i+1, syn); ok {
-				header = true
-				break
+			n, j, ok := readLen(b, i+1, syn)
+			if !ok {
+				continue
 			}
+			// How far the value reaches, under the *tightest* reading: its
+			// declared length is in decoded bytes and every spelling here
+			// spends at least one source byte on each, so the data covers at
+			// least j+n.
+			//
+			// Deliberately the tight bound rather than the loose one. A loose
+			// bound — twelve source bytes per decoded byte, which is what the
+			// widest escape actually costs — reaches past a short value into
+			// whatever follows, and a `<link rel="canonical">` after the blob
+			// then counts as the blob's own change. That is the red-on-every-
+			// page failure this signal has now had twice. Under-reaching costs
+			// a report on a value whose host sits late in a heavily escaped
+			// string; over-reaching costs the whole check.
+			reach := j + n
+			if reach > len(b) || reach < j {
+				reach = len(b)
+			}
+			heads = append(heads, head{i, reach})
+			break
 		}
-		if !header {
-			continue
-		}
-		// A real header. If any spelling parses it completely, the walk read it
-		// and re-emitted its length; nothing to report.
+	}
+	for _, h := range heads {
+		i := h.at
+		// If any spelling parses it completely, the walk read it and re-emitted
+		// its length; nothing to report.
 		if _, _, ok, _ := repairAt(b, i, func(x []byte) []byte { return x }, nil); ok {
 			continue
 		}
-		return true
+		// Its own bytes, from this header to wherever the next one starts. An
+		// unreadable value has no end this can measure — that is what makes it
+		// unreadable — so the next header is the boundary, which puts anything
+		// else on the page outside it.
+		// h.reach alone. Bounding by the next header as well was tried and no
+		// measurement could tell the difference: j+n is already tighter than
+		// the gap to the next header in every shape I could build, and a
+		// second bound nothing can distinguish is a second thing to keep true.
+		end := h.reach
+		// Against the *whole* buffer's rewrite, compared by position, not by
+		// rewriting the fragment. A fragment is not the document it came from —
+		// a reference-encoded host in an attribute value decodes there and not
+		// in a bare slice of the same bytes — so asking rw about a fragment
+		// answers a question about a page that does not exist.
+		if lo < end && hi > i {
+			return true
+		}
 	}
 	return false
 }
