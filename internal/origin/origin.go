@@ -83,11 +83,17 @@ func Parse(s string) (Origin, error) {
 	if err != nil {
 		return Origin{}, fmt.Errorf("parse origin %q: %w", s, err)
 	}
-	// The declared spelling, folded the same way but left in Unicode. Compared
-	// against Host so the common all-ASCII case carries nothing extra.
-	display, derr := foldHost(u.Hostname())
-	if derr != nil || display == host {
-		display = ""
+	// The declared spelling, folded the same way but left in Unicode — and only
+	// when the declaration was non-ASCII to begin with. `ToUnicode` decodes an
+	// A-label, so without this test a punycode declaration came back as the
+	// U-label: the same defect with the spellings swapped, writing a Unicode
+	// host into a database that holds the ACE. What is preserved is what was
+	// written down, whichever of the two that was.
+	display := ""
+	if !isASCII(u.Hostname()) {
+		if f, ferr := foldHost(u.Hostname()); ferr == nil && f != host {
+			display = f
+		}
 	}
 	return Origin{
 		Scheme: scheme, Host: host, Port: NormalisePort(scheme, u.Port()),
@@ -144,6 +150,17 @@ var hostFold = idna.New(
 // because a miss falls through to real DNS. Two places asking "is this the same
 // host" with different answers is the shape of half this project's bugs.
 func NormaliseHost(h string) (string, error) { return normaliseHost(h) }
+
+// isASCII reports whether s is all ASCII, which is what decides whether an
+// origin has a second spelling worth carrying at all.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
 
 // foldHost is normaliseHost stopping one step short: the same UTS46 mapping and
 // the same root-dot trim, but left in Unicode instead of encoded to ACE.

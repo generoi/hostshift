@@ -5,7 +5,21 @@ Rewrite origins in HTTP traffic, in both directions.
 A site's content refers to one hostname; you want to reach it at another.
 hostshift maps between them: responses get the hostname the browser is on,
 requests get the hostname the content was written for. Nothing is rewritten at
-rest — the database is never touched.
+rest — hostshift never writes to the database itself.
+
+What the *application* writes does pass through it, though, and one thing
+changes there: **the scheme**. A canonical is declared with a scheme, and the
+matcher accepts either — so `http://www.acme.fi/legacy/` in a post becomes the
+variant on the way out, and comes back as `https://www.acme.fi/legacy/`, because
+nothing in the variant spelling records which scheme was written originally.
+Save a post you did not otherwise edit and every plain URL in it takes the
+canonical's declared scheme. That is an upgrade when the canonical is `https`
+and a downgrade when it is `http`, which some staging environments are; PLAN §M0
+measured one fleet host appearing 165 times over `http` and never over `https`.
+The data stays valid and serialized lengths are recomputed correctly — this is
+the scheme and nothing else — but it is a real change to rows you did not
+intend to touch, and `hostshift diff` cannot see it, because it only exercises
+the response direction.
 
 It is a filter and a reverse proxy, it knows nothing about any CMS, and it
 scaffolds nothing: no config files written, no slugs guessed, no directories

@@ -224,6 +224,12 @@ func TestAllocationStaysBounded(t *testing.T) {
 		// 135x, inside the old ceiling. The structural halving named below
 		// (`pos`/`end` as []int32) is the lever if this ever needs to come down.
 		{"every view fires", r46CompositeUnit, 400},
+		// A CSS escape beside an ampersand, which is the shape a gate on
+		// `\`-plus-digit armed the whole JSON view for. `\3a` is a colon and
+		// `\2014` a dash, so this is an ordinary themed page, and it measured
+		// 287x while no fixture here looked at it. The gate is two-byte needles
+		// again, and this is what pins that.
+		{"css escapes beside ampersands", `\3a &amp;#91;http:`, 200},
 		{"ampersands alone", `&`, 128},
 		{"references and brackets", `&#91;http:`, 115},
 	} {

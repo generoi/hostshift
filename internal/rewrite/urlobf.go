@@ -264,17 +264,6 @@ func stripForJSONEsc(v []byte) normalised {
 			// Tier 1. `\xe4` in particular is what a minifier run with
 			// `ascii_only` writes for every byte above 0x7E — the same IDN
 			// authority the `\u00e4` case was widened for, one member over.
-			// Line continuation: `\` then a newline is *removed* by the JS
-			// parser, joining the two halves of the string. Removing is not
-			// emitting, which is the rule this family is bound by.
-			if v[i+1] == '\n' || v[i+1] == '\r' {
-				w := 2
-				if v[i+1] == '\r' && i+2 < len(v) && v[i+2] == '\n' {
-					w = 3
-				}
-				i += w
-				continue
-			}
 			if r, w, ok := jsEscAt(v[i:]); ok {
 				for k := 0; k < len(r); k++ {
 					dec = append(dec, r[k])
@@ -318,17 +307,6 @@ func stripForJSONEsc(v []byte) normalised {
 func hasJSONEsc(v []byte) bool {
 	if bytes.Contains(v, []byte(`\u`)) || bytes.Contains(v, []byte(`\x`)) {
 		return true
-	}
-	// Octal and line continuation, which have no two-byte literal to search for.
-	// Scanned rather than matched, which allocates nothing; the view behind this
-	// is what costs, and it is only built when one of these is actually present.
-	for i := 0; i+1 < len(v); i++ {
-		if v[i] != '\\' {
-			continue
-		}
-		if c := v[i+1]; (c >= '0' && c <= '7') || c == '\n' || c == '\r' {
-			return true
-		}
 	}
 	return false
 }
@@ -379,14 +357,24 @@ func hasRefJSONEsc(v []byte) bool {
 // jsEscAt decodes `\xNN` or `\u{...}` at the start of b, returning the bytes and
 // the width consumed.
 //
-// Two of JavaScript's four string escapes. The other two are left, with a
-// reason: legacy octal is `\` followed by a digit, and line continuation is `\`
-// followed by a newline, so gating on either means gating on a backslash before
-// something ordinary — a regex backreference, a Windows path — and every view in
-// this family builds three slices the length of the body. That took the
-// allocation composite from 200x to 304x once already. These two are two-byte
-// needles and cost nothing when absent; those two are not, and no producer has
-// been named for them.
+// Two of JavaScript's four string escapes, and deliberately not the other two.
+//
+// Legacy octal and the line continuation were added and then taken out again,
+// for two reasons that turned out to be the same reason. Both are `\` followed
+// by something ordinary — a digit, a newline — so neither has a two-byte needle
+// to gate on, and a scan for them armed this whole view on every CSS escape in
+// the document: `\3a` is a colon, `\2014` a dash, and a page with one measured
+// 287x the body against a 128x fixture that does not look at this shape.
+//
+// And the line continuation is wrong outside a JS string. These views run on
+// every surface, and in an HTML attribute a backslash is a `/` to the URL
+// parser, so removing `\<LF>` from inside `www.example.f\<LF>i` invents a host
+// the browser never resolves and rewrites bytes that were not an origin.
+//
+// `\xNN` and `\u{...}` have neither problem: each decodes to a byte in place,
+// and each has a two-byte needle. `\xNN` also has a producer — a minifier run
+// with `ascii_only` writes every byte above 0x7E that way, which is the same IDN
+// authority `\u00e4` was widened for.
 func jsEscAt(b []byte) ([]byte, int, bool) {
 	if len(b) < 4 || b[0] != '\\' {
 		return nil, 0, false
@@ -397,22 +385,6 @@ func jsEscAt(b []byte) ([]byte, int, bool) {
 			return nil, 0, false
 		}
 		return r, 4, true
-	}
-	// Legacy octal, `\NNN`, one to three digits 0-7. `\170` is `x`, and a
-	// minifier that predates `\x` writes bytes this way.
-	if b[1] >= '0' && b[1] <= '7' {
-		w, val := 1, 0
-		for w < 4 && w < len(b) && b[w] >= '0' && b[w] <= '7' {
-			val = val<<3 | int(b[w]-'0')
-			w++
-		}
-		if val < 0x20 || val > 0x7E {
-			// The same rule as everywhere else in this family: never emit a
-			// control byte into the view, and an octal escape cannot reach
-			// beyond 0xFF anyway, so there is no IDN case above it to lose.
-			return nil, 0, false
-		}
-		return []byte{byte(val)}, w, true
 	}
 	if b[1] != 'u' || b[2] != '{' {
 		return nil, 0, false
@@ -1069,7 +1041,13 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 	switch {
 	case needScheme:
 		// From the scheme through the port: the whole origin, written plainly.
-		return n.pos[at], authorityEnd(n, he, end), to.String(), true
+		//
+		// Spelled out rather than `to.String()`, which is HostPort and therefore
+		// the ACE form. Two of these three arms were changed for §5.5 and this
+		// one was not, so the spelling still went punycode wherever the schemes
+		// differ — the same write into the shared database, reached through the
+		// obfuscated spellings that are the reason HostLeaksBack exists.
+		return n.pos[at], authorityEnd(n, he, end), to.Scheme + "://" + to.DisplayHostPort(), true
 	case hasPort:
 		return from, authorityEnd(n, he, end), to.DisplayHostPort(), true
 	}

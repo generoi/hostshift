@@ -43,3 +43,31 @@ func TestR48TheMatcherEmitsTheDeclaredSpelling(t *testing.T) {
 		}
 	}
 }
+
+// TestR49APercentContextKeepsTheRoundTrip: the declared spelling goes back in
+// raw, and that is a choice with a cost on each side.
+//
+// Percent-encoding the U-label would be the more correct URL — raw UTF-8 in a
+// request line is a spec violation, although nginx accepts it, and every other
+// encoding in this engine matches the spelling it found. But the replacement
+// table is static: by the time the reverse pass runs, the forward pass has
+// already put an ASCII variant where the host was, so nothing records whether
+// the original was written raw or percent-encoded. One spelling has to be
+// chosen, and the round trip is what §4.3 is about — the database holds the raw
+// U-label, because WordPress does not punycode `siteurl`.
+func TestR49APercentContextKeepsTheRoundTrip(t *testing.T) {
+	m, err := NewMap([]Site{{
+		Name:      "hml",
+		Canonical: MustParse("https://www.hämeenlinna.fi"),
+		Variant:   MustParse("https://wt-a--hml.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := []byte("redirect_to=https%3A%2F%2Fwww.hämeenlinna.fi%2Fwp-admin%2F")
+	fwd, _ := m.Forward().RewriteText(in, "text", false)
+	back, _ := m.Reverse().RewriteText(fwd, "text", false)
+	if string(back) != string(in) {
+		t.Errorf("the round trip did not restore the bytes:\n  in:   %s\n  back: %s", in, back)
+	}
+}

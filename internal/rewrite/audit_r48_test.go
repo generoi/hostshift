@@ -127,16 +127,42 @@ func TestR48TheEngineCannotReadJSsOtherStringEscapes(t *testing.T) {
 		t.Fatalf("the control case no longer holds, so this test measures nothing:\n  %s", out)
 	}
 
+	// Read: each decodes to a byte in place and each has a two-byte needle to
+	// gate the view on.
 	for name, body := range map[string]string{
-		"hex":               `fetch("https://www.e` + bs + `x78ample.fi/x")`,
-		"code point":        `fetch("https://www.e` + bs + `u{78}ample.fi/x")`,
-		"octal":             `fetch("https://www.e` + bs + `170ample.fi/x")`,
-		"line continuation": "fetch(\"https://www.exam" + bs + "\nple.fi/x\")",
+		"hex":        `fetch("https://www.e` + bs + `x78ample.fi/x")`,
+		"code point": `fetch("https://www.e` + bs + `u{78}ample.fi/x")`,
 	} {
 		in := "<script>" + body + "</script>"
 		if out := r48HTML(t, m, in); out == in {
 			t.Errorf("%s: a production origin the JS parser dereferences went out "+
 				"byte-identical:\n  %s", name, in)
+		}
+	}
+
+	// Not read, deliberately, and this pins that decision so it is a choice
+	// rather than a drift. Both were implemented in round 48 and taken out again
+	// in round 49 for reasons recorded in `jsEscAt` and in PLAN §5.2:
+	//
+	//   * neither has a two-byte needle — both are `\` before something
+	//     ordinary — so gating on them armed the whole view on every CSS escape
+	//     in the document, measured at 287x the body against a 128x fixture that
+	//     does not look at this shape;
+	//   * and the line continuation is *wrong* outside a JS string: these views
+	//     run on every surface, and in an HTML attribute a backslash is a `/` to
+	//     the URL parser, so removing it invents a host the browser never
+	//     resolves.
+	//
+	// If a producer is ever named for either, this is the test to invert — and
+	// the surface question has to be answered first.
+	for name, body := range map[string]string{
+		"octal":             `fetch("https://www.e` + bs + `170ample.fi/x")`,
+		"line continuation": "fetch(\"https://www.exam" + bs + "\nple.fi/x\")",
+	} {
+		in := "<script>" + body + "</script>"
+		if out := r48HTML(t, m, in); out != in {
+			t.Errorf("%s: this spelling is deliberately not read; something now "+
+				"reads it, which needs the surface question answered:\n  %s", name, out)
 		}
 	}
 }
