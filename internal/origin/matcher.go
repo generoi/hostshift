@@ -413,7 +413,70 @@ func delimAt(b []byte, i int) bool {
 		}
 		return true // a stray '%' is not a host byte either
 	}
+	// A backslash inside a JSON string introduces an escape, and the character
+	// it stands for is what follows the host.
+	//
+	// Read as a plain delimiter, `{"u":"https:\/\/www.acme.fi\u00a0x"}` matched
+	// `www.acme.fi` and was rewritten — but `wp_json_encode` writes every
+	// non-ASCII rune that way, so this is an ordinary non-breaking space after
+	// the site's own URL, and ada resolves the decoded form to a parse error or
+	// to `www.acme.xn--fix-rla`, never to the canonical origin. The oracle's own
+	// contract is that a reference resolving anywhere else must not be touched.
+	//
+	// Worse than a false positive: the browser decodes the escape, so what the
+	// page then posts back is the variant host followed by a letter, which the
+	// reverse direction reads correctly and finds no origin in — the variant
+	// hostname is written into the shared database and stays there.
+	//
+	// `\/` still terminates, because it decodes to a slash. It is the escapes
+	// that decode to *host* bytes that continue the host.
+	if b[i] == '\\' {
+		if c, ok := jsonEscChar(b, i); ok {
+			return !isHostByte(c)
+		}
+	}
 	return !isHostByte(b[i])
+}
+
+// jsonEscChar decodes the JSON string escape at b[i] (which must be a
+// backslash), reporting the byte it stands for. A `\uXXXX` above ASCII reports
+// 0x80, which is a host byte — the exact value does not matter, only whether the
+// host continues.
+func jsonEscChar(b []byte, i int) (byte, bool) {
+	if i+1 >= len(b) {
+		return 0, false
+	}
+	switch b[i+1] {
+	case '/', '\\', '"':
+		return b[i+1], true
+	case 'n':
+		return '\n', true
+	case 'r':
+		return '\r', true
+	case 't':
+		return '\t', true
+	case 'b':
+		return '\b', true
+	case 'f':
+		return '\f', true
+	case 'u':
+		if i+6 > len(b) {
+			return 0, false
+		}
+		n := 0
+		for k := i + 2; k < i+6; k++ {
+			d, ok := hexVal(b[k])
+			if !ok {
+				return 0, false
+			}
+			n = n<<4 | int(d)
+		}
+		if n >= 0x80 {
+			return 0x80, true
+		}
+		return byte(n), true
+	}
+	return 0, false
 }
 
 // unhex decodes the two hex digits at i.

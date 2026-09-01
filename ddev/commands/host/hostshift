@@ -1912,6 +1912,31 @@ $owns
 EOF
 
   fi
+  # Every variant's homepage, not only the first one's.
+  #
+  # `probe` is `cut -d, -f1`, and `probe_body` is the sole evidence for all four
+  # scans below — the map-scoped leak count, the database's home, the parent's
+  # unmapped hostnames, and the off-map hosts. So on a multisite no state of any
+  # site but the first could fail `check`: site 1's homepage clean and site 2's
+  # carrying seventeen live production origins exited 0. A multisite is the
+  # configuration hostshift.yaml exists for.
+  #
+  # Appended here, after the routing diagnosis above has had its say on the
+  # first variant alone — a sibling's failure must not be read as this one's.
+  # Best-effort and capped: this runs on every `ddev start`, so a short timeout,
+  # no retries, and a bound on how many pages a large multisite fetches.
+  if [ -n "${probe_body:-}" ] && command -v curl >/dev/null; then
+    n_extra=0
+    for extra in $(printf '%s' "$variants" | tr ',' ' '); do
+      [ "$extra" = "${probe:-}" ] && continue
+      [ "$n_extra" -ge 8 ] && break
+      n_extra=$((n_extra + 1))
+      probe_body="$probe_body
+$(curl -sk --noproxy '*' --connect-timeout 2 --max-time 5 \
+        "https://$extra$port/" 2>/dev/null || true)"
+    done
+  fi
+
   # The hostnames the parent declares that this map does not name, counted on
   # the page rather than reasoned about.
   #
@@ -2015,6 +2040,66 @@ EOF
       # "check fails" passed on the crash.
       exit 2
     fi
+
+    # And the other direction: origins on the page that the map names *nowhere*.
+    #
+    # Every leak instrument in this product is map-scoped. The scan above sums
+    # `rewrites` from `hostshift rewrite --dry-run`, which by construction counts
+    # only origins the forward map matches; `hostshift diff`'s LEAKS column is
+    # the same question asked of the same map. The three gates that can speak
+    # about an unknown hostname each read one named list — `wp_options.home`,
+    # the parent's hostshift.yaml, `$DDEV_HOSTNAME` — so a hostname on none of
+    # those lists is on no list at all.
+    #
+    # That is one defect, and rounds 50, 51 and 52 each found a different
+    # symptom of it. Enumerating the deployment states showed the shape: a
+    # worktree owning its own map whose hostshift.yaml simply omits an alias —
+    # the apex sibling of the canonical, which is the commonest hostname pair
+    # WordPress has — served seventeen live production origins with every gate
+    # correct on its own terms and `check` exiting 0, and `diff` printing "no
+    # canonical origin reached the browser" over it.
+    #
+    # So ask the page instead of asking the map: every absolute-URL host in the
+    # body, minus everything this deployment legitimately names.
+    others="$(printf '%s' "$probe_body" \
+      | grep -oE '//[A-Za-z0-9][A-Za-z0-9._-]*' 2>/dev/null \
+      | sed 's|^//||' | tr 'A-Z' 'a-z' | sort | uniq -c | sort -rn || true)"
+    known_hosts=",$(printf '%s,%s,%s,' "$canon_list" "$variants" "${DDEV_HOSTNAME:-}" \
+      | tr -s ',' ','),"
+    while read -r cnt host; do
+      [ -n "${host:-}" ] || continue
+      [ "${cnt:-0}" -ge 5 ] 2>/dev/null || continue
+      case "$known_hosts" in *",$host,"*) continue ;; esac
+      case "$host" in
+        localhost|*.localhost|*.test|127.*|*.ddev.site) continue ;;
+      esac
+      # Same registrable domain as something the map names — an apex sibling, a
+      # `shop.`, a `media.`. Third-party hosts on a real WordPress page (w3.org,
+      # gravatar, googleapis) share none, so they stay a note rather than a
+      # refusal. Two labels is an approximation, wrong for `.co.uk`; it decides
+      # only whether this is loud or fatal, and the count is printed either way.
+      reg="$(printf '%s' "$host" | awk -F. '{ if (NF>=2) print $(NF-1)"."$NF; else print $0 }')"
+      related=""
+      for c in $(printf '%s' "$canon_list" | tr ',' ' '); do
+        creg="$(printf '%s' "$c" | awk -F. '{ if (NF>=2) print $(NF-1)"."$NF; else print $0 }')"
+        [ "$creg" = "$reg" ] && related=1 && break
+      done
+      if [ -n "$related" ]; then
+        echo "hostshift: refusing to call this healthy — the page served at" >&2
+        echo "  https://$probe carries $cnt links to $host, which this map does" >&2
+        echo "  not name and which is the same site as a hostname it does" >&2
+        echo "  ($reg). They are not rewritten, so they are live production" >&2
+        echo "  links in a preview." >&2
+        echo "  Add $host to hostshift.yaml — as an alias of the canonical it" >&2
+        echo "  belongs to — and \`ddev hostshift init && ddev restart\`." >&2
+        exit 2
+      fi
+      echo "hostshift: note: the page carries $cnt links to $host, which this map" >&2
+      echo "  does not name. If that is a third party it is nothing; if it is" >&2
+      echo "  this site under another name, add it to hostshift.yaml." >&2
+    done <<EOF
+$others
+EOF
   fi
 
   # The parent-declares verdict, now that the database has had its say.

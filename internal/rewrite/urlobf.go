@@ -1054,6 +1054,18 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) 
 	if hs >= he {
 		return 0, 0, "", false
 	}
+	// A JSON escape after the host continues the host.
+	//
+	// `stripForURL` reads a backslash as a slash, so `www.acme.fi\u00a0x` ends
+	// the host at the backslash and matched — but `wp_json_encode` writes every
+	// non-ASCII rune that way, and the browser decodes it, so the reference
+	// resolves to something that is not this origin. The byte matcher had the
+	// same hole and is fixed in `delimAt`; this is the locator's half.
+	if he < len(n.pos) && n.pos[he] < len(v) && v[n.pos[he]] == '\\' {
+		if c, ok := jsonEscHostByte(v, n.pos[he]); ok && c {
+			return 0, 0, "", false
+		}
+	}
 	host := h.key(percentDecode(n.b[hs:he]))
 	// host:port first, and the bare host only when the port is the scheme's
 	// default. §5.4 matches on exact origin equality, so `https://h:80` is a
@@ -1181,6 +1193,43 @@ func userinfoAt(v []byte, n normalised, at, hs int) string {
 		return string(v[n.pos[j]:n.pos[hs]])
 	}
 	return ""
+}
+
+// jsonEscHostByte reports whether the JSON escape at b[i] decodes to a byte
+// that continues a host, rather than one that ends it. `\/` ends it; `\u00e4`
+// and `\u0041` do not.
+func jsonEscHostByte(b []byte, i int) (bool, bool) {
+	if i+1 >= len(b) || b[i] != '\\' {
+		return false, false
+	}
+	switch b[i+1] {
+	case '/', '\\', '"', 'n', 'r', 't', 'b', 'f':
+		return false, true
+	case 'u':
+		if i+6 > len(b) {
+			return false, false
+		}
+		n := 0
+		for k := i + 2; k < i+6; k++ {
+			var d int
+			switch c := b[k]; {
+			case c >= '0' && c <= '9':
+				d = int(c - '0')
+			case c >= 'a' && c <= 'f':
+				d = int(c-'a') + 10
+			case c >= 'A' && c <= 'F':
+				d = int(c-'A') + 10
+			default:
+				return false, false
+			}
+			n = n<<4 | d
+		}
+		if n >= 0x80 {
+			return true, true
+		}
+		return isAuthorityByte(byte(n)) && !isSlashish(byte(n)), true
+	}
+	return false, false
 }
 
 // verbatimSep returns the source bytes between the scheme's colon and the host,

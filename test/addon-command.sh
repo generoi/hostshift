@@ -1033,10 +1033,15 @@ mkdir -p "$fakecurl"
 cat > "$fakecurl/curl" <<'FAKECURL'
 #!/usr/bin/env bash
 # Emits the codes listed in $HS_CURL_CODES, one per call, last one repeating.
+# Records which host each call asked for, so a test can assert that every
+# variant is probed and not only the first.
 f="${HS_CURL_STATE:-/tmp/hs-curl-n}"
 n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$f"
 # The body too, since check now reads what the page says about itself.
+for a in "$@"; do
+  case "$a" in https://*) printf '%s\n' "$a" >> "${HS_FAKE_DIR}/curl-hosts" ;; esac
+done
 [ -n "${HS_CURL_BODY:-}" ] && printf '%s\n' "$HS_CURL_BODY"
 set -- ${HS_CURL_CODES:-200}
 [ "$n" -le $# ] && eval "printf '%s' "\${$n}"" || eval "printf '%s' "\${$#}""
@@ -1368,8 +1373,86 @@ out="$(cd "$wt" && HS_CURL_BODY="$leaky" \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 [ "$rc" = 2 ] && pass "a page carrying the parent's undeclared hostnames is refused" \
   || fail "a page carrying the parent's undeclared hostnames is refused" "exit $rc"
-contains "and the count is measured, not inferred" "5 links to" "$out"
+contains "and the count is measured, not inferred" "links to www.acme.example" "$out"
 contains "and it does not suggest a search-replace" "moves production" "$out"
+
+# An origin the map names *nowhere* — the apex sibling of the canonical.
+#
+# Every leak instrument in this product is map-scoped: the `--dry-run` scan sums
+# origins the forward map matches, `diff`'s LEAKS column asks the same map, and
+# the three gates that can speak about an unknown hostname each read one named
+# list. A hostname on none of those lists is on no list at all, and rounds 50,
+# 51 and 52 each found a different symptom of that one defect. Forgetting one
+# `aliases:` entry is exactly the mistake hostshift.yaml exists to let you make.
+cp "$wt/.ddev/.env" "$work/apex-env.hold" 2>/dev/null || true
+mv "$wt/hostshift.yaml" "$work/apex-hs.hold" 2>/dev/null || true
+printf 'sites:\n  - canonical: https://www.acme.example\n    variant: https://wt-a--acme.ddev.site\n' \
+  > "$wt/hostshift.yaml"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+apexleak='<link rel="canonical" href="https://acme.example/">
+<link rel="alternate" href="https://acme.example/feed/">
+<link rel="https://api.w.org/" href="https://acme.example/wp-json/">
+<link rel="shortlink" href="https://acme.example/?p=1">
+<a href="https://acme.example/x">t</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$apexleak" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "an origin the map names nowhere is refused" \
+  || fail "an origin the map names nowhere is refused" "exit $rc"
+contains "and it is named with its count" "links to acme.example" "$out"
+contains "and the remedy is an alias" "as an alias of the canonical" "$out"
+
+# ...and a third party is a note, not a refusal. A real WordPress page carries
+# w3.org, gravatar and googleapis; refusing on those is the warning nobody reads.
+third='<link rel="stylesheet" href="https://fonts.googleapis.com/a">
+<link rel="stylesheet" href="https://fonts.googleapis.com/b">
+<script src="https://fonts.googleapis.com/c"></script>
+<script src="https://fonts.googleapis.com/d"></script>
+<img src="https://fonts.googleapis.com/e">'
+out="$(cd "$wt" && HS_CURL_BODY="$third" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 0 ] && pass "a third-party host is a note, not a refusal" \
+  || fail "a third-party host is a note, not a refusal" "exit $rc"
+contains "and it is still counted out loud" "links to fonts.googleapis.com" "$out"
+
+# ...and the healthy page says nothing at all. Every origin on it is the variant
+# — that is what a working deployment looks like — so subtracting what this
+# deployment legitimately names is what keeps this from firing on every start.
+healthy='<link rel="canonical" href="https://wt-a--acme.ddev.site/">
+<link rel="alternate" href="https://wt-a--acme.ddev.site/feed/">
+<link rel="https://api.w.org/" href="https://wt-a--acme.ddev.site/wp-json/">
+<link rel="shortlink" href="https://wt-a--acme.ddev.site/?p=1">
+<a href="https://wt-a--acme.ddev.site/x">t</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$healthy" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 0 ] && pass "a page of nothing but variant origins is silent" \
+  || fail "a page of nothing but variant origins is silent" "exit $rc"
+case "$out" in
+  *"links to wt-a--acme.ddev.site"*)
+    fail "and the variant is not reported as a stranger" "$out" ;;
+  *) pass "and the variant is not reported as a stranger" ;;
+esac
+rm -f "$wt/hostshift.yaml"
+mv "$work/apex-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
+cp "$work/apex-env.hold" "$wt/.ddev/.env" 2>/dev/null || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+
+# ...and every variant is probed, not only the first. `probe` is `cut -f1`, and
+# probe_body was the sole evidence for all four scans — so on a multisite no
+# state of any site but the first could fail check: site 1 clean and site 2
+# carrying seventeen production origins exited 0.
+: > "$HS_FAKE_DIR/curl-hosts"
+out="$(cd "$wt" && HS_CURL_BODY="$healthy" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+n_probed="$(sort -u "$HS_FAKE_DIR/curl-hosts" 2>/dev/null | wc -l | tr -d ' ')"
+[ "${n_probed:-0}" -ge 2 ] && pass "check probes every variant, not just the first" \
+  || fail "check probes every variant, not just the first" "probed $n_probed host(s)"
 
 # ...and one link is not that. A developer's note pointing at the client's site
 # is an ordinary content link, and refusing on it would be the warning-on-every-
