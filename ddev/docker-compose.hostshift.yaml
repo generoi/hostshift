@@ -75,7 +75,25 @@ services:
     # them on the host and passes them through. With no map arg, -C /project
     # applies — right when the project has a hostshift.yaml, since that file
     # *is* mounted.
-    command: proxy -C /project --listen 0.0.0.0:8080 --upstream http://web:80
+    #
+    # `ddev-${DDEV_SITENAME}-web`, not the bare `web`. This service is on
+    # `ddev_default` as well as its own network — it has to be, so the router
+    # can reach it — and *every* DDEV web container carries the alias `web`
+    # there. While this project's own web is up its own network wins, so the
+    # bare name is right nearly always; when web alone is down, resolution falls
+    # through to the shared network and picks whichever other project answers.
+    #
+    # That is not a failed request. The developer's variant hostname serves
+    # another client's site, and the request is delivered *into* it carrying
+    # this project's Host header — under production-canonical, the client's real
+    # production hostname arriving inside a different client's WordPress. The
+    # proxy logs nothing at serve time, so there is no signal anywhere.
+    #
+    # `docker stop` on web while debugging, an OOM, or an interrupted restart
+    # all produce it, and that is exactly when a developer looks at the variant
+    # to see what broke. The container name is unambiguous on both networks.
+    command: proxy -C /project --listen 0.0.0.0:8080
+      --upstream http://ddev-${DDEV_SITENAME}-web:80
       ${HOSTSHIFT_ARGS:-${HOSTSHIFT_MAP_ARGS:---slug ${HOSTSHIFT_SLUG:-wt}}}
     labels:
       com.ddev.site-name: ${DDEV_SITENAME}

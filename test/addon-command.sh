@@ -1556,5 +1556,22 @@ args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wtk/.ddev/.env")"
 n="$(printf '%s\n' "$args" | grep -o -- '--max-body' | wc -l | tr -d ' ')"
 check "a second init does not duplicate it" "1" "$n"
 
+echo "== the proxy dials its own web container, not whichever answers"
+
+# The service sits on ddev_default as well as its own network — it must, so the
+# router can reach it — and every DDEV web container carries the alias `web`
+# there. With this project's own web down, the bare name resolves through the
+# shared network to another project: the developer's variant hostname serves a
+# different client's site, and the request is delivered into it carrying this
+# project's Host header. The proxy logs nothing at serve time, so nothing says so.
+compose="$repo/ddev/docker-compose.hostshift.yaml"
+up="$(tr '\n' ' ' < "$compose" | sed -n 's/.*--upstream \([^ ]*\).*/\1/p')"
+check "the upstream names the project's own container" \
+  'http://ddev-${DDEV_SITENAME}-web:80' "$up"
+case "$up" in
+  *//web:*) fail "the upstream is not the bare alias" "got $up" ;;
+  *) pass "the upstream is not the bare alias" ;;
+esac
+
 if [ "$fails" -gt 0 ]; then echo "$fails failure(s)"; exit 1; fi
 echo "all passed"

@@ -639,7 +639,29 @@ func cmdDiff(args []string) (int, error) {
 	// loopback containment the add-on ships a whole compose file to provide.
 	// `--resolve`'s help text names the hazard; nothing said it at the moment it
 	// happens, which is the only moment it can be acted on.
-	if len(resolveMap) == 0 && !isLoopbackHost(cb.Hostname()) {
+	// Whether *this* host is covered, not whether the flag was passed at all.
+	// `--resolve` copies curl's syntax and so inherits curl's classic mistake —
+	// the wrong port, or a host that is not the one being crawled — and the
+	// crawl then falls through to real DNS while the warning stays silent. A
+	// guardrail switched off by a typo is worse than none, because it reads as
+	// confirmation.
+	port := cb.Port()
+	if port == "" {
+		port = map[string]string{"https": "443", "http": "80"}[cb.Scheme]
+	}
+	covered := false
+	for hp := range resolveMap {
+		h, p, ok := strings.Cut(hp, ":")
+		// Host *and* port. The map is keyed on both, so a right host on the
+		// wrong port resolves nothing — and that is the mistake curl's own
+		// syntax invites, which is the whole reason to check rather than to
+		// take the flag's presence as an answer.
+		if ok && strings.EqualFold(h, cb.Hostname()) && p == port {
+			covered = true
+			break
+		}
+	}
+	if !covered && !isLoopbackHost(cb.Hostname()) {
 		fmt.Fprintf(os.Stderr,
 			"hostshift: crawling %d page(s) from %s, which is not pointed anywhere local.\n"+
 				"  Under production-canonical that is the client's live site. Pass --resolve\n"+

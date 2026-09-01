@@ -216,15 +216,33 @@ func TestTheLiveCrawlWarningRespectsResolve(t *testing.T) {
 	const canon, variant = "https://www.client.fi", "https://wt-a--client.ddev.site"
 	// A port nothing listens on: the crawl fails immediately, which is fine —
 	// the warning is emitted before any fetch and is what is under test.
+	// The suppressing cases and the non-suppressing ones. `--resolve` copies
+	// curl's syntax and inherits its classic mistake — the wrong port, or a host
+	// that is not the one being crawled — and taking the flag's mere presence as
+	// an answer means a typo silences the guardrail while the crawl still goes
+	// to the live site. A guardrail switched off by a typo is worse than none,
+	// because it reads as confirmation.
+	silent := map[string]bool{
+		"with --resolve":    true,
+		"a ddev canonical":  true,
+		"an http canonical": true,
+	}
 	for name, args := range map[string][]string{
 		"without --resolve": {"--from", canon, "--to", variant, "-n", "1"},
 		"with --resolve": {"--from", canon, "--to", variant, "-n", "1",
 			"--resolve", "www.client.fi:443:127.0.0.1:9"},
 		"a ddev canonical": {"--from", "https://client.ddev.site", "--to", variant, "-n", "1"},
+		"--resolve on the wrong port": {"--from", canon, "--to", variant, "-n", "1",
+			"--resolve", "www.client.fi:80:127.0.0.1:9"},
+		"--resolve for another host": {"--from", canon, "--to", variant, "-n", "1",
+			"--resolve", "other.test:443:127.0.0.1:9"},
+		// An http canonical is crawled on port 80, so this one does cover it.
+		"an http canonical": {"--from", "http://www.client.fi", "--to", variant, "-n", "1",
+			"--resolve", "www.client.fi:80:127.0.0.1:9"},
 	} {
 		_, _, errOut := run(t, "", cmdDiff, args...)
 		warned := strings.Contains(errOut, "not pointed anywhere local")
-		want := name == "without --resolve"
+		want := !silent[name]
 		if warned != want {
 			t.Errorf("%s: warned=%v, want %v\n%s", name, warned, want, errOut)
 		}
