@@ -1733,6 +1733,20 @@ EOF
     # carries by default. Writing the decoder views a second time in shell was
     # never going to work; the binary already has them.
     #
+    # `done`, because awk's `exit` runs the END block on its way out. Without
+    # it every path printed twice, `leaked` held "2\n2", and `[ "$leaked" -gt 0 ]`
+    # failed on the two-line value with its error swallowed by `2>/dev/null` —
+    # so the leak check quietly did nothing at all. The version this replaced
+    # avoided it by having no print but the one in END.
+    #
+    # The empty object is on one line. `"rewrites": {}` is what encoding/json
+    # emits for the healthy case — a variant page has nothing to rewrite — and
+    # the first version skipped that line wholesale looking for a closing brace
+    # on its own, so it fell through into "candidates" and summed *those*
+    # instead. Every declined candidate is counted there, deliberately, so a
+    # page linking the project's own mailpit or carrying a near-miss hostname
+    # reported a leak and failed the post-start hook on every `ddev start`.
+    #
     # `--dry-run` so nothing is emitted, and the *forward* map: a canonical
     # origin still present in what the variant served is exactly an origin the
     # forward pass would have rewritten. Prose naming the hostname is not one,
@@ -1743,7 +1757,10 @@ EOF
       leaked="$(printf '%s' "$probe_body" \
         | hostshift rewrite --type text/html --slug "$slug" \
             "${map_args[@]+"${map_args[@]}"}" --dry-run --json 2>&1 >/dev/null \
-        | awk '/"rewrites"/{f=1;next} f&&/}/{exit} f{gsub(/[^0-9]/,"");if($0!="")s+=$0} END{print s+0}' \
+        | awk '/"rewrites"/{if ($0 ~ /\{\}/) {print 0; done=1; exit} f=1; next}
+               f && /^[[:space:]]*\}/ {print s+0; done=1; exit}
+               f {gsub(/[^0-9]/,""); if ($0 != "") s += $0}
+               END {if (!done) print s+0}' \
         || true)"
       [ -n "$leaked" ] || leaked=0
     fi

@@ -69,9 +69,18 @@ func TestRedirectsAreNotSilentlyGreen(t *testing.T) {
 					}
 				}
 				if loc == "SELF" {
-					// Both sides return the canonical origin verbatim, which is
-					// what the guard lets through.
-					loc = "https://acme.ddev.site/app/uploads/2025/07/x.jpg"
+					// The canonical origin, at *the path that was requested*.
+					// That is what redirect-uploads.conf does and what PLAN
+					// §4.4 defines the guard as: rewriting this Location would
+					// yield the URL the browser just asked for.
+					//
+					// The fixture used to name a different path from the one it
+					// requested, which is not a self-redirect at all — so it
+					// passed under a guard that exempted *any* unchanged
+					// Location, and nothing noticed that guard was wider than
+					// the proxy's. A URL-level version of the same-byte-length
+					// fixture mistake.
+					loc = "https://acme.ddev.site" + r.URL.EscapedPath()
 				}
 				if loc != "" {
 					w.Header().Set("Location", loc)

@@ -190,8 +190,22 @@ func compare(ctx context.Context, o Options, path string) Result {
 		//
 		// Under --strict-origins the guard is off in the proxy too, so the
 		// exemption goes with it.
+		//
+		// And it is the *proxy's* guard, which asks whether rewriting the
+		// Location would yield the URL the browser just requested — PLAN §4.4's
+		// wording, and `sameURL(rewritten, st.url)` in modifyResponse. This
+		// asked only whether the Location came back unchanged, which is a
+		// strictly wider question and, worse, is the exact signature of the
+		// failure it is meant to sit beside: an unrewritten canonical Location
+		// is byte-identical on both sides *by construction*. So the check
+		// switched itself off precisely when it was needed. An all-redirect
+		// crawl with hostshift out of the path — the case the comment above
+		// records this Location comparison as having been added to catch — was
+		// GREEN again, and so was a login redirect that PLAN test 32 names as
+		// one the guard must not cover.
 		unchangedSelfRedirect := !o.StrictOrigins &&
-			variant.location == canon.location && canon.location != ""
+			variant.location == canon.location && canon.location != "" &&
+			redirectsToItself(string(wantLoc), o.Map, path)
 		if string(wantLoc) != variant.location && !unchangedSelfRedirect {
 			r.Err = fmt.Errorf("Location %q, want %q", variant.location, wantLoc)
 			return r
@@ -309,6 +323,37 @@ func compare(ctx context.Context, o Options, path string) Result {
 // all. Scoring every body through the HTML pipeline made a PDF or a WooCommerce
 // download link — which the `<a href>` crawler reaches routinely — read as
 // CANONICAL ORIGIN REACHED THE BROWSER.
+// redirectsToItself reports whether loc — the *rewritten* Location — is the URL
+// the browser asked for. That is the proxy's self-redirect test, asked from the
+// outside.
+//
+// Against a *variant origin from the map*, not the fetch base. Those differ:
+// `--variant-base` and `--resolve` exist so the crawl can be pointed somewhere
+// else, and the URL the browser would have used is the one the map names.
+//
+// Host comparison is case-insensitive and ignores the scheme, like the proxy's:
+// a router that terminates TLS turns an https request into an http one
+// upstream, and the guard has to recognise its own redirect through that.
+func redirectsToItself(loc string, m *origin.Map, path string) bool {
+	u, err := url.Parse(loc)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	want, err := url.Parse("https://x" + path)
+	if err != nil {
+		return false
+	}
+	if u.EscapedPath() != want.EscapedPath() || u.RawQuery != want.RawQuery {
+		return false
+	}
+	for _, site := range m.Sites {
+		if strings.EqualFold(u.Host, site.Variant.Host) {
+			return true
+		}
+	}
+	return false
+}
+
 func countLeaks(m *origin.Matcher, r response) (leaks, tier2 int) {
 	if r.attachment {
 		return 0, 0

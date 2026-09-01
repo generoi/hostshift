@@ -940,7 +940,15 @@ fi
 
 # And a page with none of them is still healthy, so this is not a check that is
 # red on everything — the failure mode its own predecessor had.
-printf '<a href="https://wt-a--acme.ddev.site/a">a</a>\n' > "$HS_FAKE_DIR/page"
+#
+# The mailpit link is the case that matters: a *declined* candidate. Every
+# candidate is counted in the engine's JSON, deliberately, and the first version
+# of the sum fell through the one-line `"rewrites": {}` into the candidates
+# block — so an ordinary variant page linking the project's own mailpit, or
+# carrying a near-miss hostname, reported a leak and failed the post-start hook
+# on every `ddev start`.
+printf '<a href="https://wt-a--acme.ddev.site/a">a</a><a href="https://acme.ddev.site:8026/">mailpit</a>\n' \
+  > "$HS_FAKE_DIR/page"
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"canonical origin"*) fail "a clean page is not reported" "$out" ;;
