@@ -1713,7 +1713,53 @@ hostshift: listening on"*) logs_has_banner=1 ;;
           echo "  \`#ddev-generated\` is still on wp-config.php, remove that first" >&2
           echo "  or DDEV will restore the pin on the next start." >&2
       fi
-    done <<<"$owns"
+    done <<EOF
+$owns
+EOF
+
+  fi
+  if [ -n "${probe_body:-}" ]; then
+    canon_list="${canon_list:-$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+      --canonical-hosts 2>/dev/null | paste -sd, - || true)}"
+    # And the other direction, which is the one test 28 is about: a *canonical*
+    # origin in the page the variant serves is a live production link in a
+    # preview, and check called that healthy.
+    #
+    # It has said "the map is injective and anchored" and exited 0 on a
+    # deployment serving thirty-nine of them per page, because everything above
+    # asks about configuration and nothing asked what came back. The bytes were
+    # already in hand — probe_body is fetched forty lines up, and canon_list is
+    # built right here for a different comparison.
+    #
+    # `//host` with a boundary, so a bare hostname in prose is not a hit: PLAN
+    # is explicit that prose must *not* be rewritten, and matching it would make
+    # this the warning a developer learns to ignore. A URL is the thing that
+    # dereferences.
+    while IFS= read -r canon; do
+      [ -n "$canon" ] || continue
+      hits="$(printf '%s' "$probe_body" \
+        | grep -oE "//${canon//./\\.}[/\"'\''<> ?#:]" 2>/dev/null | wc -l | tr -d ' ' || true)"
+      [ -n "$hits" ] || hits=0
+      if [ "$hits" -ge 1 ]; then
+        echo "hostshift: the page served at https://$probe carries $hits link(s) to" >&2
+        echo "  $canon, which is a canonical hostname. Those are live production" >&2
+        echo "  links in a preview — the one thing this tool exists to prevent." >&2
+        case "$cmd_running" in
+          *--dry-run*)
+            echo "  The proxy is running with --dry-run, which serves every response" >&2
+            echo "  unmodified. Remove it from HOSTSHIFT_ARGS in .ddev/.env." >&2 ;;
+          *--no-sweep*)
+            echo "  The proxy is running with --no-sweep, which disables the" >&2
+            echo "  straggler backstop. Remove it from HOSTSHIFT_ARGS in .ddev/.env." >&2 ;;
+          *)
+            echo "  Run \`hostshift diff\` against this deployment to see which" >&2
+            echo "  surface they are on." >&2 ;;
+        esac
+        fails=$((fails + 1))
+      fi
+    done <<EOF
+$(printf '%s' "$canon_list" | tr ',' '\n')
+EOF
   fi
 
   # The parent-declares verdict, now that the database has had its say.

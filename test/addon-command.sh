@@ -903,6 +903,52 @@ FAKECURL
 chmod +x "$fakecurl/curl"
 export HS_CURL_STATE="$work/curl-n"
 
+echo "== check looks at what came back, not only at the configuration"
+
+# check said "the map is injective and anchored" and exited 0 on a deployment
+# serving thirty-nine live production links per page, because everything it
+# asked about was configuration and nothing asked what the page contained. The
+# bytes were already in hand: it fetches one to decide whether the proxy is
+# answering at all.
+#
+# The cause in the report was --dry-run surviving in HOSTSHIFT_ARGS — which the
+# preservation added one round earlier is what let it stick — so the fake proxy
+# here is running with it, and the fake page carries the canonical origin.
+cat > "$fakebin/curl" <<'FAKE'
+#!/usr/bin/env bash
+# The probe asks for a page and appends the status code; give it both.
+cat "${HS_FAKE_DIR}/page" 2>/dev/null
+printf '\n200\n'
+FAKE
+chmod +x "$fakebin/curl"
+
+writefake
+# The proxy is up, and running with --dry-run.
+printf 'true\nproxy %s --dry-run \nVIRTUAL_HOST=%s\n' "$env_args" "$env_variants" \
+  > "$HS_FAKE_DIR/hostshift-state"
+printf '<a href="https://acme.ddev.site/a">a</a><link href="https://acme.ddev.site/b">\n' \
+  > "$HS_FAKE_DIR/page"
+
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a canonical origin in the served page is reported" "canonical hostname" "$out"
+contains "and the cause is named" "--dry-run" "$out"
+if (cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
+  fail "check fails when the page carries one" "it exited 0"
+else
+  pass "check fails when the page carries one"
+fi
+
+# And a page with none of them is still healthy, so this is not a check that is
+# red on everything — the failure mode its own predecessor had.
+printf '<a href="https://wt-a--acme.ddev.site/a">a</a>\n' > "$HS_FAKE_DIR/page"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"canonical hostname"*) fail "a clean page is not reported" "$out" ;;
+  *) pass "a clean page is not reported" ;;
+esac
+rm -f "$fakebin/curl"
+writefake
+
 writefake
 : > "$HS_CURL_STATE"
 out="$(cd "$wt" && HS_CURL_CODES="502 502 200" PATH="$fakecurl:$fakebin:$PATH" \
