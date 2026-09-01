@@ -191,3 +191,28 @@ func TestR49DeclaringTheALabelRewritesItToUnicode(t *testing.T) {
 		t.Errorf("the A-label was declared but is not what came back:\n%s", out)
 	}
 }
+
+// TestR50TheTrailingDotCarveOutIsValueOnly: the root dot is trimmed from a host
+// only in prose, never in a URL-bearing attribute.
+//
+// The `!value &&` half had no test: dropping it left the whole suite green, and
+// the variant then went out with a root dot in an `href`. The distinction is the
+// one this file makes everywhere — in a text node a trailing dot is a full stop,
+// and in an attribute value it is part of the name.
+func TestR50TheTrailingDotCarveOutIsValueOnly(t *testing.T) {
+	m := r49Map(t, "https://www.example.fi", "https://wt-a--example.ddev.site")
+
+	// value=true: an attribute. The dot belongs to the host, so the whole thing
+	// is the origin and the replacement carries no stray dot.
+	got := string(HostLeaks(m.Forward(), []byte("https://www.example.fi./x"), true))
+	if strings.Contains(got, "ddev.site./x") {
+		t.Errorf("an attribute value kept a root dot on the variant: %s", got)
+	}
+
+	// value=false: prose. `See https://www.example.fi. Thanks` — the dot is a
+	// full stop and must survive as one.
+	got = string(HostLeaks(m.Forward(), []byte("See https://www.example.fi. Thanks"), false))
+	if !strings.Contains(got, "ddev.site. Thanks") {
+		t.Errorf("prose lost its full stop: %s", got)
+	}
+}

@@ -86,3 +86,31 @@ func TestR49DisplayInMapKeys(t *testing.T) {
 		t.Logf("rejected: %v", err)
 	}
 }
+
+// TestR50DisplayIsAlwaysTheSameHostAsHost: foldHost's comment says the two have
+// to fold identically "or the display form would be a *different* host". Nothing
+// checked it, and a declaration mixing a broken `xn--` label with a non-ASCII
+// one produced exactly that — a Display that normalises to some third name,
+// which the reverse direction would then splice into a save.
+func TestR50DisplayIsAlwaysTheSameHostAsHost(t *testing.T) {
+	for _, decl := range []string{
+		"https://Xn--Xn--ք--",
+		"https://xn--hmeenlinna-q5a.hämeenlinna.fi",
+		"https://www.hämeenlinna.fi",
+		"https://www.xn--hmeenlinna-q5a.fi",
+		"https://www.example.fi",
+	} {
+		o, err := Parse(decl)
+		if err != nil {
+			continue
+		}
+		if o.Display == "" {
+			continue
+		}
+		back, err := NormaliseHost(o.Display)
+		if err != nil || back != o.Host {
+			t.Errorf("%s: Display %q normalises to %q, not to Host %q",
+				decl, o.Display, back, o.Host)
+		}
+	}
+}

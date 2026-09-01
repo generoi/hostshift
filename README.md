@@ -453,9 +453,18 @@ hostshift diff -n 20 --slug wt-a \
   --variant-base   https://wt-a--acme.ddev.site
 ```
 
-Under production-canonical the map names both sides itself and neither flag is
-needed beyond `--canonical-base`. `diff` warns when the base you passed is not a
-hostname its map knows, and says what it fell back to.
+Under production-canonical `--variant-base` is not needed — the map names the
+variant — but `--slug` still is, unless the site declares `variant:` outright
+rather than deriving it from `base:`. The README's own `hostshift.yaml` derives
+it, so `--slug` applies there too.
+
+When you pass one base, `diff` warns if it is not a hostname its map knows and
+says what it fell back to. When you pass **both** and the map knows neither —
+the worktree case above — the two bases *are* the comparison, and `diff` says so
+and uses them as its map. That is what makes the worktree form mean anything:
+the bases used to move only the crawl, while the rewriting map still came from
+`--slug`, so the leak scan looked for an origin that could not occur and printed
+`0 leaks` over pages that were full of them.
 
 The assertions that fail a run are the ones that cannot be innocent — a canonical origin
 reaching the browser, a serialized value served with a length that does not

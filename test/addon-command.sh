@@ -1306,6 +1306,29 @@ out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a page answering with a hostname the map does not name is called out" \
   "which is neither a canonical hostname nor a" "$out"
+# And the remedy it prints has to name files this project actually has.
+#
+# The advice was written for stock WordPress — `wp-config-ddev.php` and a
+# `#ddev-generated` marker — and this fleet is Bedrock, which has neither. Worse,
+# on `wp-bedrock` DDEV writes WP_HOME into the project-root `.env` and rewrites
+# it on every `ddev start`, so the one step a developer could act on was undone
+# by the next restart, silently.
+contains "and the remedy is for stock WordPress when there is no .env" \
+  "wp-config-ddev.php" "$out"
+
+printf 'WP_HOME="https://acme-wt-a.ddev.site"\nWP_SITEURL="https://acme-wt-a.ddev.site/wp"\n' \
+  > "$wt/.env"
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
+  HS_CURL_BODY="$pinned" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a Bedrock project is told where DDEV actually pins it" \
+  "the project-root .env, rewritten on" "$out"
+contains "and how to stop it being rewritten" "disable_settings_management: true" "$out"
+case "$out" in
+  *"wp-config-ddev.php"*) fail "and is not told about a file it does not have" "$out" ;;
+  *) pass "and is not told about a file it does not have" ;;
+esac
+rm -f "$wt/.env"
 
 # But one incidental content link is not that, and warning on it meant warning
 # on every `ddev start` of a healthy site. A developer's note pointing at the

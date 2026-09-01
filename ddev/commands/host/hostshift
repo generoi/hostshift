@@ -1870,11 +1870,22 @@ hostshift: listening on"*) logs_has_banner=1 ;;
           echo "hostshift: warning: the page served at https://$probe answers with" >&2
           echo "  links to $own, which is neither a canonical hostname nor a" >&2
           echo "  variant — so those links are not being rewritten and do not" >&2
-          echo "  reach this preview. A stock DDEV WordPress does this: its" >&2
-          echo "  wp-config-ddev.php pins WP_HOME to DDEV_PRIMARY_URL. Remove" >&2
-          echo "  that pin, or set WP_HOME to a canonical hostname. If the marker" >&2
-          echo "  \`#ddev-generated\` is still on wp-config.php, remove that first" >&2
-          echo "  or DDEV will restore the pin on the next start." >&2
+          echo "  reach this preview. DDEV pins WP_HOME, and where it does that" >&2
+          echo "  depends on the project type:" >&2
+          if [ -f .env ] && grep -q "^WP_HOME=" .env 2>/dev/null; then
+            echo "    Bedrock (wp-bedrock): the project-root .env, rewritten on" >&2
+            echo "    every \`ddev start\` — so editing it is undone by the next" >&2
+            echo "    restart. Stop DDEV managing it:" >&2
+            echo "      echo \"disable_settings_management: true\" >> .ddev/config.hostshift.local.yaml" >&2
+            echo "    then set WP_HOME and WP_SITEURL in .env to a canonical" >&2
+            echo "    hostname and \`ddev restart\`." >&2
+          else
+            echo "    stock WordPress: wp-config-ddev.php pins WP_HOME to" >&2
+            echo "    DDEV_PRIMARY_URL. Remove that pin, or set WP_HOME to a" >&2
+            echo "    canonical hostname. If the marker \`#ddev-generated\` is" >&2
+            echo "    still on wp-config.php, remove that first or DDEV will" >&2
+            echo "    restore the pin on the next start." >&2
+          fi
       fi
     done <<EOF
 $owns

@@ -345,7 +345,16 @@ func cmdRewrite(args []string) (int, error) {
 		return exitConfig, nil
 	}
 	// Anything else streams through untouched and never enters a rewriter —
-	// which is what test 25's per-surface counter of zero proves.
+	// which is what test 25's per-surface counter of zero proves — and says so
+	// on stderr, because a typo looks exactly like a clean result otherwise.
+	if !*quiet {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: --type %s is outside the rewritable set, so the input is "+
+				"passed through unchanged.\n  Rewritten types: text/html, "+
+				"application/xhtml+xml, the JSON family, text/plain and the XML "+
+				"family.\n  Tier 2 (text/css, JavaScript) is excluded by design — "+
+				"PLAN §5.2.\n", mt)
+	}
 
 	if _, err := io.Copy(os.Stdout, src); err != nil {
 		return exitRuntime, err
@@ -806,6 +815,52 @@ func cmdDiff(args []string) (int, error) {
 				"  Under production-canonical that is the client's live site. Pass --resolve\n"+
 				"  to send these fetches somewhere else, as the loopback containment does for\n"+
 				"  the application's own requests.\n", want, cb.Host)
+	}
+
+	// When both bases are given and the map knows neither, the bases *are* the
+	// map.
+	//
+	// `--canonical-base` and `--variant-base` moved only the crawl; the rewriting
+	// map still came from `-C`/`--slug`. In a worktree that resolves to the
+	// worktree's own DDEV hostnames, which appear on neither side of the
+	// comparison — so `want` was the canonical body unrewritten and the leak scan
+	// looked for an origin that could not occur. Measured: 0 leaks and "no
+	// canonical origin reached the browser" over four pages carrying 193 of
+	// them, on the invocation README documents for worktrees.
+	//
+	// Only when the map knows neither. Under production-canonical the baseline
+	// is deliberately a third hostname and the variant *is* in the map, so that
+	// map is the right one and is left alone.
+	if *canonicalBase != "" && *variantBase != "" {
+		known := func(h string) bool {
+			for _, st := range res.Map.Sites {
+				if strings.EqualFold(st.Variant.Host, h) {
+					return true
+				}
+				for _, o := range st.CanonicalSet() {
+					if strings.EqualFold(o.Host, h) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		if !known(cb.Hostname()) && !known(vb.Hostname()) {
+			m, err := origin.NewMap([]origin.Site{{
+				Name:      "bases",
+				Canonical: origin.Origin{Scheme: cb.Scheme, Host: cb.Hostname(), Port: cb.Port()},
+				Variant:   origin.Origin{Scheme: vb.Scheme, Host: vb.Hostname(), Port: vb.Port()},
+			}})
+			if err != nil {
+				return exitConfig, fmt.Errorf("--canonical-base/--variant-base: %w", err)
+			}
+			fmt.Fprintf(os.Stderr,
+				"hostshift: neither base is in the map from %s, so the comparison is\n"+
+					"  between the two bases themselves — %s and %s — and that is what\n"+
+					"  the leak scan looks for. Pass --map to say otherwise.\n",
+				res.Source, cb.Hostname(), vb.Hostname())
+			res.Map = m
+		}
 	}
 
 	fmt.Fprintf(os.Stderr, "corpus diff: %s vs %s\n", cb, vb)

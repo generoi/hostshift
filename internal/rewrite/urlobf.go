@@ -386,6 +386,25 @@ func jsEscAt(b []byte) ([]byte, int, bool) {
 		}
 		return r, 4, true
 	}
+	// Legacy octal, `\NNN`, one to three digits 0-7 — decoded when the view is
+	// already being built, never gated on. `hasJSONEsc` deliberately does not
+	// arm for this: `\` before a digit is a CSS escape far more often than a JS
+	// one, and scanning for it took an ordinary themed page from 118x the body
+	// to 287x. But a body that already contains `\u` or `\x` — which is most
+	// WordPress inline script — has the view built anyway, and reading `\056`
+	// there costs nothing. A purely-octal body stays unread, which is the price
+	// of not arming.
+	if b[1] >= '0' && b[1] <= '7' {
+		w, val := 1, 0
+		for w < 4 && w < len(b) && b[w] >= '0' && b[w] <= '7' {
+			val = val<<3 | int(b[w]-'0')
+			w++
+		}
+		if val < 0x20 || val > 0x7E {
+			return nil, 0, false
+		}
+		return []byte{byte(val)}, w, true
+	}
 	if b[1] != 'u' || b[2] != '{' {
 		return nil, 0, false
 	}
@@ -1033,9 +1052,19 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 	// keyed host:port, the request parsed a host with no port, and the *variant*
 	// hostname went upstream into the shared database.
 	//
-	// Widening the range to cover the scheme drops the obfuscated separator with
-	// it. That is a fair trade: what replaces it resolves to the same origin, and
-	// one fewer obfuscated URL on the page is not a loss.
+	// Widening the range to cover the scheme takes the separator with it, so the
+	// separator has to be written back in the encoding it was found in.
+	//
+	// A raw `://` over a `%3A%2F%2F` is not "one fewer obfuscated URL", which is
+	// what this comment used to claim: inside a path segment the `%2F` is what
+	// keeps it one segment, so `/go/http%3A%2F%2Fwww.acme.fi%2Fbar` became
+	// `/go/https://wt-a--acme.ddev.site%2Fbar` — three path separators where
+	// there was one, and a URL that no longer routes. Through HostLeaksBack that
+	// is a save writing a dead path into the shared database.
+	//
+	// The byte matcher has known this since it was written: `encoding.schemeSep`
+	// exists so its replacements carry `%3A%2F%2F` and the JSON spelling. The
+	// locator had no notion of it, so the two spellings of one URL disagreed.
 	needScheme := to.Scheme != scheme
 	hasPort := to.Port != "" || portOf(n.b, he, end) != ""
 	switch {
@@ -1047,7 +1076,8 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 		// one was not, so the spelling still went punycode wherever the schemes
 		// differ — the same write into the shared database, reached through the
 		// obfuscated spellings that are the reason HostLeaksBack exists.
-		return n.pos[at], authorityEnd(n, he, end), to.Scheme + "://" + to.DisplayHostPort(), true
+		return n.pos[at], authorityEnd(n, he, end),
+			to.Scheme + schemeSepAt(n, at, hs) + to.DisplayHostPort(), true
 	case hasPort:
 		return from, authorityEnd(n, he, end), to.DisplayHostPort(), true
 	}
@@ -1065,6 +1095,34 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 // not the host's root label. `See http:www.example.fi. Thanks` came out as
 // `See https://v.ddev.site Thanks`. Prose corruption rather than a leak, but it
 // is the `value` distinction this file is careful about everywhere else.
+// schemeSepAt reports the `://` between a scheme at view index at and a host at
+// view index hs, in the encoding the source wrote it in.
+//
+// Read off the source *widths*, which is what the view carries: a `:` that came
+// from three source bytes is `%3A`, and a slash from two is the JSON `\/`. Those
+// are the two encodings `encoding.schemeSep` knows; the third is raw.
+func schemeSepAt(n normalised, at, hs int) string {
+	width := func(i int) int {
+		if i < 0 || i >= len(n.pos) {
+			return 1
+		}
+		return n.end[i] - n.pos[i]
+	}
+	for i := at; i < hs && i < len(n.b); i++ {
+		if n.b[i] != ':' {
+			continue
+		}
+		if width(i) >= 3 {
+			return "%3A%2F%2F"
+		}
+		if i+1 < hs && isSlashish(n.b[i+1]) && width(i+1) == 2 {
+			return ":" + `\/` + `\/`
+		}
+		return "://"
+	}
+	return "://"
+}
+
 func authorityEnd(n normalised, he, end int) int {
 	if end > he && n.b[he] == ':' {
 		return n.end[end-1]

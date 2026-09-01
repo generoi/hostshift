@@ -92,7 +92,9 @@ func Parse(s string) (Origin, error) {
 	display := ""
 	if !isASCII(u.Hostname()) {
 		if f, ferr := foldHost(u.Hostname()); ferr == nil && f != host {
-			display = f
+			if back, berr := normaliseHost(f); berr == nil && back == host {
+				display = f
+			}
 		}
 	}
 	return Origin{
