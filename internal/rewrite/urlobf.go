@@ -980,7 +980,7 @@ func urlTokenStarts(v []byte) []int {
 // O(k·n) — measured at 55 seconds for a 320 KB attribute value, which
 // extrapolates to hours at the shipped 4 MiB token cap. That is the same bug
 // class scan.go documents having already fixed once.
-func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, until int, repl string, ok bool) {
+func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) (from, until int, repl string, ok bool) {
 	// The scheme decides which port is the default, so it has to be found
 	// wherever the caller entered. foldedHostLeak enters at the slash *run*, so
 	// looking only forwards saw no scheme and fell back to https — and
@@ -1077,7 +1077,7 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 		// differ — the same write into the shared database, reached through the
 		// obfuscated spellings that are the reason HostLeaksBack exists.
 		return n.pos[at], authorityEnd(n, he, end),
-			to.Scheme + schemeSepAt(n, at, hs) + to.DisplayHostPort(), true
+			to.Scheme + schemeSepAt(v, n, at, hs) + to.DisplayHostPort(), true
 	case hasPort:
 		return from, authorityEnd(n, he, end), to.DisplayHostPort(), true
 	}
@@ -1098,25 +1098,39 @@ func (h *hostReplacer) locateHostIn(n normalised, at int, value bool) (from, unt
 // schemeSepAt reports the `://` between a scheme at view index at and a host at
 // view index hs, in the encoding the source wrote it in.
 //
-// Read off the source *widths*, which is what the view carries: a `:` that came
-// from three source bytes is `%3A`, and a slash from two is the JSON `\/`. Those
-// are the two encodings `encoding.schemeSep` knows; the third is raw.
-func schemeSepAt(n normalised, at, hs int) string {
-	width := func(i int) int {
-		if i < 0 || i >= len(n.pos) {
-			return 1
-		}
-		return n.end[i] - n.pos[i]
-	}
+// Read from the source *bytes*, not from the source width. Width says only how
+// many bytes one view byte came from, and three of them is `%3A` — but it is
+// also `\3a`, the CSS escape this file keeps an entire view for, and five is
+// `&#58;` and six is `\u003a`. Answering `%3A%2F%2F` to all of them did to those
+// spellings exactly what the round before had stopped it doing to percent: an
+// inline `style="background:url(http\3a\2f\2fwww.acme.fi/l.png)"` came out as
+// `url(https%3A%2F%2Fwt-a--acme.ddev.site/l.png)`, which the CSS tokenizer
+// unescapes to nothing useful — a single relative path segment, a 404 where
+// production served an image, and through HostLeaksBack the same unresolvable
+// spelling written back into the shared database.
+//
+// Raw is the right fallback for everything else: it is what an HTML attribute,
+// a CSS value and XML text all resolve, and it is what this arm emitted for
+// those shapes before any of this.
+func schemeSepAt(v []byte, n normalised, at, hs int) string {
 	for i := at; i < hs && i < len(n.b); i++ {
 		if n.b[i] != ':' {
 			continue
 		}
-		if width(i) >= 3 {
-			return "%3A%2F%2F"
+		if len(v[n.pos[i]:n.end[i]]) == 3 {
+			if src := v[n.pos[i]:n.end[i]]; src[0] == '%' && src[1] == '3' &&
+				(src[2] == 'A' || src[2] == 'a') {
+				return "%3A%2F%2F"
+			}
 		}
-		if i+1 < hs && isSlashish(n.b[i+1]) && width(i+1) == 2 {
-			return ":" + `\/` + `\/`
+		// Everything the source wrote between the colon and the host. A
+		// backslash anywhere in it is JSON's `\/` — the view cannot show this,
+		// because stripForURL reads a backslash as a slash and the escape
+		// disappears into the authority run.
+		if hs < len(n.pos) && n.end[i] <= n.pos[hs] {
+			if bytes.IndexByte(v[n.end[i]:n.pos[hs]], '\\') >= 0 {
+				return ":" + `\/` + `\/`
+			}
 		}
 		return "://"
 	}
@@ -1195,7 +1209,7 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 			i = run - 1
 			continue
 		}
-		from, until, repl, ok := w.hosts.locateHostIn(n, i, value)
+		from, until, repl, ok := w.hosts.locateHostIn(v, n, i, value)
 		if !ok {
 			i = run - 1
 			continue
@@ -1254,7 +1268,7 @@ func (w *HTML) normaliseURLLeak(surface string, base int, v []byte, value bool) 
 		if off < len(n.pos) && n.pos[off] < prev {
 			continue // inside a host already replaced
 		}
-		from, until, repl, ok := w.hosts.locateHostIn(n, off, value)
+		from, until, repl, ok := w.hosts.locateHostIn(v, n, off, value)
 		if !ok {
 			continue
 		}
@@ -1461,7 +1475,7 @@ func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte
 		if off < len(n.pos) && n.pos[off] < prev {
 			continue
 		}
-		from, until, repl, ok := h.locateHostIn(n, off, value)
+		from, until, repl, ok := h.locateHostIn(v, n, off, value)
 		if !ok {
 			continue
 		}

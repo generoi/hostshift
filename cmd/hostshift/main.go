@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -327,6 +328,25 @@ func cmdRewrite(args []string) (int, error) {
 		}
 		src = bytes.NewReader(out)
 
+	default:
+		// Anything else streams through untouched and never enters a rewriter —
+		// which is what test 25's per-surface counter of zero proves — and says
+		// so, because a mistyped `--type text/htm` otherwise looks exactly like a
+		// clean result.
+		//
+		// In the `default` arm, not after the switch: the rewriting arms only
+		// assign `src`, so a notice placed below them fired on every type,
+		// `text/html` included, and `--json`'s object came out behind three
+		// lines of prose.
+		if !*quiet {
+			fmt.Fprintf(os.Stderr,
+				"hostshift: --type %s is outside the rewritable set, so the input is "+
+					"passed through unchanged.\n  Rewritten types: text/html, "+
+					"application/xhtml+xml, the JSON family, text/plain and the XML "+
+					"family.\n  Tier 2 (text/css, JavaScript) is excluded by design — "+
+					"PLAN §5.2.\n", mt)
+		}
+
 	case mt == "application/x-www-form-urlencoded" || mt == "multipart/form-data":
 		// Refused, not passed through.
 		//
@@ -344,18 +364,6 @@ func cmdRewrite(args []string) (int, error) {
 				"  here would print an empty counter block and read like a clean result.\n", mt)
 		return exitConfig, nil
 	}
-	// Anything else streams through untouched and never enters a rewriter —
-	// which is what test 25's per-surface counter of zero proves — and says so
-	// on stderr, because a typo looks exactly like a clean result otherwise.
-	if !*quiet {
-		fmt.Fprintf(os.Stderr,
-			"hostshift: --type %s is outside the rewritable set, so the input is "+
-				"passed through unchanged.\n  Rewritten types: text/html, "+
-				"application/xhtml+xml, the JSON family, text/plain and the XML "+
-				"family.\n  Tier 2 (text/css, JavaScript) is excluded by design — "+
-				"PLAN §5.2.\n", mt)
-	}
-
 	if _, err := io.Copy(os.Stdout, src); err != nil {
 		return exitRuntime, err
 	}
@@ -846,10 +854,14 @@ func cmdDiff(args []string) (int, error) {
 			return false
 		}
 		if !known(cb.Hostname()) && !known(vb.Hostname()) {
+			co, cerr := origin.Parse(cb.Scheme + "://" + cb.Host)
+			vo, verr := origin.Parse(vb.Scheme + "://" + vb.Host)
+			if cerr != nil || verr != nil {
+				return exitConfig, fmt.Errorf("--canonical-base/--variant-base: %w",
+					cmp.Or(cerr, verr))
+			}
 			m, err := origin.NewMap([]origin.Site{{
-				Name:      "bases",
-				Canonical: origin.Origin{Scheme: cb.Scheme, Host: cb.Hostname(), Port: cb.Port()},
-				Variant:   origin.Origin{Scheme: vb.Scheme, Host: vb.Hostname(), Port: vb.Port()},
+				Name: "bases", Canonical: co, Variant: vo,
 			}})
 			if err != nil {
 				return exitConfig, fmt.Errorf("--canonical-base/--variant-base: %w", err)

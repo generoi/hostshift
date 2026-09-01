@@ -992,6 +992,11 @@ case "$out" in
   *) fail "and one whose banner predates the version" "$out" ;;
 esac
 contains "and says what that costs" "serialized length prefixes" "$out"
+# ...and the way out. A pull cannot help here — `:latest` is byte-identical to
+# the image being warned about, so the developer loops. The sentence saying so
+# was on the version-*mismatch* branch, where it is unreachable: that branch is
+# entered because the banner carried a version.
+contains "and that a pull may not be enough" "built from the repository" "$out"
 
 # …including when this command is a source build.
 #
@@ -1316,6 +1321,52 @@ contains "a page answering with a hostname the map does not name is called out" 
 contains "and the remedy is for stock WordPress when there is no .env" \
   "wp-config-ddev.php" "$out"
 
+# ...and when the page actually carries those hostnames, that is a refusal.
+#
+# Both leak scans look for origins *the map names*, so the state they cannot see
+# is the one where the map names the wrong ones: a worktree whose branch predates
+# the hostshift.yaml, against a database already on production hostnames. check
+# printed two accurate warnings and exited 0 while the page carried 31 live
+# production links, and diff printed GREEN for the same reason.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
+  > "$main/hostshift.yaml"
+mv "$wt/hostshift.yaml" "$work/wt-hs.hold" 2>/dev/null || true
+cp "$wt/.ddev/.env" "$work/wt-env.hold" 2>/dev/null || true
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+leaky='<link rel="canonical" href="https://www.acme.example/">
+<link rel="alternate" href="https://www.acme.example/feed/">
+<link rel="https://api.w.org/" href="https://www.acme.example/wp-json/">
+<link rel="shortlink" href="https://www.acme.example/?p=1">
+<a href="https://www.acme.example/x">t</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$leaky" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "a page carrying the parent's undeclared hostnames is refused" \
+  || fail "a page carrying the parent's undeclared hostnames is refused" "exit $rc"
+contains "and the count is measured, not inferred" "5 links to" "$out"
+contains "and it does not suggest a search-replace" "moves production" "$out"
+
+# ...and one link is not that. A developer's note pointing at the client's site
+# is an ordinary content link, and refusing on it would be the warning-on-every-
+# start failure the stranger-hostname loop beside this one already learned.
+out="$(cd "$wt" && HS_CURL_BODY='<a href="https://www.acme.example/x">t</a>' \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+case "$out" in
+  *"refusing to call this healthy — the page served at"*)
+    fail "one incidental link to a declared hostname is not a refusal" "$out" ;;
+  *) pass "one incidental link to a declared hostname is not a refusal" ;;
+esac
+rm -f "$main/hostshift.yaml"
+mv "$work/wt-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
+cp "$work/wt-env.hold" "$wt/.ddev/.env" 2>/dev/null || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+
 printf 'WP_HOME="https://acme-wt-a.ddev.site"\nWP_SITEURL="https://acme-wt-a.ddev.site/wp"\n' \
   > "$wt/.env"
 out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
@@ -1324,10 +1375,21 @@ out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
 contains "a Bedrock project is told where DDEV actually pins it" \
   "the project-root .env, rewritten on" "$out"
 contains "and how to stop it being rewritten" "disable_settings_management: true" "$out"
+
 case "$out" in
   *"wp-config-ddev.php"*) fail "and is not told about a file it does not have" "$out" ;;
   *) pass "and is not told about a file it does not have" ;;
 esac
+rm -f "$wt/.env"
+# ...and a .env that defines no WP_HOME is not a Bedrock pin. The probe tests
+# both halves — the file existing and the variable being in it — and only the
+# first half had a test, so a project with an unrelated .env got advice about a
+# pin it does not have.
+printf 'APP_ENV=development\nDB_NAME=db\n' > "$wt/.env"
+out="$(cd "$wt" && DDEV_HOSTNAME=acme-wt-a.ddev.site \
+  HS_CURL_BODY="$pinned" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a .env without WP_HOME is not a Bedrock pin" "wp-config-ddev.php" "$out"
 rm -f "$wt/.env"
 
 # But one incidental content link is not that, and warning on it meant warning

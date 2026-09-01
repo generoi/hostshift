@@ -1550,6 +1550,9 @@ hostshift: listening on"*) logs_has_banner=1 ;;
     echo "  which PHP refuses or truncates — in the request direction that is a" >&2
     echo "  write to the shared database with no undo." >&2
     echo "  Pull it: \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
+    echo "  If the banner still carries no version afterwards, the published tag is" >&2
+    echo "  itself that old image — \`:latest\` moves only when a release is tagged —" >&2
+    echo "  and the engine has to be built from the repository to get past it." >&2
   elif [ -n "$running_ver" ] && [ -n "$host_ver" ] && [ "$running_ver" != "$host_ver" ] &&
      [ "$running_ver" != "dev" ] && [ "$host_ver" != "dev" ]; then
     echo "hostshift: warning: the proxy image is $running_ver and this command is" >&2
@@ -1558,9 +1561,6 @@ hostshift: listening on"*) logs_has_banner=1 ;;
     echo "  versions is not running here — silently, since the map and the" >&2
     echo "  hostnames still check out." >&2
     echo "  Pull it: \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
-    echo "  If the banner still carries no version afterwards, the published tag is" >&2
-    echo "  itself that old image — \`:latest\` moves only when a release is tagged —" >&2
-    echo "  and the engine has to be built from the repository to get past it." >&2
   fi
   if [ -n "$running_map" ]; then
     want_map="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" 2>/dev/null \
@@ -1891,6 +1891,40 @@ hostshift: listening on"*) logs_has_banner=1 ;;
 $owns
 EOF
 
+  fi
+  # The hostnames the parent declares that this map does not name, counted on
+  # the page rather than reasoned about.
+  #
+  # This is the one state both leak scans are blind to: they look for origins
+  # *the map names*, and the defect here is that the map names the wrong ones. A
+  # worktree whose branch predates the commit that added hostshift.yaml, against
+  # a database already moved to production hostnames, served 31 live production
+  # origins in `<head>` alone while `check` printed two accurate warnings and
+  # exited 0, `ddev restart` reported success, and `diff` printed GREEN.
+  #
+  # The instrument is the stranger-hostname count above, at the same threshold,
+  # pointed at `$unmapped`. Evidence, not inference — this file records seven
+  # rounds of inference-based refusals that had to be taken back out.
+  if [ -n "${probe_body:-}" ] && [ -n "${unmapped:-}" ]; then
+    for u in $unmapped; do
+      uh="${u#*://}"; uh="${uh%%/*}"
+      [ -n "$uh" ] || continue
+      uhits="$(printf '%s' "$probe_body" \
+        | grep -oE "//${uh//./\\.}[/\"'\''<> ?#:]" 2>/dev/null | wc -l | tr -d ' ' || true)"
+      [ -n "$uhits" ] || uhits=0
+      if [ "$uhits" -ge 5 ]; then
+        echo "hostshift: refusing to call this healthy — the page served at" >&2
+        echo "  https://${probe:-$(printf '%s' "$variants" | cut -d, -f1)} carries" >&2
+        echo "  $uhits links to $uh, which the parent" >&2
+        echo "  declares and this map does not name. They are not rewritten, so" >&2
+        echo "  they are live production links in a preview." >&2
+        echo "  This worktree's branch predates the hostshift.yaml that declares" >&2
+        echo "  them: merge or rebase onto it. Do *not* run a search-replace —" >&2
+        echo "  the database is the parent's, and moving it off those hostnames" >&2
+        echo "  moves production." >&2
+        exit 2
+      fi
+    done
   fi
   if [ -n "${probe_body:-}" ]; then
     canon_list="${canon_list:-$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \

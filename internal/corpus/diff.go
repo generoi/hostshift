@@ -122,11 +122,14 @@ func Run(ctx context.Context, o Options) ([]Result, error) {
 			base := &net.Dialer{Timeout: timeout}
 			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 				// The keys are folded where they are built, by ResolveKey, and
-				// net/http hands this the punycode host lowercased — so folding
-				// again here is unmeasurable, and an unmeasurable guard is one
-				// nobody can tell has stopped working. Keying both sides through
-				// one function is the fix; doing it twice is not more of it.
-				if to, ok := o.Resolve[addr]; ok {
+				// Through the same fold as the guard. net/http punycodes the
+				// host but does not lowercase it — `idnaASCII` returns an ASCII
+				// host unchanged and `canonicalAddr` folds nothing — so a
+				// mis-cased `--canonical-base` was "covered" by the guard and a
+				// miss for the dialer, which then went to real DNS with nothing
+				// printed. Round 41 keyed the guard and the map through one
+				// function; this is the third side of the same question.
+				if to, ok := o.Resolve[ResolveKey(addr)]; ok {
 					addr = to
 				}
 				return base.DialContext(ctx, network, addr)
