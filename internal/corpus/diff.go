@@ -848,9 +848,9 @@ func WriteReport(w io.Writer, results []Result) bool {
 			green = false
 		}
 		if r.BrokenSerialized > 0 {
-			notes = append(notes, fmt.Sprintf("%d serialized value(s) served with "+
-				"a length that does not describe the data — PHP will refuse or "+
-				"truncate them", r.BrokenSerialized))
+			notes = append(notes, fmt.Sprintf("serialized data PHP will refuse or "+
+				"truncate: %d header(s) failed to parse, and one bad length fails "+
+				"every container around it", r.BrokenSerialized))
 			broken += r.BrokenSerialized
 			green = false
 		}

@@ -508,8 +508,15 @@ func TestAStaleLengthIsNotAGreenRun(t *testing.T) {
 	if WriteReport(&buf, []Result{r}) {
 		t.Errorf("the run was GREEN with a broken payload on the page:\n%s", buf.String())
 	}
-	if !strings.Contains(buf.String(), "does not describe the data") {
+	if !strings.Contains(buf.String(), "PHP will refuse or truncate") {
 		t.Errorf("the report does not say what is wrong:\n%s", buf.String())
+	}
+	// And it does not claim the count is a number of values. One stale length
+	// fails every container around it, so the number is a detector; saying
+	// "N serialized value(s) … with a length that does not describe the data"
+	// read it as a census and was wrong by the nesting depth.
+	if strings.Contains(buf.String(), "serialized value(s) served") {
+		t.Errorf("the report states the count as a census of values:\n%s", buf.String())
 	}
 }
 
@@ -627,7 +634,7 @@ func TestAPageReportsEveryNoteItEarned(t *testing.T) {
 	if !strings.Contains(out, "CANONICAL ORIGIN REACHED THE BROWSER") {
 		t.Errorf("the leak was not reported:\n%s", out)
 	}
-	if !strings.Contains(out, "3 serialized value(s)") {
+	if !strings.Contains(out, "3 header(s) failed to parse") {
 		t.Errorf("the broken payload was not reported:\n%s", out)
 	}
 	// And the summary names both, so a RED run says what was wrong without

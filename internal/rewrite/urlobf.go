@@ -260,10 +260,16 @@ func stripForJSONEsc(v []byte) normalised {
 				continue
 			}
 			if v[i+1] == 'u' && i+6 <= len(v) {
-				if c, ok := jsonEscByte(v[i+2 : i+6]); ok {
-					dec = append(dec, c)
-					pos = append(pos, i)
-					end = append(end, i+6)
+				if r, ok := jsonEscRune(v[i+2 : i+6]); ok {
+					// Every byte of the rune points at the whole escape, the way
+					// stripForRefs already maps a multi-byte named reference, so
+					// a splice that lands anywhere inside it replaces all six
+					// source bytes.
+					for k := 0; k < len(r); k++ {
+						dec = append(dec, r[k])
+						pos = append(pos, i)
+						end = append(end, i+6)
+					}
 					i += 6
 					continue
 				}
@@ -292,27 +298,61 @@ func hasJSONEsc(v []byte) bool {
 // character references are decoded — the backslash spelled either way, followed
 // by the `u`.
 //
-// The needle and not just the ampersand. Gating this composition on `&` alone
-// built a whole-buffer view for every page with a character reference in it and
-// took the ampersand-only allocation case from 128x the body to 185x, for a
-// decode that finds nothing: `&#92;3a` is a CSS escape, not a JSON one.
+// Asked of the decoder, not of a list of spellings. The first version named six
+// fixed strings, and `parseURLRef` accepts more ways to write that backslash than
+// six: `&#092;` with a leading zero, `&bsol;` (in this package's own table,
+// annotated as the JSON separator's byte), and `&#92` with no terminating
+// semicolon, which browsers accept and so does the decoder. Each one the gate
+// refused is a spelling the view behind it would have read, and on the request
+// path that is the variant hostname going upstream into the shared database.
+//
+// A gate narrower than the thing it guards is the same defect as a needle list
+// narrower than a family, one level up. It allocates nothing, so the
+// ampersand-only allocation case stays where it is rather than paying the 185x
+// a bare `&` gate costs.
 func hasRefJSONEsc(v []byte) bool {
-	if hasJSONEsc(v) || bytes.Contains(v, []byte("&#92;u")) {
+	if hasJSONEsc(v) {
 		return true
 	}
-	for _, n := range [][]byte{[]byte("&#x5c;u"), []byte("&#x5C;u"), []byte("&#X5c;u"), []byte("&#X5C;u")} {
-		if bytes.Contains(v, n) {
+	for i := 0; i < len(v); i++ {
+		if v[i] != '&' {
+			continue
+		}
+		c, n := parseURLRef(v[i:])
+		if n == 0 || len(c) != 1 || c[0] != '\\' {
+			continue
+		}
+		if i+n < len(v) && v[i+n] == 'u' {
 			return true
 		}
 	}
 	return false
 }
 
-// jsonEscByte decodes the four hex digits of a `\uXXXX` escape, and reports
-// whether they spell a printable ASCII byte.
-func jsonEscByte(h []byte) (byte, bool) {
+// jsonEscRune decodes the four hex digits of a `\uXXXX` escape into the bytes
+// it stands for, or reports false.
+//
+// The lower bound is the rule stripForURL's comment sets: a decoder must never
+// *emit* a control character, and here it would also invent a byte the authority
+// scanner reads as a separator, so the scan would locate a host across a break
+// that is not in the document.
+//
+// There is no upper bound, and the one that was here — `> 0x7E`, "no authority
+// byte lives there" — was simply wrong. An IDN authority is made of exactly
+// those bytes, `wp_json_encode` writes them as `\u00e4`, and §M4 lists that
+// spelling among the three it calls a dereferenceable production origin reaching
+// the browser. The blob it lives in is `wp_localize_script`'s, which is on
+// essentially every WordPress page, and the JS parser decodes it before the
+// browser dereferences it — so the developer's own session posts to the client's
+// live admin-ajax.
+//
+// Surrogates stay refused: a lone one is not a character, and a pair needs the
+// second escape, which this function does not see. A canonical host reaches this
+// package already folded to punycode, and the fold happens on the decoded bytes,
+// so the UTF-8 spelling is what has to arrive here.
+func jsonEscRune(h []byte) ([]byte, bool) {
 	if len(h) != 4 {
-		return 0, false
+		return nil, false
 	}
 	n := 0
 	for _, c := range h {
@@ -324,13 +364,16 @@ func jsonEscByte(h []byte) (byte, bool) {
 		case c >= 'A' && c <= 'F':
 			n = n<<4 | int(c-'A') + 10
 		default:
-			return 0, false
+			return nil, false
 		}
 	}
-	if n < 0x20 || n > 0x7E {
-		return 0, false
+	if n < 0x20 || n == 0x7F {
+		return nil, false
 	}
-	return byte(n), true
+	if n >= 0xD800 && n <= 0xDFFF {
+		return nil, false
+	}
+	return []byte(string(rune(n))), true
 }
 
 // stripForPercent is stripForURL with percent-escapes decoded into the view.
@@ -1136,6 +1179,22 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	if bytes.IndexByte(v, '%') >= 0 {
 		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value, ev)
 	}
+	// And percent-then-JSON, which is `post.php` sending a block delimiter as a
+	// urlencoded field: the backslash Gutenberg wrote is `%5C`, so the escape
+	// reads `%5Cu002d%5Cu002d` and no literal backslash is there for the plain
+	// view to find.
+	//
+	// Here, not on the reference path. Moving it there was reasoned as "a
+	// urlencoded body is a request" — but `rewriteAll` is not the request path.
+	// It is what the proxy runs over every Tier 1 response header and over a
+	// non-XML `text/plain` body, in the *forward* direction, so the move left
+	// the two directions disagreeing about one encoding: `HostLeaksBack` read
+	// the spelling and `HostLeaks` no longer did. One copy, because two costs
+	// 455x the body and blows the allocation ceiling.
+	if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
+		v = h.spliceHostsIn(composeView(stripForPercent(v), stripForJSONEsc), v,
+			urlTokenStarts, value, ev)
+	}
 	// And JSON's own escape, which is the same rule again and the sharpest case
 	// of it: Gutenberg escapes `--` to `\u002d\u002d` in every block delimiter,
 	// and every variant hostname contains `--` by construction. Here rather than
@@ -1168,20 +1227,6 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, ev *[]origin.Event) 
 			v = h.spliceHostsIn(composeView(stripForRefs(v), stripForJSONEsc), v,
 				urlTokenStarts, value, ev)
 		}
-	}
-	// Percent-then-JSON, on this path only. `post.php` sends the whole `content`
-	// field urlencoded, so the backslash Gutenberg wrote is `%5C` and the escape
-	// reads `%5Cu002d%5Cu002d` — no literal backslash for the plain view to
-	// find. Same shape as WooCommerce's percent-encoded `\/`, one layer out.
-	//
-	// Here rather than in rewriteAll because a urlencoded body is a *request*,
-	// and this is the request path. In rewriteAll it also built a whole-buffer
-	// view for every response containing `%5Cu`, which is allocation spent where
-	// the shape cannot occur — and TestAllocationStaysBounded measures exactly
-	// that composite.
-	if h != nil && len(h.to) > 0 &&
-		(bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu"))) {
-		v = h.spliceHostsIn(composeView(stripForPercent(v), stripForJSONEsc), v, urlTokenStarts, value, ev)
 	}
 	return v
 }

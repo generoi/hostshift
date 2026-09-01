@@ -2441,7 +2441,9 @@ func BrokenSerialized(b []byte) int {
 		}
 		if committed {
 			n++
-			// Past this header, so one broken value is counted once.
+			// Past this header, so the same header is not counted twice. An
+			// *enclosing* header still fails and still counts, which is why the
+			// doc comment above calls this a detector rather than a census.
 			i += 2
 			continue
 		}

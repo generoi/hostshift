@@ -737,6 +737,27 @@ esac
 contains "the remedy redirects loopback into the file" \
   "ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml" "$out"
 
+# And the file that remedy writes must not carry DDEV's generated-file marker.
+#
+# DDEV greps for the literal string `#ddev-generated` anywhere in a file and
+# overwrites it on `ddev add-on get`. The header said "this file carries no
+# #ddev-generated marker, so edits survive" — and that sentence *was* the
+# marker, so an upgrade silently replaced a containment file the developer had
+# added hosts to with the shipped www.example.com placeholder. Under
+# production-canonical that is wp-cron reaching the client's live site again,
+# and `check` only names hostnames hostshift.yaml knows, so hand-added ones go
+# unmentioned. The whole point of the paragraph was to say the file is safe.
+lb="$work/loopmarker"; newproject "$lb"
+printf 'sites:\n  - canonical: https://www.loopmarker.fi\n    variant: https://lm--loopmarker.ddev.site\n' \
+  > "$lb/hostshift.yaml"
+out="$(cd "$lb" && "$cmd" loopback --slug lm 2>/dev/null || true)"
+contains "loopback emits the containment file" "127.0.0.1" "$out"
+case "$out" in
+  *"#ddev-generated"*)
+    fail "and it carries no generated-file marker" "$out" ;;
+  *) pass "and it carries no generated-file marker" ;;
+esac
+
 # copy-db refuses when the worktree is configured to *use* the parent's
 # database. Sharing is as often set in a compose override as in config.*.yaml.
 mkdir -p "$wt/.ddev"
@@ -1684,11 +1705,43 @@ rm -f "$HS_FAKE_DIR/DESTROYED"
 out="$(copydb || true)"
 contains "copy-db refuses a database belonging to neither project" \
   "configured to *use*" "$out"
+
 if [ -f "$HS_FAKE_DIR/DESTROYED" ]; then
   fail "and writes nothing" "mysqldump ran"
 else
   pass "and writes nothing"
 fi
+
+# ...and a project that pins `name:` in a config override recognises its *own*
+# database. `self` was derived from the directory basename, which is wrong on
+# exactly the projects that pin a name — 62 of 66 in this fleet — so the
+# project's own db looked foreign and a correct copy was refused, with --force
+# unable to bypass it. The same file already derives this identity properly two
+# hundred lines down, for the same reason, and this now uses that.
+#
+# The directory and the pinned name have to differ, or the test cannot tell the
+# two derivations apart.
+pin="$work/pinproj"; newproject "$pin"
+git -C "$pin" worktree add -q "$work/pindir" -b wt-p
+pinwt="$work/pindir"
+printf 'name: pinnedname\n' > "$pinwt/.ddev/config.worktree.local.yaml"
+(cd "$pinwt" && "$cmd" init --slug wt-p >/dev/null 2>&1) || fail "init for the pinned fixture" ""
+cat > "$cdb/bin/ddev" <<'FAKE4'
+#!/usr/bin/env bash
+case "$*" in
+  *printenv*)                     echo "DB_HOST=ddev-pinnedname-db" ;;
+  *information_schema.tables*)    echo 0 ;;
+  *mysqldump*)                    echo copied > "${HS_FAKE_DIR}/DESTROYED" ;;
+esac
+exit 0
+FAKE4
+chmod +x "$cdb/bin/ddev"
+rm -f "$HS_FAKE_DIR/DESTROYED"
+out="$(cd "$pinwt" && PATH="$cdb/bin:$PATH" "$cmd" copy-db 2>&1 || true)"
+case "$out" in
+  *"configured to *use*"*) fail "a pinned name recognises its own database" "$out" ;;
+  *) pass "a pinned name recognises its own database" ;;
+esac
 
 # `wp-cli` redirected onto its own input.
 #
@@ -1709,9 +1762,9 @@ err="$( ( cd "$wcw" && "$cmd" wp-cli --slug wt-w > wp-cli.yml ) 2>&1 >/dev/null 
 contains "and says the shell already truncated it" "already" "$err"
 contains "and points at the way back" "git checkout -- wp-cli.yml" "$err"
 contains "and names the file it belongs in" "wp-cli.local.yml" "$err"
-# An *untracked* empty wp-cli.yml is not evidence of anything, and must not
-# refuse a redirect to somewhere else. The guard's signal is the truncation of a
-# file the team shares: tracked, non-empty in HEAD, empty on disk right now.
+# An empty wp-cli.yml is not evidence of anything, and must not refuse a
+# redirect to somewhere else. The guard's signal is whether writing to stdout
+# moves wp-cli.yml — not anything about the file's history.
 ut="$work/wpcliuntracked"; newproject "$ut"
 git -C "$ut" worktree add -q "$work/wpcliuntracked-wt" -b wt-u
 utw="$work/wpcliuntracked-wt"
@@ -1719,6 +1772,29 @@ utw="$work/wpcliuntracked-wt"
 ( cd "$utw" && "$cmd" wp-cli --slug wt-u > wp-cli.local.yml ) 2>/dev/null && rc=0 || rc=$?
 [ "$rc" = 0 ] && pass "an untracked empty wp-cli.yml does not block a real redirect" \
   || fail "an untracked empty wp-cli.yml does not block a real redirect" "exit $rc"
+
+# ...and a wp-cli.yml that is *committed and empty on disk* must not refuse it
+# either. Asking git instead of asking stdout refused the documented command
+# here, on a tree where nothing was being overwritten.
+git -C "$utw" add wp-cli.yml
+git -C "$utw" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -qm empty
+printf 'path: web\n' > "$utw/wp-cli.yml"
+git -C "$utw" add wp-cli.yml
+git -C "$utw" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -qm filled
+: > "$utw/wp-cli.yml"
+( cd "$utw" && "$cmd" wp-cli --slug wt-u > wp-cli.local.yml ) 2>/dev/null && rc=0 || rc=$?
+[ "$rc" = 0 ] && pass "a committed-but-empty wp-cli.yml does not block one either" \
+  || fail "a committed-but-empty wp-cli.yml does not block one either" "exit $rc"
+
+# ...and without git at all, the real accident is still caught. The question is
+# about this process's stdout, which git cannot see.
+git -C "$wcw" checkout -- wp-cli.yml
+out="$( cd "$wcw" && PATH="/usr/bin:/bin" "$cmd" wp-cli --slug wt-w > wp-cli.yml 2>&1 || true )"
+err="$( cd "$wcw" && PATH="/usr/bin:/bin" "$cmd" wp-cli --slug wt-w 2>&1 >/dev/null || true )"
+case "$err" in
+  *"writing wp-cli.yml from itself"*) fail "no false positive without git" "$err" ;;
+  *) pass "no false positive without git" ;;
+esac
 
 # The documented form still works — on the file as committed.
 git -C "$wcw" checkout -- wp-cli.yml

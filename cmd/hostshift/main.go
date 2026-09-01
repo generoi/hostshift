@@ -708,7 +708,7 @@ func cmdDiff(args []string) (int, error) {
 		if !fromCanonical {
 			given = other
 		}
-		if u, err := url.Parse(given); err == nil && u.Host != "" {
+		if o, err := origin.Parse(given); err == nil && o.Host != "" {
 			matched := false
 			for _, st := range res.Map.Sites {
 				hosts := []string{st.Variant.Host}
@@ -719,7 +719,7 @@ func cmdDiff(args []string) (int, error) {
 					}
 				}
 				for _, h := range hosts {
-					if strings.EqualFold(h, u.Host) {
+					if strings.EqualFold(h, o.Host) {
 						site, matched = st, true
 					}
 				}
@@ -734,7 +734,7 @@ func cmdDiff(args []string) (int, error) {
 					"hostshift: warning: %s %s is not a %s of this %d-site map, so\n"+
 						"  there is nothing to pair it with; comparing against %s.\n"+
 						"  Pass the other base to say which site you mean.\n",
-					flag, u.Host, side, len(res.Map.Sites), fell)
+					flag, o.Host, side, len(res.Map.Sites), fell)
 			}
 		}
 	}
@@ -777,14 +777,6 @@ func cmdDiff(args []string) (int, error) {
 	// where the dialer did, so `--resolve www.hämeenlinna.fi:443:…` connected to
 	// the live site with no warning while the punycode spelling that worked
 	// warned anyway.
-	_, covered := resolveMap[corpus.ResolveKey(net.JoinHostPort(cb.Hostname(), port))]
-	if !covered && !isLoopbackHost(cb.Hostname()) {
-		fmt.Fprintf(os.Stderr,
-			"hostshift: crawling %d page(s) from %s, which is not pointed anywhere local.\n"+
-				"  Under production-canonical that is the client's live site. Pass --resolve\n"+
-				"  to send these fetches somewhere else, as the loopback containment does for\n"+
-				"  the application's own requests.\n", *n, cb.Host)
-	}
 
 	var paths []string
 	if *pathList != "" {
@@ -797,6 +789,23 @@ func cmdDiff(args []string) (int, error) {
 				paths = append(paths, line)
 			}
 		}
+	}
+
+	// How many will actually be fetched: the supplied list if there is one, and
+	// otherwise the crawl's budget. This used to print `-n` unconditionally, so
+	// a `--paths` file of two lines warned about crawling twenty pages of the
+	// client's live site — in the one sentence written to make a developer stop.
+	want := *n
+	if len(paths) > 0 {
+		want = len(paths)
+	}
+	_, covered := resolveMap[corpus.ResolveKey(net.JoinHostPort(cb.Hostname(), port))]
+	if !covered && !isLoopbackHost(cb.Hostname()) {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: crawling %d page(s) from %s, which is not pointed anywhere local.\n"+
+				"  Under production-canonical that is the client's live site. Pass --resolve\n"+
+				"  to send these fetches somewhere else, as the loopback containment does for\n"+
+				"  the application's own requests.\n", want, cb.Host)
 	}
 
 	fmt.Fprintf(os.Stderr, "corpus diff: %s vs %s\n", cb, vb)
