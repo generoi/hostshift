@@ -580,16 +580,17 @@ func cmdCheck(args []string) (int, error) {
 	// which is how a warning stops being read.
 	if len(res.ExternalCanonicals) > 0 && len(res.DirectlyServed) > 0 {
 		fmt.Fprintf(os.Stderr,
-			"hostshift: note: this map is canonical-on-production (%s), so DDEV's own\n"+
-				"  hostname(s) for this project serve the database unrewritten — every\n"+
-				"  link on them points at the live site, and `ddev launch` opens one:\n",
+			"hostshift: note: this map is canonical-on-production (%s), so the\n"+
+				"  hostname(s) DDEV registers here that are not variants serve the\n"+
+				"  database unrewritten — every link on them points at the live site,\n"+
+				"  and `ddev launch` opens one:\n",
 			strings.Join(res.ExternalCanonicals, ", "))
 		for _, h := range res.DirectlyServed {
 			fmt.Fprintf(os.Stderr, "  https://%s\n", h)
 		}
 		fmt.Fprintln(os.Stderr, "  Preview through the variant(s) instead:")
 		for _, st := range res.Map.Sites {
-			fmt.Fprintf(os.Stderr, "  https://%s\n", st.Variant.Host)
+			fmt.Fprintf(os.Stderr, "  %s\n", st.Variant.String())
 		}
 	}
 
@@ -609,15 +610,11 @@ func cmdCheck(args []string) (int, error) {
 // reality. Fixtures would not have caught the double-port bug; this would.
 // isLoopbackHost reports whether a crawl of this host stays on the machine.
 func isLoopbackHost(h string) bool {
-	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
-		return true
-	}
-	if ip := net.ParseIP(h); ip != nil {
-		return ip.IsLoopback()
-	}
 	// `.ddev.site` resolves to 127.0.0.1 by wildcard, which is what a worktree
-	// crawl uses and is exactly the case that must not warn.
-	return strings.HasSuffix(h, ".ddev.site") || strings.HasSuffix(h, ".test")
+	// crawl uses and is exactly the case that must not warn. The rest —
+	// loopback names and addresses, and the reserved TLDs — is the same question
+	// the map diagnostics ask, so it is answered in one place.
+	return strings.HasSuffix(h, ".ddev.site") || origin.ResolvesLocally(h)
 }
 
 func cmdDiff(args []string) (int, error) {
@@ -681,22 +678,45 @@ func cmdDiff(args []string) (int, error) {
 	// project's own `<project>.ddev.site` — deliberately not a hostname the map
 	// knows. So an unmatched base is allowed and named: the pair it is actually
 	// comparing is the thing a reader has to be able to check.
-	if *canonicalBase != "" && *variantBase == "" {
-		if u, err := url.Parse(*canonicalBase); err == nil && u.Host != "" {
+	//
+	// Both directions. The first version paired from the canonical side only, so
+	// `--variant-base <site 2>` left the *canonical* at site 1's — the same two
+	// different sites with the flags swapped, and unwarned. The asymmetry had no
+	// reason behind it: the argument for tolerating an unmatched base is about
+	// the canonical side, where the production-canonical baseline is the
+	// project's own `<project>.ddev.site` and deliberately not in the map. Every
+	// variant is in the map by construction.
+	if given, other := *canonicalBase, *variantBase; (given == "") != (other == "") {
+		fromCanonical := given != ""
+		if !fromCanonical {
+			given = other
+		}
+		if u, err := url.Parse(given); err == nil && u.Host != "" {
 			matched := false
 			for _, st := range res.Map.Sites {
-				for _, o := range st.CanonicalSet() {
-					if strings.EqualFold(o.Host, u.Host) {
+				hosts := []string{st.Variant.Host}
+				if fromCanonical {
+					hosts = nil
+					for _, o := range st.CanonicalSet() {
+						hosts = append(hosts, o.Host)
+					}
+				}
+				for _, h := range hosts {
+					if strings.EqualFold(h, u.Host) {
 						site, matched = st, true
 					}
 				}
 			}
 			if !matched && len(res.Map.Sites) > 1 {
+				flag, side, fell := "--canonical-base", "canonical", site.Variant.String()
+				if !fromCanonical {
+					flag, side, fell = "--variant-base", "variant", site.Canonical.String()
+				}
 				fmt.Fprintf(os.Stderr,
-					"hostshift: warning: --canonical-base %s is not a canonical of this %d-site\n"+
-						"  map, so there is nothing to pair it with; comparing against %s.\n"+
-						"  Pass --variant-base to say which site you mean.\n",
-					u.Host, len(res.Map.Sites), site.Variant.String())
+					"hostshift: warning: %s %s is not a %s of this %d-site map, so\n"+
+						"  there is nothing to pair it with; comparing against %s.\n"+
+						"  Pass the other base to say which site you mean.\n",
+					flag, u.Host, side, len(res.Map.Sites), fell)
 			}
 		}
 	}

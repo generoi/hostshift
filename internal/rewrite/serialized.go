@@ -358,10 +358,30 @@ func repairField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 }
 
 // onlySpaceAfter reports whether nothing but whitespace follows end.
+//
+// In every spelling the transport may have applied, not only the literal one.
+// A serialized value posted as a urlencoded field arrives with its trailing
+// newline as `%0A`, which read as "something other than whitespace follows" — so
+// the repair declined, the generic rewriter replaced the host anyway, and the
+// field went into the shared database with a length describing the string it
+// used to be. PHP returns false for that, or truncates it. A trailing byte the
+// developer never typed decided which.
 func onlySpaceAfter(b []byte, end int) bool {
 	for i := end; i < len(b); i++ {
 		switch b[i] {
 		case ' ', '\t', '\r', '\n':
+		// `+` is how form encoding spells a space, and `%XX` how it spells the
+		// rest. Widening what counts as trailing whitespace cannot make a repair
+		// wrong: repairAt has already parsed the value, so the length re-emitted
+		// describes it either way, and anything after `end` is rewritten by the
+		// generic path exactly as before.
+		case '+':
+		case '%':
+			if i+2 < len(b) && pctWhitespace(b[i+1], b[i+2]) {
+				i += 2
+				continue
+			}
+			return false
 		case '\\':
 			if i+1 < len(b) && (b[i+1] == 't' || b[i+1] == 'r' || b[i+1] == 'n') {
 				i++
@@ -373,6 +393,31 @@ func onlySpaceAfter(b []byte, end int) bool {
 		}
 	}
 	return true
+}
+
+// pctWhitespace reports whether %XY spells a whitespace byte: tab, LF, CR or
+// space, in either hex case.
+func pctWhitespace(x, y byte) bool {
+	hex := func(c byte) int {
+		switch {
+		case c >= '0' && c <= '9':
+			return int(c - '0')
+		case c >= 'a' && c <= 'f':
+			return int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			return int(c-'A') + 10
+		}
+		return -1
+	}
+	hi, lo := hex(x), hex(y)
+	if hi < 0 || lo < 0 {
+		return false
+	}
+	switch byte(hi<<4 | lo) {
+	case '\t', '\n', '\r', ' ':
+		return true
+	}
+	return false
 }
 
 // repairAt tries each spelling at i. committed reports whether the candidate got
@@ -2185,6 +2230,22 @@ func occupiesItsField(b []byte, start, end int) bool {
 	for i := end; i < len(b); i++ {
 		if b[i] == ' ' || b[i] == '\t' || b[i] == '\r' || b[i] == '\n' {
 			continue
+		}
+		// The same whitespace in the spelling its transport uses. A serialized
+		// value posted as a urlencoded field carries its trailing newline as
+		// `%0A`, and reading that as "something else follows" made this return
+		// false — so the repair declined, the generic rewriter replaced the host
+		// anyway, and the field went to the database with a length describing
+		// the string it used to be. Only in the two encoded contexts: `+` is a
+		// space in a form and a literal plus everywhere else.
+		if open == ownField || open == pctQuote {
+			if b[i] == '+' {
+				continue
+			}
+			if b[i] == '%' && i+2 < len(b) && pctWhitespace(b[i+1], b[i+2]) {
+				i += 2
+				continue
+			}
 		}
 		switch open {
 		case ownField:

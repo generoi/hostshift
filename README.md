@@ -178,6 +178,12 @@ After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
   back to the request it just made, so hostshift passes it through unmodified
   and counts it as `self-redirect`. `--strict-origins` returns 404 instead.
 
+  A JSON body over the 8 MB cap is another: it streams through untouched with
+  only a `WARN` in `ddev logs -s hostshift`, and under production-canonical every
+  origin in it reaches the browser. PLAN §5.8 decides the cap deliberately —
+  buffering an arbitrarily large body is the thing it exists to prevent — but
+  `/wp-json/wp/v2/posts?per_page=100` on a content-heavy site gets there.
+
   It is not the only exception. Tier 2 content types — `text/css` and
   JavaScript — are excluded by design (PLAN §5.2), so an absolute canonical URL
   inside a stylesheet reaches the browser unrewritten. That is a deliberate
@@ -407,12 +413,19 @@ it needs `--canonical-base` to say what the canonical side is, since the
 production hostname is not routed locally:
 
 ```
-hostshift diff -n 20 --canonical-base https://<project>.ddev.site
+hostshift diff -n 20 --slug <slug> --canonical-base https://<project>.ddev.site
 ```
+
+`--slug` is not optional here. Without it the worktree's map has no variant side
+to derive — `hostshift diff` exits 2 with *no variant — pass --slug, or declare
+`variant:` on the site* — and there is no `ddev hostshift diff` wrapper to supply
+it for you.
 
 The assertions that fail a run are the ones that cannot be innocent — a canonical origin
 reaching the browser, a serialized value served with a length that does not
-describe its data, which PHP will refuse or silently truncate, and a page whose
+describe its data, which PHP will refuse or silently truncate, a page whose byte
+count moved by more than a quarter — which is how an upstream that answers 200
+with an empty body, or dies mid-stream, is caught — and a page whose
 line count moved by more than a Host-dependent line could explain (over eight
 lines, or over a quarter of the page). A one-line difference is reported and
 does not fail the run: the two fetches carry different `Host` headers, so

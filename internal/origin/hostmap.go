@@ -2,6 +2,7 @@ package origin
 
 import (
 	"fmt"
+	"net"
 	"strings"
 )
 
@@ -161,4 +162,23 @@ func (m *Map) String() string {
 		}
 	}
 	return sb.String()
+}
+
+// ResolvesLocally reports whether a hostname can never reach another machine:
+// the loopback names and addresses, and the reserved TLDs that are never
+// delegated. `.test` is RFC 6761 and has no root delegation at all.
+//
+// It exists because two places were answering this question differently. `diff`
+// used its own copy to decide whether a crawl would hit the client's live site,
+// while the map diagnostics used a TLD suffix test alone — so `additional_fqdns:
+// [acme.test]` was reported as canonical-on-production by one half of the same
+// binary that the other half already knew could not resolve anywhere.
+func ResolvesLocally(h string) bool {
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.HasSuffix(h, ".test")
 }

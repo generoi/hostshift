@@ -109,6 +109,19 @@ func TestAVariantIsNotDirectlyServed(t *testing.T) {
 	}
 }
 
+// noNetwork points every host a diff test would fetch at a closed local port, so
+// the crawl fails instantly instead of resolving and dialling the real internet.
+// Without it these tests spend a second and a half each on a DNS lookup for a
+// client's actual domain — from a unit suite, which is the wrong place to be
+// making that request at all.
+func noNetwork(hosts ...string) []string {
+	var out []string
+	for _, h := range hosts {
+		out = append(out, "--resolve", h+":443:127.0.0.1:1", "--resolve", h+":80:127.0.0.1:1")
+	}
+	return append(out, "--timeout", "2s")
+}
+
 // TestDiffPairsTheBasesBySite: on a multisite, --canonical-base names one site
 // and the variant side has to follow it. It used to override the canonical
 // alone, so `--canonical-base <site 2>` was crawled against site 1's variant —
@@ -126,8 +139,10 @@ func TestDiffPairsTheBasesBySite(t *testing.T) {
 		"  - canonical: https://www.acme.fi\n    variant: https://wt-a--acme.ddev.site\n"+
 		"  - canonical: https://shop.acme.fi\n    variant: https://wt-a--shop.ddev.site\n")
 
-	_, _, errOut := run(t, "", cmdDiff, "-C", dir, "--slug", "wt-a", "-n", "1",
-		"--canonical-base", "https://shop.acme.fi")
+	args := append([]string{"-C", dir, "--slug", "wt-a", "-n", "1",
+		"--canonical-base", "https://shop.acme.fi"},
+		noNetwork("shop.acme.fi", "wt-a--shop.ddev.site")...)
+	_, _, errOut := run(t, "", cmdDiff, args...)
 	if !strings.Contains(errOut, "corpus diff: https://shop.acme.fi vs https://wt-a--shop.ddev.site") {
 		t.Errorf("the second site's base was not paired with its own variant:\n%s", errOut)
 	}
@@ -146,8 +161,10 @@ func TestDiffSaysWhenABaseBelongsToNoSite(t *testing.T) {
 		"  - canonical: https://www.acme.fi\n    variant: https://wt-a--acme.ddev.site\n"+
 		"  - canonical: https://shop.acme.fi\n    variant: https://wt-a--shop.ddev.site\n")
 
-	_, _, errOut := run(t, "", cmdDiff, "-C", dir, "--slug", "wt-a", "-n", "1",
-		"--canonical-base", "https://acme-wt-b.ddev.site")
+	args := append([]string{"-C", dir, "--slug", "wt-a", "-n", "1",
+		"--canonical-base", "https://acme-wt-b.ddev.site"},
+		noNetwork("acme-wt-b.ddev.site", "wt-a--acme.ddev.site")...)
+	_, _, errOut := run(t, "", cmdDiff, args...)
 	if !strings.Contains(errOut, "is not a canonical of this 2-site") {
 		t.Errorf("an unrelated base was accepted in silence:\n%s", errOut)
 	}

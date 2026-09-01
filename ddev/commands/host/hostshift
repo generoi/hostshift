@@ -1350,19 +1350,30 @@ if [ "$cmd" = "check" ]; then
   if [ -n "$external" ] && [ -n "$webenv" ]; then
     extra="$(docker inspect "ddev-$name-web" \
       --format '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' 2>/dev/null || true)"
+    # Whole entries, not a substring of the blob. `acme.fi:127.0.0.1` is a
+    # substring of `www.acme.fi:127.0.0.1`, so an unanchored match called the
+    # apex domain contained whenever the `www` name was — the commonest hostname
+    # pair WordPress has, and exactly the shape a containment file generated
+    # before the apex alias was added to the map produces.
+    # Comma-delimited on both ends: `$(...)` strips the trailing newline, so
+    # without the closing comma the *last* entry could never match its pattern.
+    extra_list=",$(printf '%s' "$extra" | tr -s '\n' ','),"
     uncontained=""
     for h in $external; do
-      case "$extra" in
-        *"$h:127.0.0.1"*) ;;
+      case "$extra_list" in
+        *",$h:127.0.0.1,"*) ;;
         *) uncontained="$uncontained $h" ;;
       esac
     done
     if [ -n "$uncontained" ]; then
-      echo "hostshift: warning: web can reach these canonical hostnames for real:" >&2
+      echo "hostshift: warning: these canonical hostnames are not pinned to the" >&2
+      echo "  loopback inside web, so nothing here stops it reaching them:" >&2
       for h in $uncontained; do echo "    $h" >&2; done
       echo "  wp-cron, Site Health and any \`wp_remote_post\` will hit the live site" >&2
-      echo "  from here. Run \`ddev hostshift loopback\` to regenerate" >&2
-      echo "  .ddev/docker-compose.hostshift-loopback.yaml, then \`ddev restart\`." >&2
+      echo "  from here. Run:" >&2
+      echo "    ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml" >&2
+      echo "    ddev restart" >&2
+      echo "  \`loopback\` prints the file; it does not write it." >&2
     fi
   fi
 

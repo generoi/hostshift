@@ -99,6 +99,13 @@ type Result struct {
 	// markup — so a small delta is reported and a large one is fatal, per
 	// hostDependentLines.
 	LinesCanonical, LinesVariant int
+	// BytesCanonical and BytesVariant are the same question in a unit every
+	// document has. Lines are not: minified HTML — WP Rocket, Autoptimize,
+	// LiteSpeed and Cloudflare's minifier all emit one — and every JSON body
+	// count zero lines however much or little is in them, so for that whole
+	// class the line counts were equal by construction and the size bound never
+	// ran at all.
+	BytesCanonical, BytesVariant int
 	DiffLines                    int
 	Err                          error
 }
@@ -237,6 +244,8 @@ func compare(ctx context.Context, o Options, path string) Result {
 	r.Equal = string(want) == string(variant.body)
 	r.LinesCanonical = strings.Count(string(want), "\n")
 	r.LinesVariant = strings.Count(string(variant.body), "\n")
+	r.BytesCanonical = len(want)
+	r.BytesVariant = len(variant.body)
 	r.DiffLines = countDiffLines(string(want), string(variant.body))
 
 	// The safety-critical assertion, independent of byte equality: a live site
@@ -810,6 +819,37 @@ func WriteReport(w io.Writer, results []Result) bool {
 		} else if len(notes) == 0 && !r.Equal {
 			notes = append(notes, fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines))
 		}
+
+		// The same question in bytes, asked unconditionally.
+		//
+		// The bound above is expressed entirely in newlines, and a document with
+		// none counts zero lines however much is in it — so for minified HTML
+		// (WP Rocket, Autoptimize, LiteSpeed and Cloudflare's minifier all emit
+		// one line) and for every JSON body the two counts are equal by
+		// construction, the branch above is never entered, and the size
+		// assertion never ran at all. An upstream answering 200 with nothing in
+		// it scored "1 lines differ (dynamic content?)" and GREEN, under a
+		// verdict line claiming every page was the length it should be.
+		//
+		// Outside both branches rather than inside one, because a page can have
+		// earned a note already — a Tier 2 origin, a self-redirect — and being
+		// half-served is not less true for it.
+		//
+		// A quarter again, and for the same reason: rewriting changes lengths,
+		// since a variant hostname is not the length of the canonical it
+		// replaces, but it changes them by a few bytes per URL and never by a
+		// quarter of the document.
+		db := r.BytesCanonical - r.BytesVariant
+		if db < 0 {
+			db = -db
+		}
+		if db*4 > r.BytesCanonical {
+			green = false
+			notes = append(notes, fmt.Sprintf(
+				"%d→%d bytes — too much of the page to be rewriting; the proxy "+
+					"served a different document",
+				r.BytesCanonical, r.BytesVariant))
+		}
 		note := strings.Join(notes, "; ")
 		// Counted outside the switch. `equal++` used to sit in its last arm, so
 		// a page that *is* byte-identical but carries a note was never counted:
@@ -838,10 +878,26 @@ func WriteReport(w io.Writer, results []Result) bool {
 			"proxy excludes by design — PLAN's fast path adds them \"only if the "+
 			"corpus diff shows a leak\", and this is that\n", tier2)
 	}
-	if green {
+	switch {
+	case green && tier2 > 0:
+		// The verdict has to be scoped to what was actually asked.
+		//
+		// "no canonical origin reached the browser" was printed unconditionally,
+		// two lines under a count of origins that had just reached the browser
+		// in an excluded type — a production-canonical run with live URLs inside
+		// Elementor CSS said GREEN and exited 0. The exclusion is designed
+		// (PLAN §5.2 Tier 2) and stays; what could not stay is a sentence
+		// asserting the one thing invariant 28 forbids about bytes it never
+		// looked at, in the command the README calls the check that validates a
+		// deployment against reality.
+		fmt.Fprintf(w, "corpus diff GREEN for the types it rewrites: no canonical origin "+
+			"reached the browser\n  in Tier 1, no page re-serialised, every page the "+
+			"length it should be. %d origin(s)\n  did reach it in Tier 2 types, which "+
+			"this run does not fail on — see the line above.\n", tier2)
+	case green:
 		fmt.Fprintln(w, "corpus diff GREEN: no canonical origin reached the browser, "+
 			"no page re-serialised, every page the length it should be")
-	} else {
+	default:
 		fmt.Fprintln(w, "corpus diff RED")
 	}
 	return green

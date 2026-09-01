@@ -314,7 +314,7 @@ out3="$(cd "$wt3" && ddev start -y 2>&1)" || fail "the hostshift.yaml worktree s
 # and reported "hostshift is serving".
 out="$(cd "$wt3" && ddev hostshift check 2>&1 || true)"
 contains "check notices that loopback containment is not in place" \
-  "can reach these canonical hostnames for real" "$out"
+  "not pinned to the" "$out"
 contains "and names the hostname that is not contained" "${tag}3.staging.example" "$out"
 
 # And it stops once containment is real. Without this the check could warn
@@ -325,7 +325,7 @@ contains "and names the hostname that is not contained" "${tag}3.staging.example
 out="$(cd "$wt3" && ddev restart -y 2>&1)" || fail "restart with containment" "$out"
 out="$(cd "$wt3" && ddev hostshift check 2>&1 || true)"
 case "$out" in
-  *"can reach these canonical hostnames for real"*)
+  *"not pinned to the"*)
     fail "and goes quiet once containment is in place" "$out" ;;
   *) pass "and goes quiet once containment is in place" ;;
 esac

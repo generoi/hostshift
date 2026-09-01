@@ -647,6 +647,67 @@ out="$(cd "$wt" && DDEV_SITENAME=pinned-wt-a "$cmd" check --slug wt-a 2>&1 || tr
 contains "check asks docker about the name DDEV uses, not one it re-derives" \
   "ddev-pinned-wt-a-hostshift" "$out"
 
+# Loopback containment, compared entry by entry.
+#
+# `acme.fi:127.0.0.1` is a substring of `www.acme.fi:127.0.0.1`, so an unanchored
+# match against docker's whole ExtraHosts blob called the apex domain contained
+# whenever the `www` name was — the commonest hostname pair WordPress has, and
+# exactly what a containment file generated before the apex alias joined the map
+# looks like. `check` then said nothing while web resolved the apex over public
+# DNS.
+#
+# A `docker` on PATH ahead of the real one, so the actual comparison runs.
+pc="$work/contain"; newproject "$pc"
+printf 'sites:\n  - canonical: https://www.contain.fi\n    aliases:\n      - https://contain.fi\n    variant: https://ct--contain.ddev.site\n' \
+  > "$pc/hostshift.yaml"
+(cd "$pc" && "$cmd" init --slug ct >/dev/null 2>&1) || fail "init for the containment fixture" ""
+webhosts="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$pc/.ddev/.env")"
+cvariants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$pc/.ddev/.env")"
+cargs="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$pc/.ddev/.env")"
+# Answers as the two containers `check` interrogates: the proxy (running, with
+# the map .ddev/.env asks for) and web (serving the right hostnames, and
+# containing only the `www` name). Everything else exits non-zero, as the real
+# docker does for a container that is not there.
+cat > "$work/docker" <<SHIM
+#!/usr/bin/env bash
+target=""
+for a in "\$@"; do
+  case "\$a" in
+    *-hostshift) target=proxy ;;
+    *-web)       target=web ;;
+  esac
+done
+for a in "\$@"; do
+  case "\$target:\$a" in
+    web:*HostConfig.ExtraHosts*) printf 'www.contain.fi:127.0.0.1\n'; exit 0 ;;
+    web:*Config.Env*)            printf 'VIRTUAL_HOST=%s\n' "$webhosts"; exit 0 ;;
+    proxy:*State.Running*)
+      printf 'true\nhostshift proxy $cargs \nVIRTUAL_HOST=%s\n' "$cvariants"; exit 0 ;;
+  esac
+done
+exit 1
+SHIM
+chmod +x "$work/docker"
+out="$(cd "$pc" && "$cmd" check --slug ct 2>&1 || true)"
+rm -f "$work/docker"
+contains "the apex domain is not contained by its www sibling" \
+  "not pinned to the" "$out"
+case "$out" in
+  *"    contain.fi"*) pass "and it is the apex that is named" ;;
+  *) fail "and it is the apex that is named" "$out" ;;
+esac
+case "$out" in
+  *"    www.contain.fi"*) fail "while the contained name is not named" "$out" ;;
+  *) pass "while the contained name is not named" ;;
+esac
+
+# And the remedy it prints has to be the one that works. `loopback` writes to
+# stdout and exits; a developer who ran the command as it was printed — without
+# the redirect — saw the shipped placeholder file unchanged, restarted, and
+# believed containment was in place while wp-cron kept reaching production.
+contains "the remedy redirects loopback into the file" \
+  "ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml" "$out"
+
 # copy-db refuses when the worktree is configured to *use* the parent's
 # database. Sharing is as often set in a compose override as in config.*.yaml.
 mkdir -p "$wt/.ddev"

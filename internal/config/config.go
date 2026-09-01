@@ -262,11 +262,30 @@ func annotate(res *Resolved, proj *ddev.Project, sites []origin.Site) {
 	// `*.ddev.site` is a real public record pointing at the loopback, so
 	// everything under the TLD stays on the machine with nothing registered
 	// anywhere; a name outside it is one the application can actually reach.
+	mine := map[string]bool{own: true}
+	for _, h := range proj.Hosts {
+		mine[h] = true
+	}
 	for _, st := range sites {
 		for _, o := range st.CanonicalSet() {
-			if !strings.HasSuffix(o.Host, "."+proj.TLD) {
-				res.ExternalCanonicals = append(res.ExternalCanonicals, o.Host)
+			// Three ways a name cannot reach another machine, and the map has to
+			// clear all of them. Under the project TLD it resolves by wildcard
+			// to the loopback. Registered by DDEV for this project — an
+			// `additional_fqdns` entry — it is in /etc/hosts, which is the case
+			// the add-on's own variant check spends a paragraph on. And a
+			// reserved TLD is never delegated at all.
+			//
+			// The TLD test alone reported `additional_fqdns: [acme.test]` as
+			// canonical-on-production, so `ddev hostshift check` — the
+			// post-start hook — printed a paragraph about live production URLs
+			// on every start of a project that had none. Third wrong answer to
+			// the same question; the first two flagged every stock project and
+			// every ordinary worktree.
+			if strings.HasSuffix(o.Host, "."+proj.TLD) || mine[o.Host] ||
+				origin.ResolvesLocally(o.Host) {
+				continue
 			}
+			res.ExternalCanonicals = append(res.ExternalCanonicals, o.Host)
 		}
 	}
 
