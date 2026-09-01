@@ -454,6 +454,16 @@ does not fail the run: the two fetches carry different `Host` headers, so
 WordPress emits one extra `<link rel="dns-prefetch">` on every page of a
 healthy production-canonical site.
 
+That one-line expectation assumes `WP_HOME` is **pinned to the canonical**. If
+you derive it from the request — which this README recommends above, and which
+is right for serving — then under production-canonical the only baseline you can
+fetch locally, `<project>.ddev.site`, emits *that* hostname throughout instead of
+the database's. Every page then differs by a tenth of its lines, reported as
+`N lines differ (dynamic content?)`, and the run is still GREEN. Measured: 20–29
+lines a page against 0–1 with `WP_HOME` pinned. A real re-serialisation sits
+inside that noise indistinguishably, so pin `WP_HOME` for the run you intend to
+read, or compare against a checkout that has it pinned.
+
 That last one is asserted on the served bytes alone, not by comparing the proxy
 against the engine. Every other check here compares the two, so when both are
 wrong in the same way the run is green — which is how five consecutive rounds of

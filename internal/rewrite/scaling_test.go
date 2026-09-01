@@ -190,6 +190,12 @@ func TestHostLeaksStaysLinear(t *testing.T) {
 // measured, deliberate deferral rather than something done in the same pass as
 // a leak fix. This test is what makes it a tracked number instead of a
 // forgotten one.
+// r46CompositeUnit is the body the composite case is built from. Named so the
+// audit test can assert it still reaches every view: two of the six are behind
+// two-byte needles, and a unit that loses one stops measuring a third of the
+// machinery while still passing.
+const r46CompositeUnit = `&#92;u002d %5Cu002d \u002d \3a [http:`
+
 func TestAllocationStaysBounded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("allocation")
@@ -205,7 +211,19 @@ func TestAllocationStaysBounded(t *testing.T) {
 		name, unit string
 		ceiling    float64
 	}{
-		{"every view fires", `&#92;3a %5C\3a [http:`, 200},
+		// Every view means every view. This unit carried no `\u` and no `%5Cu`,
+		// so once those two views were added behind their own needles it
+		// measured four of six and passed at 186x — a budget that had quietly
+		// stopped bounding what it names.
+		//
+		// The honest composite is 371x, and it is recorded rather than trimmed:
+		// it needs a body carrying *both* escape spellings at once, which no
+		// producer is known to emit — a classic-editor save has `%5Cu002d`, an
+		// inline JSON blob has `\u00e4`, and one body having both is this
+		// fixture's construction. Realistic single-needle bodies measure 85x and
+		// 135x, inside the old ceiling. The structural halving named below
+		// (`pos`/`end` as []int32) is the lever if this ever needs to come down.
+		{"every view fires", r46CompositeUnit, 400},
 		{"ampersands alone", `&`, 128},
 		{"references and brackets", `&#91;http:`, 115},
 	} {

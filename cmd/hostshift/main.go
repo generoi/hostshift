@@ -724,7 +724,8 @@ func cmdDiff(args []string) (int, error) {
 					}
 				}
 			}
-			if !matched && (len(res.Map.Sites) > 1 || len(res.ExternalCanonicals) == 0) {
+			if !matched && (!fromCanonical || len(res.Map.Sites) > 1 ||
+				len(res.ExternalCanonicals) == 0) {
 				flag, side, fell := "--canonical-base", "canonical", site.Variant.String()
 				if !fromCanonical {
 					flag, side, fell = "--variant-base", "variant", site.Canonical.String()

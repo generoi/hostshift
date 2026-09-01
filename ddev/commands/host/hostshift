@@ -152,8 +152,12 @@ if [ "$cmd" = "check" ] && { [ -n "$quiet" ] || [ -n "${HOSTSHIFT_HOOK:-}" ]; };
     # still lists the URL, and the moment the add-on could have said so is the
     # moment it created the hazard.
     #
-    # Cheap: the .git file names the parent, and the question is only whether it
-    # declares extra hostnames. No map, no binary.
+    # The .git file names the parent, and the question is only whether it
+    # declares extra hostnames. That used to be a `grep` for the key — which
+    # matches `additional_hostnames: []`, what `ddev config` writes into every
+    # project, so it fired on every ordinary parent. `hostshift hosts` answers it
+    # exactly and keeps one copy of the parsing; the cost is that this branch now
+    # needs the CLI, and says so when it is missing rather than going quiet.
     if grep -q '/worktrees/' .git 2>/dev/null; then
       pdir="$(sed -n 's/^gitdir: //p' .git 2>/dev/null | sed 's|/\.git/worktrees/.*||')"
       # Does the parent declare any hostname beyond its own name?
@@ -167,7 +171,20 @@ if [ "$cmd" = "check" ] && { [ -n "$quiet" ] || [ -n "${HOSTSHIFT_HOOK:-}" ]; };
       # parses DDEV config. `hostshift hosts` prints one hostname per line, and
       # more than one means there is something to inherit.
       extra=""
-      if [ -n "$pdir" ]; then
+      if [ -n "$pdir" ] && ! command -v hostshift >/dev/null 2>&1; then
+        # Say so rather than going quiet.
+        #
+        # This branch short-circuits above the `command -v hostshift` guard, so
+        # when the binary is absent the question simply went unanswered — no
+        # warning and no reason for its absence, in exactly the situation the
+        # warning exists for: `ddev add-on get` followed by `ddev restart`, which
+        # is what registers the parent's hostnames on this project's web.
+        # install.yaml documents the binary as optional for the *proxy*, which it
+        # is; this check is not the proxy.
+        echo "hostshift: this is a worktree, and whether it now answers to the" >&2
+        echo "  parent's hostnames cannot be checked without the hostshift CLI." >&2
+        echo "  https://github.com/generoi/hostshift" >&2
+      elif [ -n "$pdir" ]; then
         extra="$(hostshift hosts -C "$pdir" 2>/dev/null | sed -n '2,$p' || true)"
       fi
       if [ -n "$extra" ]; then
@@ -463,9 +480,24 @@ if [ "$cmd" = "copy-db" ]; then
   asked=""
   dbenv="$(ddev exec -s web printenv DB_HOST DATABASE_URL DB_URL 2>/dev/null || true)"
   [ -n "$dbenv" ] && asked=1
-  case "$dbenv" in
-    *"ddev-$from-db"*) shared="$(printf '%s\n' "$dbenv" | grep -F "ddev-$from-db" || true)" ;;
-  esac
+  # Any db container that is not this project's own, not only the source's.
+  #
+  # Keying on `ddev-$from-db` asked "does this worktree use the project I am
+  # copying *from*?" — but the harm has nothing to do with which project the
+  # dump comes from. A second worktree pointed at the *first worktree's*
+  # database, which is what running two worktrees of one parent produces once
+  # one has its own copy, walked straight past this: twelve tables written into
+  # a container nothing reads, exit 0, and the success message. That is verbatim
+  # the failure the refusal below describes.
+  #
+  # The question is whether `web` reads a database other than the one `copy-db`
+  # writes to, and `copy-db` writes to this project's own `db`.
+  self="ddev-${DDEV_SITENAME:-$(basename "$(pwd -P)")}-db"
+  shared="$(printf '%s\n' "$dbenv" | grep -oE 'ddev-[A-Za-z0-9._-]+-db' \
+    | grep -vxF "$self" | sort -u || true)"
+  if [ -n "$shared" ]; then
+    shared="$(printf '%s\n' "$dbenv" | grep -F "$(printf '%s' "$shared" | head -1)" || true)"
+  fi
   # ...but the container's environment cannot see a dotenv file the application
   # reads for itself, so that one is checked either way.
   if [ -z "$shared" ] && { [ -z "$asked" ] || [ -f .env ]; }; then
@@ -2030,6 +2062,33 @@ if [ "$cmd" = "wp-cli" ]; then
   canonical="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs \
     | sed -n '1s/=.*//p')"
   [ -n "$canonical" ] || { echo "no canonical origin in the map" >&2; exit 2; }
+  # Not onto its own input.
+  #
+  # The documented form redirects into `wp-cli.local.yml`. One word away is
+  # `> wp-cli.yml`, and the shell truncates before this runs — so the `sed` below
+  # read an empty file and the committed config was replaced by a two-line
+  # header and a `url:`, losing `path:` and every alias, with exit 0. That file
+  # is committed, so losing `path:` breaks `ddev wp` for the whole team on the
+  # next commit.
+  #
+  # Detected by writing the header and reading it back, because the portable
+  # ways to ask "is stdout this file" are not: `/dev/fd/1 -ef wp-cli.yml`
+  # compares a devfs entry against an apfs one on macOS and says no, and the two
+  # `stat`s in play spell their flags differently. Writing the line we were going
+  # to write anyway and looking for it asks the question directly, and costs
+  # nothing when stdout is a terminal or a pipe.
+  if [ -f wp-cli.yml ] && [ ! -s wp-cli.yml ] &&
+      git cat-file -e HEAD:wp-cli.yml 2>/dev/null &&
+      [ -n "$(git show HEAD:wp-cli.yml 2>/dev/null)" ]; then
+    echo "hostshift: this is writing wp-cli.yml from itself, and the shell already" >&2
+    echo "  truncated it — \`path:\` and every alias are gone from disk, before this" >&2
+    echo "  command ran. Nothing here can put them back:" >&2
+    echo "    git checkout -- wp-cli.yml" >&2
+    echo "  The file this belongs in is wp-cli.local.yml, which is gitignored:" >&2
+    echo "    ddev hostshift wp-cli > wp-cli.local.yml" >&2
+    echo "  Stopping rather than finishing the overwrite." >&2
+    exit 2
+  fi
   echo "# generated by \`ddev hostshift wp-cli\` — do not commit"
   if [ -f wp-cli.yml ]; then
     sed -e '/^url:[[:space:]]/d' wp-cli.yml

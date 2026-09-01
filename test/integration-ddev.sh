@@ -66,6 +66,13 @@ newsite() {
   {
     echo "type: php"
     echo "docroot: web"
+    # DDEV waits 120s for a container to become healthy and then fails the
+    # start. On a machine already running the fleet, a *bare* project — no
+    # add-on, no hostshift — measured 2m34s to come up, so the suite failed on
+    # `ddev start` with a health-check timeout and every assertion after it,
+    # while nothing in this repository was wrong. The failure text names this
+    # setting; a suite that a busy machine turns red is a suite nobody can read.
+    echo "default_container_timeout: \"600\""
     [ -n "${3:-}" ] && printf 'additional_hostnames:\n  - %s\n' "$3"
   } > "$1/.ddev/config.yaml"
   printf '<?php echo "PROJECT=%s HOST=", $_SERVER["HTTP_HOST"], "\\n";' "$2" > "$1/web/index.php"

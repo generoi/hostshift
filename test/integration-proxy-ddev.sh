@@ -99,7 +99,8 @@ export PATH="$work/bin:$PATH"
 # newsite DIR NAME — a git repo with a DDEV project and a one-line web root.
 newsite() {
   mkdir -p "$1/.ddev" "$1/web"
-  printf 'type: php\ndocroot: web\n' > "$1/.ddev/config.yaml"
+  printf 'type: php\ndocroot: web\ndefault_container_timeout: "600"\n' \
+    > "$1/.ddev/config.yaml"
   printf '<?php echo "PROJECT=%s HOST=", $_SERVER["HTTP_HOST"], "\\n";' "$2" > "$1/web/index.php"
   git -C "$1" init -q -b main
   git -C "$1" add .ddev/config.yaml web/index.php

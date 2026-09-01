@@ -218,6 +218,14 @@ out="$(cd "$wt" && HOSTSHIFT_HOOK=1 "$cmd" check 2>&1 || true)"
 contains "an unconfigured worktree of a multi-hostname parent is warned" \
   "not configured" "$out"
 contains "and names the hostnames at stake" "nat.acme.ddev.site" "$out"
+
+# ...and when the CLI is not on PATH, it says that rather than going quiet.
+#
+# This branch short-circuits above the `command -v hostshift` guard, so a missing
+# binary left the question unanswered with no warning and no reason — in exactly
+# the situation the warning exists for.
+out="$(cd "$wt" && HOSTSHIFT_HOOK=1 PATH="/usr/bin:/bin" "$cmd" check 2>&1 || true)"
+contains "a missing CLI is reported, not swallowed" "cannot be checked without" "$out"
 # ...and a project whose parent declares nothing extra stays silent.
 cp "$main/.ddev/config.yaml" "$work/pcfg.hold"
 printf 'name: acme\n' > "$main/.ddev/config.yaml"
@@ -1614,7 +1622,7 @@ cat > "$cdb/bin/ddev" <<'FAKE'
 printf '%s\n' "$*" >> "${HS_FAKE_DIR}/ddev-calls"
 case "$*" in
   # The shared-database probe: say the worktree has its own db container.
-  *printenv*)                     echo "DB_HOST=ddev-wt-db" ;;
+  *printenv*)                     echo "DB_HOST=ddev-$(basename "$PWD")-db" ;;
   *information_schema.tables*)    cat "${HS_FAKE_DIR}/tablecount" 2>/dev/null || echo 0 ;;
   *mysqldump*)                    echo copied > "${HS_FAKE_DIR}/DESTROYED" ;;
 esac
@@ -1653,6 +1661,69 @@ if [ -f "$HS_FAKE_DIR/DESTROYED" ]; then
 else
   fail "--force still copies" "mysqldump did not run: $out"
 fi
+
+# A database belonging to a *third* project — neither this one nor the source.
+#
+# The guard used to ask "does web read `ddev-$from-db`?", which is the wrong
+# question: the harm has nothing to do with which project the dump comes from.
+# Two worktrees of one parent produce this the moment one of them has its own
+# copy and the other points at it — twelve tables written into a container
+# nothing reads, exit 0, and the success message, which is verbatim the failure
+# the refusal describes.
+cat > "$cdb/bin/ddev" <<'FAKE3'
+#!/usr/bin/env bash
+case "$*" in
+  *printenv*)                     echo "DB_HOST=ddev-some-other-worktree-db" ;;
+  *information_schema.tables*)    echo 0 ;;
+  *mysqldump*)                    echo copied > "${HS_FAKE_DIR}/DESTROYED" ;;
+esac
+exit 0
+FAKE3
+chmod +x "$cdb/bin/ddev"
+rm -f "$HS_FAKE_DIR/DESTROYED"
+out="$(copydb || true)"
+contains "copy-db refuses a database belonging to neither project" \
+  "configured to *use*" "$out"
+if [ -f "$HS_FAKE_DIR/DESTROYED" ]; then
+  fail "and writes nothing" "mysqldump ran"
+else
+  pass "and writes nothing"
+fi
+
+# `wp-cli` redirected onto its own input.
+#
+# The documented form writes wp-cli.local.yml. One word away is `> wp-cli.yml`,
+# which the shell truncates before the command reads it — so the committed
+# config was replaced by a header and a `url:`, losing `path:` and every alias,
+# with exit 0.
+wc="$work/wpcliself"; newproject "$wc"
+git -C "$wc" worktree add -q "$work/wpcliself-wt" -b wt-w
+wcw="$work/wpcliself-wt"
+printf 'path: web\n@prod:\n  ssh: deploy@prod.example.com/var/www/site\n' > "$wcw/wp-cli.yml"
+git -C "$wcw" add wp-cli.yml
+git -C "$wcw" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -qm wpcli
+( cd "$wcw" && "$cmd" wp-cli --slug wt-w > wp-cli.yml ) 2>/dev/null && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "wp-cli refuses to write over its own input" \
+  || fail "wp-cli refuses to write over its own input" "exit $rc"
+err="$( ( cd "$wcw" && "$cmd" wp-cli --slug wt-w > wp-cli.yml ) 2>&1 >/dev/null || true )"
+contains "and says the shell already truncated it" "already" "$err"
+contains "and points at the way back" "git checkout -- wp-cli.yml" "$err"
+contains "and names the file it belongs in" "wp-cli.local.yml" "$err"
+# An *untracked* empty wp-cli.yml is not evidence of anything, and must not
+# refuse a redirect to somewhere else. The guard's signal is the truncation of a
+# file the team shares: tracked, non-empty in HEAD, empty on disk right now.
+ut="$work/wpcliuntracked"; newproject "$ut"
+git -C "$ut" worktree add -q "$work/wpcliuntracked-wt" -b wt-u
+utw="$work/wpcliuntracked-wt"
+: > "$utw/wp-cli.yml"
+( cd "$utw" && "$cmd" wp-cli --slug wt-u > wp-cli.local.yml ) 2>/dev/null && rc=0 || rc=$?
+[ "$rc" = 0 ] && pass "an untracked empty wp-cli.yml does not block a real redirect" \
+  || fail "an untracked empty wp-cli.yml does not block a real redirect" "exit $rc"
+
+# The documented form still works — on the file as committed.
+git -C "$wcw" checkout -- wp-cli.yml
+( cd "$wcw" && "$cmd" wp-cli --slug wt-w > wp-cli.local.yml ) 2>/dev/null
+contains "and the documented form still emits path:" "path: web" "$(cat "$wcw/wp-cli.local.yml")"
 
 echo "== a proxy flag in HOSTSHIFT_ARGS survives check and init"
 

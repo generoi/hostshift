@@ -288,6 +288,26 @@ func hasJSONEsc(v []byte) bool {
 	return bytes.Contains(v, []byte(`\u`))
 }
 
+// hasRefJSONEsc reports whether the buffer could hold a JSON escape once
+// character references are decoded — the backslash spelled either way, followed
+// by the `u`.
+//
+// The needle and not just the ampersand. Gating this composition on `&` alone
+// built a whole-buffer view for every page with a character reference in it and
+// took the ampersand-only allocation case from 128x the body to 185x, for a
+// decode that finds nothing: `&#92;3a` is a CSS escape, not a JSON one.
+func hasRefJSONEsc(v []byte) bool {
+	if hasJSONEsc(v) || bytes.Contains(v, []byte("&#92;u")) {
+		return true
+	}
+	for _, n := range [][]byte{[]byte("&#x5c;u"), []byte("&#x5C;u"), []byte("&#X5c;u"), []byte("&#X5C;u")} {
+		if bytes.Contains(v, n) {
+			return true
+		}
+	}
+	return false
+}
+
 // jsonEscByte decodes the four hex digits of a `\uXXXX` escape, and reports
 // whether they spell a printable ASCII byte.
 func jsonEscByte(h []byte) (byte, bool) {
@@ -1125,14 +1145,6 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	if hasJSONEsc(v) {
 		v = h.spliceHostsIn(stripForJSONEsc(v), v, urlTokenStarts, value, ev)
 	}
-	// And the two composed, because that is how the classic editor posts it.
-	// `post.php` sends the whole `content` field urlencoded, so the backslash
-	// Gutenberg wrote is `%5C` and the escape reads `%5Cu002d%5Cu002d` — no
-	// literal backslash anywhere for the view above to find. Same shape as
-	// WooCommerce's percent-encoded `\/`, one layer further out.
-	if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
-		v = h.spliceHostsIn(composeView(stripForPercent(v), stripForJSONEsc), v, urlTokenStarts, value, ev)
-	}
 	return v
 }
 
@@ -1145,6 +1157,31 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, ev *[]origin.Event) 
 		if n, ok := refsThenCSS(v); ok {
 			v = h.spliceHostsIn(n, v, urlTokenStarts, value, ev)
 		}
+		// And references spelling a JSON escape, which is the same composition
+		// on the axis the escape view was added without. `stripForCSS` is
+		// reachable through a reference decode and `stripForJSONEsc` was not, so
+		// `wt-a&#92;u002d&#92;u002dacme.ddev.site` was read in its literal
+		// spelling and not in its reference-encoded one — on every surface whose
+		// parser decodes references, which includes every request body. A
+		// spelling is a family; this is the member the family was missing.
+		if hasRefJSONEsc(v) {
+			v = h.spliceHostsIn(composeView(stripForRefs(v), stripForJSONEsc), v,
+				urlTokenStarts, value, ev)
+		}
+	}
+	// Percent-then-JSON, on this path only. `post.php` sends the whole `content`
+	// field urlencoded, so the backslash Gutenberg wrote is `%5C` and the escape
+	// reads `%5Cu002d%5Cu002d` — no literal backslash for the plain view to
+	// find. Same shape as WooCommerce's percent-encoded `\/`, one layer out.
+	//
+	// Here rather than in rewriteAll because a urlencoded body is a *request*,
+	// and this is the request path. In rewriteAll it also built a whole-buffer
+	// view for every response containing `%5Cu`, which is allocation spent where
+	// the shape cannot occur — and TestAllocationStaysBounded measures exactly
+	// that composite.
+	if h != nil && len(h.to) > 0 &&
+		(bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu"))) {
+		v = h.spliceHostsIn(composeView(stripForPercent(v), stripForJSONEsc), v, urlTokenStarts, value, ev)
 	}
 	return v
 }

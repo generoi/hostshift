@@ -148,13 +148,20 @@ func Run(ctx context.Context, o Options) ([]Result, error) {
 	}
 
 	paths := o.Paths
-	if len(paths) == 0 {
+	crawled := len(paths) == 0
+	if crawled {
 		var err error
 		if paths, err = crawl(ctx, o); err != nil {
 			return nil, err
 		}
 	}
-	if o.N > 0 && len(paths) > o.N {
+	// `-n` bounds a supplied list here, and the crawl there.
+	//
+	// Truncating the crawl's own output undid its budgeting: it returns pages
+	// and subresources, sorted, so `/a0.css` sorts ahead of `/b/` and cutting at
+	// `-n` kept the assets and dropped the pages — the starvation the two
+	// budgets exist to prevent, reintroduced one function up.
+	if !crawled && o.N > 0 && len(paths) > o.N {
 		paths = paths[:o.N]
 	}
 
@@ -672,16 +679,40 @@ func crawl(ctx context.Context, o Options) ([]string, error) {
 		subQueue = append(subQueue, key)
 	}
 
-	for (len(queue) > 0 || len(subQueue) > 0) && (o.N == 0 || len(out) < o.N) {
-		// Drain every page first, and only then the subresources they named. A
-		// single FIFO put them in document order, and a `<head>` comes before a
-		// `<body>` — so every stylesheet and script was enqueued ahead of the
-		// first `<a href>`.
+	// Pages up to `-n`, then subresources on top of it, up to `-n` again.
+	//
+	// Two budgets rather than one, because either single budget starves the
+	// other. One FIFO in document order spent it all on assets: a `<head>`
+	// precedes a `<body>`, so every stylesheet was enqueued ahead of the first
+	// `<a href>`, and `-n 20` fetched one page and nineteen files from its head.
+	// Draining pages first fixed that and introduced the mirror — any site whose
+	// linked pages exceed `-n` never empties the page queue, so no subresource
+	// is ever fetched and `Tier2` is structurally zero, which is exactly the
+	// unreachability the subresource-following exists to end.
+	//
+	// The asset budget is the same number the caller chose. It is a bound, not a
+	// target: it exists so a page with a thousand stylesheets cannot run away
+	// with the crawl, and `-n 0` means unbounded for both.
+	pageCap, assetCap := o.N, o.N
+	pages, assets := 0, 0
+	for len(queue) > 0 || len(subQueue) > 0 {
 		var p string
-		if len(queue) > 0 {
+		switch {
+		case len(queue) > 0 && (pageCap == 0 || pages < pageCap):
 			p, queue = queue[0], queue[1:]
-		} else {
+			pages++
+		case len(subQueue) > 0 && (assetCap == 0 || assets < assetCap):
 			p, subQueue = subQueue[0], subQueue[1:]
+			assets++
+		default:
+			// Both budgets spent, or the only work left is behind a spent one.
+			if len(queue) > 0 && (pageCap == 0 || pages < pageCap) {
+				continue
+			}
+			p = ""
+		}
+		if p == "" {
+			break
 		}
 		out = append(out, p)
 
