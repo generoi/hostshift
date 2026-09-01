@@ -1133,6 +1133,44 @@ HOSTSHIFT_WEB_HOSTS=$web"
 if [ "$cmd" = "check" ]; then
   hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
 
+  # And the hostname DDEV itself hands the developer.
+  #
+  # Under production-canonical, `<project>.ddev.site` is the *canonical* side:
+  # `web` answers on it and serves the database's pristine production URLs,
+  # unrewritten, because a project must stay reachable at its own name and
+  # `hostshift diff --canonical-base` needs exactly that. Both are right.
+  #
+  # What is wrong is that nothing says so. `ddev start` ends with "Your project
+  # can be reached at https://<project>.ddev.site" — printed *after* hostshift's
+  # own line — `ddev describe` lists it under Project URLs, and `ddev launch`
+  # opens it. Follow that and every asset, feed and link on the page is the
+  # client's live site; loopback containment is container-scoped, so the browser
+  # resolves them for real. §4.4's first hazard, reached through a hostname that
+  # is never rewritten rather than through a missed rewrite.
+  if [ -n "${DDEV_HOSTNAME:-}" ]; then
+    # Built here if the probe above did not run — it is behind `command -v curl`
+    # and a reachable proxy, and this note is about the map, not about what
+    # answered.
+    canon_list="${canon_list:-$(hostshift map --slug "$slug" \
+      "${map_args[@]+"${map_args[@]}"}" --canonical-hosts 2>/dev/null | paste -sd, - || true)}"
+    own="$(printf '%s' "${DDEV_HOSTNAME}" | tr ',' '\n' | head -1)"
+    # Only when this project's own name is a canonical origin — that is what
+    # production-canonical means, and it is exactly what `hostshift map` prints
+    # as `(alias)`. Under DDEV-canonical the same hostname is the thing being
+    # rewritten *from* and there is nothing to say.
+    case ",$canon_list," in
+      *",$own,"*)
+        echo "hostshift: note: https://$own is the canonical side of this map, so it" >&2
+        echo "  serves the database's production URLs unrewritten — that is what" >&2
+        echo "  \`hostshift diff --canonical-base\` reads. DDEV advertises it as the" >&2
+        echo "  project URL and \`ddev launch\` opens it; the preview is:" >&2
+        # Indented per line, not per substitution: a multisite parent has
+        # several variants and `printf '    %s\n' "$multiline"` indents only
+        # the first of them.
+        printf '%s' "$variants" | tr ',' '\n' | sed 's|^|    https://|' >&2 ;;
+    esac
+  fi
+
   if [ ! -f .ddev/.env ]; then
     echo "hostshift: nothing deployed yet — run \`ddev hostshift init\`" >&2
     exit 2

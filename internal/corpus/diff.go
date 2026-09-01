@@ -742,8 +742,30 @@ func WriteReport(w io.Writer, results []Result) bool {
 			tier2 += r.Tier2
 		}
 		if r.LinesCanonical != r.LinesVariant {
-			notes = append(notes, "line count changed — something re-serialised")
-			green = false
+			// Reported, not fatal.
+			//
+			// This was a proxy for "something re-serialised" from before there
+			// was a direct test for it. There is now: `broken` asks PHP's own
+			// question of the served bytes, and `unread` names a value the walk
+			// could not read. Both are exact where this is an inference.
+			//
+			// And under production-canonical the inference is simply wrong. The
+			// canonical hostname is not routed locally — that is the whole point
+			// of the mode — so the canonical fetch carries a different Host than
+			// the proxy sends upstream, and WordPress emits one extra
+			// `<link rel="dns-prefetch">` for every asset host that is not
+			// SERVER_NAME. Exactly one line, on every page, on a site with
+			// nothing wrong with it. Measured: 1825/1824 across a whole stock
+			// Bedrock crawl, every row RED.
+			//
+			// A verdict that is red on every healthy page in the mode its own
+			// README calls "where the hazards live" is one nobody reads, and on
+			// the run that did carry 32 broken values the real signal was a
+			// clause appended to a phrase that fires regardless.
+			notes = append(notes, fmt.Sprintf(
+				"line count %d→%d — a Host-dependent line like dns-prefetch does this; "+
+					"`broken` and `unread` are the tests for re-serialisation",
+				r.LinesCanonical, r.LinesVariant))
 		} else if len(notes) == 0 && !r.Equal {
 			notes = append(notes, fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines))
 		}

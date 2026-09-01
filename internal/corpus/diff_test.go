@@ -129,10 +129,27 @@ func TestLeakFailsTheRun(t *testing.T) {
 	}
 }
 
-// TestLineCountChangeFailsTheRun: splicing never rebuilds whitespace, so a
-// line-count change means something re-serialised — the lol-html failure mode
-// §5.7 rejected Rust for.
-func TestLineCountChangeFailsTheRun(t *testing.T) {
+// TestLineCountChangeIsReported: splicing never rebuilds whitespace, so a
+// line-count change is worth naming — the lol-html failure mode §5.7 rejected
+// Rust for.
+//
+// Reported, not fatal, and the demotion is deliberate. Under
+// production-canonical the canonical hostname is not routed locally, so the
+// canonical fetch carries a different Host than the proxy sends upstream, and
+// WordPress emits one extra `<link rel="dns-prefetch">` for every asset host
+// that is not SERVER_NAME. Exactly one line, on every page, on a site with
+// nothing wrong with it — so this fired on every row of a stock Bedrock crawl,
+// in the mode the README calls the one where the hazards live. A verdict that
+// is red on every healthy page stops being read, and on the run that carried 32
+// genuinely broken values the real signal was one clause appended to a phrase
+// that fires regardless.
+//
+// Nothing is lost that is not covered better elsewhere. A rewriter that
+// re-serialised HTML would change bytes under an identity map, which is test 24
+// and is asserted directly in the Go suite; a re-serialised *value* is what
+// `broken` and `unread` ask PHP's own question about. This was an inference
+// standing in for tests that did not exist yet.
+func TestLineCountChangeIsReported(t *testing.T) {
 	canonical := map[string]string{"/": "<a href=\"" + canonicalOrigin + "/a\"\n  class=\"k\">a</a>\n"}
 	// Same links, but re-serialised onto one line.
 	reserialised := map[string]string{"/": `<a href="` + variantOrigin + `/a" class="k">a</a>` + "\n"}
@@ -147,11 +164,21 @@ func TestLineCountChangeFailsTheRun(t *testing.T) {
 		t.Fatalf("this fixture should leak nothing; it tests line counts")
 	}
 	var buf bytes.Buffer
-	if WriteReport(&buf, results) {
-		t.Errorf("a run whose line count changed must not be green:\n%s", buf.String())
+	green := WriteReport(&buf, results)
+	// Green, because that is the whole demotion: a line-count change alone must
+	// not fail a run. Assert the verdict and not only the wording — the note can
+	// be printed by a version that still sends the run RED, and that version is
+	// the bug this test exists to keep out.
+	if !green {
+		t.Errorf("a line-count change alone must not fail the run:\n%s", buf.String())
 	}
-	if !strings.Contains(buf.String(), "re-serialised") {
-		t.Errorf("the report does not name the failure:\n%s", buf.String())
+	// Named, with both counts, so a developer can see what moved.
+	if !strings.Contains(buf.String(), "line count 2→1") {
+		t.Errorf("the report does not name the change:\n%s", buf.String())
+	}
+	// And it points at the tests that answer the question it used to guess at.
+	if !strings.Contains(buf.String(), "re-serialisation") {
+		t.Errorf("the report does not say where to look:\n%s", buf.String())
 	}
 }
 
