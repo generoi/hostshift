@@ -1254,6 +1254,28 @@ else
   fail "a database the map does not name does not fail the start" "$out"
 fi
 contains "but it does say so" "the database says its home is" "$out"
+contains "and never suggests a search-replace" "moves production" "$out"
+
+# ...and when the page proves it — five or more links to that hostname — it is a
+# refusal, not a warning.
+#
+# This is the day-one state of every production-canonical site: the database
+# holds production hostnames, no hostshift.yaml has been adopted, and *nothing*
+# on the page is rewritten. `check` exited 0, `ddev restart` reported success,
+# and `diff` printed GREEN, because all three instruments count only origins the
+# map names and the defect is that the map names none of them.
+dbleak='<link rel="canonical" href="https://www.somewhere-else.test/">
+<link rel="alternate" href="https://www.somewhere-else.test/feed/">
+<link rel="https://api.w.org/" href="https://www.somewhere-else.test/wp-json/">
+<link rel="shortlink" href="https://www.somewhere-else.test/?p=1">
+<a href="https://www.somewhere-else.test/x">t</a>'
+out="$(cd "$wt" && HS_FAKE_HOME="https://www.somewhere-else.test" \
+  HS_CURL_BODY="$dbleak" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "a page proving the database's home is unmapped is refused" \
+  || fail "a page proving the database's home is unmapped is refused" "exit $rc"
+contains "and counts the links it found" "links to www.somewhere-else.test" "$out"
+contains "and points at hostshift.yaml, not at the database" "Name www.somewhere-else.test in hostshift.yaml" "$out"
 # ...and says nothing when it agrees.
 out="$(cd "$wt" && HS_FAKE_HOME="https://acme.ddev.site" \
   PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"

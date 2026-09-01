@@ -1811,13 +1811,33 @@ hostshift: listening on"*) logs_has_banner=1 ;;
       db_confirms_map=1
     fi
     if [ -z "$known" ]; then
-      echo "hostshift: warning: the database says its home is $dbhome, which this" >&2
-      echo "  map does not name. If that is right, nothing on the page is being" >&2
-      echo "  rewritten and every link points at it. The map covers:" >&2
+      dbh="${dbhome#*://}"; dbh="${dbh%%/*}"
+      hits=0
+      if [ -n "${probe_body:-}" ] && [ -n "$dbh" ]; then
+        hits="$(printf '%s' "$probe_body" \
+          | grep -oE "//${dbh//./\\.}[/\"'\''<> ?#:]" 2>/dev/null | wc -l | tr -d ' ' || true)"
+        [ -n "$hits" ] || hits=0
+      fi
+      if [ "$hits" -ge 5 ]; then
+        echo "hostshift: refusing to call this healthy — the database's home is" >&2
+        echo "  $dbhome, which this map does not name, and the page served at" >&2
+        echo "  https://${probe:-$(printf '%s' "$variants" | cut -d, -f1)} carries" >&2
+        echo "  $hits links to $dbh. Nothing on the page is being rewritten." >&2
+      else
+        echo "hostshift: warning: the database says its home is $dbhome, which this" >&2
+        echo "  map does not name. If that is right, nothing on the page is being" >&2
+        echo "  rewritten and every link points at it." >&2
+      fi
+      echo "  The map covers:" >&2
       printf '    %s\n' $canon_hosts >&2
-      echo "  Either the database has not been moved to the hostnames" >&2
-      echo "  hostshift.yaml declares, or the map is built from the wrong" >&2
-      echo "  checkout. \`ddev hostshift wp-cli\` and a search-replace move it." >&2
+      echo "  Name $dbh in hostshift.yaml — as the canonical, or as an alias of" >&2
+      echo "  it — and \`ddev hostshift init && ddev restart\`." >&2
+      echo "  Do *not* search-replace the database to match the map: under the" >&2
+      echo "  arrangement this tool is for, that database is the parent's, and" >&2
+      echo "  moving it off those hostnames moves production." >&2
+      if [ "$hits" -ge 5 ]; then
+        exit 2
+      fi
     fi
   fi
 

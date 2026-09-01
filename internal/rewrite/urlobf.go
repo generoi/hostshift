@@ -735,6 +735,30 @@ func (h *hostReplacer) schemeAt(b []byte, at int) string {
 	return "https"
 }
 
+// schemeWrittenAt reports whether the document actually wrote a scheme at this
+// candidate, as opposed to schemeAt falling back to the map's.
+//
+// The two halves of schemeAt that read the buffer, and neither of the two that
+// guess. A guess is fine for choosing which target to prefer and wrong for
+// deciding which port is that scheme's default: on a mixed-scheme map the guess
+// is the alphabetically first *variant* scheme anywhere in the map, so one
+// site's `//host:443` was judged under another site's configuration.
+func schemeWrittenAt(b []byte, at int) bool {
+	if _, s := schemeLen(b[at:]); s != "" {
+		return true
+	}
+	j := at
+	for j > 0 && isSlashish(b[j-1]) {
+		j--
+	}
+	for _, s := range []string{"https:", "http:"} {
+		if j >= len(s) && hasFoldPrefixASCII(b[j-len(s):j], s) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *hostReplacer) authorityStart(b []byte) (int, bool) {
 	if n, _ := schemeLen(b); n > 0 {
 		i := n
@@ -825,6 +849,20 @@ func hostRange(b []byte, at int) (start, hostEnd, end int, port string) {
 	// longer is one, so a `]` that is not inside the window means this is not an
 	// authority rather than a literal we should keep looking for. And there is no
 	// userinfo to search for, because userinfo would precede the bracket.
+	// Past the userinfo before asking whether this is a bracketed literal.
+	//
+	// `at` is the authority start, and an authority may open with `user@`. The
+	// test below was made on `b[at]`, so `http://u@[::1]/` never entered the
+	// bracket branch — the general branch ran instead, and that branch treats
+	// `[` as a boundary, so the scan stopped at the bracket and the host came
+	// out empty. This function's own comment says the bracket branch needs no
+	// userinfo search "because userinfo would precede the bracket": true, and
+	// the reason it has to be skipped rather than assumed absent.
+	if k := bytes.IndexByte(b[at:min(at+maxHost, len(b))], '@'); k >= 0 {
+		if j := at + k + 1; j < len(b) && b[j] == '[' {
+			at = j
+		}
+	}
 	if at < len(b) && b[at] == '[' {
 		lim := at + maxIPv6
 		if lim > len(b) {
@@ -987,6 +1025,7 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) 
 	// `http://h:443`, whose 443 is not http's default and so is a different
 	// origin, was rewritten.
 	scheme := h.schemeAt(n.b, at)
+	schemeWritten := schemeWrittenAt(n.b, at)
 	rel, needsDifferingScheme := h.authorityStart(n.b[at:])
 	if rel < 0 {
 		return 0, 0, "", false
@@ -1008,7 +1047,8 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) 
 	// with a root dot and a port that the request direction could not read back
 	// — the round trip §4.3 exists to hold. authorityEnd re-widening to the
 	// whole authority had been hiding it.
-	if !value && he == end && he > hs && n.b[he-1] == '.' {
+	if !value && he == end && he > hs && n.b[he-1] == '.' &&
+		!(end < len(n.b) && isURLDelim(n.b[end])) {
 		he--
 	}
 	if hs >= he {
@@ -1022,7 +1062,15 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) 
 	var to origin.Origin
 	if port != "" {
 		to, ok = h.to[host+":"+port]
-		if !ok && origin.NormalisePort(scheme, port) == "" {
+		if !ok && !schemeWritten {
+			// The target for this host names the scheme the document is served
+			// on, which is what a scheme-relative reference resolves under.
+			if cand, have := h.to[host]; have &&
+				origin.NormalisePort(cand.Scheme, port) == "" {
+				to, ok = cand, true
+			}
+		}
+		if !ok && schemeWritten && origin.NormalisePort(scheme, port) == "" {
 			to, ok = h.to[host]
 		}
 	} else {
@@ -1069,15 +1117,32 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) 
 	hasPort := to.Port != "" || portOf(n.b, he, end) != ""
 	switch {
 	case needScheme:
-		// From the scheme through the port: the whole origin, written plainly.
+		// The scheme word, then everything up to the host copied out of the
+		// source unchanged, then the host.
 		//
-		// Spelled out rather than `to.String()`, which is HostPort and therefore
-		// the ACE form. Two of these three arms were changed for §5.5 and this
-		// one was not, so the spelling still went punycode wherever the schemes
-		// differ — the same write into the shared database, reached through the
-		// obfuscated spellings that are the reason HostLeaksBack exists.
+		// Four rounds fixed one facet of this arm each: punycode, then the third
+		// arm, then a literal separator written over an encoded one, then a
+		// source width mistaken for a spelling. Each fix enumerated the
+		// encodings it knew, and each time the next encoding was the next
+		// defect. Enumeration does not terminate here, for the reason PLAN 5.2
+		// records it not terminating for the serialized spellings.
+		//
+		// So stop enumerating. Copying the span verbatim is right for every
+		// encoding at once, including ones nobody has thought of yet - and it
+		// keeps the userinfo, which lives inside that span and which this arm
+		// used to delete. That was its own defect: the other two arms begin past
+		// the at-sign and preserve it, so one URL got two answers depending only
+		// on whether the schemes agreed, against a contract this file states
+		// outright a hundred lines down.
+		if sep, ok := verbatimSep(v, n, at, hs); ok {
+			return n.pos[at], authorityEnd(n, he, end),
+				to.Scheme + sep + to.DisplayHostPort(), true
+		}
+		// Zero or one slash: there is no separator run to copy, so the target's
+		// own separator belongs — but the userinfo still does not disappear.
 		return n.pos[at], authorityEnd(n, he, end),
-			to.Scheme + schemeSepAt(v, n, at, hs) + to.DisplayHostPort(), true
+			to.Scheme + schemeSepAt(v, n, at, hs) + userinfoAt(v, n, at, hs) +
+				to.DisplayHostPort(), true
 	case hasPort:
 		return from, authorityEnd(n, he, end), to.DisplayHostPort(), true
 	}
@@ -1095,6 +1160,59 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) 
 // not the host's root label. `See http:www.example.fi. Thanks` came out as
 // `See https://v.ddev.site Thanks`. Prose corruption rather than a leak, but it
 // is the `value` distinction this file is careful about everywhere else.
+// userinfoAt returns the source bytes between the separator and the host — the
+// userinfo and its at-sign, exactly as written, or empty when there is none.
+//
+// `http:user:pw@host` has no separator run for verbatimSep to copy, and the
+// credentials still have to survive: this arm replaces from the scheme through
+// the port, so anything in that range it does not re-emit is deleted.
+func userinfoAt(v []byte, n normalised, at, hs int) string {
+	for i := at; i < hs && i < len(n.b); i++ {
+		if n.b[i] != ':' {
+			continue
+		}
+		j := i + 1
+		for j < hs && j < len(n.b) && isSlashish(n.b[j]) {
+			j++
+		}
+		if j >= hs || hs >= len(n.pos) || n.pos[j] >= n.pos[hs] {
+			return ""
+		}
+		return string(v[n.pos[j]:n.pos[hs]])
+	}
+	return ""
+}
+
+// verbatimSep returns the source bytes between the scheme's colon and the host,
+// when there is a separator run there to copy.
+//
+// Two or more slash-ish bytes in the view means the source wrote a real
+// separator in some spelling, and copying it is exact by construction - no
+// encoding table, so no next encoding to miss. Fewer than two is `http:host`,
+// where there is nothing to copy and the target's own separator belongs.
+func verbatimSep(v []byte, n normalised, at, hs int) (string, bool) {
+	for i := at; i < hs && i < len(n.b); i++ {
+		if n.b[i] != ':' {
+			continue
+		}
+		slashes := 0
+		for j := i + 1; j < hs && j < len(n.b); j++ {
+			if !isSlashish(n.b[j]) {
+				break
+			}
+			slashes++
+		}
+		if slashes < 2 || hs >= len(n.pos) {
+			return "", false
+		}
+		if n.pos[i] >= n.pos[hs] || n.pos[hs] > len(v) {
+			return "", false
+		}
+		return string(v[n.pos[i]:n.pos[hs]]), true
+	}
+	return "", false
+}
+
 // schemeSepAt reports the `://` between a scheme at view index at and a host at
 // view index hs, in the encoding the source wrote it in.
 //
@@ -1135,6 +1253,12 @@ func schemeSepAt(v []byte, n normalised, at, hs int) string {
 		return "://"
 	}
 	return "://"
+}
+
+// isURLDelim reports whether c ends the authority: the start of a path, query
+// or fragment.
+func isURLDelim(c byte) bool {
+	return c == '/' || c == '\\' || c == '?' || c == '#'
 }
 
 func authorityEnd(n normalised, he, end int) int {
