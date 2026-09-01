@@ -54,41 +54,81 @@ func RepairSerializedFound(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	return repairField(b, rw)
 }
 
-// UnreadRewrites counts spans that look serialized, that no spelling could
-// read, and whose bytes the rewrite changed anyway.
+// UnreadSerialized reports whether b carries a serialized header that no
+// spelling could read, in a buffer the rewrite changed.
 //
-// This exists because enumerating the spellings does not terminate. Five real
-// encoders give twenty-five ordered pairs and each one added multiplies them,
-// so there will always be a composition the walk cannot read — and a value it
-// cannot read still has its host rewritten and no length re-emitted, which is a
-// value PHP refuses.
+// It is a page-level signal — "look at this one" — not a census, and it is
+// deliberately that: what a developer needs is the page, and claiming a count
+// of spans invites believing an arithmetic the evidence does not support.
 //
-// `BrokenSerialized` cannot report those, and the reason is structural rather
-// than an oversight: it asks whether the served bytes parse, and a spelling it
-// cannot read does not parse on the canonical page either, so the corpus diff's
-// baseline subtraction cancels it to zero. Four rounds of real corruption were
-// reported GREEN that way.
+// # Why this exists
 //
-// This asks a different question, and the difference is what makes it visible:
-// *did we change bytes we could not account for*. That is host-dependent by
-// construction — on the canonical page the rewrite is a no-op, so the count is
-// zero there and non-zero on the variant, and the subtraction reports it. It
-// costs one extra walk of the fields the repair already declined, and it is
-// exact about the one thing it claims: not "this is broken" but "this is
-// outside what the walk models, and we edited it".
-func UnreadRewrites(b []byte, rw func([]byte) []byte) int {
-	n := 0
-	for start := 0; start <= len(b); {
-		end := fieldBreak(b, start)
-		f := b[start:end]
-		if _, found := repairField(f, rw); !found && mayHoldSerialized(f) {
-			if !bytes.Equal(rw(f), f) {
-				n++
+// Enumerating the spellings does not terminate. Five real encoders give
+// twenty-five ordered pairs and each one added multiplies them, so there will
+// always be a composition the walk cannot read — and a value it cannot read
+// still has its host rewritten with no length re-emitted, which is a value PHP
+// refuses.
+//
+// `BrokenSerialized` cannot report those, for a structural reason rather than
+// an oversight: it asks whether the served bytes parse, and a spelling this
+// build cannot read does not parse on the canonical page either, so the corpus
+// diff's baseline subtraction cancels it to zero. Four consecutive rounds of
+// real corruption were reported GREEN that way. This asks instead whether the
+// rewrite touched bytes it could not account for, which the canonical pass
+// never does, so it survives the same subtraction.
+//
+// # Why the gate is readLen and not mayHoldSerialized
+//
+// The first version of this used mayHoldSerialized, whose own doc says it is
+// deliberately wrong in one direction — it must never refuse a value the walk
+// would repair, so it accepts anything shaped like a type letter, a colon and a
+// digit. `border:1px` is `r`, `:`, `1`. So is `background:0 0`, `order:2`, and
+// the `{a:1,b:2}` of any minified script. Every real WordPress page has inline
+// CSS and was therefore red, and a check that is red on every page carries no
+// information — so the false GREEN this was added to close stayed open.
+//
+// A gate built to over-accept cannot be the evidence for a red signal. readLen
+// is the narrow one: it requires a complete `:<digits>:`, which none of those
+// have, and which every serialized header in every spelling does.
+//
+// # Why it does not split fields
+//
+// The first version split on `&` with fieldBreak, which is the *form-body*
+// splitter. An HTML body is not a form body, and the proxy runs
+// RepairSerialized there, which does not split — so the metric measured a
+// different buffer from the one the rewriter edited, and an ordinary `&` in a
+// serialized string put the header and the host in different halves and hid
+// them from each other.
+func UnreadSerialized(b []byte, rw func([]byte) []byte) bool {
+	if bytes.Equal(rw(b), b) {
+		return false // nothing was touched, so nothing was touched unread
+	}
+	for i := 0; i < len(b); i++ {
+		if !valueShape(b, i) {
+			continue
+		}
+		header := false
+		for _, syn := range []syntax{
+			literalSyntax, percentSyntax, htmlSyntax, jsonSyntax,
+			jsonHTMLSyntax, percentHTMLSyntax, percentJSONSyntax,
+			htmlJSONSyntax, jsonDoubleSyntax,
+		} {
+			if _, _, ok := readLen(b, i+1, syn); ok {
+				header = true
+				break
 			}
 		}
-		start = end + 1
+		if !header {
+			continue
+		}
+		// A real header. If any spelling parses it completely, the walk read it
+		// and re-emitted its length; nothing to report.
+		if _, _, ok, _ := repairAt(b, i, func(x []byte) []byte { return x }, nil); ok {
+			continue
+		}
+		return true
 	}
-	return n
+	return false
 }
 
 // RepairSerializedFields is RepairSerialized for an

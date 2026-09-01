@@ -598,13 +598,16 @@ func TestAPageReportsEveryNoteItEarned(t *testing.T) {
 func TestTheReportNamesAnUnreadableRewrite(t *testing.T) {
 	var buf bytes.Buffer
 	WriteReport(&buf, []Result{{
-		Path: "/x", Equal: true, UnreadRewrites: 2, ContentType: "text/html",
+		Path: "/x", Equal: true, UnreadRewrites: 1, ContentType: "text/html",
 	}})
 	out := buf.String()
 	if !strings.Contains(out, "cannot read") {
 		t.Errorf("the page was not named:\n%s", out)
 	}
-	if !strings.Contains(out, "2 unread") {
+	// One per page, not a count of spans. The signal is "look at this page";
+	// claiming an arithmetic the evidence does not support is what the first
+	// version of this did, and it was wrong in both directions.
+	if !strings.Contains(out, "1 unread") {
 		t.Errorf("the summary did not count it:\n%s", out)
 	}
 	if strings.Contains(out, "GREEN") {
@@ -639,4 +642,49 @@ func TestTheScorerSeesARewriteItCouldNotRead(t *testing.T) {
 		t.Errorf("a readable spelling was reported as unread: %d", clean.UnreadRewrites)
 	}
 	_ = variant
+}
+
+// A Tier 2 body carrying an unreadable serialized value is still not scored.
+//
+// The proxy does not rewrite text/css or JavaScript at all, so "we changed
+// bytes we could not read" cannot be true of one — and WriteReport's Tier 2 arm
+// deliberately refuses to turn the run red for these, because the proxy is
+// doing what it says it does. Without the guard the new column contradicts the
+// one two arms below it.
+//
+// The fixture needs a real serialized header, not just CSS that looks like one:
+// `border:1px` fails readLen, so a body without a genuine `s:NN:` would pass
+// this test whether the guard existed or not.
+func TestATier2BodyWithARealHeaderIsStillNotScored(t *testing.T) {
+	canon := "https://www.canon.test"
+	target := canon + "/a.png"
+	blob := `a:1:{i:0;s:` + strconv.Itoa(len(target)) + `:"` + target + `";}`
+	// An encoding the walk cannot read, inside a stylesheet comment.
+	wire := `.a{color:red}/* ` + strings.ReplaceAll(blob, `"`, `%5Cu0022`) + ` */`
+
+	m, err := origin.NewMap([]origin.Site{{
+		Name: "main", Canonical: origin.MustParse(canon),
+		Variant: origin.MustParse("https://v.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serve := func(body, ct string) *httptest.Server {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", ct)
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(s.Close)
+		return s
+	}
+	cs := serve(wire, "text/css")
+	vs := serve(wire, "text/css")
+	cu, _ := url.Parse(cs.URL)
+	vu, _ := url.Parse(vs.URL)
+	r := compare(context.Background(), Options{
+		Canonical: cu, Variant: vu, Map: m, Client: cs.Client(),
+	}, "/style.css")
+	if r.UnreadRewrites != 0 {
+		t.Errorf("a Tier 2 body was scored, which contradicts the Tier 2 arm below it")
+	}
 }

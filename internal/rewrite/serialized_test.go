@@ -2273,11 +2273,11 @@ func TestASpellingTheWalkCannotReadIsReportedWhenRewritten(t *testing.T) {
 		"percent over hex-quoted JSON": strings.ReplaceAll(blob, `"`, `%5Cu0022`),
 		"hex-quoted JSON twice":        strings.ReplaceAll(blob, `"`, `\\u0022`),
 	} {
-		if n := UnreadRewrites([]byte(wire), rw); n == 0 {
+		if !UnreadSerialized([]byte(wire), rw) {
 			t.Errorf("%s: rewritten without being read, and not reported:\n %s", name, wire)
 		}
-		if n := UnreadRewrites([]byte(wire), id); n != 0 {
-			t.Errorf("%s: counted %d on the canonical side, so it cancels", name, n)
+		if UnreadSerialized([]byte(wire), id) {
+			t.Errorf("%s: reported on the canonical side, so it cancels", name)
 		}
 	}
 
@@ -2288,9 +2288,14 @@ func TestASpellingTheWalkCannotReadIsReportedWhenRewritten(t *testing.T) {
 		"esc_attr":                  escAttrNoDouble(blob),
 		"no serialized content":     `<a href="https://` + canon + `/a">x</a>`,
 		"prose naming the host":     `see https://` + canon + ` for details`,
+		// The shape that made the first version red on every WordPress page:
+		// `border:1px` is a type letter, a colon and a digit, which is all
+		// mayHoldSerialized asks for. readLen wants a complete `:<digits>:`.
+		"minified CSS beside a link": `<link rel="canonical" href="https://` + canon +
+			`/x"><style>.a{border:1px solid #eee;order:2}</style>`,
 	} {
-		if n := UnreadRewrites([]byte(wire), rw); n != 0 {
-			t.Errorf("%s: reported %d on content that is fine:\n %s", name, n, wire)
+		if UnreadSerialized([]byte(wire), rw) {
+			t.Errorf("%s: reported on content that is fine:\n %s", name, wire)
 		}
 	}
 }

@@ -256,10 +256,28 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// something serialized-shaped that no spelling accounted for — which is
 	// host-dependent, so it is zero on the canonical side by construction and
 	// survives the same subtraction.
-	r.UnreadRewrites = rewrite.UnreadRewrites(canon.body, func(b []byte) []byte {
-		out, _ := o.Map.Forward().Rewrite(b, rewrite.SurfaceText, false)
-		return out
-	})
+	// Through the same pipeline countLeaks uses, not the bare byte matcher.
+	// Asking Matcher.Rewrite alone is the mistake countLeaks' own comment
+	// records — obfuscated separators, folded hosts, CSS escapes and character
+	// references are invisible to it by construction, so a host spelled any of
+	// those ways was rewritten by the proxy and reported as untouched here.
+	//
+	// No content-type guard of its own. An attachment and a Tier 2 body are ones
+	// the proxy deliberately does not rewrite, so applyLikeTheProxy returns them
+	// unchanged and the "did the rewrite touch this" test below answers no —
+	// which is the same answer a guard would give, from the property that makes
+	// it true rather than from a second list that could drift from the first.
+	{
+		if rewrite.UnreadSerialized(canon.body, func(b []byte) []byte {
+			out, err := applyLikeTheProxy(o.Map.Forward(), b, canon.contentType, nil)
+			if err != nil {
+				return b
+			}
+			return out
+		}) {
+			r.UnreadRewrites = 1
+		}
+	}
 
 	r.ContentType = variant.contentType
 	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
@@ -617,10 +635,9 @@ func WriteReport(w io.Writer, results []Result) bool {
 			green = false
 		}
 		if r.UnreadRewrites > 0 {
-			notes = append(notes, fmt.Sprintf("%d serialized-shaped value(s) rewritten "+
-				"in a spelling this build cannot read, so no length was re-emitted",
-				r.UnreadRewrites))
-			unread += r.UnreadRewrites
+			notes = append(notes, "a serialized value here was rewritten in an encoding "+
+				"this build cannot read, so no length was re-emitted — look at this page")
+			unread++
 			green = false
 		}
 		if r.BrokenSerialized > 0 {
