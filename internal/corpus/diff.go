@@ -93,9 +93,11 @@ type Result struct {
 	// Leaks counts canonical origins in the variant response. Any non-zero
 	// value is a test 28 failure and is what this whole exercise is for.
 	Leaks int
-	// LinesCanonical and LinesVariant should match even when bytes do not:
-	// splicing never rebuilds whitespace, so a line-count change means
-	// something re-serialised.
+	// LinesCanonical and LinesVariant are close even when bytes are not:
+	// splicing never rebuilds whitespace. They are not identical — the two
+	// fetches carry different Host headers, and WordPress emits Host-dependent
+	// markup — so a small delta is reported and a large one is fatal, per
+	// hostDependentLines.
 	LinesCanonical, LinesVariant int
 	DiffLines                    int
 	Err                          error
@@ -697,7 +699,16 @@ func countDiffLines(a, b string) int {
 }
 
 // WriteReport summarises a run. It returns true when the run is green: no
-// canonical origin reached the browser, and no page lost or gained lines.
+// canonical origin reached the browser, no served value was re-serialised past
+// what PHP will read, and no page lost or gained enough lines to be a different
+// document.
+// hostDependentLines: how many lines of a document may differ between the two
+// fetches purely because they carry different Host headers. WordPress emits one
+// `<link rel="dns-prefetch">` per asset host that is not SERVER_NAME, and a
+// multisite parent can have a few asset hosts; nothing plausible emits eight.
+// Truncation loses far more, which is the point of the bound.
+const hostDependentLines = 8
+
 func WriteReport(w io.Writer, results []Result) bool {
 	green := true
 	var equal, leaks, errs, tier2, broken, unread int
@@ -762,10 +773,40 @@ func WriteReport(w io.Writer, results []Result) bool {
 			// README calls "where the hazards live" is one nobody reads, and on
 			// the run that did carry 32 broken values the real signal was a
 			// clause appended to a phrase that fires regardless.
-			notes = append(notes, fmt.Sprintf(
-				"line count %d→%d — a Host-dependent line like dns-prefetch does this; "+
-					"`broken` and `unread` are the tests for re-serialisation",
-				r.LinesCanonical, r.LinesVariant))
+			//
+			// Demoted, but not deleted: bounded instead. Nothing else in this
+			// report says anything about the *size* of what the proxy served.
+			// `Err` needs a transport failure, `Leaks` needs an origin to
+			// survive, `broken` and `unread` need a serialized value to be
+			// present to be wrong about — so an upstream that answers 200 with
+			// an empty body, or dies mid-stream and serves half the document,
+			// satisfies every one of them. Dropping the assertion outright
+			// scored both GREEN, under a verdict line that goes on saying "no
+			// page re-serialised".
+			//
+			// Two bounds, because the two failures have different shapes. A
+			// Host-dependent line is a handful of lines in a document of any
+			// size, so more than `hostDependentLines` of them is not that. And
+			// on a short page a handful *is* the document, so a variant that
+			// lost or gained a quarter of it is not the same page either.
+			// Measured 1825/1824 passes both; an empty body and a body cut to
+			// five lines of eight fail one each.
+			d := r.LinesCanonical - r.LinesVariant
+			if d < 0 {
+				d = -d
+			}
+			if d > hostDependentLines || d*4 > r.LinesCanonical {
+				green = false
+				notes = append(notes, fmt.Sprintf(
+					"line count %d→%d — too much of the page to be a Host-dependent "+
+						"line; the proxy served a different document",
+					r.LinesCanonical, r.LinesVariant))
+			} else {
+				notes = append(notes, fmt.Sprintf(
+					"line count %d→%d — a Host-dependent line like dns-prefetch does this; "+
+						"`broken` and `unread` are the tests for re-serialisation",
+					r.LinesCanonical, r.LinesVariant))
+			}
 		} else if len(notes) == 0 && !r.Equal {
 			notes = append(notes, fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines))
 		}
@@ -798,7 +839,8 @@ func WriteReport(w io.Writer, results []Result) bool {
 			"corpus diff shows a leak\", and this is that\n", tier2)
 	}
 	if green {
-		fmt.Fprintln(w, "corpus diff GREEN: no canonical origin reached the browser, no page re-serialised")
+		fmt.Fprintln(w, "corpus diff GREEN: no canonical origin reached the browser, "+
+			"no page re-serialised, every page the length it should be")
 	} else {
 		fmt.Fprintln(w, "corpus diff RED")
 	}

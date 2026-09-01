@@ -119,8 +119,8 @@ printf '<?php echo "PROJECT=worktree HOST=", $_SERVER["HTTP_HOST"], "\\n";' > "$
 installaddon "$wt"
 
 projects+=("$main" "$wt")
-(cd "$main" && ddev start -y >/dev/null 2>&1) || fail "the parent starts" ""
-(cd "$wt" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds in the worktree" ""
+out="$(cd "$main" && ddev start -y 2>&1)" || fail "the parent starts" "$out"
+out="$(cd "$wt" && ddev hostshift init 2>&1)" || fail "init succeeds in the worktree" "$out"
 
 start_out="$(cd "$wt" && ddev start -y 2>&1)" || fail "the worktree starts" "$start_out"
 
@@ -245,9 +245,9 @@ printf '<?php echo "PROJECT=worktree2 HOST=", $_SERVER["HTTP_HOST"], "\\n";' > "
 installaddon "$wt2"
 projects+=("$m2" "$wt2")
 
-(cd "$m2" && ddev start -y >/dev/null 2>&1) || fail "the multisite parent starts" ""
-(cd "$wt2" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds on a multisite" ""
-(cd "$wt2" && ddev start -y >/dev/null 2>&1) || fail "the multisite worktree starts" ""
+out="$(cd "$m2" && ddev start -y 2>&1)" || fail "the multisite parent starts" "$out"
+out="$(cd "$wt2" && ddev hostshift init 2>&1)" || fail "init succeeds on a multisite" "$out"
+out="$(cd "$wt2" && ddev start -y 2>&1)" || fail "the multisite worktree starts" "$out"
 # Both blogs, because the second one is the one that has been seen empty while
 # the first was already answering.
 ready "https://wt-b--${tag}2.ddev.site/"
@@ -294,8 +294,8 @@ YAML
 installaddon "$wt3"
 projects+=("$m3" "$wt3")
 
-(cd "$m3" && ddev start -y >/dev/null 2>&1) || fail "the hostshift.yaml parent starts" ""
-(cd "$wt3" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds with a hostshift.yaml" ""
+out="$(cd "$m3" && ddev start -y 2>&1)" || fail "the hostshift.yaml parent starts" "$out"
+out="$(cd "$wt3" && ddev hostshift init 2>&1)" || fail "init succeeds with a hostshift.yaml" "$out"
 out3="$(cd "$wt3" && ddev start -y 2>&1)" || fail "the hostshift.yaml worktree starts" "$out3"
 
 # The whole line, compared for equality. `contains "HOSTSHIFT_MAP_ARGS="` was

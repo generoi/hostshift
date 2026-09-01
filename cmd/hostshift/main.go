@@ -546,6 +546,41 @@ func cmdCheck(args []string) (int, error) {
 		fmt.Fprintf(os.Stderr, "hostshift: %d site(s) from %s — map is injective and anchored\n", n, res.Source)
 	}
 
+	// The hostname DDEV itself hands the developer.
+	//
+	// Under production-canonical this project's own `<project>.ddev.site` routes
+	// to `web`, and `web` serves the shared production database unrewritten.
+	// That is correct and must stay: a project has to answer at its own name,
+	// and `hostshift diff --canonical-base` reads exactly that baseline.
+	//
+	// What was missing is anyone saying so. `ddev start` ends with "Your project
+	// can be reached at https://<project>.ddev.site", `ddev describe` lists it
+	// under Project URLs, `ddev launch` opens it — and on a production-canonical
+	// project every link, asset and feed on that page is the client's live site.
+	// Loopback containment is container-scoped, so the browser dereferences them
+	// for real. §4.4's first hazard, arriving through a hostname that is never
+	// rewritten rather than through a missed rewrite.
+	//
+	// Both conditions, not either. Under DDEV-canonical the same hostnames are
+	// directly served and there is nothing to warn about, because the canonicals
+	// are those hostnames: the database holds `.ddev.site` URLs. Keyed on the
+	// first alone this printed on every `ddev start` of every stock project,
+	// which is how a warning stops being read.
+	if len(res.ExternalCanonicals) > 0 && len(res.DirectlyServed) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: note: this map is canonical-on-production (%s), so DDEV's own\n"+
+				"  hostname(s) for this project serve the database unrewritten — every\n"+
+				"  link on them points at the live site, and `ddev launch` opens one:\n",
+			strings.Join(res.ExternalCanonicals, ", "))
+		for _, h := range res.DirectlyServed {
+			fmt.Fprintf(os.Stderr, "  https://%s\n", h)
+		}
+		fmt.Fprintln(os.Stderr, "  Preview through the variant(s) instead:")
+		for _, st := range res.Map.Sites {
+			fmt.Fprintf(os.Stderr, "  https://%s\n", st.Variant.Host)
+		}
+	}
+
 	if len(res.Uncovered) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"hostshift: warning: DDEV registers %d hostname(s) this map does not cover, so they\n"+

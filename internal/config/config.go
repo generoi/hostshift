@@ -70,6 +70,22 @@ type Resolved struct {
 	// nowhere to be previewed. The project's own primary hostname is exempt:
 	// in a worktree it belongs to web by design.
 	Uncovered []string
+
+	// DirectlyServed lists this project's DDEV hostnames that route to `web`
+	// rather than to the proxy — every registered hostname that is not a variant.
+	// Their responses are whatever the database holds, unrewritten.
+	//
+	// ExternalCanonicals lists canonical hosts that are not hostnames of this
+	// project, which is what separates the two modes. Under DDEV-canonical the
+	// canonicals *are* this project's hostnames and the list is empty: the
+	// database holds `.ddev.site` URLs and nothing dereferences off the machine.
+	// Under production-canonical it is the client's live domains, and then every
+	// DirectlyServed hostname is a page of live production links — reached
+	// through the URL `ddev start`, `ddev describe` and `ddev launch` all
+	// advertise. Together they are the condition for that warning; separately
+	// neither is.
+	DirectlyServed     []string
+	ExternalCanonicals []string
 }
 
 // Load resolves the map for a project directory.
@@ -197,6 +213,32 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		for _, h := range proj.Hosts {
 			if !covered[h] && h != own {
 				res.Uncovered = append(res.Uncovered, h)
+			}
+		}
+
+		// The exemption above is why this exists. `own` is skipped there because
+		// in a worktree it belongs to web by design — true, and under
+		// production-canonical that design is the hazard, because what web
+		// serves on it is the shared production database, unrewritten.
+		variant := map[string]bool{}
+		for _, st := range sites {
+			variant[st.Variant.Host] = true
+		}
+		mine := map[string]bool{}
+		for _, h := range proj.Hosts {
+			mine[h] = true
+		}
+		mine[own] = true
+		for _, h := range proj.Hosts {
+			if !variant[h] {
+				res.DirectlyServed = append(res.DirectlyServed, h)
+			}
+		}
+		for _, st := range sites {
+			for _, o := range st.CanonicalSet() {
+				if !mine[o.Host] {
+					res.ExternalCanonicals = append(res.ExternalCanonicals, o.Host)
+				}
 			}
 		}
 	}

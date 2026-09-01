@@ -150,9 +150,30 @@ func TestLeakFailsTheRun(t *testing.T) {
 // `broken` and `unread` ask PHP's own question about. This was an inference
 // standing in for tests that did not exist yet.
 func TestLineCountChangeIsReported(t *testing.T) {
-	canonical := map[string]string{"/": "<a href=\"" + canonicalOrigin + "/a\"\n  class=\"k\">a</a>\n"}
-	// Same links, but re-serialised onto one line.
-	reserialised := map[string]string{"/": `<a href="` + variantOrigin + `/a" class="k">a</a>` + "\n"}
+	// A page of ordinary length missing exactly one line, which is the shape
+	// the mechanism actually produces: one `<link rel="dns-prefetch">` for an
+	// asset host that is SERVER_NAME on one fetch and not on the other.
+	//
+	// The fixture used to be two lines collapsed to one, and that is not this
+	// shape — half a document is missing, which is what a truncated response
+	// looks like, and the bounded assertion cannot tell the two apart on a
+	// page that short. It should not have to: nothing on a real site is two
+	// lines long.
+	var body strings.Builder
+	body.WriteString("<html>\n<head>\n")
+	body.WriteString(`<link rel="dns-prefetch" href="//cdn.example">` + "\n")
+	body.WriteString("</head>\n<body>\n")
+	for i := 0; i < 6; i++ {
+		fmt.Fprintf(&body, "<p>line %d</p>\n", i)
+	}
+	withPrefetch := body.String() + `<a href="` + canonicalOrigin + `/a">a</a>` + "\n</body>\n</html>\n"
+	// The same page, rewritten, minus that one Host-dependent line.
+	withoutPrefetch := strings.Replace(
+		strings.Replace(withPrefetch, canonicalOrigin, variantOrigin, 1),
+		`<link rel="dns-prefetch" href="//cdn.example">`+"\n", "", 1)
+
+	canonical := map[string]string{"/": withPrefetch}
+	reserialised := map[string]string{"/": withoutPrefetch}
 
 	results, err := Run(context.Background(), Options{
 		Canonical: site(t, canonical), Variant: site(t, reserialised), Map: testMap(t), N: 5,
@@ -173,7 +194,7 @@ func TestLineCountChangeIsReported(t *testing.T) {
 		t.Errorf("a line-count change alone must not fail the run:\n%s", buf.String())
 	}
 	// Named, with both counts, so a developer can see what moved.
-	if !strings.Contains(buf.String(), "line count 2→1") {
+	if !strings.Contains(buf.String(), "line count 14→13") {
 		t.Errorf("the report does not name the change:\n%s", buf.String())
 	}
 	// And it points at the tests that answer the question it used to guess at.

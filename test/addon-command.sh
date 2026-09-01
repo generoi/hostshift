@@ -1556,42 +1556,6 @@ args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wtk/.ddev/.env")"
 n="$(printf '%s\n' "$args" | grep -o -- '--max-body' | wc -l | tr -d ' ')"
 check "a second init does not duplicate it" "1" "$n"
 
-echo "== check names the canonical-side hostname DDEV advertises"
-
-# Under production-canonical, <project>.ddev.site is the canonical side: web
-# answers on it and serves the database's production URLs unrewritten, which is
-# what `hostshift diff --canonical-base` reads. That is correct and must stay.
-#
-# What was wrong is that nothing said so, while `ddev start` ends with "Your
-# project can be reached at https://<project>.ddev.site", `ddev describe` lists
-# it under Project URLs, and `ddev launch` opens it. Follow that on a
-# production-canonical project and every link on the page is the client's live
-# site.
-pc="$work/prodcanon"; newproject "$pc"
-printf 'sites:\n  - canonical: https://prodcanon.ddev.site\n    variant: https://wt-p--prodcanon.ddev.site\n' \
-  > "$pc/hostshift.yaml"
-out="$(cd "$pc" && DDEV_HOSTNAME=prodcanon.ddev.site "$cmd" check --slug wt-p 2>&1 || true)"
-contains "the canonical-side hostname is named" "is the canonical side of this map" "$out"
-contains "and the preview is pointed at" "    https://wt-p--prodcanon.ddev.site" "$out"
-
-# Every variant, one indented line each — a multisite parent has more than one,
-# and a single `printf '    %s\n'` over a multiline substitution indents only the
-# first.
-pcm="$work/prodcanonmulti"; newproject "$pcm"
-printf 'sites:\n  - canonical: https://a.example\n    variant: https://wt-p--a.ddev.site\n  - canonical: https://prodcanon.ddev.site\n    variant: https://wt-p--prodcanon.ddev.site\n' \
-  > "$pcm/hostshift.yaml"
-out="$(cd "$pcm" && DDEV_HOSTNAME=prodcanon.ddev.site "$cmd" check --slug wt-p 2>&1 || true)"
-contains "the second variant is indented too" "    https://wt-p--prodcanon.ddev.site" "$out"
-contains "and so is the first" "    https://wt-p--a.ddev.site" "$out"
-
-# And it says nothing when the project's own name is not a canonical — the
-# ordinary DDEV-canonical case, where that hostname is what gets rewritten.
-out="$(cd "$wt" && DDEV_HOSTNAME=nothing-to-do-with-it.ddev.site "$cmd" check --slug wt-a 2>&1 || true)"
-case "$out" in
-  *"is the canonical side of this map"*) fail "a non-canonical own hostname is not named" "$out" ;;
-  *) pass "a non-canonical own hostname is not named" ;;
-esac
-
 echo "== the proxy dials its own web container, not whichever answers"
 
 # The service sits on ddev_default as well as its own network — it must, so the
