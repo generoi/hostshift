@@ -382,6 +382,64 @@ func isHostByte(c byte) bool {
 	return false
 }
 
+// escAlphabet is which string-escape alphabet the surface's own decoder applies
+// to a backslash before the URL parser ever sees the value.
+//
+// A backslash means two different things and the byte cannot tell which. In an
+// HTML attribute, a header, prose, or any value a decoder has already unquoted,
+// it is a *path separator*: WHATWG folds it to '/', so it ends the host. In a
+// buffer still carrying its source escapes — an inline <script>, the raw-text
+// scan, the straggler sweep — it opens JavaScript's alphabet, which is
+// JSON's plus `\xNN`, `\u{...}`, legacy octal, and the rule that an unrecognised
+// escape stands for the character itself: `\A` is `A`, which is more host.
+//
+// Round 53 taught the boundary test one alphabet and applied it everywhere, so
+// the same document was read as JSON in an attribute (finding 4: a live origin
+// in a plain <a href> left unrewritten) and as JSON-only in a script (findings 2
+// and 3: `\xe4` and `\x09` read as boundaries, so a URL that never pointed at
+// production was rewritten and the variant went out glued to a letter). PLAN
+// §5.2 recorded a surface-aware view as "not needed until now"; this is now.
+type escAlphabet int
+
+const (
+	// escPath: a backslash is a path separator and ends the host.
+	escPath escAlphabet = iota
+	// escJS: JSON's alphabet plus `\xNN`, `\u{...}`, legacy octal, and `\c` -> c.
+	escJS
+)
+
+// escapeAlphabetFor maps a surface to the alphabet its decoder runs.
+//
+// escPath is the positive list because the buffers that have *already* been
+// unquoted are the enumerable ones: an attribute value, a header, a request
+// line, a decoded form field, a run of prose. Everything else the engine looks
+// at is source bytes with their escapes intact — an inline script or style, the
+// raw-text scan, a JSON body still spelling `https:\/\/`, the straggler sweeping
+// all of them at once — and there is no end to that list to enumerate.
+//
+// Callers holding a value some other decoder already unquoted name it with
+// bareSurface, which is how RepairSerialized's two sites say "no escapes left"
+// even though the payload around them is JSON.
+//
+// The names are literals rather than rewrite's Surface constants because that
+// package imports this one. rewrite.TestSurfaceNamesAreKnownHere pins them, so a
+// renamed surface fails a test here rather than silently falling to the default.
+func escapeAlphabetFor(surface string) escAlphabet {
+	switch surface {
+	case "html-attr", "text", "comment", "header", "request-line", "request-body":
+		return escPath
+	// A stylesheet spells its escapes in hex — `\3a ` is a colon, `\2f ` a slash
+	// — and reading `\2f ` as JavaScript's legacy octal makes it U+0002, which is
+	// not a delimiter, so the whole origin goes out unrewritten. That is test 28,
+	// not a safe decline. stripForCSS knows the CSS alphabet and has already
+	// decoded it into the view by the time the guard runs; escPath is how the
+	// guard says "the view decided this, leave it alone".
+	case "inline-style":
+		return escPath
+	}
+	return escJS
+}
+
 // delimAt implements PLAN §4.4's right-hand anchor: a match is only an origin if
 // what follows the host terminates it. End of input terminates.
 //
@@ -394,7 +452,7 @@ func isHostByte(c byte) bool {
 // registrable domain, which this code correctly refuses when the dot is
 // written literally. Treating '%' as an unconditional terminator rewrote it.
 // So the escape is decoded and the same question asked of the byte it denotes.
-func delimAt(b []byte, i int) bool {
+func delimAt(b []byte, i int, esc escAlphabet) bool {
 	if i >= len(b) {
 		return true
 	}
@@ -413,6 +471,18 @@ func delimAt(b []byte, i int) bool {
 		}
 		return true // a stray '%' is not a host byte either
 	}
+	// An ampersand does not end a host, in either reading of it.
+	//
+	// Raw, it is not a URL delimiter — a host ends at `/ \ ? #` — so
+	// `https://www.acme.fi&x` names `www.acme.fi&x`. As a character reference it
+	// is whatever it decodes to, and `&#65;` is `A`, `&period;` a dot; both
+	// continue the host. Either way the match is a prefix of a longer name, and
+	// the locator's reference view already concludes exactly that once it has
+	// decoded. Declining is also the safe direction: it can stop a rewrite,
+	// never invent one.
+	if b[i] == '&' {
+		return false
+	}
 	// A backslash inside a JSON string introduces an escape, and the character
 	// it stands for is what follows the host.
 	//
@@ -430,53 +500,204 @@ func delimAt(b []byte, i int) bool {
 	//
 	// `\/` still terminates, because it decodes to a slash. It is the escapes
 	// that decode to *host* bytes that continue the host.
-	if b[i] == '\\' {
-		if c, ok := jsonEscChar(b, i); ok {
-			return !isHostByte(c)
+	if b[i] == '\\' && esc != escPath {
+		if term, ok := escTerminates(b, i); ok {
+			return term
 		}
 	}
 	return !isHostByte(b[i])
 }
 
-// jsonEscChar decodes the JSON string escape at b[i] (which must be a
-// backslash), reporting the byte it stands for. A `\uXXXX` above ASCII reports
-// 0x80, which is a host byte — the exact value does not matter, only whether the
-// host continues.
-func jsonEscChar(b []byte, i int) (byte, bool) {
+// escTerminates reports whether the string escape at b[i] ends the host, and
+// whether b[i] opens an escape at all.
+//
+// It takes no alphabet because delimAt calls it only on an escPath-free surface,
+// where the alphabet is JavaScript's: JSON's escapes are a subset of it, and a
+// spelling JSON cannot write is not valid JSON anyway. The surface question is
+// asked once, in delimAt, rather than again here.
+//
+// Only a decoded *delimiter* ends it — `/`, `\`, `?`, `#`, `:`. Everything else
+// continues the host, and the ways it can are all the same defect:
+//
+//   - a letter or a non-ASCII byte simply is more host, which is how
+//     `wp_json_encode`'s `ä` made `www.acme.fi x` match a canonical
+//     the browser never resolves;
+//   - a control the URL parser *strips* joins what follows to what precedes, so
+//     `www.example.fi\tx` is the host `www.example.fix` — those are reported as
+//     non-terminating here and skipped over by hostTerminated, which is the only
+//     caller that can see what comes after them;
+//   - and any other control makes the URL unparseable, which resolves to
+//     nothing at all.
+//
+// In every one of those the reference is not this origin, and rewriting it is a
+// byte changed for no reason — or, on the way back, a variant hostname written
+// into the shared database.
+func escTerminates(b []byte, i int) (bool, bool) {
 	if i+1 >= len(b) {
-		return 0, false
+		return false, false
 	}
-	switch b[i+1] {
-	case '/', '\\', '"':
-		return b[i+1], true
-	case 'n':
-		return '\n', true
-	case 'r':
-		return '\r', true
-	case 't':
-		return '\t', true
-	case 'b':
-		return '\b', true
-	case 'f':
-		return '\f', true
-	case 'u':
-		if i+6 > len(b) {
-			return 0, false
+	term := func(c byte) (bool, bool) {
+		switch c {
+		case '/', '\\', '?', '#', ':':
+			return true, true
 		}
-		n := 0
-		for k := i + 2; k < i+6; k++ {
-			d, ok := hexVal(b[k])
-			if !ok {
-				return 0, false
+		return false, true
+	}
+	c := b[i+1]
+	switch c {
+	case '/', '\\', '"':
+		return term(c)
+	case 'n', 'r', 't', 'b', 'f':
+		return false, true
+	case 'u':
+		// `\u{...}` is JavaScript's spelling and has no fixed width.
+		if i+2 < len(b) && b[i+2] == '{' {
+			j := i + 3
+			for j < len(b) && b[j] != '}' {
+				j++
 			}
-			n = n<<4 | int(d)
+			n, ok := hexRun(b, i+3, j)
+			if j >= len(b) || !ok {
+				return false, false
+			}
+			if n >= 0x80 {
+				return false, true
+			}
+			return term(byte(n))
+		}
+		if i+6 > len(b) {
+			return false, false
+		}
+		n, ok := hexRun(b, i+2, i+6)
+		if !ok {
+			return false, false
 		}
 		if n >= 0x80 {
-			return 0x80, true
+			return false, true
 		}
-		return byte(n), true
+		return term(byte(n))
 	}
-	return 0, false
+	switch {
+	// `\xNN` — what a minifier run with `ascii_only` writes for every byte
+	// above 0x7E, which is the same IDN authority round 53 widened `ä` for.
+	case c == 'x':
+		if i+4 > len(b) {
+			return false, false
+		}
+		n, ok := hexRun(b, i+2, i+4)
+		if !ok {
+			return false, false
+		}
+		if n >= 0x80 {
+			return false, true
+		}
+		return term(byte(n))
+	// Legacy octal, up to three digits.
+	case c >= '0' && c <= '7':
+		n, j := 0, i+1
+		for j < len(b) && j < i+4 && b[j] >= '0' && b[j] <= '7' {
+			n = n<<3 | int(b[j]-'0')
+			j++
+		}
+		if n >= 0x80 {
+			return false, true
+		}
+		return term(byte(n))
+	}
+	// An escape JavaScript does not recognise stands for the character itself:
+	// `\A` is `A`, `\U0041` is `U` followed by four literal digits. Both are
+	// host bytes, so the host runs on — which is the answer that declines.
+	return term(c)
+}
+
+// hexRun reads the hex digits in b[i:end] as one number. It is a helper rather
+// than three copies because every escape family spells its code point in hex
+// and only the delimiters around it differ.
+func hexRun(b []byte, i, end int) (int, bool) {
+	if i >= end || end > len(b) {
+		return 0, false
+	}
+	n := 0
+	for k := i; k < end; k++ {
+		d, ok := hexVal(b[k])
+		if !ok {
+			return 0, false
+		}
+		n = n<<4 | int(d)
+	}
+	return n, true
+}
+
+// removedEscLen is the width of the escape at b[i] when it spells a character
+// the URL parser deletes — tab, LF or CR — and 0 otherwise.
+//
+// Those do not end a host: they are removed before it is read, so they join what
+// follows to what precedes. `https://www.example.fi\tx` is the host
+// `www.example.fix` and must not be rewritten; `https://www.example.fi\n<` is
+// `www.example.fi` and must be. Only the caller can tell those apart, and only
+// by looking past the escape.
+func removedEscLen(b []byte, i int, esc escAlphabet) int {
+	if i < len(b) && (b[i] == '\t' || b[i] == '\n' || b[i] == '\r') {
+		return 1
+	}
+	if esc == escPath || i+1 >= len(b) || b[i] != '\\' {
+		return 0
+	}
+	switch b[i+1] {
+	case 'n', 'r', 't':
+		return 2
+	case 'u':
+		if n, ok := hexRun(b, i+2, i+6); ok && isRemovedRune(n) {
+			return 6
+		}
+		if esc == escJS && i+2 < len(b) && b[i+2] == '{' {
+			j := i + 3
+			for j < len(b) && b[j] != '}' {
+				j++
+			}
+			if j < len(b) {
+				if n, ok := hexRun(b, i+3, j); ok && isRemovedRune(n) {
+					return j + 1 - i
+				}
+			}
+		}
+	case 'x':
+		if esc == escJS {
+			if n, ok := hexRun(b, i+2, i+4); ok && isRemovedRune(n) {
+				return 4
+			}
+		}
+	}
+	return 0
+}
+
+func isRemovedRune(n int) bool { return n == 0x09 || n == 0x0A || n == 0x0D }
+
+// SurfaceDecodesEscapes reports whether a buffer on this surface still carries
+// string escapes that a decoder will turn into characters before the URL parser
+// runs. It is escapeAlphabetFor's answer, exported for the views: whether `\t`
+// is a tab or two characters is the same question at every layer, and answering
+// it twice is what let round 53's two halves disagree.
+func SurfaceDecodesEscapes(surface string) bool {
+	return escapeAlphabetFor(surface) != escPath
+}
+
+// EscapeContinuesHost reports whether the string escape at b[i], immediately
+// after a host, is one the page's decoder turns into *more host* rather than a
+// delimiter that ends it.
+//
+// It is exported because the locator has to answer exactly the question the byte
+// matcher answers, and round 53 answered it twice — jsonEscHostByte here,
+// jsonEscChar there — so the two halves of one fix drifted apart and disagreed
+// about the same document. There is one implementation now.
+//
+// The surface picks the alphabet through escapeAlphabetFor, the same table the
+// matcher reads, so the two halves cannot disagree about one document again.
+//
+// Only meaningful when b[i] is a backslash; the caller checks that.
+func EscapeContinuesHost(b []byte, i int, surface string) bool {
+	esc := escapeAlphabetFor(surface)
+	return esc != escPath && !hostTerminated(b, i, esc)
 }
 
 // unhex decodes the two hex digits at i.
@@ -541,11 +762,21 @@ var (
 // M0 counted five of those in acmecorp' database. So the dot terminates the
 // host and stays where it is, and only the endsHost case above — where real
 // URL structure follows, so the dot is genuinely the root label — absorbs it.
-func hostTerminated(b []byte, end int) bool {
-	if delimAt(b, end) {
+func hostTerminated(b []byte, end int, esc escAlphabet) bool {
+	// Past the characters the URL parser removes, then ask. See removedEscLen:
+	// tab, LF and CR do not end a host, they join what follows to what precedes,
+	// and answering at the control's own position got that backwards.
+	for {
+		n := removedEscLen(b, end, esc)
+		if n == 0 {
+			break
+		}
+		end += n
+	}
+	if delimAt(b, end, esc) {
 		return true
 	}
-	return b[end] == '.' && delimAt(b, end+1)
+	return b[end] == '.' && delimAt(b, end+1, esc)
 }
 
 // endsHost reports whether position i is where a URL's host component ends —
@@ -638,6 +869,7 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 	if len(b) == 0 {
 		return b, 0, nil
 	}
+	esc := escapeAlphabetFor(surface)
 	var (
 		events []Event
 		buf    []byte
@@ -791,7 +1023,7 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 		}
 		scanned = end
 		consumed = max(consumed, end)
-		if !hostTerminated(b, end) {
+		if !hostTerminated(b, end, esc) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, b[start:end], ActionSkipped, ReasonNotAURL)
 			continue

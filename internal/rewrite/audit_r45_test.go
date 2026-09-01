@@ -315,7 +315,7 @@ func jsonUnicodeAtR45(b []byte) (byte, int) {
 func TestR45TheComposedViewClosesIt(t *testing.T) {
 	h := hostsFor(r45Fwd(t))
 	splice := func(s string) string {
-		return string(h.spliceHostsIn(stripForJSONUnicodeR45([]byte(s)), []byte(s), urlTokenStarts, true, nil))
+		return string(h.spliceHostsIn(stripForJSONUnicodeR45([]byte(s)), []byte(s), urlTokenStarts, true, SurfaceHTMLAttr, nil))
 	}
 	for _, c := range []string{
 		"https:" + u("002F") + u("002F") + r45Canon + "/x",
@@ -331,7 +331,7 @@ func TestR45TheComposedViewClosesIt(t *testing.T) {
 	// And the reverse map, which is where the producer lives.
 	hr := hostsFor(r45Rev(t))
 	esc := "https://wt-a" + u("002d") + u("002d") + "example.ddev.site/bg.jpg"
-	got := string(hr.spliceHostsIn(stripForJSONUnicodeR45([]byte(esc)), []byte(esc), urlTokenStarts, true, nil))
+	got := string(hr.spliceHostsIn(stripForJSONUnicodeR45([]byte(esc)), []byte(esc), urlTokenStarts, true, SurfaceHTMLAttr, nil))
 	if !strings.Contains(got, r45Canon) {
 		t.Errorf("the block-serializer spelling still does not come home: %s", got)
 	}
@@ -357,9 +357,18 @@ func TestR45TheComposedViewClosesIt(t *testing.T) {
 // invents a byte the URL parser strips: the scan would then locate a host across
 // a separator that is not there and splice over the wrong range.
 //
-// Escapes outside printable ASCII are therefore left as written. That is not a
-// leak — a control character in a hostname is not one a browser resolves, and
-// stripForURL removes the literal spellings before matching anyway.
+// Escapes outside printable ASCII are therefore left as written, with one
+// carve-out round 54 had to make: tab, LF and CR are *removed* from the view
+// rather than left, because the URL parser deletes them and the host reads
+// across them. Removing is not emitting, which is the rule stripForURL already
+// states for the literal spellings.
+//
+// This test used to assert the buffer was unchanged for those three as well,
+// justified by "a control character in a hostname is not one a browser
+// resolves". ada disagrees — `https://www.example\u0009.fi/x` in a script is
+// the host www.example.fi — so that half was pinning a live production origin in
+// place. The invariant that survives is the one the header states: the view
+// never *emits* a control byte.
 func TestR45TheJSONViewNeverEmitsAControlCharacter(t *testing.T) {
 	for _, esc := range []string{
 		"\\u0000", "\\u0009", "\\u000A", "\\u000D", "\\u001F", "\\u007F", "\\u00e4",
@@ -372,7 +381,11 @@ func TestR45TheJSONViewNeverEmitsAControlCharacter(t *testing.T) {
 				break
 			}
 		}
-		// And the buffer is left alone, since nothing matched through it.
+		// And on a surface with no escapes the buffer is left alone: in an
+		// attribute a backslash is a path separator, so this names the host
+		// www.example with the path `/u0009.fi/x` and nothing here is an origin
+		// this map contains. Round 54 briefly folded it anyway and deleted six
+		// bytes from the value; escView is what stops that.
 		if got := string(HostLeaks(r45Matcher(t), v, true)); got != string(v) {
 			t.Errorf("%s: buffer changed: %q", esc, got)
 		}

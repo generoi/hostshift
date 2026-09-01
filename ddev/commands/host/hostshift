@@ -1925,6 +1925,25 @@ EOF
   # first variant alone — a sibling's failure must not be read as this one's.
   # Best-effort and capped: this runs on every `ddev start`, so a short timeout,
   # no retries, and a bound on how many pages a large multisite fetches.
+  # The page a redirect leads to, which is where the content is.
+  #
+  # The probe above deliberately does not follow redirects: a 302 answers its
+  # question, which is whether the request reached an application. But round 53
+  # made that body the evidence for four page scans, and a site whose `/`
+  # redirects to `/fi/` then had its homepage read as an empty 302 body — every
+  # scan passing on nothing. A redirecting root is the norm on the multilingual
+  # and subdirectory-multisite setups hostshift.yaml exists for. Bounded, and
+  # appended rather than replacing, so the reachability verdict above is
+  # untouched.
+  if [ -n "${probe:-}" ] && command -v curl >/dev/null; then
+    case "${code:-}" in
+      30*)
+        probe_body="$probe_body
+$(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 8 \
+          "https://$probe$port/" 2>/dev/null || true)" ;;
+    esac
+  fi
+
   if [ -n "${probe_body:-}" ] && command -v curl >/dev/null; then
     n_extra=0
     for extra in $(printf '%s' "$variants" | tr ',' ' '); do
@@ -1932,7 +1951,7 @@ EOF
       [ "$n_extra" -ge 8 ] && break
       n_extra=$((n_extra + 1))
       probe_body="$probe_body
-$(curl -sk --noproxy '*' --connect-timeout 2 --max-time 5 \
+$(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 5 \
         "https://$extra$port/" 2>/dev/null || true)"
     done
   fi
@@ -2061,9 +2080,7 @@ $(curl -sk --noproxy '*' --connect-timeout 2 --max-time 5 \
     #
     # So ask the page instead of asking the map: every absolute-URL host in the
     # body, minus everything this deployment legitimately names.
-    others="$(printf '%s' "$probe_body" \
-      | grep -oE '//[A-Za-z0-9][A-Za-z0-9._-]*' 2>/dev/null \
-      | sed 's|^//||' | tr 'A-Z' 'a-z' | sort | uniq -c | sort -rn || true)"
+    others="$(printf '%s' "$probe_body" | hostshift origins 2>/dev/null || true)"
     known_hosts=",$(printf '%s,%s,%s,' "$canon_list" "$variants" "${DDEV_HOSTNAME:-}" \
       | tr -s ',' ','),"
     while read -r cnt host; do
@@ -2073,22 +2090,32 @@ $(curl -sk --noproxy '*' --connect-timeout 2 --max-time 5 \
       case "$host" in
         localhost|*.localhost|*.test|127.*|*.ddev.site) continue ;;
       esac
-      # Same registrable domain as something the map names — an apex sibling, a
-      # `shop.`, a `media.`. Third-party hosts on a real WordPress page (w3.org,
-      # gravatar, googleapis) share none, so they stay a note rather than a
-      # refusal. Two labels is an approximation, wrong for `.co.uk`; it decides
-      # only whether this is loud or fatal, and the count is printed either way.
-      reg="$(printf '%s' "$host" | awk -F. '{ if (NF>=2) print $(NF-1)"."$NF; else print $0 }')"
+      # Under the canonical's *parent* domain — an apex sibling, a `shop.`, a
+      # `media.`. Third-party hosts on a real WordPress page (w3.org, gravatar,
+      # googleapis) are not, so they stay a note rather than a refusal.
+      #
+      # The parent, not a two-label registrable domain: that approximation called
+      # `www.example.co.uk` and `anything.co.uk` relatives, so a healthy `.co.uk`
+      # site was refused and the remedy it printed — add the shared domain as an
+      # alias — would have proxied every unrelated `.co.uk` link on the page. The
+      # parent of `www.example.co.uk` is `example.co.uk`, which needs no public
+      # suffix list to be right. It decides only whether this is loud or fatal;
+      # the count is printed either way.
       related=""
       for c in $(printf '%s' "$canon_list" | tr ',' ' '); do
-        creg="$(printf '%s' "$c" | awk -F. '{ if (NF>=2) print $(NF-1)"."$NF; else print $0 }')"
-        [ "$creg" = "$reg" ] && related=1 && break
+        parent="$c"
+        if [ "$(printf '%s' "$c" | awk -F. '{print NF}')" -ge 3 ]; then
+          parent="$(printf '%s' "$c" | cut -d. -f2-)"
+        fi
+        [ "$host" = "$parent" ] && related=1 && break
+        case "$host" in *".$parent") related=1; break ;; esac
       done
       if [ -n "$related" ]; then
         echo "hostshift: refusing to call this healthy — the page served at" >&2
         echo "  https://$probe carries $cnt links to $host, which this map does" >&2
-        echo "  not name and which is the same site as a hostname it does" >&2
-        echo "  ($reg). They are not rewritten, so they are live production" >&2
+        echo "  not name and which is under the same domain as a hostname it" >&2
+        echo "  does ($parent). They are not rewritten, so they are live" >&2
+        echo "  production" >&2
         echo "  links in a preview." >&2
         echo "  Add $host to hostshift.yaml — as an alias of the canonical it" >&2
         echo "  belongs to — and \`ddev hostshift init && ddev restart\`." >&2

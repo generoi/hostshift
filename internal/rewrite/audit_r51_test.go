@@ -158,8 +158,12 @@ func TestR51TheJSONSeparatorArmHasATest(t *testing.T) {
 // above 3, so narrowing the digit range stops it matching at all.
 func TestR51TheOctalDecoderKeepsItsRange(t *testing.T) {
 	m := r51Matcher(t, "https://www.example.fi", "https://wt-a--example.ddev.site")
+	// Through the HTML path, because the octal arm is a *JavaScript* spelling and
+	// round 54 made the view that decodes it surface-aware: a bare buffer is
+	// prose, where a backslash is a path separator and `\56` is three characters.
+	// The fixture was always an inline <script>; only the entry point was wrong.
 	rw := func(in string) string {
-		return string(HostLeaks(m.Forward(), []byte(in), false))
+		return rewriteHTML(t, m.Forward(), in, NewStats(false))
 	}
 
 	// `\56` is `.`, first digit 5. The view is armed because `\u` is present.

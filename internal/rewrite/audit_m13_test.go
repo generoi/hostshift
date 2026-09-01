@@ -58,7 +58,7 @@ func m13JSONString(s string) string {
 // json.go's decodeJSONLeak runs
 //
 //	out := RepairSerialized(dec, m.Rewrite)
-//	out = hostsFor(m).rewriteAllRefs(out, true, nil)
+//	out = hostsFor(m).rewriteAllRefs(out, true, SurfaceHTMLAttr, nil)
 //
 // and the second line is not inside the walk. rewriteAllRefs is the URL-parser
 // locator, the CSS view, the percent view and the reference views — every

@@ -231,7 +231,7 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 		// re-emitted — the corruption this file's header is about, at the one
 		// call site that reached for the views after the walk instead of from
 		// within it. Every other surface wraps them.
-		return hostsFor(m).rewriteAllRefs(nv, true, nil)
+		return hostsFor(m).rewriteAllRefs(nv, true, bareSurface(true), nil)
 	})
 	// The same two catchers the HTML surfaces get. Without them the REST body
 	// was the one surface with neither: `{"u":"https:\\h/x"}` and an NFD host in
@@ -289,7 +289,7 @@ func serializedJSONValue(m *origin.Matcher, v []byte, explain bool) ([]byte, []o
 		// payload that it could not. `https:\\host` next to an ordinary URL in
 		// one blob went out live, and the detector said nothing, because a value
 		// nobody rewrote still parses.
-		return hostsFor(m).rewriteAllRefs(nv, true, nil)
+		return hostsFor(m).rewriteAllRefs(nv, true, bareSurface(true), nil)
 	})
 	// Only a value that actually carries a span belongs on this path. Routing
 	// on "did anything change" instead sent every rewritten value here and

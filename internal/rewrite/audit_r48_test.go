@@ -132,6 +132,12 @@ func TestR48TheEngineCannotReadJSsOtherStringEscapes(t *testing.T) {
 	for name, body := range map[string]string{
 		"hex":        `fetch("https://www.e` + bs + `x78ample.fi/x")`,
 		"code point": `fetch("https://www.e` + bs + `u{78}ample.fi/x")`,
+		// Round 54 answered the surface question below, so this row moved up
+		// here: escView runs the decoding view only where a backslash really
+		// opens an escape, which bounds the cost the second bullet priced and
+		// retires the third one entirely. `\170` is `x`, a browser dereferences
+		// www.example.fi, and leaving it unread was a test 28 leak.
+		"octal": `fetch("https://www.e` + bs + `170ample.fi/x")`,
 	} {
 		in := "<script>" + body + "</script>"
 		if out := r48HTML(t, m, in); out == in {
@@ -142,21 +148,20 @@ func TestR48TheEngineCannotReadJSsOtherStringEscapes(t *testing.T) {
 
 	// Not read, deliberately, and this pins that decision so it is a choice
 	// rather than a drift. Both were implemented in round 48 and taken out again
-	// in round 49 for reasons recorded in `jsEscAt` and in PLAN §5.2:
+	// in round 49 for reasons recorded in `jsEscAt` and in PLAN §5.2. Round 54
+	// answered the surface question and moved octal up into the read set; the
+	// line continuation stays here, because the first reason still stands and
+	// jsEscAt still does not decode it:
 	//
 	//   * neither has a two-byte needle — both are `\` before something
 	//     ordinary — so gating on them armed the whole view on every CSS escape
 	//     in the document, measured at 287x the body against a 128x fixture that
 	//     does not look at this shape;
-	//   * and the line continuation is *wrong* outside a JS string: these views
-	//     run on every surface, and in an HTML attribute a backslash is a `/` to
-	//     the URL parser, so removing it invents a host the browser never
-	//     resolves.
-	//
-	// If a producer is ever named for either, this is the test to invert — and
-	// the surface question has to be answered first.
+	//   * and the line continuation is *wrong* outside a JS string: it was true
+	//     that "these views run on every surface", which is what round 54's
+	//     escView changed. What has not changed is that removing the backslash
+	//     invents a host, so this needs a named producer before it moves.
 	for name, body := range map[string]string{
-		"octal":             `fetch("https://www.e` + bs + `170ample.fi/x")`,
 		"line continuation": "fetch(\"https://www.exam" + bs + "\nple.fi/x\")",
 	} {
 		in := "<script>" + body + "</script>"

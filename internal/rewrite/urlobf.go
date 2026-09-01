@@ -44,6 +44,10 @@ import (
 // a lookup keyed by the *parsed* host, which is a different question from the
 // anchored byte scan the patterns answer.
 type hostReplacer struct {
+	// collect, when non-nil, turns every pass into a scan: hosts are recorded
+	// and nothing is rewritten. See locateHostIn.
+	collect map[string]int
+
 	to map[string]origin.Origin
 	// schemes is the set of schemes the variants are served on. The document's
 	// own scheme decides whether a reference with a scheme and no slashes is an
@@ -88,6 +92,12 @@ func newHostReplacer(m *origin.Matcher) *hostReplacer {
 // an NFD spelling all name the canonical host to a browser while sharing no
 // bytes with it. §5.5 calls IDN real for .fi client domains, and NFD is what a
 // macOS filesystem or a paste produces without anyone trying.
+// active reports whether a pass has anything to do: a map to rewrite with, or a
+// collection to fill. Every view guards on this, so a scan reaches all of them.
+func (h *hostReplacer) active() bool {
+	return h != nil && (len(h.to) > 0 || h.collect != nil)
+}
+
 func (h *hostReplacer) key(b []byte) string {
 	s := strings.ToLower(string(b))
 	// Origins store an IPv6 literal unbracketed — url.Hostname() strips them —
@@ -241,8 +251,43 @@ func stripForRefs(v []byte) normalised {
 // exactly, and it also keeps the view from inventing a byte the authority
 // scanner would read as a separator. Surrogate pairs and everything above 0x7E
 // are left as written, because no authority byte lives there.
-func stripForJSONEsc(v []byte) normalised {
-	if !hasJSONEsc(v) {
+func stripForJSONEsc(v []byte) normalised { return stripJSONEsc(v, false) }
+
+// stripForJSONEscCtl is stripForJSONEsc for a surface whose escapes are real: it
+// also removes `\t`, `\n`, `\r` and their `\uXXXX` spellings, because the string
+// decoder turns them into the characters the URL parser then deletes.
+// `<script>fetch("https://www.example\t.fi/p")</script>` is the host
+// www.example.fi to a browser, and refusing the escape left a live production
+// origin in the preview.
+//
+// Two views rather than one rule, because whether the escape is an escape is the
+// surface's answer and nothing below this line can see it. In an `href` a
+// backslash is a path separator: `https://www.example\u0009.fi/x` is the host
+// www.example with the path `/u0009.fi/x`, and folding it removed six bytes from
+// a value nothing should have touched. See origin.SurfaceDecodesEscapes.
+func stripForJSONEscCtl(v []byte) normalised { return stripJSONEsc(v, true) }
+
+// escView picks between them.
+func escView(surface string) func([]byte) normalised {
+	if origin.SurfaceDecodesEscapes(surface) {
+		return stripForJSONEscCtl
+	}
+	return stripForJSONEsc
+}
+
+// hasEsc is hasJSONEsc widened for the ctl view, whose two-byte spellings
+// (`\t`) carry no `\u` for the cheap gate to find.
+func hasEsc(v []byte, surface string) bool {
+	if hasJSONEsc(v) {
+		return true
+	}
+	return origin.SurfaceDecodesEscapes(surface) && bytes.IndexByte(v, '\\') >= 0
+}
+
+func stripJSONEsc(v []byte, ctl bool) normalised {
+	// The ctl view also decodes two-byte spellings, which carry no `\u` for
+	// hasJSONEsc's cheap gate to find.
+	if !hasJSONEsc(v) && !(ctl && bytes.IndexByte(v, '\\') >= 0) {
 		return stripForURL(v)
 	}
 	dec := make([]byte, 0, len(v))
@@ -250,6 +295,16 @@ func stripForJSONEsc(v []byte) normalised {
 	end := make([]int, 0, len(v))
 	for i := 0; i < len(v); {
 		if v[i] == '\\' && i+1 < len(v) {
+			// The letter spellings of the three the URL parser removes. Same
+			// rule as the `\u0009` form below: removed from the view, so the
+			// host reads across them exactly as a browser reads it.
+			if ctl {
+				switch v[i+1] {
+				case 't', 'n', 'r':
+					i += 2
+					continue
+				}
+			}
 			// `\/` is already handled by the JSON surface, but it reaches here
 			// too on the composed views, and decoding it costs nothing.
 			if v[i+1] == '/' {
@@ -264,7 +319,7 @@ func stripForJSONEsc(v []byte) normalised {
 			// Tier 1. `\xe4` in particular is what a minifier run with
 			// `ascii_only` writes for every byte above 0x7E — the same IDN
 			// authority the `\u00e4` case was widened for, one member over.
-			if r, w, ok := jsEscAt(v[i:]); ok {
+			if r, w, ok := jsEscAt(v[i:]); ok && ctl {
 				for k := 0; k < len(r); k++ {
 					dec = append(dec, r[k])
 					pos = append(pos, i)
@@ -274,7 +329,7 @@ func stripForJSONEsc(v []byte) normalised {
 				continue
 			}
 			if v[i+1] == 'u' && i+6 <= len(v) {
-				if r, ok := jsonEscRune(v[i+2 : i+6]); ok {
+				if r, ok := jsonEscRune(v[i+2:i+6], ctl); ok {
 					// Every byte of the rune points at the whole escape, the way
 					// stripForRefs already maps a multi-byte named reference, so
 					// a splice that lands anywhere inside it replaces all six
@@ -380,7 +435,7 @@ func jsEscAt(b []byte) ([]byte, int, bool) {
 		return nil, 0, false
 	}
 	if b[1] == 'x' {
-		r, ok := jsonEscRune(append([]byte("00"), b[2:4]...))
+		r, ok := jsonEscRune(append([]byte("00"), b[2:4]...), true)
 		if !ok {
 			return nil, 0, false
 		}
@@ -424,7 +479,7 @@ func jsEscAt(b []byte) ([]byte, int, bool) {
 		if len(padded) > 4 {
 			return nil, 0, false
 		}
-		r, ok := jsonEscRune(padded)
+		r, ok := jsonEscRune(padded, true)
 		if !ok {
 			return nil, 0, false
 		}
@@ -454,7 +509,7 @@ func jsEscAt(b []byte) ([]byte, int, bool) {
 // second escape, which this function does not see. A canonical host reaches this
 // package already folded to punycode, and the fold happens on the decoded bytes,
 // so the UTF-8 spelling is what has to arrive here.
-func jsonEscRune(h []byte) ([]byte, bool) {
+func jsonEscRune(h []byte, ctl bool) ([]byte, bool) {
 	if len(h) != 4 {
 		return nil, false
 	}
@@ -470,6 +525,22 @@ func jsonEscRune(h []byte) ([]byte, bool) {
 		default:
 			return nil, false
 		}
+	}
+	switch n {
+	case 0x09, 0x0A, 0x0D:
+		if !ctl {
+			// Not an escape on this surface: a backslash in an `href` or a
+			// header is a path separator, so these six bytes are ordinary path
+			// characters. Removing them there deleted bytes from a value that
+			// names a different host entirely.
+			return nil, false
+		}
+		// Removed by the URL parser, so removed from the view: the host reads
+		// across them. `https://www.example\t.fi/p` is the host `www.example.fi`
+		// to a browser, and refusing the escape left it unrewritten — a live
+		// production origin in the preview. Removing is not emitting, which is
+		// the rule stripForURL states for the literal spellings.
+		return []byte{}, true
 	}
 	if n < 0x20 || n == 0x7F {
 		return nil, false
@@ -1018,7 +1089,7 @@ func urlTokenStarts(v []byte) []int {
 // O(k·n) — measured at 55 seconds for a 320 KB attribute value, which
 // extrapolates to hours at the shipped 4 MiB token cap. That is the same bug
 // class scan.go documents having already fixed once.
-func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) (from, until int, repl string, ok bool) {
+func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, surface string) (from, until int, repl string, ok bool) {
 	// The scheme decides which port is the default, so it has to be found
 	// wherever the caller entered. foldedHostLeak enters at the slash *run*, so
 	// looking only forwards saw no scheme and fell back to https — and
@@ -1054,19 +1125,46 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool) 
 	if hs >= he {
 		return 0, 0, "", false
 	}
-	// A JSON escape after the host continues the host.
+	// A string escape after the host can continue the host.
 	//
 	// `stripForURL` reads a backslash as a slash, so `www.acme.fi\u00a0x` ends
 	// the host at the backslash and matched — but `wp_json_encode` writes every
 	// non-ASCII rune that way, and the browser decodes it, so the reference
-	// resolves to something that is not this origin. The byte matcher had the
-	// same hole and is fixed in `delimAt`; this is the locator's half.
-	if he < len(n.pos) && n.pos[he] < len(v) && v[n.pos[he]] == '\\' {
-		if c, ok := jsonEscHostByte(v, n.pos[he]); ok && c {
-			return 0, 0, "", false
-		}
+	// resolves to something that is not this origin.
+	//
+	// Whether it is an escape at all is the surface's answer, not the byte's. In
+	// an attribute the URL parser reads a backslash as a `/`: it is structure,
+	// and `<a href="https://www.acme.fi\u002d/p">` is a live origin with the path
+	// `/u002d/p`. In prose `\p` is two characters. Only a buffer still carrying
+	// its source escapes — a script, a style, the straggler's raw bytes — has an
+	// alphabet. Round 53 applied one reading everywhere and got both ends wrong.
+	// See origin.escapeAlphabetFor, which is now the only copy of that table.
+	//
+	// The byte matcher answers the same question at the same position, and round
+	// 53 gave it a second implementation that then drifted; both halves call
+	// origin.EscapeContinuesHost now.
+	if he < len(n.pos) && n.pos[he] < len(v) && v[n.pos[he]] == '\\' &&
+		origin.EscapeContinuesHost(v, n.pos[he], surface) {
+		return 0, 0, "", false
 	}
 	host := h.key(percentDecode(n.b[hs:he]))
+	// Collecting rather than rewriting.
+	//
+	// `check` needs the list of absolute-URL hosts a page carries, so it can
+	// subtract what the deployment names and report the rest. Round 53 wrote
+	// that scan as a `//host` grep in shell — and the comment forty lines above
+	// the block it sits in says why that could not work: "one spelling of an
+	// origin out of the dozen this project knows a browser resolves … Writing
+	// the decoder views a second time in shell was never going to work; the
+	// binary already has them." A JSON-escaped `https:\/\/shop.acme.fi`, which
+	// is how wp_json_encode writes every URL, was invisible to it.
+	//
+	// So the answer comes from here, where every view already runs. Recording
+	// and declining leaves the buffer untouched, which is what a scan wants.
+	if h.collect != nil {
+		h.collect[host]++
+		return 0, 0, "", false
+	}
 	// host:port first, and the bare host only when the port is the scheme's
 	// default. §5.4 matches on exact origin equality, so `https://h:80` is a
 	// different origin from `https://h` and rewriting it was a false positive —
@@ -1195,43 +1293,6 @@ func userinfoAt(v []byte, n normalised, at, hs int) string {
 	return ""
 }
 
-// jsonEscHostByte reports whether the JSON escape at b[i] decodes to a byte
-// that continues a host, rather than one that ends it. `\/` ends it; `\u00e4`
-// and `\u0041` do not.
-func jsonEscHostByte(b []byte, i int) (bool, bool) {
-	if i+1 >= len(b) || b[i] != '\\' {
-		return false, false
-	}
-	switch b[i+1] {
-	case '/', '\\', '"', 'n', 'r', 't', 'b', 'f':
-		return false, true
-	case 'u':
-		if i+6 > len(b) {
-			return false, false
-		}
-		n := 0
-		for k := i + 2; k < i+6; k++ {
-			var d int
-			switch c := b[k]; {
-			case c >= '0' && c <= '9':
-				d = int(c - '0')
-			case c >= 'a' && c <= 'f':
-				d = int(c-'a') + 10
-			case c >= 'A' && c <= 'F':
-				d = int(c-'A') + 10
-			default:
-				return false, false
-			}
-			n = n<<4 | d
-		}
-		if n >= 0x80 {
-			return true, true
-		}
-		return isAuthorityByte(byte(n)) && !isSlashish(byte(n)), true
-	}
-	return false, false
-}
-
 // verbatimSep returns the source bytes between the scheme's colon and the host,
 // when there is a separator run there to copy.
 //
@@ -1340,7 +1401,7 @@ func portOf(b []byte, he, end int) string {
 // the entire pass on most documents, and on the rest the work is bounded by the
 // number of `//` runs.
 func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []byte {
-	if w.hosts == nil || len(w.hosts.to) == 0 {
+	if !w.hosts.active() {
 		return v
 	}
 	nonASCII := false
@@ -1382,7 +1443,7 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 			i = run - 1
 			continue
 		}
-		from, until, repl, ok := w.hosts.locateHostIn(v, n, i, value)
+		from, until, repl, ok := w.hosts.locateHostIn(v, n, i, value, surface)
 		if !ok {
 			i = run - 1
 			continue
@@ -1431,7 +1492,7 @@ func hasNonASCII(b []byte) bool {
 // and every byte between the entries of a list — is copied through, so this
 // cannot damage a value it does not need to fix.
 func (w *HTML) normaliseURLLeak(surface string, base int, v []byte, value bool) []byte {
-	if w.hosts == nil || len(w.hosts.to) == 0 {
+	if !w.hosts.active() {
 		return v
 	}
 	n := stripForURL(v)
@@ -1441,7 +1502,7 @@ func (w *HTML) normaliseURLLeak(surface string, base int, v []byte, value bool) 
 		if off < len(n.pos) && n.pos[off] < prev {
 			continue // inside a host already replaced
 		}
-		from, until, repl, ok := w.hosts.locateHostIn(v, n, off, value)
+		from, until, repl, ok := w.hosts.locateHostIn(v, n, off, value, surface)
 		if !ok {
 			continue
 		}
@@ -1478,8 +1539,8 @@ func hostsFor(m *origin.Matcher) *hostReplacer {
 // rewriteAll applies both catchers to a standalone buffer — the JSON path, which
 // has no HTML tokenizer around it. Counters are the caller's business; the
 // events this would emit duplicate the ones RewriteJSON already records.
-func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []byte {
-	if h == nil || len(h.to) == 0 {
+func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]origin.Event) []byte {
+	if !h.active() {
 		return v
 	}
 	// One pass, not two.
@@ -1495,7 +1556,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	// It was not free: the gate is one non-ASCII byte anywhere in the buffer, so
 	// every Finnish page, feed, sitemap and request body paid for it. On an
 	// 8 MiB body a single `ä` took transient allocation from 156 MB to 292 MB.
-	v = h.spliceHosts(v, urlTokenStarts, value, ev)
+	v = h.spliceHosts(v, urlTokenStarts, value, surface, ev)
 	// The CSS view too, because the *forward* direction emits it.
 	//
 	// cssEscapeLeak splices the host into the escaped spelling, so a style
@@ -1509,11 +1570,11 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	// The rule this is an instance of: every spelling the forward direction can
 	// *emit*, the reverse direction must be able to *read*.
 	if bytes.IndexByte(v, '\\') >= 0 {
-		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value, ev)
+		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value, surface, ev)
 	}
 	// And the percent view, for an encoding composed with another one.
 	if bytes.IndexByte(v, '%') >= 0 {
-		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value, ev)
+		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value, surface, ev)
 	}
 	// And percent-then-JSON, which is `post.php` sending a block delimiter as a
 	// urlencoded field: the backslash Gutenberg wrote is `%5C`, so the escape
@@ -1528,8 +1589,8 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	// the spelling and `HostLeaks` no longer did. One copy, because two costs
 	// 455x the body and blows the allocation ceiling.
 	if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
-		v = h.spliceHostsIn(composeView(stripForPercent(v), stripForJSONEsc), v,
-			urlTokenStarts, value, ev)
+		v = h.spliceHostsIn(composeView(stripForPercent(v), escView(surface)), v,
+			urlTokenStarts, value, surface, ev)
 	}
 	// And JSON's own escape, which is the same rule again and the sharpest case
 	// of it: Gutenberg escapes `--` to `\u002d\u002d` in every block delimiter,
@@ -1537,20 +1598,20 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, ev *[]origin.Event) []by
 	// in a forward-only surface precisely so the reverse direction gets it —
 	// this spelling is emitted by *WordPress*, not by us, and the failure it
 	// causes is the variant hostname landing in the shared database.
-	if hasJSONEsc(v) {
-		v = h.spliceHostsIn(stripForJSONEsc(v), v, urlTokenStarts, value, ev)
+	if hasEsc(v, surface) {
+		v = h.spliceHostsIn(escView(surface)(v), v, urlTokenStarts, value, surface, ev)
 	}
 	return v
 }
 
 // rewriteAllRefs is rewriteAll for a consumer that decodes character references
 // — the XML family, XHTML's script and style, and every request body.
-func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, ev *[]origin.Event) []byte {
-	v = h.refsOnly(h.rewriteAll(v, value, ev), value, ev)
+func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, surface string, ev *[]origin.Event) []byte {
+	v = h.refsOnly(h.rewriteAll(v, value, surface, ev), value, surface, ev)
 	// And references spelling CSS escapes, which needs both decodes composed.
-	if h != nil && len(h.to) > 0 && bytes.IndexByte(v, '&') >= 0 {
+	if h.active() && bytes.IndexByte(v, '&') >= 0 {
 		if n, ok := refsThenCSS(v); ok {
-			v = h.spliceHostsIn(n, v, urlTokenStarts, value, ev)
+			v = h.spliceHostsIn(n, v, urlTokenStarts, value, surface, ev)
 		}
 		// And references spelling a JSON escape, which is the same composition
 		// on the axis the escape view was added without. `stripForCSS` is
@@ -1560,8 +1621,8 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, ev *[]origin.Event) 
 		// parser decodes references, which includes every request body. A
 		// spelling is a family; this is the member the family was missing.
 		if hasRefJSONEsc(v) {
-			v = h.spliceHostsIn(composeView(stripForRefs(v), stripForJSONEsc), v,
-				urlTokenStarts, value, ev)
+			v = h.spliceHostsIn(composeView(stripForRefs(v), escView(surface)), v,
+				urlTokenStarts, value, surface, ev)
 		}
 	}
 	return v
@@ -1570,11 +1631,11 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, ev *[]origin.Event) 
 // refsOnly is the reference view alone, for callers where the other views would
 // be wrong — an HTML attribute, where the browser decodes references but not CSS
 // escapes.
-func (h *hostReplacer) refsOnly(v []byte, value bool, ev *[]origin.Event) []byte {
-	if h == nil || len(h.to) == 0 || bytes.IndexByte(v, '&') < 0 {
+func (h *hostReplacer) refsOnly(v []byte, value bool, surface string, ev *[]origin.Event) []byte {
+	if !h.active() || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
-	return h.spliceHostsIn(stripForRefs(v), v, urlTokenStarts, value, ev)
+	return h.spliceHostsIn(stripForRefs(v), v, urlTokenStarts, value, surface, ev)
 }
 
 // slashRunStarts yields the first byte of each run of two or more slashes, which
@@ -1605,8 +1666,8 @@ func slashRunStarts(b []byte) []int {
 	return out
 }
 
-func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bool, ev *[]origin.Event) []byte {
-	return h.spliceHostsIn(stripForURL(v), v, starts, value, ev)
+func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bool, surface string, ev *[]origin.Event) []byte {
+	return h.spliceHostsIn(stripForURL(v), v, starts, value, surface, ev)
 }
 
 // spliceHostsIn splices, and appends what it did to ev when the caller has a
@@ -1622,8 +1683,8 @@ func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bo
 // checkout to decide whether a site needs hostshift — answered "nothing to do"
 // on the very shapes these views exist for. Third recurrence of the
 // instrument-lies class, at the entry points the earlier fix did not enumerate.
-func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte) []int, value bool, ev *[]origin.Event) []byte {
-	out, events := h.spliceHostsLog(n, v, starts, value)
+func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte) []int, value bool, surface string, ev *[]origin.Event) []byte {
+	out, events := h.spliceHostsLog(n, v, starts, value, surface)
 	if ev != nil {
 		*ev = append(*ev, events...)
 	}
@@ -1640,7 +1701,7 @@ func (h *hostReplacer) spliceHostsIn(n normalised, v []byte, starts func([]byte)
 // It answered "nothing to do" on the very WooCommerce blob stripForPercent was
 // written for. That is the instrument-reporting-health-it-did-not-measure
 // failure the PLAN already records twice, reintroduced by the fix for it.
-func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte) []int, value bool) ([]byte, []origin.Event) {
+func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte) []int, value bool, surface string) ([]byte, []origin.Event) {
 	var out []byte
 	var events []origin.Event
 	prev := 0
@@ -1648,7 +1709,7 @@ func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte
 		if off < len(n.pos) && n.pos[off] < prev {
 			continue
 		}
-		from, until, repl, ok := h.locateHostIn(v, n, off, value)
+		from, until, repl, ok := h.locateHostIn(v, n, off, value, surface)
 		if !ok {
 			continue
 		}
@@ -1750,10 +1811,10 @@ func refsThenCSS(v []byte) (normalised, bool) {
 // another one — `https%3A%5C%2F%5C%2Fhost`, which is what percent-encoding a
 // JSON-escaped URL produces and what WooCommerce hands to decodeURIComponent.
 func (w *HTML) percentLeak(surface string, base int, v []byte, value bool) []byte {
-	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '%') < 0 {
+	if !w.hosts.active() || bytes.IndexByte(v, '%') < 0 {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForPercent(v), v, urlTokenStarts, value)
+	out, events := w.hosts.spliceHostsLog(stripForPercent(v), v, urlTokenStarts, value, surface)
 	w.record(surface, base, events)
 	return out
 }
@@ -1761,10 +1822,10 @@ func (w *HTML) percentLeak(surface string, base int, v []byte, value bool) []byt
 // jsonEscLeak is the JSON-escape view as a recorded HTML-surface catcher, for
 // the spelling WordPress's own block serializer emits.
 func (w *HTML) jsonEscLeak(surface string, base int, v []byte, value bool) []byte {
-	if w.hosts == nil || len(w.hosts.to) == 0 || !hasJSONEsc(v) {
+	if !w.hosts.active() || !hasEsc(v, surface) {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForJSONEsc(v), v, urlTokenStarts, value)
+	out, events := w.hosts.spliceHostsLog(escView(surface)(v), v, urlTokenStarts, value, surface)
 	w.record(surface, base, events)
 	return out
 }
@@ -1790,10 +1851,10 @@ func (w *HTML) record(surface string, base int, events []origin.Event) {
 // records nothing, so a reference-encoded origin inside `<svg><style>` was
 // rewritten with the census reporting a clean page.
 func (w *HTML) refsLeak(surface string, base int, v []byte, value bool) []byte {
-	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '&') < 0 {
+	if !w.hosts.active() || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForRefs(v), v, urlTokenStarts, value)
+	out, events := w.hosts.spliceHostsLog(stripForRefs(v), v, urlTokenStarts, value, surface)
 	w.record(surface, base, events)
 	return out
 }
@@ -1801,26 +1862,39 @@ func (w *HTML) refsLeak(surface string, base int, v []byte, value bool) []byte {
 // refsCSSLeak is stripForRefsCSS as a recorded HTML-surface catcher, for a style
 // surface whose references the parser decodes before the CSS tokenizer runs.
 func (w *HTML) refsCSSLeak(surface string, base int, v []byte) []byte {
-	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '&') < 0 {
+	if !w.hosts.active() || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
 	n, ok := refsThenCSS(v)
 	if !ok {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(n, v, urlTokenStarts, true)
+	out, events := w.hosts.spliceHostsLog(n, v, urlTokenStarts, true, surface)
 	w.record(surface, base, events)
 	return out
 }
 
 // cssEscapeLeak is the CSS-tokenizer view of a style surface.
 func (w *HTML) cssEscapeLeak(surface string, base int, v []byte) []byte {
-	if w.hosts == nil || len(w.hosts.to) == 0 || bytes.IndexByte(v, '\\') < 0 {
+	if !w.hosts.active() || bytes.IndexByte(v, '\\') < 0 {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForCSS(v), v, urlTokenStarts, true)
+	out, events := w.hosts.spliceHostsLog(stripForCSS(v), v, urlTokenStarts, true, surface)
 	w.record(surface, base, events)
 	return out
+}
+
+// bareSurface names what a caller holds when it holds a buffer no string
+// decoder will run over again: a complete URL-bearing value, or a run of prose.
+// Neither carries source escapes, so in neither is a backslash anything but a
+// path separator — which is the whole reason the surface has to travel this far
+// down. RepairSerialized uses it for values it has already unquoted, where the
+// JSON surface name would claim escapes that are no longer there.
+func bareSurface(value bool) string {
+	if value {
+		return SurfaceHTMLAttr
+	}
+	return SurfaceText
 }
 
 // HostLeaks applies the URL-parser locator and the IDNA fold to a standalone
@@ -1838,7 +1912,7 @@ func HostLeaks(m *origin.Matcher, b []byte, value bool) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAll(b, value, nil)
+	return hostsFor(m).rewriteAll(b, value, bareSurface(value), nil)
 }
 
 // HostLeaksXML is HostLeaks for a body whose parser decodes character
@@ -1862,14 +1936,14 @@ func HostLeaksBack(m *origin.Matcher, b []byte) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAllRefs(b, true, nil)
+	return hostsFor(m).rewriteAllRefs(b, true, SurfaceHTMLAttr, nil)
 }
 
 func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAllRefs(b, value, nil)
+	return hostsFor(m).rewriteAllRefs(b, value, bareSurface(value), nil)
 }
 
 // Counted returns HostLeaks, HostLeaksBack and HostLeaksXML with the census
@@ -1886,7 +1960,7 @@ func HostLeaksCounted(m *origin.Matcher, b []byte, value bool, st *Stats, surfac
 		return b
 	}
 	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
-		return hostsFor(m).rewriteAll(b, value, ev)
+		return hostsFor(m).rewriteAll(b, value, surface, ev)
 	})
 }
 
@@ -1896,7 +1970,7 @@ func HostLeaksBackCounted(m *origin.Matcher, b []byte, st *Stats, surface string
 		return b
 	}
 	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
-		return hostsFor(m).rewriteAllRefs(b, true, ev)
+		return hostsFor(m).rewriteAllRefs(b, true, surface, ev)
 	})
 }
 
@@ -1906,7 +1980,7 @@ func HostLeaksXMLCounted(m *origin.Matcher, b []byte, value bool, st *Stats, sur
 		return b
 	}
 	return counted(st, surface, base, func(ev *[]origin.Event) []byte {
-		return hostsFor(m).rewriteAllRefs(b, value, ev)
+		return hostsFor(m).rewriteAllRefs(b, value, surface, ev)
 	})
 }
 
@@ -1919,4 +1993,33 @@ func counted(st *Stats, surface string, base int, f func(*[]origin.Event) []byte
 	}
 	st.Record(surface, base, ev)
 	return out
+}
+
+// HostsIn reports every absolute-URL host the body carries, with a count, using
+// the same views the rewriter uses — every escape spelling, every composed
+// encoding, on every surface.
+//
+// This exists so `ddev hostshift check` can ask "what hostnames does this page
+// actually link to" without a map. Round 53 asked that question with a `//host`
+// grep in shell, which sees exactly one spelling out of the dozen this project
+// knows a browser resolves: a JSON-escaped `https:\/\/shop.acme.fi` — how
+// wp_json_encode writes every URL — was invisible, and so were the percent and
+// character-reference spellings. The engine already decodes all of them, and the
+// comment above the canonical-direction scan in that same shell function had
+// already said so in as many words.
+func HostsIn(b []byte) map[string]int {
+	if len(b) == 0 {
+		return nil
+	}
+	h := &hostReplacer{collect: map[string]int{}}
+	// The reference-decoding pass, which runs every other view inside it. `value`
+	// is false: a page is prose as often as it is markup, and a scan wants the
+	// conservative reading of a trailing dot.
+	//
+	// Raw text for the surface, because the buffer is a whole served page with
+	// its script escapes intact, and what the scan reports is what the browser
+	// would dereference: a canonical followed by `\xe4` resolves somewhere else
+	// and is not an origin this page carries.
+	h.rewriteAllRefs(append([]byte(nil), b...), false, SurfaceRawText, nil)
+	return h.collect
 }

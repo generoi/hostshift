@@ -244,7 +244,7 @@ func r52Run(t *testing.T, c r52Cell) (in, out string, err string) {
 		t.Fatalf("%s: %v", c.label, mErr)
 	}
 	in = c.input()
-	out = string(hostsFor(m).rewriteAllRefs([]byte(in), c.value, nil))
+	out = string(hostsFor(m).rewriteAllRefs([]byte(in), c.value, SurfaceHTMLAttr, nil))
 
 	// Only the reference may change. Anything else is damage to a value this
 	// pass had no business touching.

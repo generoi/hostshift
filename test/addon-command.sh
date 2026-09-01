@@ -1418,6 +1418,28 @@ out="$(cd "$wt" && HS_CURL_BODY="$third" \
   || fail "a third-party host is a note, not a refusal" "exit $rc"
 contains "and it is still counted out loud" "links to fonts.googleapis.com" "$out"
 
+# ...and the escaped spellings, which is how WordPress writes URLs by default.
+#
+# The first version of this scan was a `//host` grep in shell — one spelling of
+# an origin out of the dozen a browser resolves. `wp_json_encode` writes every
+# URL in a block attribute or an inline script data island as `https:\/\/host`,
+# and that was invisible: ten of them served, exit 0, `ddev restart` reporting
+# success. It asks the binary now, which has the decoders.
+for spelling in json pct refs; do
+  case "$spelling" in
+    json) esc='{"u":"https:\\/\\/acme.example\\/p"}' ;;
+    pct)  esc='<a href="https%3A%2F%2Facme.example%2Fp">t</a>' ;;
+    refs) esc='<a href="https:&#x2F;&#x2F;acme.example/p">t</a>' ;;
+  esac
+  body=""
+  for i in 1 2 3 4 5; do body="$body
+$esc"; done
+  out="$(cd "$wt" && HS_CURL_BODY="$body" \
+    PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+  [ "$rc" = 2 ] && pass "a $spelling-escaped off-map origin is refused" \
+    || fail "a $spelling-escaped off-map origin is refused" "exit $rc"
+done
+
 # ...and the healthy page says nothing at all. Every origin on it is the variant
 # — that is what a working deployment looks like — so subtracting what this
 # deployment legitimately names is what keeps this from firing on every start.
@@ -1435,6 +1457,52 @@ case "$out" in
     fail "and the variant is not reported as a stranger" "$out" ;;
   *) pass "and the variant is not reported as a stranger" ;;
 esac
+
+# ...and a ccSLD sibling is not "the same site".
+#
+# The registrable domain was approximated as the last two labels, which for a
+# canonical of `www.acme.co.uk` is `co.uk` — so six links to `www.bbc.co.uk` in
+# an "as featured in" block were refused as the same site, on every `ddev start`,
+# with no way to silence it. Following the printed remedy (add it as an alias)
+# then proxied the BBC's links to the local container and turned the refusal
+# green. The parent domain needs no public-suffix list: `www.bbc.co.uk` is not
+# under `www.acme.co.uk`'s parent `acme.co.uk`.
+cp "$wt/.ddev/.env" "$work/cc-env.hold" 2>/dev/null || true
+mv "$wt/hostshift.yaml" "$work/cc-hs.hold" 2>/dev/null || true
+printf 'sites:\n  - canonical: https://www.acme.co.uk\n    variant: https://wt-a--acme.ddev.site\n' \
+  > "$wt/hostshift.yaml"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+ccbody='<a href="https://www.bbc.co.uk/news/1">a</a>
+<a href="https://www.bbc.co.uk/news/2">b</a>
+<a href="https://www.bbc.co.uk/news/3">c</a>
+<a href="https://www.bbc.co.uk/news/4">d</a>
+<a href="https://www.bbc.co.uk/news/5">e</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$ccbody" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 0 ] && pass "a ccSLD sibling is not refused as the same site" \
+  || fail "a ccSLD sibling is not refused as the same site" "exit $rc"
+
+# ...while a genuine subdomain of the canonical's parent still is.
+ccown='<a href="https://shop.acme.co.uk/1">a</a>
+<a href="https://shop.acme.co.uk/2">b</a>
+<a href="https://shop.acme.co.uk/3">c</a>
+<a href="https://shop.acme.co.uk/4">d</a>
+<a href="https://shop.acme.co.uk/5">e</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$ccown" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "and a subdomain of the canonical's parent still is" \
+  || fail "and a subdomain of the canonical's parent still is" "exit $rc"
+rm -f "$wt/hostshift.yaml"
+mv "$work/cc-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
+cp "$work/cc-env.hold" "$wt/.ddev/.env" 2>/dev/null || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
 rm -f "$wt/hostshift.yaml"
 mv "$work/apex-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
 cp "$work/apex-env.hold" "$wt/.ddev/.env" 2>/dev/null || true

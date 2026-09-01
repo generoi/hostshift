@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -91,6 +92,8 @@ func main() {
 		code, err = cmdProxy(os.Args[2:])
 	case "hosts":
 		code, err = cmdHosts(os.Args[2:])
+	case "origins":
+		code, err = cmdOrigins(os.Args[2:])
 	case "map":
 		code, err = cmdMap(os.Args[2:])
 	case "check":
@@ -478,6 +481,49 @@ func cmdHosts(args []string) (int, error) {
 	}
 	for _, h := range proj.Hosts {
 		fmt.Println(h)
+	}
+	return exitOK, nil
+}
+
+// cmdOrigins lists the absolute-URL hosts a body carries, with counts, one per
+// line, most frequent first.
+//
+// It answers "what does this page actually link to" using the engine's own
+// decoders rather than a pattern — every escape spelling, every composed
+// encoding. `ddev hostshift check` needs that to subtract what a deployment
+// names and report the rest; asking it with a shell grep saw one spelling out
+// of a dozen, and a JSON-escaped URL is the spelling WordPress emits by default.
+func cmdOrigins(args []string) (int, error) {
+	fs := flag.NewFlagSet("origins", flag.ContinueOnError)
+	if describe(fs, args, "list the absolute-URL hosts a body on stdin carries") {
+		return exitOK, nil
+	}
+	if err := fs.Parse(args); err != nil {
+		return exitConfig, nil
+	}
+	body, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return exitRuntime, err
+	}
+	counts := rewrite.HostsIn(body)
+	type row struct {
+		host string
+		n    int
+	}
+	rows := make([]row, 0, len(counts))
+	for h, n := range counts {
+		rows = append(rows, row{h, n})
+	}
+	// Deterministic: by count, then by name. A caller reading the first line
+	// must get the same answer twice.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].n != rows[j].n {
+			return rows[i].n > rows[j].n
+		}
+		return rows[i].host < rows[j].host
+	})
+	for _, r := range rows {
+		fmt.Printf("%d %s\n", r.n, r.host)
 	}
 	return exitOK, nil
 }
