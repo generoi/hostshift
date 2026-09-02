@@ -1,6 +1,9 @@
 package rewrite
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -414,6 +417,20 @@ func TestR54NoDecoderRunsInAnAttribute(t *testing.T) {
 			t.Errorf("a browser resolves this to a host this map does not contain, so nothing may change:\n  in  %s\n  out %s", in, out)
 		}
 	}
+	// And the complement, which is the half that leaks: in an attribute `\t` is
+	// two ordinary path characters, so `https://www.example.fi\tx` is the
+	// canonical with the path `/tx` and must be rewritten. Round 55's mutation
+	// M23 — dropping removedEscLen's escPath guard — survived the whole suite on
+	// this row, because every case here asserted the *declining* direction.
+	for _, url := range []string{
+		`https://www.example.fi\tx`,
+		`https://www.example.fi\u0009x`,
+	} {
+		in := `<a href="` + url + `">x</a>`
+		if out := rewriteHTML(t, m, in, NewStats(false)); !strings.Contains(out, "wt-a--example.ddev.site") {
+			t.Errorf("a browser resolves this to the canonical and it was served live:\n  %s", out)
+		}
+	}
 	// The same two spellings in a script, where a decoder does run and both are
 	// the canonical. Without this the test above passes by never decoding at all.
 	for _, url := range []string{
@@ -432,30 +449,73 @@ func TestR54NoDecoderRunsInAnAttribute(t *testing.T) {
 // package rewrite imports package origin and not the other way round. That makes
 // a rename here a silent fall-through to the default there — a script surface
 // renamed would keep working, an attribute surface renamed would quietly start
-// reading escapes and deleting bytes. This is the test that turns it into a
-// failure instead.
+// reading escapes and deleting bytes.
+//
+// The names are read out of the source rather than repeated, because the first
+// version of this test repeated them and that is exactly how it failed: it
+// listed twelve of the fourteen surface names this package defines, and two of
+// the two it omitted were surfaces round 54 had put on the wrong side. A
+// hand-written list cannot pin a hand-written list. Adding a Surface constant
+// now fails here until someone says which alphabet it takes.
 func TestSurfaceNamesAreKnownHere(t *testing.T) {
-	for _, c := range []struct {
-		surface string
-		escapes bool
-	}{
-		{SurfaceHTMLAttr, false},
-		{SurfaceText, false},
-		{SurfaceComment, false},
-		{SurfaceHeader, false},
-		{SurfaceRequestLine, false},
-		{SurfaceRequestBody, false},
-		{SurfaceInlineStyle, false},
-		{SurfaceInlineScript, true},
-		{SurfaceRawText, true},
-		{SurfaceStraggler, true},
-		{SurfaceJSONString, true},
-		{SurfaceJSONEscape, true},
-	} {
-		if got := origin.SurfaceDecodesEscapes(c.surface); got != c.escapes {
-			t.Errorf("%s: SurfaceDecodesEscapes = %v, want %v — either the name "+
-				"changed or the alphabet did, and both need deciding here",
-				c.surface, got, c.escapes)
+	// false = a backslash is a path separator: the buffer is an attribute value,
+	// a header, prose, or markup, and no string decoder will run over it.
+	want := map[string]bool{
+		SurfaceHTMLAttr:       false,
+		SurfaceText:           false,
+		SurfaceComment:        false,
+		SurfaceHeader:         false,
+		SurfaceRequestLine:    false,
+		SurfaceRequestBody:    false,
+		SurfaceInlineStyle:    false,
+		SurfaceHTMLEntity:     false,
+		SurfaceHTMLObfuscated: false,
+		SurfaceRawText:        false,
+		SurfaceInlineScript:   true,
+		SurfaceStraggler:      true,
+		SurfaceJSONString:     true,
+		SurfaceJSONEscape:     false,
+	}
+	for name, value := range surfaceConstants(t) {
+		esc, listed := want[value]
+		if !listed {
+			t.Errorf("%s = %q is not classified: decide whether a buffer on that "+
+				"surface still carries string escapes, add it to origin."+
+				"escapeAlphabetFor if it does not, and list it here", name, value)
+			continue
+		}
+		if got := origin.SurfaceDecodesEscapes(value); got != esc {
+			t.Errorf("%s (%q): SurfaceDecodesEscapes = %v, want %v — either the "+
+				"name changed or the alphabet did, and both need deciding here",
+				name, value, got, esc)
 		}
 	}
+}
+
+// surfaceConstants reads every `SurfaceX = "y"` this package declares.
+func surfaceConstants(t *testing.T) map[string]string {
+	t.Helper()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(?m)^\s*(Surface\w+)\s*=\s*"([^"]+)"`)
+	out := map[string]string{}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+			out[m[1]] = m[2]
+		}
+	}
+	if len(out) < 10 {
+		t.Fatalf("found only %d surface constants, so the scan is broken and "+
+			"this test would pass by finding nothing: %v", len(out), out)
+	}
+	return out
 }

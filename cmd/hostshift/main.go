@@ -668,10 +668,17 @@ func cmdCheck(args []string) (int, error) {
 		for _, h := range res.DirectlyServed {
 			fmt.Fprintf(os.Stderr, "  https://%s\n", h)
 		}
-		fmt.Fprintln(os.Stderr, "  Preview through the variant(s) instead:")
+		// "the variant(s) this map resolves to", not "preview through these":
+		// these come from the map as recomputed *now*, and what DDEV routes
+		// comes from `.ddev/.env`. After a branch rename the two differ, so the
+		// URL offered here 404s — printed directly above the staleness warning
+		// that explains why, which reads as the tool contradicting itself.
+		fmt.Fprintln(os.Stderr, "  The variant(s) this map resolves to:")
 		for _, st := range res.Map.Sites {
 			fmt.Fprintf(os.Stderr, "  %s\n", st.Variant.String())
 		}
+		fmt.Fprintln(os.Stderr,
+			"  Those serve once `.ddev/.env` names them; `check` says below if it does not.")
 	}
 
 	if len(res.Uncovered) > 0 {

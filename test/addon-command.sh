@@ -1039,10 +1039,32 @@ f="${HS_CURL_STATE:-/tmp/hs-curl-n}"
 n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$f"
 # The body too, since check now reads what the page says about itself.
+hdr=""
+prev=""
 for a in "$@"; do
   case "$a" in https://*) printf '%s\n' "$a" >> "${HS_FAKE_DIR}/curl-hosts" ;; esac
+  [ "$prev" = "-D" ] && hdr="$a"
+  prev="$a"
 done
-[ -n "${HS_CURL_BODY:-}" ] && printf '%s\n' "$HS_CURL_BODY"
+# Headers when asked for them, so a test can drive a redirect. HS_CURL_LOCATION
+# is served once, on the first call that asks for headers — hostshift's own
+# first probe does not, so keying this on the call number made it never fire and
+# the off-deployment test pass without a redirect ever being offered.
+if [ -n "$hdr" ]; then
+  if [ -n "${HS_CURL_LOCATION:-}" ] && [ ! -f "${HS_FAKE_DIR}/curl-redirected" ]; then
+    : > "${HS_FAKE_DIR}/curl-redirected"
+    printf 'HTTP/1.1 302 Found\r\nLocation: %s\r\n\r\n' "$HS_CURL_LOCATION" > "$hdr"
+  else
+    printf 'HTTP/1.1 200 OK\r\n\r\n' > "$hdr"
+  fi
+fi
+# A second body from the second call on, so a test can put the leak on a page
+# other than the first — which is where it is on a multisite.
+if [ -n "${HS_CURL_BODY2:-}" ] && [ "$n" -ge 2 ]; then
+  printf '%s\n' "$HS_CURL_BODY2"
+elif [ -n "${HS_CURL_BODY:-}" ]; then
+  printf '%s\n' "$HS_CURL_BODY"
+fi
 set -- ${HS_CURL_CODES:-200}
 [ "$n" -le $# ] && eval "printf '%s' "\${$n}"" || eval "printf '%s' "\${$#}""
 exit 0
@@ -1078,6 +1100,18 @@ printf '<a href="https://acme.ddev.site/a">a</a><link href="https://acme.ddev.si
 
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a canonical origin in the served page is reported" "canonical origin" "$out"
+# ...and the pages it lists under that are URLs and nothing else. The list is
+# word-split when it is printed, and the redirect page's label reads "(after its
+# redirect)", so storing the label in the list turned it into three more lines
+# that a reader would take for hostnames.
+case "$out" in
+  *"
+    its"*|*"
+    (after"*|*"
+    redirect)"*)
+    fail "and the pages it lists are URLs" "the label was word-split into the list" ;;
+  *) pass "and the pages it lists are URLs" ;;
+esac
 contains "and the cause is named" "--dry-run" "$out"
 if (cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
   fail "check fails when the page carries one" "it exited 0"
@@ -1416,7 +1450,121 @@ out="$(cd "$wt" && HS_CURL_BODY="$third" \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 [ "$rc" = 0 ] && pass "a third-party host is a note, not a refusal" \
   || fail "a third-party host is a note, not a refusal" "exit $rc"
-contains "and it is still counted out loud" "links to fonts.googleapis.com" "$out"
+# "reference(s)", not "links": round 55 found six `<svg xmlns>` declarations
+# reported as links, and a namespace URI is not one a browser dereferences.
+contains "and it is still counted out loud" "reference(s) to fonts.googleapis.com" "$out"
+
+# A redirect is followed only while it stays on this deployment.
+#
+# Round 54 added `curl -L` so a `/` that 302s to `/fi/` is still scanned, and
+# `curl -L` has no same-origin restriction — so a `Location:` anywhere was
+# followed, with `-k` and `--noproxy '*'`, on every `ddev start`. Under
+# production-canonical that fetches the client's live site from the developer's
+# laptop, and loopback containment cannot stop it because this curl runs on the
+# host and not in `web`. The body then came back attributed to the variant, so
+# `check` refused a preview by name over somebody else's links.
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+# A counter of our own, zeroed: the shared one is unset by this point, and
+# HS_CURL_CODES is indexed by it — left running it is read past its list and
+# yields the last entry forever, so the 302 never happens.
+hs55n="$work/curl-n55"; echo 0 > "$hs55n"
+out="$(cd "$wt" && HS_CURL_BODY="$third" HS_CURL_CODES="302 200 200" \
+  HS_CURL_STATE="$hs55n" \
+  HS_CURL_LOCATION="https://elsewhere.example/landing" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+if grep -q "elsewhere.example" "$HS_FAKE_DIR/curl-hosts" 2>/dev/null; then
+  fail "a redirect off this deployment is not followed" \
+    "fetched $(grep -c elsewhere.example "$HS_FAKE_DIR/curl-hosts") time(s)"
+else
+  pass "a redirect off this deployment is not followed"
+fi
+
+# ...and one that stays on a variant still is, which is what round 54 bought.
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+# A counter of our own, zeroed: the shared one is unset by this point, and
+# HS_CURL_CODES is indexed by it — left running it is read past its list and
+# yields the last entry forever, so the 302 never happens.
+hs55n="$work/curl-n55"; echo 0 > "$hs55n"
+out="$(cd "$wt" && HS_CURL_BODY="$third" HS_CURL_CODES="302 200 200" \
+  HS_CURL_STATE="$hs55n" \
+  HS_CURL_LOCATION="https://wt-a--acme.ddev.site/fi/" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+if grep -q "wt-a--acme.ddev.site/fi/" "$HS_FAKE_DIR/curl-hosts" 2>/dev/null; then
+  pass "a redirect within the deployment is still followed"
+else
+  fail "a redirect within the deployment is still followed" \
+    "probed: $(tr '\n' ' ' < "$HS_FAKE_DIR/curl-hosts")"
+fi
+
+# An apex canonical under a multi-label suffix is not a relative of every other
+# site under it.
+#
+# Round 54 replaced a two-label registrable domain with the canonical's parent.
+# The parent of `example.co.uk` is `co.uk`, so a healthy site was refused over
+# ordinary `www.bbc.co.uk` links — and the remedy it printed, add the host as an
+# alias, would have made the preview proxy the BBC. The apex is the canonical
+# with a leading `www.` removed and only that: `www` is not a public suffix in
+# any registry, so `www.x` and `x` are always one site while `x.co.uk` and
+# `y.co.uk` never have to be.
+mv "$wt/hostshift.yaml" "$work/couk-hs.hold" 2>/dev/null || true
+printf 'sites:\n  - canonical: https://example.co.uk\n    variant: https://wt-a--acme.ddev.site\n' \
+  > "$wt/hostshift.yaml"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+writefake
+couk='<a href="https://www.bbc.co.uk/news/1">a</a>
+<a href="https://www.bbc.co.uk/sport">b</a>
+<a href="https://www.bbc.co.uk/iplayer">c</a>
+<a href="https://www.bbc.co.uk/weather">d</a>
+<a href="https://www.bbc.co.uk/sounds">e</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$couk" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 0 ] && pass "an apex canonical does not make its public suffix a relative" \
+  || fail "an apex canonical does not make its public suffix a relative" "exit $rc"
+case "$out" in
+  *"as an alias of the canonical it"*"belongs to"*)
+    # Only the note's own wording may say this; the refusal must not have fired.
+    case "$out" in
+      *"refusing to call this healthy"*)
+        fail "and it does not tell them to alias the BBC" "refused" ;;
+      *) pass "and it does not tell them to alias the BBC" ;;
+    esac ;;
+  *) pass "and it does not tell them to alias the BBC" ;;
+esac
+# ...while a genuine sibling under that same apex is still caught.
+sib='<a href="https://shop.example.co.uk/1">a</a>
+<a href="https://shop.example.co.uk/2">b</a>
+<a href="https://shop.example.co.uk/3">c</a>
+<a href="https://shop.example.co.uk/4">d</a>
+<a href="https://shop.example.co.uk/5">e</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$sib" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "a real sibling under the apex is still refused" \
+  || fail "a real sibling under the apex is still refused" "exit $rc"
+mv "$work/couk-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+writefake
+
+# The message names the page that actually carries the finding.
+#
+# `probe_body` is up to nine documents concatenated — the first variant, the
+# page its redirect leads to, and up to eight siblings — and every scan reported
+# its finding as "the page served at https://$probe". The developer opened that
+# URL, viewed source, found nothing, and had no way from the message to the page
+# that is leaking. Here the first page is clean and the redirect target is not.
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+hs55n="$work/curl-n55b"; echo 0 > "$hs55n"
+sibleak='<a href="https://media.acme.example/1">a</a>
+<a href="https://media.acme.example/2">b</a>
+<a href="https://media.acme.example/3">c</a>
+<a href="https://media.acme.example/4">d</a>
+<a href="https://media.acme.example/5">e</a>'
+out="$(cd "$wt" && HS_CURL_BODY='<p>clean</p>' HS_CURL_BODY2="$sibleak" \
+  HS_CURL_CODES="302 200 200" HS_CURL_STATE="$hs55n" \
+  HS_CURL_LOCATION="https://wt-a--acme.ddev.site/fi/" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "a leak on the page behind a redirect is found" \
+  || fail "a leak on the page behind a redirect is found" "exit $rc"
+contains "and the message names that page, not the first" "after its redirect" "$out"
 
 # ...and the escaped spellings, which is how WordPress writes URLs by default.
 #

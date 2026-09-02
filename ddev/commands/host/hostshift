@@ -609,10 +609,32 @@ if [ "$cmd" = "copy-db" ]; then
     # database dropped and partially reloaded. Saying so is the difference
     # between re-running the command and debugging a site that is now missing
     # half its tables.
+    # Which of the two failures it was, measured rather than assumed.
+    #
+    # "may be half-replaced … re-run with --force" is written for the
+    # interruption and was printed for every failure mode, so the ordinary "you
+    # forgot to start the parent" case — where mysqldump never connected and
+    # nothing was dropped — ended by naming the one destructive flag. The
+    # database itself can say which happened.
+    #
+    # --force is not the answer to either. It gates overwriting a worktree
+    # database that has content, and re-running meets exactly the same gate this
+    # invocation already passed.
+    ntables="$(ddev exec -s web bash -c \
+      'mysql -h db -udb -pdb -N -B -e "show tables" db 2>/dev/null | wc -l' \
+      2>/dev/null | tr -cd '0-9')"
     echo "hostshift: the copy failed." >&2
     echo "  Is $from running? \`ddev start $from\`" >&2
-    echo "  This worktree's database may be half-replaced: the dump drops it" >&2
-    echo "  before reloading. Re-run with --force once $from is up." >&2
+    if [ -n "$ntables" ] && [ "$ntables" -gt 0 ] 2>/dev/null; then
+      echo "  This worktree's database still has $ntables table(s), so the dump" >&2
+      echo "  never got as far as dropping it and nothing here changed. Fix the" >&2
+      echo "  above and re-run the same command." >&2
+    else
+      echo "  This worktree's database has no tables. --add-drop-database puts" >&2
+      echo "  \`DROP DATABASE\` at the top of the stream, so a copy interrupted" >&2
+      echo "  after that point leaves it half-replaced — which is what this" >&2
+      echo "  looks like. Re-run once $from is up." >&2
+    fi
     exit 1; }
   echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
   echo "  hostshift maps — nothing else to do." >&2
@@ -1925,6 +1947,116 @@ EOF
   # first variant alone — a sibling's failure must not be read as this one's.
   # Best-effort and capped: this runs on every `ddev start`, so a short timeout,
   # no retries, and a bound on how many pages a large multisite fetches.
+  # The hostnames a redirect may be followed to: the variants and DDEV's own.
+  #
+  # A canonical is deliberately not among them. Under production-canonical the
+  # canonical *is* production, so following a redirect there fetches the
+  # client's live site.
+  local_hosts=",$(printf '%s,%s,' "$variants" "${DDEV_HOSTNAME:-}" \
+    | tr -s ',' ','),"
+
+  # hs_fetch_local fetches a URL, following redirects only while they stay on a
+  # hostname this deployment serves. It prints the final body, or nothing.
+  #
+  # `curl -L` has no same-origin restriction: a `Location:` pointing anywhere is
+  # followed, with `-k` and `--noproxy '*'`. Round 54 added `-L` so a `/` that
+  # 302s to `/fi/` is still scanned, and bought an outbound fetch of whatever
+  # the site redirects to — on every `ddev start`, from the developer's laptop.
+  # WordPress's own canonical redirect is enough to trigger it, and loopback
+  # containment cannot stop it, because this curl runs on the host and not in
+  # `web`. The body then came back attributed to the variant, so `check` refused
+  # a preview by name over links that were on somebody else's page.
+  hs_fetch_local() {
+    _url="$1"; _max="${2:-8}"; _hop=0
+    # An explicit template: GNU mktemp rejects `-t hostshift-hdr` for having too
+    # few X's, and the `|| return 0` beside it turned that into a silent
+    # fail-open — every sibling variant went unprobed and `check` passed on a
+    # multisite by never looking at it.
+    _hf="$(mktemp "${TMPDIR:-/tmp}/hostshift-hdr.XXXXXX" 2>/dev/null)" || _hf=""
+    if [ -z "$_hf" ]; then
+      curl -sk --noproxy '*' --connect-timeout 2 --max-time "$_max" \
+        "$_url" 2>/dev/null || true
+      return 0
+    fi
+    while :; do
+      _body="$(curl -sk -D "$_hf" --noproxy '*' --connect-timeout 2 \
+        --max-time "$_max" "$_url" 2>/dev/null || true)"
+      case "$(awk 'NR == 1 { print $2; exit }' "$_hf" 2>/dev/null)" in
+        30*) ;;
+        *) break ;;
+      esac
+      [ "$_hop" -ge 3 ] && break
+      _hop=$((_hop + 1))
+      _loc="$(tr -d '\r' < "$_hf" \
+        | awk 'tolower($1) == "location:" { print $2; exit }')"
+      [ -n "$_loc" ] || break
+      case "$_loc" in
+        //*) _loc="https:$_loc" ;;
+        /*) _loc="$(printf '%s' "$_url" | sed 's|\(https*://[^/]*\).*|\1|')$_loc" ;;
+        http://*|https://*) ;;
+        # A relative path. Resolving it means reimplementing the URL parser in
+        # shell, which is the mistake round 54 took out of the off-map scan.
+        *) break ;;
+      esac
+      _lh="${_loc#*://}"; _lh="${_lh%%/*}"; _lh="${_lh%%:*}"
+      case "$local_hosts" in
+        *",$_lh,"*) ;;
+        *) break ;;
+      esac
+      _url="$_loc"
+    done
+    rm -f "$_hf"
+    printf '%s' "$_body"
+  }
+
+  # Every probed page kept separately, as well as concatenated.
+  #
+  # `probe_body` is up to nine documents run together — the first variant, the
+  # page its redirect leads to, and up to eight sibling variants — and every
+  # scan below reported its finding as "the page served at https://$probe". On a
+  # multisite the leak is usually on a *sibling*, so the developer opened the URL
+  # the tool named, viewed source, found nothing, and had no way from the message
+  # to the page that is actually leaking.
+  #
+  # A record marker rather than temp files, because the scans below `exit 2` from
+  # inside loops and the one EXIT trap in this file belongs to `init`. A body
+  # containing a line that starts with the marker would split a record early,
+  # which mis-attributes one message; it cannot crash the scan.
+  probe_pages=""
+  hs_add_page() {
+    [ -n "$2" ] || return 0
+    # The bare URL for the list, which is word-split when it is printed — the
+    # label carries "(after its redirect)" and would have arrived as three more
+    # lines that look like hostnames. The label stays on the record below, where
+    # hs_page_carrying reads it whole.
+    case " $probe_urls " in
+      *" ${1%% *} "*) ;;
+      *) probe_urls="$probe_urls ${1%% *}" ;;
+    esac
+    probe_pages="$probe_pages
+=== $1
+$2"
+  }
+
+  # The probed page that carries a host, for the messages. Falls back to the
+  # first variant, which is what every message used to say unconditionally.
+  hs_page_carrying() {
+    _u="$(printf '%s\n' "$probe_pages" | awk -v needle="$1" '
+      /^=== / { url = substr($0, 5); next }
+      url != "" && index($0, needle) { print url; exit }')"
+    [ -n "$_u" ] || _u="https://${probe:-}${port:-}/"
+    printf '%s' "$_u"
+  }
+
+  probe_urls=""
+  # An `if`, not `[ ] && cmd`: this file runs under `set -e`, where a bare test
+  # that comes out false is the script's exit status. Written the short way it
+  # ended `check` silently on any deployment with no probe host, and the suite
+  # saw it as "probed 1 host(s)".
+  if [ -n "${probe:-}" ]; then
+    hs_add_page "https://$probe${port:-}/" "${probe_body:-}"
+  fi
+
   # The page a redirect leads to, which is where the content is.
   #
   # The probe above deliberately does not follow redirects: a 302 answers its
@@ -1938,9 +2070,10 @@ EOF
   if [ -n "${probe:-}" ] && command -v curl >/dev/null; then
     case "${code:-}" in
       30*)
+        red_body="$(hs_fetch_local "https://$probe$port/" 8)"
+        hs_add_page "https://$probe$port/ (after its redirect)" "$red_body"
         probe_body="$probe_body
-$(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 8 \
-          "https://$probe$port/" 2>/dev/null || true)" ;;
+$red_body" ;;
     esac
   fi
 
@@ -1950,9 +2083,10 @@ $(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 8 \
       [ "$extra" = "${probe:-}" ] && continue
       [ "$n_extra" -ge 8 ] && break
       n_extra=$((n_extra + 1))
+      extra_body="$(hs_fetch_local "https://$extra$port/" 5)"
+      hs_add_page "https://$extra$port/" "$extra_body"
       probe_body="$probe_body
-$(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 5 \
-        "https://$extra$port/" 2>/dev/null || true)"
+$extra_body"
     done
   fi
 
@@ -1978,7 +2112,7 @@ $(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 5 \
       [ -n "$uhits" ] || uhits=0
       if [ "$uhits" -ge 5 ]; then
         echo "hostshift: refusing to call this healthy — the page served at" >&2
-        echo "  https://${probe:-$(printf '%s' "$variants" | cut -d, -f1)} carries" >&2
+        echo "  $(hs_page_carrying "$uh") carries" >&2
         echo "  $uhits links to $uh, which the parent" >&2
         echo "  declares and this map does not name. They are not rewritten, so" >&2
         echo "  they are live production links in a preview." >&2
@@ -2037,9 +2171,13 @@ $(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 5 \
       [ -n "$leaked" ] || leaked=0
     fi
     if [ "$leaked" -gt 0 ] 2>/dev/null; then
-      echo "hostshift: the page served at https://$probe still carries $leaked" >&2
+      echo "hostshift: the pages probed for this deployment still carry $leaked" >&2
       echo "  canonical origin(s) — live production links in a preview, which is" >&2
       echo "  the one thing this tool exists to prevent." >&2
+      # Every probed page, because the count is a sum over all of them and on a
+      # multisite the leak is usually on a sibling. Naming only the first sent
+      # the developer to a page whose source was clean.
+      for pu in ${probe_urls:-}; do echo "    $pu" >&2; done
       case "$cmd_running" in
         *--dry-run*)
           echo "  The proxy is running with --dry-run, which serves every response" >&2
@@ -2049,7 +2187,12 @@ $(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 5 \
           echo "  straggler backstop. Remove it from HOSTSHIFT_ARGS in .ddev/.env." >&2 ;;
         *)
           echo "  Run \`hostshift diff\` against this deployment to see which" >&2
-          echo "  surface they are on." >&2 ;;
+          echo "  surface they are on — but under production-canonical its" >&2
+          echo "  canonical base is the client's live site, and diff fetches it." >&2
+          echo "  Point it somewhere local first:" >&2
+          echo "    hostshift diff --resolve ${canon_list%%,*}:443:127.0.0.1:443" >&2
+          echo "  diff prints the same warning and then crawls anyway, so this is" >&2
+          echo "  not a formality." >&2 ;;
       esac
       # exit 2, the refusal this script uses everywhere else. The first version
       # incremented a `fails` counter declared nowhere and read nowhere — so
@@ -2090,40 +2233,52 @@ $(curl -skL --max-redirs 3 --noproxy '*' --connect-timeout 2 --max-time 5 \
       case "$host" in
         localhost|*.localhost|*.test|127.*|*.ddev.site) continue ;;
       esac
-      # Under the canonical's *parent* domain — an apex sibling, a `shop.`, a
-      # `media.`. Third-party hosts on a real WordPress page (w3.org, gravatar,
-      # googleapis) are not, so they stay a note rather than a refusal.
+      # At or under the canonical's apex — the apex sibling of a `www.`
+      # canonical, a `shop.`, a `media.`. Third-party hosts on a real WordPress
+      # page (w3.org, gravatar, googleapis) are not, so they stay a note.
       #
-      # The parent, not a two-label registrable domain: that approximation called
-      # `www.example.co.uk` and `anything.co.uk` relatives, so a healthy `.co.uk`
-      # site was refused and the remedy it printed — add the shared domain as an
-      # alias — would have proxied every unrelated `.co.uk` link on the page. The
-      # parent of `www.example.co.uk` is `example.co.uk`, which needs no public
-      # suffix list to be right. It decides only whether this is loud or fatal;
-      # the count is printed either way.
+      # The apex is the canonical with a leading `www.` removed, and *only*
+      # that. Two wider rules have been tried and both refused `ddev start` on a
+      # correct configuration: a two-label registrable domain called
+      # `www.example.co.uk` and `www.bbc.co.uk` relatives, and round 54's
+      # unconditional parent made the apex of `example.co.uk` be `co.uk`, which
+      # is the same bug one shape over — and the same for `acme.com.au` and for
+      # `client.kinsta.cloud`, the shape a Kinsta staging alias has.
+      #
+      # Stripping one `www.` is a rule rather than a guess: `www` is not a
+      # public suffix in any registry, so `www.x` and `x` are always the same
+      # site, while `x.co.uk` and `y.co.uk` never have to be. It keeps every
+      # catch the wider rules had — `acme.example` under `www.acme.example`,
+      # `media.acme.fi` under `www.acme.fi`, `shop.example.co.uk` under
+      # `example.co.uk` — and drops exactly the false ones.
+      #
+      # Getting this right matters more than the refusal does, because of the
+      # remedy: "add $host as an alias of the canonical" is correct advice for a
+      # real sibling and, followed on a false positive, makes the preview proxy
+      # the BBC. A message that is wrong is noise; a message whose remedy is
+      # wrong costs a working deployment.
       related=""
       for c in $(printf '%s' "$canon_list" | tr ',' ' '); do
-        parent="$c"
-        if [ "$(printf '%s' "$c" | awk -F. '{print NF}')" -ge 3 ]; then
-          parent="$(printf '%s' "$c" | cut -d. -f2-)"
-        fi
-        [ "$host" = "$parent" ] && related=1 && break
-        case "$host" in *".$parent") related=1; break ;; esac
+        apex="${c#www.}"
+        [ "$host" = "$apex" ] && related=1 && break
+        case "$host" in *".$apex") related=1; break ;; esac
       done
       if [ -n "$related" ]; then
         echo "hostshift: refusing to call this healthy — the page served at" >&2
-        echo "  https://$probe carries $cnt links to $host, which this map does" >&2
-        echo "  not name and which is under the same domain as a hostname it" >&2
-        echo "  does ($parent). They are not rewritten, so they are live" >&2
-        echo "  production" >&2
-        echo "  links in a preview." >&2
+        echo "  $(hs_page_carrying "$host") carries $cnt links to $host," >&2
+        echo "  which this map does not name and which is at or under the same" >&2
+        echo "  site as a hostname it does ($apex). They are not rewritten, so" >&2
+        echo "  they are live production links in a preview." >&2
         echo "  Add $host to hostshift.yaml — as an alias of the canonical it" >&2
         echo "  belongs to — and \`ddev hostshift init && ddev restart\`." >&2
         exit 2
       fi
-      echo "hostshift: note: the page carries $cnt links to $host, which this map" >&2
-      echo "  does not name. If that is a third party it is nothing; if it is" >&2
-      echo "  this site under another name, add it to hostshift.yaml." >&2
+      echo "hostshift: note: $(hs_page_carrying "$host")" >&2
+      echo "  carries $cnt reference(s) to $host, which this map does not name" >&2
+      echo "  — so they are not rewritten. If that is a third party or a" >&2
+      echo "  namespace URI it is nothing. If it is this site under another" >&2
+      echo "  name, add it to hostshift.yaml as an alias of the canonical it" >&2
+      echo "  belongs to and \`ddev hostshift init && ddev restart\`." >&2
     done <<EOF
 $others
 EOF

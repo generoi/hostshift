@@ -134,7 +134,7 @@ func TestTheNoteNamesAVariantYouCanActuallyReach(t *testing.T) {
 
 	_, _, errOut := run(t, "", cmdCheck, "-C", dir, "--slug", "wt-a")
 	// Premise: this is the paragraph under test.
-	if !strings.Contains(errOut, "Preview through the variant(s) instead") {
+	if !strings.Contains(errOut, "The variant(s) this map resolves to") {
 		t.Fatalf("fixture: the note did not fire:\n%s", errOut)
 	}
 	if !strings.Contains(errOut, "http://wt-a--acme.ddev.site:8080") {

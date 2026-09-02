@@ -46,7 +46,15 @@ import (
 type hostReplacer struct {
 	// collect, when non-nil, turns every pass into a scan: hosts are recorded
 	// and nothing is rewritten. See locateHostIn.
-	collect map[string]int
+	//
+	// Keyed by host and then by the *source* offset the host starts at, because
+	// a dozen views run over one buffer and several of them find the same URL.
+	// Counting each hit incremented every host once per view that fired, so one
+	// `wp_json_encode`-escaped URL anywhere in the page — which is every
+	// WordPress page — multiplied the whole census. Six SVG namespace
+	// declarations were reported as "24 links to www.w3.org", and a threshold
+	// meaning five links fired at two.
+	collect map[string]map[int]struct{}
 
 	to map[string]origin.Origin
 	// schemes is the set of schemes the variants are served on. The document's
@@ -127,14 +135,29 @@ func isSlashish(c byte) bool { return c == '/' || c == '\\' }
 // an authority in every context the rewriter sees one: a quote, a bracket,
 // whitespace, a comma, a semicolon.
 func isAuthorityByte(c byte) bool {
-	switch {
-	case c >= 0x80:
-		return true
-	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+	// The host-byte half comes from origin, not from a second copy of it. The
+	// two tables answer different questions — this one also has to admit the
+	// authority's own structure — but they must not disagree about what a *host*
+	// byte is, and they did: round 54 taught delimAt that `&` continues a host
+	// and left this stopping there, so `<p>https://www.example.fi&period;x</p>`
+	// was declined by the matcher and rewritten by the locator one pass later.
+	// A browser reads that as www.example.fi.x, and what went out was a variant
+	// hostname glued to `&period;x` that the request direction cannot read back.
+	if origin.IsHostByte(c) {
 		return true
 	}
 	switch c {
-	case '-', '.', '_', '~', '%', '+', '@', ':', '[', ']':
+	// Authority structure. `~` and `+` predate both tables and are wider than
+	// origin's host set; they are kept because narrowing the scan is a separate
+	// change with its own leak risk, and named here so the difference is a
+	// decision rather than a drift.
+	//
+	// `&` is deliberately absent, and belongs to hostRange's end scan instead:
+	// it continues a host that has already started and does not begin one.
+	// Admitting it here removed the left anchor, so `&https:\\www.example.fi/x`
+	// stopped being a candidate at all and the origin survived — a boundary this
+	// file's own TestBoundariesAreNotAnAllowlist exists to hold.
+	case '~', '%', '+', '@', ':', '[', ']':
 		return true
 	}
 	return false
@@ -965,7 +988,14 @@ func hostRange(b []byte, at int) (start, hostEnd, end int, port string) {
 	// calls Tier 1. The byte matcher never had this problem: delimAt knows a
 	// quote ends a host.
 	for i := at; i < end; i++ {
-		if !isAuthorityByte(b[i]) {
+		// `&` continues a host here although it cannot start one, which is why
+		// it is not in isAuthorityByte. A host ends at `/ \ ? #`, so
+		// `https://www.acme.fi&x` names `www.acme.fi&x` — and as a character
+		// reference it is whatever it decodes to, which is more host either way.
+		// delimAt has said so since round 54; this is the copy that still
+		// stopped, so the matcher declined the match and the locator rewrote it
+		// one pass later.
+		if !isAuthorityByte(b[i]) && b[i] != '&' {
 			end = i
 			break
 		}
@@ -1147,6 +1177,31 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, 
 		origin.EscapeContinuesHost(v, n.pos[he], surface) {
 		return 0, 0, "", false
 	}
+	// A port written behind an escaped colon.
+	//
+	// `\x3a8443` is `:8443` to a JavaScript string, and §5.4 says that is a
+	// *different* origin from the bare host. The escape view decodes it and
+	// declines correctly; the plain view folds the backslash to `/`, ends the
+	// host there, sees no port and matches the canonical — so whichever pass
+	// runs first wins, and the plain one does. Reading the port here makes both
+	// passes agree, and it has to be read rather than refused: `\x3a443` is
+	// https's default, which a browser drops, so that one *is* the canonical.
+	if port == "" && he < len(n.pos) && n.pos[he] < len(v) {
+		if w := origin.EscColonLen(v, n.pos[he], surface); w > 0 {
+			d := n.pos[he] + w
+			e := d
+			for e < len(v) && v[e] >= '0' && v[e] <= '9' {
+				e++
+			}
+			if e > d {
+				port = string(v[d:e])
+			} else if e < len(v) && !isURLDelim(v[e]) {
+				// `\072x` — a colon with neither digits nor a delimiter after
+				// it is a parse error, and no browser resolves it.
+				return 0, 0, "", false
+			}
+		}
+	}
 	host := h.key(percentDecode(n.b[hs:he]))
 	// Collecting rather than rewriting.
 	//
@@ -1162,7 +1217,11 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, 
 	// So the answer comes from here, where every view already runs. Recording
 	// and declining leaves the buffer untouched, which is what a scan wants.
 	if h.collect != nil {
-		h.collect[host]++
+		at := n.pos[hs]
+		if h.collect[host] == nil {
+			h.collect[host] = map[int]struct{}{}
+		}
+		h.collect[host][at] = struct{}{}
 		return 0, 0, "", false
 	}
 	// host:port first, and the bare host only when the port is the scheme's
@@ -2011,15 +2070,23 @@ func HostsIn(b []byte) map[string]int {
 	if len(b) == 0 {
 		return nil
 	}
-	h := &hostReplacer{collect: map[string]int{}}
+	h := &hostReplacer{collect: map[string]map[int]struct{}{}}
 	// The reference-decoding pass, which runs every other view inside it. `value`
 	// is false: a page is prose as often as it is markup, and a scan wants the
 	// conservative reading of a trailing dot.
 	//
-	// Raw text for the surface, because the buffer is a whole served page with
-	// its script escapes intact, and what the scan reports is what the browser
-	// would dereference: a canonical followed by `\xe4` resolves somewhere else
-	// and is not an origin this page carries.
-	h.rewriteAllRefs(append([]byte(nil), b...), false, SurfaceRawText, nil)
-	return h.collect
+	// The straggler's surface, because the buffer is a whole served page with its
+	// script escapes intact, and what the scan reports is what the browser would
+	// dereference: a canonical followed by `\xe4` resolves somewhere else and is
+	// not an origin this page carries.
+	//
+	// Not SurfaceRawText, which names the markup inside <noscript> and <title>
+	// and has no string decoder over it. One name cannot mean both, and this is
+	// the caller that made it try.
+	h.rewriteAllRefs(append([]byte(nil), b...), false, SurfaceStraggler, nil)
+	out := make(map[string]int, len(h.collect))
+	for host, at := range h.collect {
+		out[host] = len(at)
+	}
+	return out
 }

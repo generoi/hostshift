@@ -99,7 +99,7 @@ func TestAVariantIsNotDirectlyServed(t *testing.T) {
 		"sites:\n  - canonical: https://www.acme.fi\n    variant: https://preview.ddev.site\n")
 	_, _, errOut := run(t, "", cmdCheck, "-C", dir, "--slug", "wt-a")
 
-	note, _, _ := strings.Cut(errOut, "Preview through the variant(s) instead:")
+	note, _, _ := strings.Cut(errOut, "The variant(s) this map resolves to:")
 	if strings.Contains(note, "https://preview.ddev.site") {
 		t.Errorf("the variant is routed to the proxy, not to web:\n%s", errOut)
 	}
