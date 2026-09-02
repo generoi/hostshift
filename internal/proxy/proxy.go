@@ -450,6 +450,35 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	return p.finishBody(resp, st, changed)
 }
 
+// reportHiddenBase64 is the response-direction mirror of the request arm's
+// report, which round 67 wrote pointing one way only.
+//
+// `WP_REST_Widgets_Controller` returns a legacy widget's settings as
+// `instance.encoded` = base64(serialize(…)), and the widgets screen and the
+// Customizer decode it in JavaScript and render the widget — so a canonical
+// origin in there becomes a live production URL in the developer's
+// authenticated browser. It cannot be rewritten for the reason the other
+// direction cannot: `wp_hash()` covers exactly those bytes. Saying so is the
+// whole remedy.
+//
+// Called from both buffered arms. The HTML arm streams and is never buffered,
+// so a blob spliced into an attribute there is not scanned — the shapes this
+// exists for arrive as REST JSON.
+func (p *Proxy) reportHiddenBase64(resp *http.Response, body []byte) {
+	n, sample := rewrite.HiddenInBase64(body, func(b []byte) []byte {
+		nv, _ := p.Map.Forward().Rewrite(b, rewrite.SurfaceText, false)
+		return nv
+	})
+	if n == 0 {
+		return
+	}
+	p.log().Warn("a canonical origin is inside base64 in this response "+
+		"— it cannot be rewritten without breaking the signature the app checks, "+
+		"so the browser will resolve it against live production",
+		"blobs", n, "method", reqMethod(resp), "path", reqPath(resp),
+		"decoded", firstBytes(sample, 120))
+}
+
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	// Vary first, before anything can return early.
 	//
@@ -541,6 +570,7 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		if err != nil {
 			return err
 		}
+		p.reportHiddenBase64(resp, body)
 		if over != nil {
 			p.log().Warn("JSON body exceeds the size cap, passing through untouched",
 				"cap", p.maxBody(), "content-type", ct,
@@ -604,6 +634,7 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		if err != nil {
 			return err
 		}
+		p.reportHiddenBase64(resp, body)
 		if over != nil {
 			p.log().Warn("body exceeds the size cap, passing through untouched",
 				"cap", p.maxBody(), "content-type", ct,
@@ -863,7 +894,11 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		p.log().Warn("a variant hostname is inside base64 in this request body "+
 			"— it cannot be mapped back without breaking the signature the app "+
 			"checks, so it will reach the shared database as it stands",
-			"blobs", n, "method", r.Method, "path", r.URL.Path,
+			// RequestURI, not Path: the refusal tells a developer to grep this
+			// log to find what was written, and on a plain-permalink site the
+			// REST endpoint is entirely in the query — `path=/index.php` names
+			// nothing.
+			"blobs", n, "method", r.Method, "path", r.URL.RequestURI(),
 			"decoded", firstBytes(sample, 120))
 	}
 	if p.DryRun {

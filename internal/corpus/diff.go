@@ -352,6 +352,20 @@ func compare(ctx context.Context, o Options, path string) Result {
 
 	r.ContentType = variant.contentType
 	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
+	// Base64 here too, and for the same reason it is below: countLeaks runs the
+	// rewrite pipeline, and the pipeline has no base64 view. That reasoning is
+	// direction-free — it is a property of the pipeline, not of which map is
+	// pointed at it — and round 67 applied it to the write-back column alone. So
+	// the mirror of the fixture it added, a widget instance carrying *production's*
+	// hostname served through the proxy, was still scored GREEN. The widgets
+	// screen and the Customizer decode `instance.encoded` in JavaScript and render
+	// it, so that is a live production URL in an authenticated browser.
+	if n, _ := rewrite.HiddenInBase64(variant.body, func(b []byte) []byte {
+		out, _ := o.Map.Forward().Rewrite(b, rewrite.SurfaceRequestBody, false)
+		return out
+	}); n > 0 {
+		r.Leaks += n
+	}
 	// And the other direction, which this could not see at all until round 66.
 	//
 	// Leaks are canonical origins in the *variant* response — test 28. The §4.3

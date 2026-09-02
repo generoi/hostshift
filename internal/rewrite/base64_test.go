@@ -3,6 +3,7 @@ package rewrite
 import (
 	"encoding/base64"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/generoi/hostshift/internal/origin"
@@ -63,6 +64,60 @@ func TestHiddenInBase64(t *testing.T) {
 			}
 			if c.want > 0 && len(sample) == 0 {
 				t.Error("reported a blob with no sample, so the log names nothing")
+			}
+		})
+	}
+}
+
+// RFC 2045 wraps base64 at 76 columns, and a hostname straddling a break sits in
+// no single unbroken run.
+//
+// A `Content-Transfer-Encoding: base64` multipart part is the shape that does
+// this. Round 68 measured the detector reporting nothing on one, with the body
+// forwarded verbatim — narrow, since WordPress core never wraps, but it is where
+// the detector could see least.
+func TestHiddenInBase64AcrossALineBreak(t *testing.T) {
+	rev, err := origin.NewMatcher([]origin.Pair{{
+		Canonical: origin.MustParse("https://wt-a--example.ddev.site"),
+		Variant:   origin.MustParse("https://www.example.fi"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rw := func(b []byte) []byte {
+		out, _ := rev.Rewrite(b, SurfaceRequestBody, false)
+		return out
+	}
+	link := `<a href="https://wt-a--example.ddev.site/promo/">the promo</a>`
+	one := base64.StdEncoding.EncodeToString([]byte(
+		`a:1:{s:7:"content";s:` + strconv.Itoa(len(link)) + `:"` + link + `";}`))
+
+	// Wrapped at 76 columns, which is what an RFC 2045 encoder emits.
+	var wrapped strings.Builder
+	for i := 0; i < len(one); i += 76 {
+		if i > 0 {
+			wrapped.WriteString("\r\n")
+		}
+		wrapped.WriteString(one[i:min(i+76, len(one))])
+	}
+	if !strings.Contains(wrapped.String(), "\r\n") {
+		t.Fatal("fixture is too short to wrap, so it tests nothing")
+	}
+
+	for _, c := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"unwrapped", "customized=" + one, 1},
+		{"wrapped at 76 columns", "customized=" + wrapped.String(), 1},
+		{"wrapped with bare LF", "customized=" + strings.ReplaceAll(wrapped.String(), "\r\n", "\n"), 1},
+		// And whitespace alone is still not a blob.
+		{"a run of spaces", "x=aaaa bbbb cccc dddd eeee ffff gggg hhhh", 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if n, _ := HiddenInBase64([]byte(c.body), rw); n != c.want {
+				t.Errorf("reported %d blobs, want %d", n, c.want)
 			}
 		})
 	}

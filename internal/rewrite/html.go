@@ -446,6 +446,39 @@ func asciiSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
 }
 
+// reportHiddenBase64 warns once per value carrying an origin this map would
+// rewrite, hidden inside base64 where no spelling reaches it.
+//
+// Round 67 added this on the request arm and round 68 found it pointed one way
+// only; putting the response half on the two *buffered* arms then missed the
+// HTML one, which is where the widgets screen actually serves it. The scan is
+// the cheap half — a run of 32+ base64 bytes has to exist before anything is
+// decoded — so ordinary attribute values cost a character-class walk.
+func (w *HTML) reportHiddenBase64(base int, v []byte) {
+	if w.log == nil {
+		return
+	}
+	n, sample := HiddenInBase64(v, func(b []byte) []byte {
+		out, _ := w.m.RewriteText(b, SurfaceText, false)
+		return out
+	})
+	if n == 0 {
+		return
+	}
+	w.log.Warn("an origin is inside base64 here — it cannot be rewritten without "+
+		"breaking the signature the app checks, so the browser will resolve it "+
+		"against live production",
+		"blobs", n, "offset", base, "decoded", firstBytes(sample, 120))
+}
+
+// firstBytes is a log-safe prefix of a decoded blob.
+func firstBytes(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "…"
+}
+
 // writeRawTextAroundStyles writes a raw-text token that the parser would have
 // split into real elements: the content of each `<style>` gets the CSS view, and
 // everything else gets the raw-text view.
@@ -628,6 +661,13 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	if s := structuredAttr(name); s != nil {
 		w.stats.Structured(string(s))
 	}
+	// A canonical origin inside base64 goes out as it stands — `wp_hash()` covers
+	// exactly those bytes, so rewriting it makes the app reject the value — and
+	// the whole remedy is that something says so. The widgets screen carries
+	// `instance.encoded` in a hidden input on an ordinary HTML page, which
+	// streams and is never buffered, so the report has to sit where every value
+	// passes rather than on a whole body.
+	w.reportHiddenBase64(base, v)
 	// An attribute value is a value; a text node, a comment and the contents of
 	// a raw-text element are prose. The distinction is one byte wide — whether
 	// a trailing root dot at the end of the buffer is the host's root label or

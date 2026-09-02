@@ -1,7 +1,7 @@
 #ddev-generated
 # hostshift — the whole DDEV add-on.
 #
-# One compose service, and one host command beside it. No lib.sh, no hooks, no
+# One compose service, and one host command beside it. No lib.sh, no
 # guard; nothing runs during a request. The command writes one file,
 # .ddev/.env — which DDEV does *not* gitignore, contrary to what this comment
 # used to say: the generated .ddev/.gitignore on v1.25.2 has no .env rule, and

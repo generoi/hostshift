@@ -9,6 +9,44 @@ import (
 	"github.com/generoi/hostshift/internal/rewrite"
 )
 
+// boundaryOf extracts the multipart boundary the way the application will.
+//
+// `mime.ParseMediaType` wants Go's parameter grammar, which is RFC 9110's
+// `token`. RFC 2046 §5.1.1's `bchars` is wider — it admits `( ) , / : = ?` and
+// space — so a producer that leaves such a boundary unquoted, which
+// `----=_Part_0_12345.67890` and every base64-derived boundary with `=` padding
+// does, gets an error and a nil params map here. PHP's `php_rfc1867.c` does not
+// tokenise at all: it finds `boundary`, takes the next `=`, and reads to the
+// next `,` or `;`. So the body PHP happily parses and stores was the one
+// hostshift passed through untouched, with the worktree hostname in it (§4.3,
+// unrecoverable).
+//
+// The strict parser is tried first, so every well-formed body keeps exactly the
+// behaviour it had. The lenient read is a fallback, matching what the receiver
+// will do rather than what the sender should have done.
+func boundaryOf(ct string) string {
+	if _, params, err := mime.ParseMediaType(ct); err == nil {
+		if b := params["boundary"]; b != "" {
+			return b
+		}
+	}
+	i := strings.Index(strings.ToLower(ct), "boundary")
+	if i < 0 {
+		return ""
+	}
+	rest := ct[i+len("boundary"):]
+	eq := strings.Index(rest, "=")
+	if eq < 0 {
+		return ""
+	}
+	b := rest[eq+1:]
+	if j := strings.IndexAny(b, ",;"); j >= 0 {
+		b = b[:j]
+	}
+	b = strings.TrimSpace(b)
+	return strings.Trim(b, `"`)
+}
+
 // rewriteMultipart rewrites only the bodies of non-file text parts, splicing
 // them in place (PLAN §5.1).
 //
@@ -19,11 +57,7 @@ import (
 // Locating spans and splicing keeps file parts, boundaries and headers
 // byte-identical, which is what "file parts pass through byte-identical" means.
 func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Stats, explain bool) []byte {
-	_, params, err := mime.ParseMediaType(ct)
-	if err != nil {
-		return body
-	}
-	boundary := params["boundary"]
+	boundary := boundaryOf(ct)
 	if boundary == "" {
 		return body
 	}

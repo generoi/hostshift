@@ -263,11 +263,30 @@ func peelFormField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 // spans has one entry per decoded byte plus a terminator: spans[i] is the offset
 // in val at which decoded byte i begins.
 func formDecodeSpans(val string) (dec string, spans []int, ok bool) {
+	return formDecode(val, true)
+}
+
+// formDecodeOnly is formDecodeSpans for a caller that does not splice.
+//
+// The spans slice is an []int — eight bytes per input byte — so building it for
+// the base64 detector, which reads only the decoded string, allocated 67 MB on
+// an 8 MB body and dropped it. Measured at 633 MB peak live heap against 558 MB
+// with the second view stubbed out, on six concurrent 7.9 MB bodies.
+func formDecodeOnly(val string) (dec string, ok bool) {
+	d, _, o := formDecode(val, false)
+	return d, o
+}
+
+func formDecode(val string, wantSpans bool) (dec string, spans []int, ok bool) {
 	var sb strings.Builder
 	sb.Grow(len(val))
-	spans = make([]int, 0, len(val)+1)
+	if wantSpans {
+		spans = make([]int, 0, len(val)+1)
+	}
 	for i := 0; i < len(val); {
-		spans = append(spans, i)
+		if wantSpans {
+			spans = append(spans, i)
+		}
 		switch c := val[i]; {
 		case c == '+':
 			sb.WriteByte(' ')
@@ -293,7 +312,9 @@ func formDecodeSpans(val string) (dec string, spans []int, ok bool) {
 			i++
 		}
 	}
-	spans = append(spans, len(val))
+	if wantSpans {
+		spans = append(spans, len(val))
+	}
 	return sb.String(), spans, true
 }
 

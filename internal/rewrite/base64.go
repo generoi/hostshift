@@ -37,7 +37,7 @@ func HiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
 	//
 	// `+` decodes to a space here, which is right: a literal `+` inside base64
 	// arrives as `%2B`, and a raw one really was a space.
-	if dec, _, ok := formDecodeSpans(string(b)); ok && dec != string(b) {
+	if dec, ok := formDecodeOnly(string(b)); ok && dec != string(b) {
 		if dn, ds := hiddenInBase64([]byte(dec), rw); dn > n {
 			n, sample = dn, ds
 		}
@@ -51,8 +51,12 @@ func hiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
 			i++
 			continue
 		}
+		// Whitespace inside the run is part of it. RFC 2045 wraps base64 at 76
+		// columns, so a `Content-Transfer-Encoding: base64` part splits the blob
+		// across lines and a hostname straddling a break sits in no single run.
+		// The alphabet check below still bounds what is decoded.
 		j := i
-		for j < len(b) && isB64(b[j]) {
+		for j < len(b) && (isB64(b[j]) || isB64Space(b[j])) {
 			j++
 		}
 		// Padding belongs to the run.
@@ -62,7 +66,11 @@ func hiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
 		// Short runs are words, hex digests and ids, not payloads. A serialized
 		// array holding a URL cannot encode to fewer bytes than this.
 		if j-i >= 32 {
-			if dec, err := base64.StdEncoding.DecodeString(string(b[i:j])); err == nil {
+			run := b[i:j]
+			if hasB64Space(run) {
+				run = stripB64Space(run)
+			}
+			if dec, err := base64.StdEncoding.DecodeString(string(run)); err == nil {
 				if !bytes.Equal(rw(dec), dec) {
 					n++
 					if sample == nil {
@@ -74,6 +82,27 @@ func hiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
 		i = j
 	}
 	return n, sample
+}
+
+func isB64Space(c byte) bool { return c == '\r' || c == '\n' || c == ' ' || c == '\t' }
+
+func hasB64Space(b []byte) bool {
+	for _, c := range b {
+		if isB64Space(c) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripB64Space(b []byte) []byte {
+	out := make([]byte, 0, len(b))
+	for _, c := range b {
+		if !isB64Space(c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func isB64(c byte) bool {

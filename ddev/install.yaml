@@ -7,7 +7,8 @@ name: hostshift
 # The command is where the DDEV- and stack-shaped opinions live — deriving a slug
 # from a branch, deciding which hostnames web keeps, writing .ddev/ files — so
 # that the binary can stay a general origin mapper that scaffolds nothing.
-# PLAN §5.7. There are still no hooks and no guard.
+# PLAN §5.7. There is a post-start hook — config.hostshift.yaml installs one,
+# and it runs `check` on every start — but still no guard.
 
 pre_install_actions:
   - |
