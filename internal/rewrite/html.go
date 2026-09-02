@@ -75,6 +75,12 @@ type HTML struct {
 	// Comparing depths restores the sign: anything that loses track resolves to
 	// "still foreign", which over-decodes.
 	foreignObjectAt int
+	// mathTextPoint records whether the integration point that resumed HTML
+	// rules was a MathML text one, the only kind with a carve-out.
+	mathTextPoint bool
+	// rawTextForeign records whether the open raw-text element is itself a
+	// foreign one, decided at its start tag.
+	rawTextForeign bool
 	// foreignSpan marks a byte range inside one raw-text token as foreign when
 	// the element stack cannot say so.
 	//
@@ -420,6 +426,21 @@ func openForeignBefore(b []byte) bool {
 	return depth > 0
 }
 
+// rcdataOpensBefore reports whether this already-lowercased span opens an
+// element whose content is text rather than markup.
+//
+// Inside one of these the tokenizer would be in RCDATA and no `<style>` after it
+// is an element. They are the elements that swallow markup: `title` and
+// `textarea` are RCDATA, `iframe` and `noscript` are raw text.
+func rcdataOpensBefore(b []byte) bool {
+	for _, n := range [...]string{"title", "textarea", "iframe", "noscript"} {
+		if tagStartIn(b, n) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // asciiSpace is the HTML tokenizer's whitespace, which is not unicode.IsSpace.
 func asciiSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
@@ -441,6 +462,16 @@ func (w *HTML) writeRawTextAroundStyles(off int, raw []byte) {
 			break
 		}
 		i += pos
+		// An RCDATA element opened before it makes this `<style>` literal text
+		// rather than an element: `<svg><title><title><style>` builds an *HTML*
+		// title inside the SVG one, and everything after that is its text — with
+		// references decoded, which is where the origin then sits. The CSS view
+		// does not decode them, so the span walk has to stop here and let the
+		// raw-text view take the rest. Stopping is also the over-decode
+		// direction, which is the one to fail toward.
+		if rcdataOpensBefore(low[pos:i]) {
+			break
+		}
 		gt := bytes.IndexByte(raw[i:], '>')
 		if gt < 0 {
 			break
@@ -938,6 +969,18 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// and inline script is where the JS URLs actually are (§5.2).
 			if name := rawTextElement(tagNameOf(raw)); name != "" {
 				w.rawText = name
+				// Whether the *element* is a foreign one is decided here, at its
+				// start tag, and not later by whatever the stack says while its
+				// content is being written. `<svg><foreignObject><title>` is an
+				// HTML title — HTML rules resumed at the foreignObject — so a
+				// `<style>` inside it is literal text and not an element, while
+				// `<svg><title>` is an SVG one where the parser builds a real
+				// stylesheet. Reading the current state instead gave the first a
+				// CSS view, and the CSS view is the one view here that does not
+				// decode references, so the decoded title text kept naming
+				// production. §4.4's copy-paste hazard, found by the generated
+				// grid and by neither auditor.
+				w.rawTextForeign = w.inForeignContent()
 			}
 			// Foreign content: inside <svg> and <math> the HTML tokenizer never
 			// enters the raw-text states, so a browser decodes character
@@ -968,6 +1011,27 @@ func (w *HTML) Read(p []byte) (int, error) {
 			if n := string(bytes.ToLower(tagNameOf(raw))); w.inForeignContent() &&
 				breaksOutOfForeign(n, raw) {
 				w.foreignNS = w.foreignNS[:w.foreignObjectAt]
+			}
+			// `<mglyph>` and `<malignmark>` are 13.2.6's carve-out: inside a
+			// MathML text integration point every start tag goes to the HTML
+			// insertion mode *except* those two, which are processed by the
+			// foreign-content rules and inserted as MathML elements. So the
+			// parser is back in foreign content below them and decodes character
+			// references there — measured, `<math><mi><mglyph><script>` puts that
+			// script in the MathML namespace with its references resolved, while
+			// `<math><mi><span><script>` is an HTML script where they are not.
+			//
+			// Round 63's daily audit flagged this as unsettled and could not
+			// build a payload; the payload is a `<script>` the page runs.
+			//
+			// Not restored on the end tag: staying foreign for the rest of the
+			// integration point over-decodes, which is the direction to fail in.
+			if w.foreignObjectAt > 0 && w.mathTextPoint &&
+				len(w.foreignNS) == w.foreignObjectAt {
+				switch string(bytes.ToLower(tagNameOf(raw))) {
+				case "mglyph", "malignmark":
+					w.foreignObjectAt = 0
+				}
 			}
 			// The push stays start-tags-only: a self-closing `<svg/>` opens and
 			// closes in the same token, so it never becomes the current node.
@@ -1024,6 +1088,9 @@ func (w *HTML) Read(p []byte) (int, error) {
 					// "foreign", which over-decodes.
 					if integrationPointIn(n, w.currentNS()) && w.foreignObjectAt == 0 {
 						w.foreignObjectAt = len(w.foreignNS)
+						// Only a MathML *text* integration point carries the
+						// mglyph/malignmark carve-out; SVG has no analogue.
+						w.mathTextPoint = w.currentNS() == "math"
 					}
 				}
 			}
@@ -1096,7 +1163,7 @@ func (w *HTML) Read(p []byte) (int, error) {
 				// sees and not a stylesheet — round 60's text/plain over-rewrite
 				// again, in one element. The text keeps the raw-text view, which
 				// still decodes character references in foreign content.
-				if len(w.foreignNS) > 0 && integrationPointIn(w.rawText, w.currentNS()) &&
+				if w.rawTextForeign && integrationPointIn(w.rawText, w.currentNS()) &&
 					tagStartIn(bytes.ToLower(raw), "style") >= 0 {
 					w.writeRawTextAroundStyles(off, raw)
 					break

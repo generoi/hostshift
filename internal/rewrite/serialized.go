@@ -2,7 +2,6 @@ package rewrite
 
 import (
 	"bytes"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -209,26 +208,113 @@ func UnreadSerialized(b []byte, rw func([]byte) []byte) bool {
 // one layer the content type *declares* is the fix, and the three spellings then
 // handle what is inside.
 //
-// The peel applies only when re-encoding reproduces the original bytes exactly.
-// That guard is what makes it safe: a value this cannot round-trip is left to
-// the existing path untouched, so no body can be reshaped in passing — and where
-// it does apply, an unchanged value re-encodes to itself, byte for byte.
+// It splices rather than re-serialising, and that is the whole of why it is safe.
+//
+// Round 63 guarded the peel by requiring the value to re-encode byte-identically,
+// first under Go's `url.QueryEscape` and then under the WHATWG *form-submission*
+// serializer. Both are the wrong question, because there is no one encoder: a
+// `<form>` POST, `URLSearchParams`, and jQuery's `encodeURIComponent` with
+// `%20`→`+` — which is what WordPress core posts from `admin-ajax.php` and the
+// Customizer — disagree on `!`, `'`, `(`, `)` and `~`. Every disagreement
+// declined the peel whole, so the Customizer's `customized` field, which carries
+// every setting in one value, leaked its variant hostname into the shared
+// database the moment any setting held a paren or an apostrophe. `url()` in CSS
+// always holds parens. Read back out of a real database, and served from the
+// canonical hostname to everyone afterwards.
+//
+// So: decode, rewrite, and put back only the bytes that changed, keeping every
+// other byte's original spelling exactly as the sender wrote it. No sender's
+// encoder has to be guessed, and the replacement is a hostname — unreserved
+// bytes that every one of those encoders spells the same way.
 func peelFormField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	eq := bytes.IndexByte(b, '=')
 	if eq < 0 || !bytes.ContainsRune(b[eq+1:], '%') {
 		return nil, false
 	}
 	val := string(b[eq+1:])
-	dec, err := url.QueryUnescape(val)
-	if err != nil || formEncode(dec) != val {
+	dec, spans, ok := formDecodeSpans(val)
+	if !ok {
 		return nil, false
 	}
-	rep := RepairSerialized([]byte(dec), rw)
-	if string(rep) == dec {
+	rep := string(RepairSerialized([]byte(dec), rw))
+	if rep == dec {
 		return nil, false
+	}
+	// The changed range, as one span between the common prefix and suffix.
+	// Everything outside it is copied through in the sender's own spelling.
+	p := 0
+	for p < len(dec) && p < len(rep) && dec[p] == rep[p] {
+		p++
+	}
+	sfx := 0
+	for sfx < len(dec)-p && sfx < len(rep)-p &&
+		dec[len(dec)-1-sfx] == rep[len(rep)-1-sfx] {
+		sfx++
 	}
 	out := append([]byte(nil), b[:eq+1]...)
-	return append(out, formEncode(string(rep))...), true
+	out = append(out, val[:spans[p]]...)
+	out = append(out, formEncode(rep[p:len(rep)-sfx])...)
+	return append(out, val[spans[len(dec)-sfx]:]...), true
+}
+
+// formDecodeSpans decodes an urlencoded value and records where each decoded
+// byte came from, so a rewrite can be spliced back without re-encoding the rest.
+//
+// spans has one entry per decoded byte plus a terminator: spans[i] is the offset
+// in val at which decoded byte i begins.
+func formDecodeSpans(val string) (dec string, spans []int, ok bool) {
+	var sb strings.Builder
+	sb.Grow(len(val))
+	spans = make([]int, 0, len(val)+1)
+	for i := 0; i < len(val); {
+		spans = append(spans, i)
+		switch c := val[i]; {
+		case c == '+':
+			sb.WriteByte(' ')
+			i++
+		case c == '%':
+			// An invalid escape is three literal bytes, which is what the
+			// WHATWG parser and PHP both do with `50%25 off` written as
+			// `50% off`. Declining the whole field instead — the first version
+			// of this — meant a value with one stray `%` kept its variant
+			// hostname all the way into the shared database, and a stray `%` in
+			// a setting is ordinary.
+			h, ok1 := hexAt(val, i+1)
+			l, ok2 := hexAt(val, i+2)
+			if !ok1 || !ok2 {
+				sb.WriteByte('%')
+				i++
+				break
+			}
+			sb.WriteByte(h<<4 | l)
+			i += 3
+		default:
+			sb.WriteByte(c)
+			i++
+		}
+	}
+	spans = append(spans, len(val))
+	return sb.String(), spans, true
+}
+
+// hexAt reads one hex digit at i, reporting whether there is one there.
+func hexAt(s string, i int) (byte, bool) {
+	if i >= len(s) {
+		return 0, false
+	}
+	return unhexDigit(s[i])
+}
+
+func unhexDigit(c byte) (byte, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0', true
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10, true
+	case 'A' <= c && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 // formEncode is the WHATWG urlencoded serializer — what the browser that sent

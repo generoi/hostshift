@@ -338,13 +338,13 @@ func TestR63AFormEncodedOriginComesHome(t *testing.T) {
 		// is left alone rather than reshaped in passing.
 		{"a value that does not round-trip is untouched",
 			"v=no%20plus%20style", "v=no%20plus%20style"},
-		// The guard is what keeps the peel from reshaping a body in passing:
-		// this value *does* carry an origin under two layers, but its spaces are
-		// `%20` where re-encoding writes `+`. Rewriting it would hand the app a
-		// value whose other bytes had been rewritten too, so it is declined
-		// whole. A conservative miss, and a deliberate one.
-		{"an origin whose encoding cannot be reproduced is declined, not reshaped",
-			"v=x%20y%20" + esc(esc(variant)), "v=x%20y%20" + esc(esc(variant))},
+		// Round 63 declined this whole, because its spaces are `%20` where the
+		// re-encoder writes `+` and the guard asked for a byte-identical
+		// round-trip. Round 65 replaced that guard with a splice: the origin
+		// comes home and every byte outside it keeps the sender's own spelling,
+		// `%20` included. There is no encoder to guess any more.
+		{"an origin comes home without reshaping the spelling around it",
+			"v=x%20y%20" + esc(esc(variant)), "v=x%20y%20" + esc(esc(canon))},
 		{"a field with nothing to do is untouched",
 			"v=nothing-to-do", "v=nothing-to-do"},
 	} {
