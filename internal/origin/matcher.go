@@ -466,7 +466,7 @@ const (
 // renamed surface fails a test here rather than silently falling to the default.
 func escapeAlphabetFor(surface string) escAlphabet {
 	switch surface {
-	case "html-attr", "text", "comment", "header", "response-header",
+	case "html-attr", "text", "xml-text", "comment", "header", "response-header",
 		"request-line", "request-body":
 		return escPath
 	// The three round 54 missed, and they are all attribute values or markup.

@@ -12,8 +12,18 @@
 #   test/bootstrap-ddev.sh up      create the project and run the suite
 #   test/bootstrap-ddev.sh down    delete it
 #
-# The canonical hostnames use the reserved .test TLD, so nothing here can reach
-# a real site even if the loopback containment were broken.
+# The canonical hostnames use the reserved .example TLD, so nothing here can
+# reach a real site even if the loopback containment were broken.
+#
+# `.example` and not `.test`, which this used until round 60. `check` skips
+# `*.test` along with localhost and `*.ddev.site` — right for a real deployment,
+# where those never name production — so on the only reproducible WordPress
+# fixture this project has, every sibling of the canonical was skipped and the
+# whole related-unmapped refusal was unreachable. Measured: six links to
+# `media.hostshift-a.test` on the page and `check` exited 0 printing nothing;
+# the same fixture under `.example` refused immediately. `.example` is reserved
+# by RFC 2606 exactly as `.test` is, does not resolve, and is not in that skip
+# list.
 set -euo pipefail
 
 PROJECT=${HOSTSHIFT_TEST_PROJECT:-hostshift-e2e}
@@ -21,8 +31,8 @@ ROOT=${HOSTSHIFT_TEST_ROOT:-$HOME/Projects/Genero/$PROJECT}
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLUG=wt-a
 
-CANON_A=www.hostshift-a.test
-CANON_B=www.hostshift-b.test
+CANON_A=www.hostshift-a.example
+CANON_B=www.hostshift-b.example
 VARIANT_A=$SLUG--$PROJECT.ddev.site
 VARIANT_B=$SLUG--b.$PROJECT.ddev.site
 

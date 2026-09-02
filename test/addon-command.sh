@@ -1527,7 +1527,9 @@ out="$(cd "$wt" && HS_CURL_BODY="$apexleak" \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 [ "$rc" = 2 ] && pass "an origin the map names nowhere is refused" \
   || fail "an origin the map names nowhere is refused" "exit $rc"
-contains "and it is named with its count" "links to acme.example" "$out"
+contains "and it is named with its count" "reference(s) to" "$out"
+contains "and the host it counted" "acme.example" "$out"
+contains "and the count is not attributed to one page" "across the pages probed" "$out"
 contains "and the remedy is an alias" "as an alias of the canonical" "$out"
 
 # ...and a third party is a note, not a refusal. A real WordPress page carries
@@ -1687,11 +1689,13 @@ contains "the leak refusal offers a remedy that runs here" "--explain" "$out"
 # mid test-28 incident recreated every container in the project on the tool's own
 # instruction and learned nothing.
 contains "and the remedy greps a word the proxy writes" "grep census" "$out"
-contains "and it says why diff cannot compare under this map" "additional_fqdns" "$out"
+contains "and it says why the router cannot answer for the canonical" "returns 404" "$out"
+contains "and it routes diff at web's published port" "docker port" "$out"
+contains "and the diff command it prints passes --slug" "hostshift diff --slug" "$out"
 case "$out" in
-  *"hostshift diff --slug"*)
-    fail "and it does not print a diff command that returns 404" "$out" ;;
-  *) pass "and it does not print a diff command that returns 404" ;;
+  *"Add that hostname to"*|*"additional_fqdns first"*)
+    fail "and it does not send them to /etc/hosts" "advised additional_fqdns" ;;
+  *) pass "and it does not send them to /etc/hosts" ;;
 esac
 writefake
 
@@ -1738,9 +1742,43 @@ contains "and it names the direction's own harm" "shared database" "$out"
 # wp_options: a save lands in post content, an upload in post meta. Measured —
 # a 33 KB REST save put the variant in wp_posts while the printed query returned
 # nothing and exit 0, which a developer reads as "nothing was written".
-contains "and the sweep looks in post content" "wp_posts" "$out"
-contains "and in post meta" "wp_postmeta" "$out"
+contains "and the sweep looks in post content" "post_content', count(*) from wp_posts" "$out"
+contains "and at the guid" "guid', count(*) from wp_posts" "$out"
+contains "and in post meta" "postmeta', count(*) from wp_postmeta" "$out"
 contains "and says a subsite keeps its own tables" "wp_2_posts" "$out"
+
+# ...and it queries the database the *application* writes to.
+#
+# `ddev exec -s db` is this project's own container. In a worktree sharing the
+# parent's — the configuration this whole tool exists for — that container is
+# idle, so the sweep printed zeros about the one thing the message above says
+# has no undo, while the rows sat in production's database. copy-db has detected
+# this state since round 40 and the remedies never asked it.
+writefake
+printf 'time=x level=WARN msg="request body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
+  >> "$HS_FAKE_DIR/logs"
+sharedbin="$work/sharedbin"; mkdir -p "$sharedbin"
+cat > "$sharedbin/ddev" <<'SHAREDDEV'
+#!/usr/bin/env bash
+# A worktree whose web container reads the parent's database.
+case "$*" in
+  *printenv*) echo "DB_HOST=ddev-acme-db" ;;
+esac
+exit 0
+SHAREDDEV
+chmod +x "$sharedbin/ddev"
+out="$(cd "$wt" && PATH="$sharedbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"ddev exec -s db"*)
+    fail "the sweep names the database the application writes to" \
+      "pointed at this project's own idle container" ;;
+  *"docker exec ddev-acme-db"*)
+    pass "the sweep names the database the application writes to" ;;
+  *) fail "the sweep names the database the application writes to" \
+       "named neither: $out" ;;
+esac
+writefake
+
 case "$out" in
   *"went to"*"the browser unrewritten"*)
     fail "and it is not described as a response" "$out" ;;

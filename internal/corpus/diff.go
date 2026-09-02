@@ -566,15 +566,23 @@ func applyLikeTheProxy(m *origin.Matcher, body []byte, ct string, st *rewrite.St
 		// scorer disagreed with the proxy on any body carrying an `s:N:"…"` —
 		// which sends the run spuriously RED on a real page.
 		var ev []origin.Event
+		// The same surface the proxy picks, by the same question: an XML body's
+		// `<style>` is CSS and its references are decoded, and nothing decodes
+		// either in text/plain. Naming it `text` on both arms let the scorer read
+		// a plain-text body as a stylesheet exactly as the proxy did.
+		textSurface := rewrite.SurfaceText
+		if strings.HasSuffix(mt, "xml") {
+			textSurface = rewrite.SurfaceXMLText
+		}
 		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
-			nv, nev := m.RewriteText(b, rewrite.SurfaceText, false)
+			nv, nev := m.RewriteText(b, textSurface, false)
 			ev = append(ev, nev...)
 			if strings.HasSuffix(mt, "xml") {
-				return rewrite.HostLeaksXMLCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+				return rewrite.HostLeaksXMLCounted(m, nv, false, st, textSurface, 0)
 			}
-			return rewrite.HostLeaksCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+			return rewrite.HostLeaksCounted(m, nv, false, st, textSurface, 0)
 		})
-		st.Record(rewrite.SurfaceText, 0, ev)
+		st.Record(textSurface, 0, ev)
 		// Inside the repair: the sweep is a raw byte matcher, so a host it
 		// rewrites inside a serialized string leaves the length stale. On
 		// RewriteJSON's decline path — a duplicate member is legal JSON and

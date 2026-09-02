@@ -463,6 +463,7 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 	want := map[string]bool{
 		SurfaceHTMLAttr:       false,
 		SurfaceText:           false,
+		SurfaceXMLText:        false,
 		SurfaceComment:        false,
 		SurfaceHeader:         false,
 		SurfaceResponseHeader: false,
@@ -477,6 +478,29 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		SurfaceJSONString:     true,
 		SurfaceJSONEscape:     false,
 	}
+	// The second axis: whether a CSS tokenizer runs before the URLs are read.
+	// surfaceDecodesCSS defaults to true, and its comment claimed this test
+	// guarded it a round before the guard existed — so `text` inherited the
+	// default in silence and a text/plain body was read as a stylesheet.
+	wantCSS := map[string]bool{
+		SurfaceHTMLAttr:       true, // a style="" attribute
+		SurfaceText:           false,
+		SurfaceXMLText:        true, // an SVG's <style>
+		SurfaceComment:        true,
+		SurfaceHeader:         true, // the request side, which reads what we emit
+		SurfaceResponseHeader: false,
+		SurfaceRequestLine:    true,
+		SurfaceRequestBody:    true,
+		SurfaceInlineStyle:    true,
+		SurfaceHTMLEntity:     true,
+		SurfaceHTMLObfuscated: true,
+		SurfaceRawText:        true,
+		SurfaceInlineScript:   true,
+		SurfaceStraggler:      true,
+		SurfaceJSONString:     true,
+		SurfaceJSONEscape:     true,
+	}
+
 	found := surfaceConstants(t)
 	// Every name in the table must have been seen, or the scanner is narrower
 	// than the thing it guards and the check passes by looking at less. Round 55
@@ -497,6 +521,14 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		}
 	}
 	for name, value := range found {
+		css, classified := wantCSS[value]
+		if !classified {
+			t.Errorf("%s = %q is not classified for the CSS axis: decide whether a "+
+				"tokenizer runs over that surface before its URLs are read, and "+
+				"say so in rewrite.surfaceDecodesCSS and here", name, value)
+		} else if got := surfaceDecodesCSS(value); got != css {
+			t.Errorf("%s (%q): surfaceDecodesCSS = %v, want %v", name, value, got, css)
+		}
 		esc, listed := want[value]
 		if !listed {
 			t.Errorf("%s = %q is not classified: decide whether a buffer on that "+

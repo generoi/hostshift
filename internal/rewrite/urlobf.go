@@ -1932,12 +1932,27 @@ func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte
 // A switch and not `surface != SurfaceResponseHeader`, which is how this was
 // first written and what let `diff` lose the fix: `HostLeaks(b, true)` renames
 // the buffer to SurfaceHTMLAttr through bareSurface, and against a negative test
-// a rename silently re-arms the view. Every surface is classified here, and
-// rewrite.TestSurfaceNamesAreKnownHere requires a new one to be added.
+// a rename silently re-arms the view.
+//
+// The default is "a CSS tokenizer may run", which is the direction that
+// over-rewrites rather than leaks. TestSurfaceNamesAreKnownHere classifies every
+// surface on this axis as well, so a new one has to be decided here rather than
+// inheriting the default in silence — the earlier version of this comment
+// claimed that guarantee before it existed.
 func surfaceDecodesCSS(surface string) bool {
 	switch surface {
 	// A browser following a Location runs the URL parser and nothing else.
 	case SurfaceResponseHeader:
+		return false
+	// And nothing at all decodes a CSS escape in text/plain. The same call site
+	// already splits by content type for the reference view — "nothing parses
+	// references in plain text, so leaving them is correct there" — and the CSS
+	// view needed the identical split: 3,876 of 6,300 CSS-encoded corpus shapes
+	// were being changed in a document the reader sees literally, where ada
+	// resolves the bytes as served to the *variant* and so nothing points at
+	// production at all. An SVG shares the arm and its `<style>` really is CSS,
+	// which is why the split is by media type and not by this name.
+	case SurfaceText:
 		return false
 	}
 	return true
@@ -2178,7 +2193,11 @@ func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAllRefs(b, value, bareSurface(value), nil)
+	// The XML family names itself: an SVG's `<style>` is CSS, and bareSurface
+	// would call this `text`, which round 60 made CSS-free because nothing
+	// decodes an escape in text/plain. The counted form takes its surface from
+	// the caller, which is where the proxy makes the same choice by media type.
+	return hostsFor(m).rewriteAllRefs(b, value, SurfaceXMLText, nil)
 }
 
 // Counted returns HostLeaks, HostLeaksBack and HostLeaksXML with the census

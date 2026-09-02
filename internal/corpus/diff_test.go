@@ -429,8 +429,7 @@ func TestTheScorerRunsTheArmTheProxyWouldRun(t *testing.T) {
 			`<rss><channel><item><guid>https:&#47;&#47;www.canon.test/x</guid></item></channel></rss>`},
 		{"a sitemap loc, css-escaped", "application/xml",
 			`<urlset><url><loc>https\3a \2f \2f www.canon.test/x</loc></url></urlset>`},
-		{"css escapes in plain text", "text/plain",
-			`a{background:url(https\3a \2f \2f www.canon.test/x)}`},
+
 		{"an atom link href, which always worked", "application/atom+xml",
 			`<feed><entry><link href="https:&#47;&#47;www.canon.test/x"/></entry></feed>`},
 		{"an ordinary page, which always worked", "text/html",
@@ -444,6 +443,24 @@ func TestTheScorerRunsTheArmTheProxyWouldRun(t *testing.T) {
 			}
 		})
 	}
+
+	// And the row that used to be here: a CSS escape in text/plain.
+	//
+	// It asserted that the proxy rewrites it and the scorer must agree. The
+	// parity claim was right and the premise was not — ada resolves the bytes as
+	// served to the *variant*, because `\3a` is not a colon to the URL parser,
+	// so the value is a relative reference and nothing in it points at
+	// production. Round 58 recorded this as "a decision, not a bug"; round 60
+	// asked ada and it is a bug. Nothing decodes a CSS escape in text/plain, and
+	// changing those bytes corrupts a document the reader sees literally.
+	t.Run("css escapes in plain text are not CSS", func(t *testing.T) {
+		body := `a{background:url(https\3a \2f \2f www.canon.test/x)}`
+		leaks, tier2 := countLeaks(m, response{body: []byte(body), contentType: "text/plain"})
+		if leaks != 0 || tier2 != 0 {
+			t.Errorf("a browser resolves this to the variant, so nothing here "+
+				"points at production and nothing may be scored as a leak:\n%s", body)
+		}
+	})
 }
 
 // The assertion that would have caught rounds twenty-two through twenty-six on

@@ -128,3 +128,39 @@ func TestR58AResponseHeaderDecodesNoCSSEscapeAnySpelling(t *testing.T) {
 		}
 	}
 }
+
+// `<foreignObject>` is where SVG hands the parser back to HTML.
+//
+// Inside `<svg>` the parser is in foreign content and decodes character
+// references in `<script>` and `<style>` — verified in Chrome, which is why the
+// engine decodes them there. `<foreignObject>` is named for the fact that its
+// children are *not* foreign: the parser returns to HTML rules, so an HTML
+// `<script>` inside it is script data and decodes nothing. Treating it as
+// foreign rewrote a JS string literal the browser reads verbatim, which is the
+// mirror of the error this whole file guards against.
+func TestR60ForeignObjectReturnsToHTMLRules(t *testing.T) {
+	m := r55Matcher(t)
+	// The control first: inside <svg> and outside <foreignObject>, a reference
+	// really is decoded, so this must still be rewritten.
+	ctl := `<svg><script>fetch("https:&#47;&#47;` + r55Canonical + `/x")</script></svg>`
+	if out := rewriteHTML(t, m, ctl, NewStats(false)); !strings.Contains(out, r55Variant) {
+		t.Fatalf("the foreign-content decode regressed, so the case below proves "+
+			"nothing:\n  %s", out)
+	}
+	// And inside foreignObject it is not.
+	in := `<svg><foreignObject><script>fetch("https:&#47;&#47;` + r55Canonical +
+		`/x")</script></foreignObject></svg>`
+	if out := rewriteHTML(t, m, in, NewStats(false)); out != in {
+		t.Errorf("a script inside <foreignObject> is HTML script data and decodes "+
+			"no references, so this is not a URL and nothing may change:\n  in  %s\n  out %s",
+			in, out)
+	}
+	// ...and the depth is tracked, not just the presence: back outside it, the
+	// decode is on again.
+	after := `<svg><foreignObject><p>x</p></foreignObject>` +
+		`<script>fetch("https:&#47;&#47;` + r55Canonical + `/x")</script></svg>`
+	if out := rewriteHTML(t, m, after, NewStats(false)); !strings.Contains(out, r55Variant) {
+		t.Errorf("the foreignObject depth was not unwound, so a real decode was "+
+			"lost after it closed:\n  %s", out)
+	}
+}

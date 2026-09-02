@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -236,6 +238,119 @@ func TestR59TheCookieNameIsNotAnAttribute(t *testing.T) {
 	} {
 		if got := p.dropCookieDomain(c.in); got != c.want {
 			t.Errorf("Set-Cookie %q\n  got  %q\n  want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// The size-cap WARN names the request it belongs to.
+//
+// `check`'s refusal promises "Which paths:" and points the developer at these
+// log lines, and they carried `cap` and `content-type` only — so the answer to
+// "which large responses put production origins in the browser" was a
+// content-type histogram. Same gap on the request side, where the question is
+// which save wrote a variant hostname into the shared database.
+func TestR60TheSizeCapWarnNamesThePath(t *testing.T) {
+	big := `{"u":"https://www.example.fi/x","pad":"` + strings.Repeat("z", 4096) + `"}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(big))
+	}))
+	defer up.Close()
+	target, _ := url.Parse(up.URL)
+
+	m, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://www.example.fi"),
+		Variant:   origin.MustParse("https://wt-a--ex.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	p := &Proxy{
+		Upstream: target, Map: m, Stats: rewrite.NewStats(false),
+		MaxBody: 128, // below the body above, so the cap fires
+		Log:     slog.New(slog.NewTextHandler(&log, nil)),
+	}
+	front := httptest.NewServer(p.Handler())
+	defer front.Close()
+
+	req, _ := http.NewRequest("GET", front.URL+"/wp-json/wp/v2/posts/5", nil)
+	req.Host = "wt-a--ex.ddev.site"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	got := log.String()
+	if !strings.Contains(got, "size cap") {
+		t.Fatalf("fixture: the cap did not fire, so this asserts nothing:\n%s", got)
+	}
+	for _, want := range []string{"/wp-json/wp/v2/posts/5", "GET"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the log promises \"which paths\" and does not carry %q:\n%s",
+				want, got)
+		}
+	}
+}
+
+// The self-redirect carve-out is a *response* event.
+//
+// It is the one enumerated test-28 exemption — an asset the worktree does not
+// have, redirected to the canonical on purpose, which redirect-uploads.conf does
+// in 87% of the fleet — and it was filed under the surface that means §4.3, a
+// variant hostname going into the database. Round 59 moved the guard that
+// decides it and left the Record that reports it, and the test written to stop
+// exactly that inversion asserts only on the rewrite counters, so it could not
+// see a third Record that only ever skips.
+func TestR60TheSelfRedirectIsAResponseEvent(t *testing.T) {
+	m, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://www.example.fi"),
+		Variant:   origin.MustParse("https://wt-a--ex.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The shape redirect-uploads.conf produces: a missing asset 302'd to the
+	// canonical origin at the same path the browser asked for.
+	const path = "/wp-content/uploads/2026/01/missing.jpg"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://www.example.fi"+path)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer up.Close()
+	target, _ := url.Parse(up.URL)
+
+	st := rewrite.NewStats(true)
+	var seen []string
+	st.OnEvent(func(surface string, e origin.Event) {
+		if e.Reason == origin.ReasonSelfRedirect {
+			seen = append(seen, surface)
+		}
+	})
+	p := &Proxy{Upstream: target, Map: m, Stats: st,
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	front := httptest.NewServer(p.Handler())
+	defer front.Close()
+
+	req, _ := http.NewRequest("GET", front.URL+path, nil)
+	req.Host = "wt-a--ex.ddev.site"
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if len(seen) == 0 {
+		t.Fatalf("fixture: no self-redirect event was recorded, so this asserts nothing")
+	}
+	for _, surface := range seen {
+		if surface != rewrite.SurfaceResponseHeader {
+			t.Errorf("a self-redirect — a canonical origin going to the browser — "+
+				"was filed under %q, the surface that means a variant hostname "+
+				"going into the database", surface)
 		}
 	}
 }

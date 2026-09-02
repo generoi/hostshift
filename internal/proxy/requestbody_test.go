@@ -158,7 +158,7 @@ func TestEveryTypeTheResponseRewritesIsMappedBack(t *testing.T) {
 // which is why nothing noticed.
 func TestWhateverIsRewrittenIsCounted(t *testing.T) {
 	for _, c := range []struct{ name, ctype, body string }{
-		{"a css-escaped response body", "text/plain",
+		{"a css-escaped response body", "application/xml",
 			`<loc>https\3a \2f \2f www.acmecorp.fi/x</loc>`},
 		{"a percent-composed response body", "text/plain",
 			`https%3A%5C%2F%5C%2Fwww.acmecorp.fi%2Fx`},

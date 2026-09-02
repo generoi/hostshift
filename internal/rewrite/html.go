@@ -44,6 +44,9 @@ type HTML struct {
 	hosts   *hostReplacer
 	xmlEnt  bool
 	foreign int // depth inside <svg>/<math>, where references are decoded
+	// foreignObject is depth inside <foreignObject>, where the parser goes back
+	// to HTML rules and references are *not* decoded in script or style.
+	foreignObject int
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -196,6 +199,29 @@ var rawTextNameBytes = func() [][]byte {
 	return out
 }()
 
+// rcdataElement reports whether an element's text is RCDATA rather than RAWTEXT.
+//
+// The tokenizer hands both back as one text token, and rawTextNames is one list
+// — but the parser has three states for them. RAWTEXT (`style`, `xmp`,
+// `iframe`, `noembed`, `noframes`) decodes nothing, which is what SurfaceRawText
+// is documented for. **RCDATA** (`title`, `textarea`) decodes character
+// references (HTML 13.2.5.2), and `noscript` with scripting disabled is
+// ordinary parsed markup, so it decodes them too. Measured: `&#47;&#47;` was
+// decoded 22 times out of 22 in an `href` and 0 out of 22 in a `title`, while
+// ada resolves the decoded form to the canonical either way.
+//
+// `noscript` is the one of the three that is dereferenced — its classic payload
+// is an analytics `<img>` — so this is test 28 there and a byte-accuracy
+// question in the other two. A proxy cannot know whether scripting is on, and
+// decoding is the direction that rewrites rather than leaks.
+func rcdataElement(name string) bool {
+	switch name {
+	case "title", "textarea", "noscript":
+		return true
+	}
+	return false
+}
+
 // rawTextElement returns the canonical name when name is a raw-text element,
 // and "" otherwise. Case-folding here rather than lowercasing into a string is
 // what keeps a start tag from allocating at all.
@@ -304,7 +330,8 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	out = w.foldedHostLeak(surface, base, out, value)
 	// An XML parser decodes references inside script and style; an HTML parser
 	// does not. Attribute values are already handled by decodeEntityLeak on both.
-	if (w.xmlEnt || w.foreign > 0) &&
+	inForeign := w.foreign > 0 && w.foreignObject == 0
+	if (w.xmlEnt || inForeign || (surface == SurfaceRawText && rcdataElement(w.rawText))) &&
 		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
 			surface == SurfaceRawText || surface == SurfaceText) {
 		// refsLeak alone, deliberately. The composed refs-then-CSS view would
@@ -609,16 +636,30 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// foreign content: the same SVG served standalone was rewritten and
 			// inlined in a page was not.
 			if tt == html.StartTagToken {
-				if n := string(bytes.ToLower(tagNameOf(raw))); n == "svg" || n == "math" {
+				switch n := string(bytes.ToLower(tagNameOf(raw))); n {
+				case "svg", "math":
 					w.foreign++
+				case "foreignobject":
+					// Which is what it is named for: inside it the parser
+					// returns to HTML rules, so an HTML <script> there is
+					// script data and decodes nothing. Counting it as foreign
+					// decoded references the browser reads verbatim — a
+					// rewrite of a JS string literal, the mirror of the error
+					// this file exists to prevent.
+					w.foreignObject++
 				}
 			}
 			w.write(off, len(raw), w.rewriteTag(raw, off))
 		case html.EndTagToken:
 			w.rawText = ""
-			if n := string(bytes.ToLower(endTagNameOf(raw))); n == "svg" || n == "math" {
+			switch n := string(bytes.ToLower(endTagNameOf(raw))); n {
+			case "svg", "math":
 				if w.foreign > 0 {
 					w.foreign--
+				}
+			case "foreignobject":
+				if w.foreignObject > 0 {
+					w.foreignObject--
 				}
 			}
 			w.write(off, len(raw), raw)

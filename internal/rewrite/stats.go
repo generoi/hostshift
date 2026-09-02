@@ -25,7 +25,12 @@ const (
 	// paragraph quoting its own URL, and sage-cachetags emitting one per cached
 	// page — and anchoring is what keeps a bare hostname in prose untouched
 	// (test 28).
-	SurfaceText    = "text"
+	SurfaceText = "text"
+	// SurfaceXMLText is a whole XML-family body — a feed, a sitemap, an SVG.
+	// It is not SurfaceText, because the two differ in what will decode them:
+	// an XML parser reads character references, and an SVG's `<style>` is
+	// genuinely CSS, while nothing at all decodes either in text/plain.
+	SurfaceXMLText = "xml-text"
 	SurfaceComment = "comment"
 	// SurfaceHTMLEntity is an attribute value whose origin was only visible
 	// after character references were decoded — the browser decodes before it

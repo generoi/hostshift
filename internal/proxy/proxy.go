@@ -302,6 +302,27 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	}
 }
 
+// reqPath and reqMethod name the request a response belongs to.
+//
+// `check`'s size-cap refusal promises "Which paths:" and points at these lines,
+// and they carried `cap` and `content-type` only — so a developer asking which
+// large responses put production origins in the browser got a content-type
+// histogram. http.Response keeps its Request, and a nil one is only possible in
+// a hand-built response.
+func reqPath(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	return resp.Request.URL.Path
+}
+
+func reqMethod(resp *http.Response) string {
+	if resp == nil || resp.Request == nil {
+		return ""
+	}
+	return resp.Request.Method
+}
+
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	st, _ := resp.Request.Context().Value(stateKey).(*state)
 	fwd := p.Map.Forward()
@@ -349,8 +370,14 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 							"redirecting the browser to the canonical origin\n")
 					return nil
 				}
-				p.Stats.Record(rewrite.SurfaceHeader, 0, []origin.Event{{
-					Surface: rewrite.SurfaceHeader, Text: loc,
+				// The response surface, like the guard above it. Round 59 moved
+				// the guard and left this, so the one enumerated test-28
+				// carve-out — a canonical origin going *to the browser* — was
+				// filed under the name that means §4.3, a variant hostname
+				// going *into the database*. `check` sends a developer to this
+				// exact field at the moment of a test-28 refusal.
+				p.Stats.Record(rewrite.SurfaceResponseHeader, 0, []origin.Event{{
+					Surface: rewrite.SurfaceResponseHeader, Text: loc,
 					Action: origin.ActionSkipped, Reason: origin.ReasonSelfRedirect,
 				}})
 				p.log().Info("self-redirect passed through", "location", loc)
@@ -507,7 +534,8 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		}
 		if over != nil {
 			p.log().Warn("JSON body exceeds the size cap, passing through untouched",
-				"cap", p.maxBody(), "content-type", ct)
+				"cap", p.maxBody(), "content-type", ct,
+				"method", reqMethod(resp), "path", reqPath(resp))
 			p.Stats.Record(rewrite.SurfaceJSONString, 0, []origin.Event{{
 				Surface: rewrite.SurfaceJSONString, Action: origin.ActionSkipped,
 				Reason: origin.ReasonSizeCap,
@@ -569,7 +597,8 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		}
 		if over != nil {
 			p.log().Warn("body exceeds the size cap, passing through untouched",
-				"cap", p.maxBody(), "content-type", ct)
+				"cap", p.maxBody(), "content-type", ct,
+				"method", reqMethod(resp), "path", reqPath(resp))
 			p.Stats.Record(rewrite.SurfaceText, 0, []origin.Event{{
 				Surface: rewrite.SurfaceText, Action: origin.ActionSkipped,
 				Reason: origin.ReasonSizeCap,
@@ -613,8 +642,16 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		// the way back cannot parse it, so the round trip never comes home.
 		var ev []origin.Event
 		isXML := strings.HasSuffix(strings.ToLower(mediaType(ct)), "xml")
+		// One name for the whole arm, chosen by what will decode the body. The
+		// reference split below was already made on this question; the CSS view
+		// keys on the surface, so it has to be made here too or a text/plain
+		// body is read as a stylesheet.
+		textSurface := rewrite.SurfaceText
+		if isXML {
+			textSurface = rewrite.SurfaceXMLText
+		}
 		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
-			nv, nev := p.Map.Forward().RewriteText(b, rewrite.SurfaceText, p.Stats.Explain())
+			nv, nev := p.Map.Forward().RewriteText(b, textSurface, p.Stats.Explain())
 			ev = append(ev, nev...)
 			// References too, when the consumer decodes them. An SVG's `href`
 			// and a feed's `<link>` are read by an XML parser, which decodes
@@ -623,12 +660,12 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			// them is correct there.
 			if isXML {
 				return rewrite.HostLeaksXMLCounted(p.Map.Forward(), nv, false, p.Stats,
-					rewrite.SurfaceText, 0)
+					textSurface, 0)
 			}
 			return rewrite.HostLeaksCounted(p.Map.Forward(), nv, false, p.Stats,
-				rewrite.SurfaceText, 0)
+				textSurface, 0)
 		})
-		p.Stats.Record(rewrite.SurfaceText, 0, ev)
+		p.Stats.Record(textSurface, 0, ev)
 		if !p.NoSweep {
 			// Inside the repair: the sweep is a raw byte matcher, so a host it
 			// rewrites inside a serialized string leaves the length stale. On
@@ -719,7 +756,8 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// Over the cap: stream through untouched and log the skip. The bytes
 		// already read are put back in front of the rest.
 		p.log().Warn("request body exceeds the size cap, passing through untouched",
-			"cap", max, "content-type", ct)
+			"cap", max, "content-type", ct,
+			"method", r.Method, "path", r.URL.Path)
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, []origin.Event{{
 			Surface: rewrite.SurfaceRequestBody, Action: origin.ActionSkipped,
 			Reason: origin.ReasonSizeCap,

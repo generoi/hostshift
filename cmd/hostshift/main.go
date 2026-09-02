@@ -393,7 +393,22 @@ func wantCensus(explain, dryRun bool) bool { return explain || dryRun }
 // that `check`'s instruction — add the flag, restart, `| grep census` — is true
 // at the moment of a test-28 refusal.
 func censusHook(log *slog.Logger) func(string, origin.Event) {
+	return censusHookFor(log, false)
+}
+
+// censusHookFor is censusHook with the dry-run marker.
+func censusHookFor(log *slog.Logger, dryRun bool) func(string, origin.Event) {
 	return func(surface string, e origin.Event) {
+		// `dry-run=true` when nothing was applied. The action says `rewrote`
+		// either way — that is what dry-run means, "every rewrite it would have
+		// made" — so without this a developer grepping the census mid-incident
+		// cannot tell a proxy that is rewriting from one that is only reporting.
+		if dryRun {
+			log.Info("census", "surface", surface, "action", e.Action,
+				"reason", e.Reason, "offset", e.Offset, "text", e.Text,
+				"dry-run", true)
+			return
+		}
 		log.Info("census", "surface", surface, "action", e.Action,
 			"reason", e.Reason, "offset", e.Offset, "text", e.Text)
 	}
@@ -439,7 +454,7 @@ func cmdProxy(args []string) (int, error) {
 	// process never wrote. `--dry-run`'s own help says it logs "every rewrite it
 	// would have made", and it logged none either. Both are true now.
 	if wantCensus(*explain, *dryRun) {
-		st.OnEvent(censusHook(log))
+		st.OnEvent(censusHookFor(log, *dryRun))
 	}
 	p := &proxy.Proxy{
 		Upstream:      up,

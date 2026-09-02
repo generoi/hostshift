@@ -737,6 +737,38 @@ EOF
   exit 2
 }
 
+# hs_db_command prints how to reach the database the *application* writes to.
+#
+# `ddev exec -s db` is this project's own database container, and in a worktree
+# sharing the parent's that is not the one anything writes to. Every remedy that
+# told a developer to look for a §4.3 write-back said `-s db`, so the query ran
+# against an idle container and printed zeros — or, where the worktree's own
+# database has no WordPress tables, `Table 'db.wp_posts' doesn't exist`. Either
+# way it answers "nothing was written" about the one thing this file says has no
+# undo, while the rows sit in production's database.
+#
+# The inversion is what makes it a defect rather than a rough edge: in the shared
+# mode, where "that database is production's" is *true*, the command is wrong;
+# in the mode where the command is right, the sentence is false. copy-db has
+# detected this exact state since round 40 and the remedies never asked it.
+hs_db_command() {
+  _self="ddev-${DDEV_SITENAME:-$(basename "$(pwd -P)")}-db"
+  _env="$(ddev exec -s web printenv DB_HOST DATABASE_URL DB_URL 2>/dev/null || true)"
+  _other="$(printf '%s\n' "$_env" | grep -oE 'ddev-[A-Za-z0-9._-]+-db' \
+    | grep -vxF "$_self" | head -1 || true)"
+  # The container's environment cannot see a dotenv the application reads for
+  # itself, which is where Bedrock keeps it.
+  if [ -z "$_other" ]; then
+    _other="$(grep -shoE 'ddev-[A-Za-z0-9._-]+-db' .env .ddev/.env.web 2>/dev/null \
+      | grep -vxF "$_self" | head -1 || true)"
+  fi
+  if [ -n "$_other" ]; then
+    printf 'docker exec %s mysql -udb -pdb -N -B' "$_other"
+  else
+    printf 'ddev exec -s db mysql -N -B'
+  fi
+}
+
 parent_declares_warn() {
   echo "hostshift: warning: $parent_declares declares the hostnames its database" >&2
   echo "  holds, and this worktree's branch predates it — so the map below was" >&2
@@ -1642,7 +1674,7 @@ if [ "$cmd" = "check" ]; then
     echo "  and \`ddev restart\`. Then find what was already written. A save" >&2
     echo "  lands in post content, an upload in post meta, and a subsite keeps" >&2
     echo "  its own tables, so wp_options alone answers no:" >&2
-    echo "    ddev exec -s db mysql -N -B db -e \"" >&2
+    echo "    $(hs_db_command) db -e \"" >&2
     echo "      select 'post_content', count(*) from wp_posts" >&2
     echo "        where post_content like '%${variants%%,*}%'" >&2
     echo "      union select 'guid', count(*) from wp_posts" >&2
@@ -2329,7 +2361,7 @@ $extra_body"
     echo "  one subsite is absent from the shared database (a partial pull, or a" >&2
     echo "  blog created after it). Compare what the database holds with what" >&2
     echo "  this map names:" >&2
-    echo "    ddev exec -s db mysql -N -B -e \\" >&2
+    echo "    $(hs_db_command) -e \\" >&2
     echo "      \"select blog_id, domain, path from wp_blogs\" db" >&2
     echo "  The scans below still apply to the pages that do serve." >&2
   elif [ -n "${hs_signup_at:-}" ]; then
@@ -2340,7 +2372,7 @@ $extra_body"
     echo "  so the map can check out against the database and every page still" >&2
     echo "  302 — nothing here is previewable." >&2
     echo "  Compare what the database holds with what this map names:" >&2
-    echo "    ddev exec -s db mysql -N -B -e \\" >&2
+    echo "    $(hs_db_command) -e \\" >&2
     echo "      \"select blog_id, domain, path from wp_blogs\" db" >&2
     echo "  If those hostnames are not the ones hostshift maps, the database" >&2
     echo "  moved and the map did not — fix hostshift.yaml to name what the" >&2
@@ -2451,10 +2483,17 @@ $extra_body"
           echo "    then: docker logs ddev-$name-hostshift 2>&1 | grep census" >&2
           echo "  \`hostshift diff\` shows it too, but it needs *both* sides" >&2
           echo "  fetchable, and this map is canonical-on-production: DDEV does" >&2
-          echo "  not register ${canon_list%%,*} here, so pointing --resolve at the" >&2
-          echo "  router returns 404 and nothing is compared. Add that hostname to" >&2
-          echo "  additional_fqdns first if you want diff — and note diff would" >&2
-          echo "  otherwise fetch the client's live site." >&2 ;;
+          echo "  not register ${canon_list%%,*} here, so pointing --resolve at" >&2
+          echo "  the router returns 404 and nothing is compared. Point it at" >&2
+          echo "  web's own published port instead:" >&2
+          echo "    port=\$(docker port ddev-$name-web 443/tcp | head -1 | sed 's/.*://')" >&2
+          echo "    hostshift diff --slug ${slug:-<slug>} \\" >&2
+          echo "      --resolve ${canon_list%%,*}:443:127.0.0.1:\$port \\" >&2
+          echo "      --canonical-header 'X-Forwarded-Proto: https'" >&2
+          echo "  Not \`additional_fqdns\`: that writes the client's production" >&2
+          echo "  hostname into /etc/hosts machine-wide, needs elevated" >&2
+          echo "  privileges, and outlives \`ddev stop\` — your whole laptop then" >&2
+          echo "  cannot reach the real site. Diff would otherwise fetch it." >&2 ;;
       esac
       # exit 2, the refusal this script uses everywhere else. The first version
       # incremented a `fails` counter declared nowhere and read nowhere — so
@@ -2526,11 +2565,13 @@ $extra_body"
         case "$host" in *".$apex") related=1; break ;; esac
       done
       if [ -n "$related" ]; then
-        echo "hostshift: refusing to call this healthy — the page served at" >&2
-        echo "  $(hs_page_carrying "$host") carries $cnt links to $host," >&2
+        echo "hostshift: refusing to call this healthy — $cnt reference(s) to" >&2
+        echo "  $host across the pages probed, first seen on" >&2
+        echo "  $(hs_page_carrying "$host")," >&2
         echo "  which this map does not name and which is at or under the same" >&2
         echo "  site as a hostname it does ($apex). They are not rewritten, so" >&2
         echo "  they are live production links in a preview." >&2
+        for pu in ${probe_urls:-}; do echo "    $pu" >&2; done
         echo "  Add $host to hostshift.yaml — as an alias of the canonical it" >&2
         echo "  belongs to — and \`ddev hostshift init && ddev restart\`." >&2
         exit 2
