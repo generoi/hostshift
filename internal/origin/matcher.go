@@ -797,9 +797,32 @@ func escColonLen(b []byte, i int, esc escAlphabet) int {
 // `www.example.fix` and must not be rewritten; `https://www.example.fi\n<` is
 // `www.example.fi` and must be. Only the caller can tell those apart, and only
 // by looking past the escape.
-func removedEscLen(b []byte, i int, esc escAlphabet) int {
-	if i < len(b) && (b[i] == '\t' || b[i] == '\n' || b[i] == '\r') {
+// value says the buffer is one URL-bearing value rather than prose, and it
+// decides what a *literal* newline means.
+//
+// Inside a value the URL parser really does strip it, so
+// `href="https://www.example.fi&#10;x"` is the host `www.example.fix`. In prose
+// it is a line break, and joining across it made
+// "https://variant\nnext line" a host called `…ddev.sitenext` that no map
+// names — so the origin was declined and left alone, in *both* directions.
+// Measured in round 70: five variant hostnames written into a shared database
+// through ordinary admin saves, and a production origin served inside a `<pre>`
+// block, with `check` and `diff` both green because both ask this same code.
+//
+// A literal tab stays removed either way. A raw newline cannot appear inside a
+// JavaScript or JSON string literal — both forbid it — so treating it as a
+// boundary in prose cannot break the inline-script case §5.5 exists for, while a
+// raw tab inside a JS string is legal and really is removed before the fetch.
+// That asymmetry is the whole scope of this change.
+func removedEscLen(b []byte, i int, esc escAlphabet, value bool) int {
+	if i < len(b) && b[i] == '\t' {
 		return 1
+	}
+	if i < len(b) && (b[i] == '\n' || b[i] == '\r') {
+		if value {
+			return 1
+		}
+		return 0
 	}
 	if esc == escPath || i+1 >= len(b) || b[i] != '\\' {
 		return 0
@@ -870,7 +893,8 @@ func SurfaceDecodesEscapes(surface string) bool {
 // Only meaningful when b[i] is a backslash; the caller checks that.
 func EscapeContinuesHost(b []byte, i int, surface string) bool {
 	esc := escapeAlphabetFor(surface)
-	return esc != escPath && !hostTerminated(b, i, esc)
+	// A locator scan is looking at one value, which is what its callers pass it.
+	return esc != escPath && !hostTerminated(b, i, esc, true)
 }
 
 // unhex decodes the two hex digits at i.
@@ -935,12 +959,12 @@ var (
 // M0 counted five of those in acmecorp' database. So the dot terminates the
 // host and stays where it is, and only the endsHost case above — where real
 // URL structure follows, so the dot is genuinely the root label — absorbs it.
-func hostTerminated(b []byte, end int, esc escAlphabet) bool {
+func hostTerminated(b []byte, end int, esc escAlphabet, value bool) bool {
 	// Past the characters the URL parser removes, then ask. See removedEscLen:
 	// tab, LF and CR do not end a host, they join what follows to what precedes,
 	// and answering at the control's own position got that backwards.
 	for walked := 0; walked < maxRemovedRun; {
-		n := removedEscLen(b, end, esc)
+		n := removedEscLen(b, end, esc, value)
 		if n == 0 || walked+n > maxRemovedRun {
 			break
 		}
@@ -1204,7 +1228,7 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 		// "not a host byte, so the host ended" and the bare host matched. So a
 		// value no browser resolves was rewritten. Both spellings, since the
 		// escaped separator reaches here too now.
-		if sep > 0 && port == "" && !hostTerminated(b, end+sep, esc) {
+		if sep > 0 && port == "" && !hostTerminated(b, end+sep, esc, value) {
 			emit(start, b[start:end+sep], ActionSkipped, ReasonNotAURL)
 			scanned = end + sep
 			consumed = max(consumed, end+sep)
@@ -1212,7 +1236,7 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 		}
 		scanned = end
 		consumed = max(consumed, end)
-		if !hostTerminated(b, end, esc) {
+		if !hostTerminated(b, end, esc, value) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, b[start:end], ActionSkipped, ReasonNotAURL)
 			continue
