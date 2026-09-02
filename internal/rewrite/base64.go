@@ -26,6 +26,26 @@ import (
 // the decoded bytes actually change under it, so a base64-looking run that holds
 // no mapped origin — a nonce, an image, a hash — is not reported.
 func HiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
+	n, sample = hiddenInBase64(b, rw)
+	// And again with the transport layer off. A blob in a form body is
+	// percent-encoded — `+` becomes `%2B`, `/` becomes `%2F`, the padding `%3D` —
+	// so a scan of the raw bytes is cut at every escape, and the escape's own hex
+	// digits are themselves base64 characters, which shifts the alignment of what
+	// is left. Round 66 shipped this detector with fixtures that spliced the blob
+	// in raw: the one spelling that worked, and the one no `<form>`,
+	// `URLSearchParams`, jQuery or `wp.customize` produces.
+	//
+	// `+` decodes to a space here, which is right: a literal `+` inside base64
+	// arrives as `%2B`, and a raw one really was a space.
+	if dec, _, ok := formDecodeSpans(string(b)); ok && dec != string(b) {
+		if dn, ds := hiddenInBase64([]byte(dec), rw); dn > n {
+			n, sample = dn, ds
+		}
+	}
+	return n, sample
+}
+
+func hiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
 	for i := 0; i < len(b); {
 		if !isB64(b[i]) {
 			i++

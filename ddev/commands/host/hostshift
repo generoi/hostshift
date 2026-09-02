@@ -1702,8 +1702,17 @@ if [ "$cmd" = "check" ]; then
     | grep -c "msg=\"request body exceeds the size cap, passing through untouched\"" \
     2>/dev/null || true)"
   capped_all="$(printf '%s\n' "$logs" | grep -cE "$cap_msg" 2>/dev/null || true)"
+  # And the base64 WARN, which nothing escalated. A widget instance carrying the
+  # worktree's hostname into production's wp_options is §4.3 with no undo, and
+  # its only signal was a container log that the next `ddev restart` clears while
+  # the rows stay. Anchored on the log's own field for the same reason the cap
+  # counters are.
+  hidden_b64="$(printf '%s\n' "$logs" \
+    | grep -c 'msg="a variant hostname is inside base64 in this request body' \
+    2>/dev/null || true)"
   [ -n "$capped_req" ] || capped_req=0
   [ -n "$capped_all" ] || capped_all=0
+  [ -n "$hidden_b64" ] || hidden_b64=0
   capped=$((capped_all - capped_req))
   [ "$capped" -ge 0 ] 2>/dev/null || capped=0
   if [ "$capped" -gt 0 ] 2>/dev/null || [ "$capped_req" -gt 0 ] 2>/dev/null; then
@@ -1750,8 +1759,22 @@ if [ "$cmd" = "check" ]; then
     echo "  The restart that applies the new cap also clears this: DDEV recreates" >&2
     echo "  the container, so the log starts empty." >&2
   fi
-  # After both, so a deployment failing in both directions is told about both.
-  if [ "$capped" -gt 0 ] 2>/dev/null || [ "$capped_req" -gt 0 ] 2>/dev/null; then
+  if [ "$hidden_b64" -gt 0 ] 2>/dev/null; then
+    echo "hostshift: refusing to call this healthy — $hidden_b64 request(s) carried a" >&2
+    echo "  variant hostname inside base64, which reached the database as it stood." >&2
+    echo "  It cannot be mapped back: the Customizer validates a widget instance" >&2
+    echo "  with wp_hash() over exactly those bytes, so rewriting it makes" >&2
+    echo "  WordPress discard the save. Reporting is the whole remedy." >&2
+    echo "  This is §4.3 and there is no undo. What was written:" >&2
+    echo "    docker logs ddev-$name-hostshift 2>&1 | grep 'inside base64'" >&2
+    echo "  Then repair the rows by hand from the canonical side, or restore." >&2
+    echo "  Widget instances live in wp_options under widget_*; the block editor" >&2
+    echo "  stores them in wp_posts.post_content." >&2
+    echo "  The restart clears this log; the rows it wrote are still there." >&2
+  fi
+  # After all three, so a deployment failing several ways is told about each.
+  if [ "$capped" -gt 0 ] 2>/dev/null || [ "$capped_req" -gt 0 ] 2>/dev/null ||
+    [ "$hidden_b64" -gt 0 ] 2>/dev/null; then
     exit 2
   fi
 

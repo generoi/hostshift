@@ -743,7 +743,11 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 // receives variant URLs and sends them straight back (tests 30 and 31).
 func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch:
+	// DELETE too: `WP_REST_Request::parse_body_params()` reads a form or JSON
+	// body whatever the method, and the query string and path beside this are
+	// already mapped back for every method. The gate was an asymmetry, not a
+	// decision — a DELETE with a body put a variant hostname upstream untouched.
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 	default:
 		return
 	}
@@ -840,22 +844,27 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 				rewrite.SurfaceRequestBody, 0)
 		})
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
-		// A variant hostname inside a base64 blob is one no spelling reaches and
-		// none should: the Customizer validates a widget instance with
-		// `wp_hash()` over exactly those bytes, so rewriting it makes WordPress
-		// discard the save. What was wrong was the silence — the save went
-		// through, production's database took the worktree's hostname, the
-		// canonical site served it to the public, and nothing logged a line.
-		if n, sample := rewrite.HiddenInBase64(buf, func(b []byte) []byte {
-			nv, _ := rev.Rewrite(b, rewrite.SurfaceRequestBody, false)
-			return nv
-		}); n > 0 {
-			p.log().Warn("a variant hostname is inside base64 in this request body "+
-				"— it cannot be mapped back without breaking the signature the app "+
-				"checks, so it will reach the shared database as it stands",
-				"blobs", n, "method", r.Method, "path", r.URL.Path,
-				"decoded", firstBytes(sample, 120))
-		}
+	}
+	// A variant hostname inside a base64 blob is one no spelling reaches and none
+	// should: the Customizer validates a widget instance with `wp_hash()` over
+	// exactly those bytes, so rewriting it makes WordPress discard the save. What
+	// was wrong was the silence — the save went through, production's database
+	// took the worktree's hostname, the canonical site served it to the public,
+	// and nothing logged a line.
+	//
+	// Outside the switch, because round 66 put it inside the flat arm and a
+	// widget saved through `POST /wp-json/wp/v2/widgets`, or any form with a file
+	// field beside the settings, was silent by construction. Both auditors found
+	// that independently, which is what a body arm nobody enumerated looks like.
+	if n, sample := rewrite.HiddenInBase64(buf, func(b []byte) []byte {
+		nv, _ := rev.Rewrite(b, rewrite.SurfaceRequestBody, false)
+		return nv
+	}); n > 0 {
+		p.log().Warn("a variant hostname is inside base64 in this request body "+
+			"— it cannot be mapped back without breaking the signature the app "+
+			"checks, so it will reach the shared database as it stands",
+			"blobs", n, "method", r.Method, "path", r.URL.Path,
+			"decoded", firstBytes(sample, 120))
 	}
 	if p.DryRun {
 		out = buf

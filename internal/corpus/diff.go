@@ -367,6 +367,19 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// database names a worktree — so it costs a scan and answers the question the
 	// whole exercise exists for.
 	r.WriteBacks, _ = countLeaks(o.Map.Reverse(), canon)
+	// And base64, which countLeaks cannot see: it runs the rewrite pipeline, and
+	// the pipeline has no base64 view — deliberately, because a widget instance
+	// is validated with `wp_hash()` over exactly those bytes and rewriting it
+	// makes the app discard the save. So the very §4.3 write this column was
+	// added for — a Customizer widget carrying the worktree's hostname into
+	// production's `wp_options` — was still reported GREEN by it. Reported, not
+	// rewritten, on the same terms as the proxy's WARN.
+	if n, _ := rewrite.HiddenInBase64(canon.body, func(b []byte) []byte {
+		out, _ := o.Map.Reverse().Rewrite(b, rewrite.SurfaceRequestBody, false)
+		return out
+	}); n > 0 {
+		r.WriteBacks += n
+	}
 	return r
 }
 

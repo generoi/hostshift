@@ -3,6 +3,7 @@ package corpus
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -798,5 +799,39 @@ func TestAVariantOriginInTheCanonicalResponseIsCounted(t *testing.T) {
 		`<a href="https://v.ddev.site/promo/">promo</a>`)
 	if clean.WriteBacks != 0 {
 		t.Errorf("a healthy page reported %d write-backs", clean.WriteBacks)
+	}
+}
+
+// The write-back column has to see base64 too, because that is the write it was
+// added for.
+//
+// `countLeaks` runs the rewrite pipeline and the pipeline has no base64 view —
+// deliberately: a widget instance is validated with `wp_hash()` over exactly
+// those bytes, so rewriting it makes WordPress discard the save. The result was
+// that the one §4.3 write this column exists to catch — a Customizer widget
+// carrying the worktree's hostname into production's `wp_options` — was still
+// reported GREEN by it. Both of round 67's auditors found that independently.
+func TestAVariantOriginInsideBase64IsCountedAsAWriteBack(t *testing.T) {
+	// A widget instance as the Customizer stores it: base64 of a serialized
+	// array whose content names the variant.
+	inner := `<a href="https://v.ddev.site/promo/">promo</a>`
+	blob := base64.StdEncoding.EncodeToString([]byte(
+		`a:1:{s:7:"content";s:` + strconv.Itoa(len(inner)) + `:"` + inner + `";}`))
+	body := `<div data-cfg="` + blob + `">x</div>`
+
+	r := compareBodies(t, body, body)
+	if r.Leaks != 0 {
+		t.Fatalf("this fixture carries no plain canonical origin, got %d leaks", r.Leaks)
+	}
+	if r.WriteBacks == 0 {
+		t.Error("production is serving a variant hostname inside base64 and the " +
+			"report counted nothing — the state round 66 believed it had ended")
+	}
+	// A blob with nothing mapped in it stays at zero, so this is not just
+	// "any base64 is suspicious".
+	clean := base64.StdEncoding.EncodeToString([]byte(`a:1:{s:7:"content";s:9:"/promo/ x";}`))
+	if q := compareBodies(t, `<div data-cfg="`+clean+`">x</div>`,
+		`<div data-cfg="`+clean+`">x</div>`); q.WriteBacks != 0 {
+		t.Errorf("an ordinary base64 blob reported %d write-backs", q.WriteBacks)
 	}
 }

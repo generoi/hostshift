@@ -1928,6 +1928,26 @@ contains "both cap directions are reported" "1 request(s) reached" "$out"
 contains "and the response one too" "1 response(s) went to" "$out"
 [ "$rc" = 2 ] && pass "and it still refuses" || fail "and it still refuses" "exit $rc"
 writefake
+# A base64 WARN is escalated too, and it is the one §4.3 signal that cannot be
+# repaired by rewriting.
+#
+# Round 66 added the WARN and nothing read it: `check` exited 0 with three of
+# them in the log, and the next `ddev restart` clears the log while the rows it
+# reported stay in production's database.
+writefake
+printf 'time=x level=WARN msg="a variant hostname is inside base64 in this request body — it cannot be mapped back without breaking the signature the app checks, so it will reach the shared database as it stands" blobs=1 method=POST path=/wp-admin/admin-ajax.php\n' \
+  >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+check "a base64 write-back refuses to call the deployment healthy" "2" "$rc"
+contains "and says it reached the database" "reached the database" "$out"
+contains "and says why it cannot be rewritten" "wp_hash()" "$out"
+contains "and names where to look" "grep 'inside base64'" "$out"
+contains "and says the restart clears the log, not the rows" "rows it wrote are still there" "$out"
+
+# And a clean log still passes, so the grep is anchored and not matching prose.
+writefake
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+check "a clean log does not trip the base64 refusal" "0" "$rc"
 
 # ...and a page that merely quotes the phrase is not a cap event.
 #
