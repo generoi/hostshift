@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -219,7 +220,7 @@ func peelFormField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 	}
 	val := string(b[eq+1:])
 	dec, err := url.QueryUnescape(val)
-	if err != nil || url.QueryEscape(dec) != val {
+	if err != nil || formEncode(dec) != val {
 		return nil, false
 	}
 	rep := RepairSerialized([]byte(dec), rw)
@@ -227,7 +228,38 @@ func peelFormField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
 		return nil, false
 	}
 	out := append([]byte(nil), b[:eq+1]...)
-	return append(out, url.QueryEscape(string(rep))...), true
+	return append(out, formEncode(string(rep))...), true
+}
+
+// formEncode is the WHATWG urlencoded serializer — what the browser that sent
+// the body actually used.
+//
+// `url.QueryEscape` is not it. The two disagree on exactly two bytes and each
+// disagreement declined a peel whole, sending the variant hostname upstream into
+// the shared database: a browser leaves `*` raw where QueryEscape writes `%2A`,
+// and writes `~` as `%7E` where QueryEscape leaves it raw. Both are ordinary in
+// the bodies this exists for — they are CSS combinators, and `custom_css` is the
+// option round 63's own comment names. Checked against
+// `new URLSearchParams([["k","*~"]]).toString()`, which is `k=*%7E`.
+func formEncode(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == ' ':
+			sb.WriteByte('+')
+		case c == '*' || c == '-' || c == '.' || c == '_' ||
+			('0' <= c && c <= '9') || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z'):
+			sb.WriteByte(c)
+		default:
+			const hex = "0123456789ABCDEF"
+			sb.WriteByte('%')
+			sb.WriteByte(hex[c>>4])
+			sb.WriteByte(hex[c&0x0f])
+		}
+	}
+	return sb.String()
 }
 
 // RepairSerializedFields is RepairSerialized for an
@@ -252,14 +284,21 @@ func RepairSerializedFields(b []byte, rw func([]byte) []byte) []byte {
 		end := fieldBreak(b, start)
 		field := b[start:end]
 		rep, ok := repairField(field, rw)
-		// Strictly additive, in the sense repairAt's position arm already uses:
-		// the peel is offered only a field that came back byte-identical, so a
-		// field the existing spellings touch at all keeps exactly the bytes it
-		// had before. Round 44's `font-family:"Inter"` inside a percent-encoded
-		// `custom_css` is why — decoded, its embedded quotes are the same byte as
-		// the delimiters, and the peel re-emitted a length six bytes short.
-		if !ok && bytes.Equal(rep, field) {
-			if prep, pok := peelFormField(field, rw); pok {
+		// The peel runs on whatever the spellings left, and is withheld only from
+		// a field where one of them *repaired a serialized length*.
+		//
+		// That is the round 44 hazard and the whole of it: `font-family:"Inter"`
+		// inside a percent-encoded `custom_css` decodes to a value whose embedded
+		// quotes are the delimiters' own byte, and re-walking it re-emits a length
+		// six bytes short. Withholding on any change at all was wider than the
+		// hazard and wrong: `?u=https%3A%2F%2Fh%2Fx` inside a URL that is itself
+		// form-encoded — a share link, a redirect target, an `?ref=` — carries
+		// one origin the spellings rewrite and a second one only the peel can
+		// reach, and rewriting the first was what withheld the second. Measured
+		// through a real wp-admin save: the variant hostname reached the shared
+		// database. §4.3, no undo.
+		if !ok {
+			if prep, pok := peelFormField(rep, rw); pok {
 				rep, ok = prep, true
 			}
 		}

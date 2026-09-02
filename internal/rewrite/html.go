@@ -75,6 +75,17 @@ type HTML struct {
 	// Comparing depths restores the sign: anything that loses track resolves to
 	// "still foreign", which over-decodes.
 	foreignObjectAt int
+	// foreignSpan marks a byte range inside one raw-text token as foreign when
+	// the element stack cannot say so.
+	//
+	// `<svg><title><svg><style>` re-enters foreign content *inside* an
+	// integration point, and the whole title arrives as a single opaque token —
+	// x/net/html's tokenizer switches to RCDATA on `<title>` whatever the
+	// namespace, while its parser suppresses that switch in foreign content. So
+	// the nesting is invisible to the element stack by construction, and the
+	// `<style>` in there is an SVG one whose character references the browser
+	// decodes and whose `@import` it fetches.
+	foreignSpan bool
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -350,6 +361,70 @@ func breaksOutOfForeign(name string, raw []byte) bool {
 	}
 }
 
+// tagStartIn is the offset of `<name` in already-lowercased b, where name ends
+// at a tag-name terminator rather than anywhere.
+//
+// A bare prefix search calls `<style-guide>` a stylesheet, and the CSS view is
+// the one view in a foreign `<title>` that does *not* decode character
+// references — so an `<img src="https:&#47;&#47;canonical/x">` behind such a
+// decoy went out untouched, a fetch of live production with the developer's
+// session on it. The same document without the decoy is rewritten, which makes
+// it a scope error and not a gap.
+func tagStartIn(b []byte, name string) int {
+	lit := append([]byte{'<'}, name...)
+	for from := 0; ; {
+		i := bytes.Index(b[from:], lit)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		switch e := i + len(lit); {
+		case e == len(b):
+			// Truncated at the token boundary. The name may continue in bytes
+			// that are not here, so this is not known to be the element.
+			return -1
+		case b[e] == '>' || b[e] == '/' || asciiSpace(b[e]):
+			return i
+		}
+		from = i + 1
+	}
+}
+
+// openForeignBefore reports whether an <svg> or <math> is still open in this
+// already-lowercased prefix of a raw-text token.
+//
+// Counting is enough here and a stack is not, because the only question is
+// whether the parser is back in foreign content, and the two vocabularies answer
+// it the same way. An unbalanced tag leaves the count high, which says "foreign"
+// and over-decodes — the direction §4.4 picks when it has to pick.
+func openForeignBefore(b []byte) bool {
+	depth := 0
+	for _, n := range [...]string{"svg", "math"} {
+		for from := 0; ; {
+			i := tagStartIn(b[from:], n)
+			if i < 0 {
+				break
+			}
+			depth++
+			from += i + 1
+		}
+		for from := 0; ; {
+			i := tagStartIn(b[from:], "/"+n)
+			if i < 0 {
+				break
+			}
+			depth--
+			from += i + 1
+		}
+	}
+	return depth > 0
+}
+
+// asciiSpace is the HTML tokenizer's whitespace, which is not unicode.IsSpace.
+func asciiSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'
+}
+
 // writeRawTextAroundStyles writes a raw-text token that the parser would have
 // split into real elements: the content of each `<style>` gets the CSS view, and
 // everything else gets the raw-text view.
@@ -361,7 +436,7 @@ func (w *HTML) writeRawTextAroundStyles(off int, raw []byte) {
 	low := bytes.ToLower(raw)
 	pos := 0
 	for pos < len(raw) {
-		i := bytes.Index(low[pos:], []byte("<style"))
+		i := tagStartIn(low[pos:], "style")
 		if i < 0 {
 			break
 		}
@@ -373,11 +448,17 @@ func (w *HTML) writeRawTextAroundStyles(off int, raw []byte) {
 		// The start tag stays with the surrounding text: it is markup, not CSS.
 		start := i + gt + 1
 		end := len(raw)
-		if j := bytes.Index(low[start:], []byte("</style")); j >= 0 {
+		if j := tagStartIn(low[start:], "/style"); j >= 0 {
 			end = start + j
 		}
 		w.write(off+pos, start-pos, w.rewriteValue(SurfaceRawText, nil, off+pos, raw[pos:start]))
+		// A `<svg>` or `<math>` still open at this point puts the stylesheet back
+		// in foreign content, where the browser decodes its character references
+		// before the CSS tokenizer ever sees them. Unbalanced resolves to
+		// "foreign", which over-decodes — §4.4's direction.
+		w.foreignSpan = openForeignBefore(low[:i])
 		w.write(off+start, end-start, w.rewriteValue(SurfaceInlineStyle, nil, off+start, raw[start:end]))
+		w.foreignSpan = false
 		pos = end
 	}
 	if pos < len(raw) {
@@ -558,7 +639,7 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	// only from the HTML writer; a `text/plain` body never gets here, which is
 	// what makes always-on right — decoding references in one really would be
 	// round 60's over-rewrite.
-	inForeign := w.inForeignContent()
+	inForeign := w.inForeignContent() || w.foreignSpan
 	if (w.xmlEnt || inForeign || surface == SurfaceText ||
 		(surface == SurfaceRawText && rcdataElement(w.rawText))) &&
 		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
@@ -868,21 +949,30 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// was by content type where it belongs on whether the element is in
 			// foreign content: the same SVG served standalone was rewritten and
 			// inlined in a page was not.
+			// An HTML tag from 13.2.6.5's breakout list ends foreign content
+			// wherever it appears in it: the parser pops back to the nearest
+			// integration point or HTML element and carries on under HTML rules.
+			// So `<svg><p>` — an unclosed `<svg>` and any ordinary markup after
+			// it, which is what a malformed inline icon looks like — leaves a
+			// later `<script>` an HTML one, where references are not decoded.
+			// Without this the model stayed foreign to the end of the document
+			// and rewrote the value of a string no browser resolves. Over-decode,
+			// so it never shipped a canonical origin, but it changed bytes that
+			// had nothing to do with a URL.
+			//
+			// Outside the start-tag gate below, because the rule is a *name*
+			// test and the self-closing flag is no part of it. `<br/>`, `<hr/>`,
+			// `<img/>`, `<meta/>` and `<embed/>` are the ordinary spelling for
+			// the void elements on that list, and round 63 gated all of this on
+			// StartTagToken — so every one of them left the model foreign.
+			if n := string(bytes.ToLower(tagNameOf(raw))); w.inForeignContent() &&
+				breaksOutOfForeign(n, raw) {
+				w.foreignNS = w.foreignNS[:w.foreignObjectAt]
+			}
+			// The push stays start-tags-only: a self-closing `<svg/>` opens and
+			// closes in the same token, so it never becomes the current node.
 			if tt == html.StartTagToken {
 				n := string(bytes.ToLower(tagNameOf(raw)))
-				// An HTML tag from 13.2.6.5's breakout list ends foreign content
-				// wherever it appears in it: the parser pops back to the nearest
-				// integration point or HTML element and carries on under HTML
-				// rules. So `<svg><p>` — an unclosed `<svg>` and any ordinary
-				// markup after it, which is what a malformed inline icon looks
-				// like — leaves a later `<script>` an HTML one, where references
-				// are not decoded. Without this the model stayed foreign to the
-				// end of the document and rewrote the value of a string no
-				// browser resolves. Over-decode, so it never shipped a canonical
-				// origin, but it changed bytes that had nothing to do with a URL.
-				if w.inForeignContent() && breaksOutOfForeign(n, raw) {
-					w.foreignNS = w.foreignNS[:w.foreignObjectAt]
-				}
 				// The namespace decides, not the name.
 				//
 				// An HTML integration point is an *SVG* foreignObject/desc/
@@ -1007,7 +1097,7 @@ func (w *HTML) Read(p []byte) (int, error) {
 				// again, in one element. The text keeps the raw-text view, which
 				// still decodes character references in foreign content.
 				if len(w.foreignNS) > 0 && integrationPointIn(w.rawText, w.currentNS()) &&
-					bytes.Contains(bytes.ToLower(raw), []byte("<style")) {
+					tagStartIn(bytes.ToLower(raw), "style") >= 0 {
 					w.writeRawTextAroundStyles(off, raw)
 					break
 				}
