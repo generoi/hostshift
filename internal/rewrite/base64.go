@@ -66,11 +66,7 @@ func hiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
 		// Short runs are words, hex digests and ids, not payloads. A serialized
 		// array holding a URL cannot encode to fewer bytes than this.
 		if j-i >= 32 {
-			run := b[i:j]
-			if hasB64Space(run) {
-				run = stripB64Space(run)
-			}
-			if dec, err := base64.StdEncoding.DecodeString(string(run)); err == nil {
+			if dec, ok := decodeRun(b[i:j]); ok {
 				if !bytes.Equal(rw(dec), dec) {
 					n++
 					if sample == nil {
@@ -84,16 +80,59 @@ func hiddenInBase64(b []byte, rw func([]byte) []byte) (n int, sample []byte) {
 	return n, sample
 }
 
-func isB64Space(c byte) bool { return c == '\r' || c == '\n' || c == ' ' || c == '\t' }
-
-func hasB64Space(b []byte) bool {
-	for _, c := range b {
-		if isB64Space(c) {
-			return true
+// decodeRun decodes a whitespace-tolerant run, trying the neighbours off it.
+//
+// Making the run whitespace-tolerant — for RFC 2045's 76-column wrapping — made
+// it greedy in both directions, so any base64-alphabet word separated from the
+// blob by a space is glued on. If that word's length is not a multiple of four
+// the alignment shifts and the decode fails, and the report is silent. The word
+// that does it every time is `base64`, from the `Content-Transfer-Encoding:
+// base64` header of the very part the wrapping tolerance exists for. `binary`
+// and `quoted-printable` do it too.
+//
+// So: the whole run first, which is the wrapped-blob case and the common one,
+// then with a few leading or trailing segments dropped, which is the neighbour
+// case. Bounded because a wrapped blob has one segment per line and walking them
+// all would be quadratic in the body.
+func decodeRun(run []byte) ([]byte, bool) {
+	if dec, err := base64.StdEncoding.DecodeString(string(stripB64Space(run))); err == nil {
+		return dec, true
+	}
+	segs := splitB64Space(run)
+	if len(segs) < 2 {
+		return nil, false
+	}
+	const maxDrop = 4
+	for k := 1; k < len(segs) && k <= maxDrop; k++ {
+		for _, try := range [][][]byte{segs[k:], segs[:len(segs)-k]} {
+			if dec, err := base64.StdEncoding.DecodeString(string(bytes.Join(try, nil))); err == nil {
+				return dec, true
+			}
 		}
 	}
-	return false
+	return nil, false
 }
+
+// splitB64Space splits a run on its whitespace.
+func splitB64Space(b []byte) [][]byte {
+	var out [][]byte
+	for i := 0; i < len(b); {
+		for i < len(b) && isB64Space(b[i]) {
+			i++
+		}
+		j := i
+		for j < len(b) && !isB64Space(b[j]) {
+			j++
+		}
+		if j > i {
+			out = append(out, b[i:j])
+		}
+		i = j
+	}
+	return out
+}
+
+func isB64Space(c byte) bool { return c == '\r' || c == '\n' || c == ' ' || c == '\t' }
 
 func stripB64Space(b []byte) []byte {
 	out := make([]byte, 0, len(b))
