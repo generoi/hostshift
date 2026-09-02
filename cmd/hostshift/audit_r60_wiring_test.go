@@ -116,4 +116,13 @@ func TestR60TheProxyCommandActuallyInstallsTheCensus(t *testing.T) {
 			"leaking. wantCensus and censusHook are both tested; nothing tests\n"+
 			"that cmdProxy calls them. stderr was:\n%s", got.errOut)
 	}
+	// And the marker that says nothing was applied. Round 60 added it because a
+	// dry-run census line was indistinguishable from a real rewrite, and this
+	// test asserted only that *a* census line appeared — so passing `false`
+	// where `*dryRun` belongs survived the whole suite.
+	if !strings.Contains(got.errOut, "dry-run=true") {
+		t.Errorf("this proxy is running with --dry-run and its census does not say\n"+
+			"so, so a developer grepping it cannot tell a proxy that is rewriting\n"+
+			"from one that is only reporting. stderr was:\n%s", got.errOut)
+	}
 }

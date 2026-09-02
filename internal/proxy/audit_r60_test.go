@@ -1,9 +1,16 @@
 package proxy
 
 import (
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/generoi/hostshift/internal/origin"
+	"github.com/generoi/hostshift/internal/rewrite"
 )
 
 // Round 60, on b9b5c0b, auditing the HTML tokenizer's surface dispatch — which
@@ -85,4 +92,56 @@ func TestR60TextPlainDoesNotDecodeCSSEscapes(t *testing.T) {
 				"this one must still be rewritten:\n in  %q\n out %q", body, string(got))
 		}
 	})
+}
+
+// The XML arm reports itself as XML, in both engines.
+//
+// Round 60 split the text arm by media type and said the proxy and the scorer
+// "make the same choice by the same question" — and three mutations of the
+// census surface survived: the whole census for the commonest XML case moves
+// from `xml-text` to `text` unnoticed. The census is what `check` tells a
+// developer to grep at a test-28 refusal, so a surface field that names the
+// wrong arm answers "which surface" wrongly for every event on it.
+func TestR61TheXMLArmNamesItselfInTheCensus(t *testing.T) {
+	m, err := origin.NewMap([]origin.Site{{
+		Name:      "main",
+		Canonical: origin.MustParse("https://www.example.fi"),
+		Variant:   origin.MustParse("https://wt-a--ex.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ ctype, want string }{
+		{"application/rss+xml", rewrite.SurfaceXMLText},
+		{"image/svg+xml", rewrite.SurfaceXMLText},
+		{"text/plain", rewrite.SurfaceText},
+	} {
+		t.Run(c.ctype, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", c.ctype)
+				_, _ = w.Write([]byte("see https://www.example.fi/x here"))
+			}))
+			defer up.Close()
+			target, _ := url.Parse(up.URL)
+			st := rewrite.NewStats(false)
+			p := &Proxy{Upstream: target, Map: m, Stats: st,
+				Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			front := httptest.NewServer(p.Handler())
+			defer front.Close()
+
+			req, _ := http.NewRequest("GET", front.URL+"/x", nil)
+			req.Host = "wt-a--ex.ddev.site"
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+
+			snap := st.Snapshot()
+			if snap.Rewrites[c.want] == 0 {
+				t.Errorf("a %s body rewrote nothing under %q; the census says %v",
+					c.ctype, c.want, snap.Rewrites)
+			}
+		})
+	}
 }

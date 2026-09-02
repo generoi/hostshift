@@ -758,9 +758,25 @@ hs_db_command() {
     | grep -vxF "$_self" | head -1 || true)"
   # The container's environment cannot see a dotenv the application reads for
   # itself, which is where Bedrock keeps it.
+  #
+  # An *assignment*, not any mention. The first version of this grepped for the
+  # container-name shape anywhere in the file, so a commented-out
+  # `# was: DB_HOST=ddev-<parent>-db` — or a note reading "staging import came
+  # from ddev-otherclient-db" — sent the §4.3 sweep to a database the
+  # application does not write to, and it printed zeros about the thing the
+  # message above calls irreversible. That is round 59's failure returning
+  # through a stale note instead of through the mode, and in the worst shape it
+  # told a developer to `docker exec` into *another client's* container.
+  #
+  # copy-db's guard has been assignment-anchored since round 40 for exactly this
+  # reason — its own comment records a commented-out DB_HOST permanently
+  # refusing a legitimate copy — and this is the same expression, not a second
+  # looser one.
   if [ -z "$_other" ]; then
-    _other="$(grep -shoE 'ddev-[A-Za-z0-9._-]+-db' .env .ddev/.env.web 2>/dev/null \
-      | grep -vxF "$_self" | head -1 || true)"
+    _q='["'"'"']?'
+    _assign="^[[:space:]]*-?[[:space:]]*$_q(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*$_q[[:space:]]*[:=][^#]*ddev-[A-Za-z0-9._-]+-db"
+    _other="$(grep -shE "$_assign" .env .ddev/.env.web 2>/dev/null \
+      | grep -oE 'ddev-[A-Za-z0-9._-]+-db' | grep -vxF "$_self" | head -1 || true)"
   fi
   if [ -n "$_other" ]; then
     printf 'docker exec %s mysql -udb -pdb -N -B' "$_other"
@@ -2571,6 +2587,7 @@ $extra_body"
         echo "  which this map does not name and which is at or under the same" >&2
         echo "  site as a hostname it does ($apex). They are not rewritten, so" >&2
         echo "  they are live production links in a preview." >&2
+        echo "  Counted across:" >&2
         for pu in ${probe_urls:-}; do echo "    $pu" >&2; done
         echo "  Add $host to hostshift.yaml — as an alias of the canonical it" >&2
         echo "  belongs to — and \`ddev hostshift init && ddev restart\`." >&2

@@ -1530,6 +1530,16 @@ out="$(cd "$wt" && HS_CURL_BODY="$apexleak" \
 contains "and it is named with its count" "reference(s) to" "$out"
 contains "and the host it counted" "acme.example" "$out"
 contains "and the count is not attributed to one page" "across the pages probed" "$out"
+# ...and the pages themselves are listed, which is the half that makes the sum
+# actionable — a developer given a total and one page name counts fewer on it
+# and doubts the tool.
+contains "and the pages it counted are listed" "Counted across:" "$out"
+# ...and the number really is the sum. Hardcoding 1 survived every assertion
+# above, because "reference(s) to" matches whatever number precedes it.
+case "$out" in
+  *"— 5 reference(s) to"*|*"— 6 reference(s) to"*) pass "and the count is the sum" ;;
+  *) fail "and the count is the sum" "expected the summed count in: $out" ;;
+esac
 contains "and the remedy is an alias" "as an alias of the canonical" "$out"
 
 # ...and a third party is a note, not a refusal. A real WordPress page carries
@@ -1690,7 +1700,12 @@ contains "the leak refusal offers a remedy that runs here" "--explain" "$out"
 # instruction and learned nothing.
 contains "and the remedy greps a word the proxy writes" "grep census" "$out"
 contains "and it says why the router cannot answer for the canonical" "returns 404" "$out"
-contains "and it routes diff at web's published port" "docker port" "$out"
+# The replacement itself, not only the absence of the old advice: the whole
+# value of this remedy is that it runs, and asserting `docker port` alone let
+# the container and the port both be wrong.
+contains "and it routes diff at web's published port" "docker port ddev-" "$out"
+contains "and at web, not the database container" "-web 443/tcp" "$out"
+contains "and resolves the canonical to it" "--resolve" "$out"
 contains "and the diff command it prints passes --slug" "hostshift diff --slug" "$out"
 case "$out" in
   *"Add that hostname to"*|*"additional_fqdns first"*)
@@ -1777,6 +1792,49 @@ case "$out" in
   *) fail "the sweep names the database the application writes to" \
        "named neither: $out" ;;
 esac
+writefake
+
+# ...and it reads a dotenv the container cannot see, which is where Bedrock
+# keeps DB_HOST — the branch whose comment names this fleet's shape, and which
+# nothing exercised.
+writefake
+printf 'time=x level=WARN msg="request body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
+  >> "$HS_FAKE_DIR/logs"
+nodbbin="$work/nodbbin"; mkdir -p "$nodbbin"
+cat > "$nodbbin/ddev" <<'NODBDDEV'
+#!/usr/bin/env bash
+# web answers nothing: the application reads its own dotenv.
+exit 0
+NODBDDEV
+chmod +x "$nodbbin/ddev"
+printf 'DB_HOST=ddev-acme-db\n' > "$wt/.env"
+out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "the sweep reads a dotenv the container cannot see" "docker exec ddev-acme-db" "$out"
+
+# ...and a *comment* is not an assignment. A stale note sent the sweep to a
+# database the application does not write to, which is round 59's failure
+# returning through the other door — and in the worst shape it named another
+# client's container.
+printf '# was: DB_HOST=ddev-otherclient-db  # disabled, we have our own now\n' > "$wt/.env"
+out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"docker exec ddev-otherclient-db"*)
+    fail "a commented-out DB_HOST is not an assignment" \
+      "a stale note redirected the sweep to another database" ;;
+  *"ddev exec -s db"*) pass "a commented-out DB_HOST is not an assignment" ;;
+  *) fail "a commented-out DB_HOST is not an assignment" "named neither: $out" ;;
+esac
+
+# ...and a project does not mistake its own container for a rival.
+printf 'DB_HOST=ddev-acme-wt-a-db\n' > "$wt/.env"
+out="$(cd "$wt" && DDEV_SITENAME=acme-wt-a PATH="$nodbbin:$fakebin:$PATH" \
+  "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"docker exec ddev-acme-wt-a-db"*)
+    fail "its own container is not a shared one" "took itself for the parent" ;;
+  *) pass "its own container is not a shared one" ;;
+esac
+rm -f "$wt/.env"
 writefake
 
 case "$out" in

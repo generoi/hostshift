@@ -304,18 +304,28 @@ func cmdRewrite(args []string) (int, error) {
 		// serialized blob piped through it came out with its length prefix stale
 		// — the very corruption the proxy had just been taught to prevent.
 		var ev []origin.Event
+		// The same surface the proxy and the scorer pick, by the same question.
+		// This is the third copy of that arm; round 60 changed two of them, so
+		// the command that documents itself as "the same engine" stopped
+		// rewriting an SVG's `<style>` that the proxy still rewrites, and
+		// answered `"rewrites": {}` — which is the count `check`'s awk reads as
+		// zero leaks.
+		textSurface := rewrite.SurfaceText
+		if strings.HasSuffix(mt, "xml") {
+			textSurface = rewrite.SurfaceXMLText
+		}
 		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
-			nv, nev := m.RewriteText(b, rewrite.SurfaceText, *explain)
+			nv, nev := m.RewriteText(b, textSurface, *explain)
 			ev = append(ev, nev...)
 			// The XML family's parser decodes character references; plain text
 			// has no parser, so leaving them is correct there. The counted forms
 			// because --json and --dry-run are this command's whole output.
 			if strings.HasSuffix(mt, "xml") {
-				return rewrite.HostLeaksXMLCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+				return rewrite.HostLeaksXMLCounted(m, nv, false, st, textSurface, 0)
 			}
-			return rewrite.HostLeaksCounted(m, nv, false, st, rewrite.SurfaceText, 0)
+			return rewrite.HostLeaksCounted(m, nv, false, st, textSurface, 0)
 		})
-		st.Record(rewrite.SurfaceText, 0, ev)
+		st.Record(textSurface, 0, ev)
 		if !*noSweep {
 			// Inside the repair: the sweep is a raw byte matcher, so a host it
 			// rewrites inside a serialized string leaves the length stale. On

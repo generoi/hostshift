@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/generoi/hostshift/internal/origin"
+	"github.com/generoi/hostshift/internal/rewrite"
 )
 
 // Round 59, on 05ae5ea. `hostshift diff`'s Location scorer, the mirror of the
@@ -117,5 +118,39 @@ func TestR59TheScorerRepairsTheLengthItReEmits(t *testing.T) {
 		t.Errorf("the proxy repairs the length when it splices a longer host into a\n"+
 			"serialized Location; a scorer that does not expect the repair red-flags\n"+
 			"the correct emission and its `want` carries a stale s:30:\n%s", buf.String())
+	}
+}
+
+// The scorer's census names the arm it ran, like the proxy's.
+//
+// Round 60 split the text arm by media type in both engines and said they "make
+// the same choice by the same question". Mutating the scorer's `st.Record`
+// surface back to `text` survived the whole suite: the entire census for the
+// commonest XML case — a feed `<link>` — moves to the wrong surface unnoticed,
+// on the field `check` tells a developer to grep at a test-28 refusal.
+func TestR61TheScorerCensusNamesTheArm(t *testing.T) {
+	m, err := origin.NewMatcher([]origin.Pair{{
+		Canonical: origin.MustParse("https://www.canon.test"),
+		Variant:   origin.MustParse("https://v.ddev.site"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ ctype, body, want string }{
+		{"application/rss+xml",
+			`<rss><channel><item><link>https://www.canon.test/x</link></item></channel></rss>`,
+			rewrite.SurfaceXMLText},
+		{"text/plain", `see https://www.canon.test/x here`, rewrite.SurfaceText},
+	} {
+		t.Run(c.ctype, func(t *testing.T) {
+			st := rewrite.NewStats(false)
+			if _, err := applyLikeTheProxy(m, []byte(c.body), c.ctype, st); err != nil {
+				t.Fatal(err)
+			}
+			if st.Snapshot().Rewrites[c.want] == 0 {
+				t.Errorf("a %s body rewrote nothing under %q; the census says %v",
+					c.ctype, c.want, st.Snapshot().Rewrites)
+			}
+		})
 	}
 }

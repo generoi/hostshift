@@ -44,9 +44,26 @@ type HTML struct {
 	hosts   *hostReplacer
 	xmlEnt  bool
 	foreign int // depth inside <svg>/<math>, where references are decoded
-	// foreignObject is depth inside <foreignObject>, where the parser goes back
-	// to HTML rules and references are *not* decoded in script or style.
-	foreignObject int
+	// foreignObjectAt is the <svg>/<math> depth at which an HTML integration
+	// point resumed HTML rules, or 0 when none has.
+	//
+	// A depth and not a count, because the parser has a stack and this file has
+	// a streaming tokenizer. Round 60 counted `<foreignObject>` up and down and
+	// got both halves wrong. An integration point is *re-entrant* — an <svg>
+	// inside it puts the parser back in foreign content — so a nested
+	// `<svg><script>` had its references withheld and a canonical origin went to
+	// the browser inside a script the page runs. And the counter only came down
+	// on an explicit end tag, while `</svg>` and end-of-document close a
+	// foreignObject implicitly, so one unbalanced tag anywhere disarmed
+	// reference decoding for the whole rest of the response.
+	//
+	// `w.foreign` has always had the unbalanced shape too and it is harmless
+	// there, because an unbalanced `<svg>` leaves the model *over*-decoding —
+	// the direction §4.4 picks on purpose. Round 60 added a counter with the
+	// same shape and the opposite sign, which inverted the failure into a leak.
+	// Comparing depths restores the sign: anything that loses track resolves to
+	// "still foreign", which over-decodes.
+	foreignObjectAt int
 }
 
 // mark records that output offset out corresponds to input offset in, from
@@ -199,6 +216,43 @@ var rawTextNameBytes = func() [][]byte {
 	return out
 }()
 
+// integrationPoint reports whether an element name is an HTML integration point
+// — a place where a foreign-content parser goes back to HTML rules.
+//
+// `annotation-xml` is deliberately absent: it is one only when its encoding says
+// so, which the caller that cares checks with htmlEncoding.
+func integrationPoint(name string) bool {
+	switch name {
+	case "foreignobject", "desc", "title", "mi", "mo", "mn", "ms", "mtext":
+		return true
+	}
+	return false
+}
+
+// htmlEncoding reports whether a MathML <annotation-xml> start tag carries an
+// encoding that makes it an HTML integration point.
+//
+// The two spellings the parser accepts are `text/html` and
+// `application/xhtml+xml`, ASCII case-insensitively (HTML 13.2.6). Anything
+// else — or no encoding at all — leaves it ordinary MathML, where the parser
+// stays in foreign content and decodes references as it does everywhere else
+// inside <math>.
+func htmlEncoding(raw []byte) bool {
+	low := bytes.ToLower(raw)
+	i := bytes.Index(low, []byte("encoding"))
+	if i < 0 {
+		return false
+	}
+	rest := low[i+len("encoding"):]
+	rest = bytes.TrimLeft(rest, " \t\r\n")
+	if len(rest) == 0 || rest[0] != '=' {
+		return false
+	}
+	rest = bytes.TrimLeft(rest[1:], " \t\r\n\"'")
+	return bytes.HasPrefix(rest, []byte("text/html")) ||
+		bytes.HasPrefix(rest, []byte("application/xhtml+xml"))
+}
+
 // rcdataElement reports whether an element's text is RCDATA rather than RAWTEXT.
 //
 // The tokenizer hands both back as one text token, and rawTextNames is one list
@@ -330,7 +384,10 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	out = w.foldedHostLeak(surface, base, out, value)
 	// An XML parser decodes references inside script and style; an HTML parser
 	// does not. Attribute values are already handled by decodeEntityLeak on both.
-	inForeign := w.foreign > 0 && w.foreignObject == 0
+	// Foreign content unless an integration point below this depth resumed HTML
+	// rules. An <svg> *inside* a foreignObject is foreign again, which a count
+	// could not express.
+	inForeign := w.foreign > 0 && (w.foreignObjectAt == 0 || w.foreign > w.foreignObjectAt)
 	if (w.xmlEnt || inForeign || (surface == SurfaceRawText && rcdataElement(w.rawText))) &&
 		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
 			surface == SurfaceRawText || surface == SurfaceText) {
@@ -368,8 +425,12 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 		// And the two decodes composed, where the parser performs both: an
 		// attribute value always has its references decoded, and a `<style>`
 		// element does inside `<svg>`/`<math>` or in XHTML — the same gate the
-		// reference pass above uses.
-		if surface == SurfaceHTMLAttr || w.xmlEnt || w.foreign > 0 {
+		// reference pass above uses, which means the same `inForeign` and not a
+		// second reading of the raw depth. Round 60 taught one of the two sites
+		// that an integration point resumes HTML rules and left this one asking
+		// the older question, so a `<style>` inside `<foreignObject>` — RAWTEXT,
+		// where the parser decodes nothing — had its references decoded anyway.
+		if surface == SurfaceHTMLAttr || w.xmlEnt || inForeign {
 			out = w.refsCSSLeak(surface, base, out)
 		}
 	}
@@ -639,14 +700,31 @@ func (w *HTML) Read(p []byte) (int, error) {
 				switch n := string(bytes.ToLower(tagNameOf(raw))); n {
 				case "svg", "math":
 					w.foreign++
-				case "foreignobject":
-					// Which is what it is named for: inside it the parser
-					// returns to HTML rules, so an HTML <script> there is
-					// script data and decodes nothing. Counting it as foreign
-					// decoded references the browser reads verbatim — a
-					// rewrite of a JS string literal, the mirror of the error
-					// this file exists to prevent.
-					w.foreignObject++
+				case "annotation-xml":
+					// An integration point only when its encoding is an HTML
+					// one (13.2.6). Without that it is ordinary MathML and the
+					// parser stays in foreign content, so admitting it
+					// unconditionally withheld a decode the browser performs.
+					if htmlEncoding(raw) && w.foreignObjectAt == 0 {
+						w.foreignObjectAt = w.foreign
+					}
+				case "foreignobject", "desc", "title",
+					"mi", "mo", "mn", "ms", "mtext":
+					// Every HTML integration point, not just the one named for
+					// it. SVG has three (`foreignObject`, `desc`, `title`) and
+					// MathML has five text integration points (`mi`, `mo`,
+					// `mn`, `ms`, `mtext`) plus `annotation-xml` when its
+					// encoding is an HTML one. In all of them the parser is
+					// back on HTML rules and decodes nothing in a `<script>`,
+					// and modelling one of seven is what made that one a
+					// special case rather than a rule.
+					//
+					//
+					// Only the outermost is recorded; a nested pair resolves to
+					// "foreign", which over-decodes.
+					if w.foreignObjectAt == 0 {
+						w.foreignObjectAt = w.foreign
+					}
 				}
 			}
 			w.write(off, len(raw), w.rewriteTag(raw, off))
@@ -657,10 +735,15 @@ func (w *HTML) Read(p []byte) (int, error) {
 				if w.foreign > 0 {
 					w.foreign--
 				}
-			case "foreignobject":
-				if w.foreignObject > 0 {
-					w.foreignObject--
+				// `</svg>` closes an open foreignObject implicitly (13.2.6.5).
+				// Without this the mark outlived the element it belonged to and
+				// disarmed the rest of the document.
+				if w.foreign < w.foreignObjectAt {
+					w.foreignObjectAt = 0
 				}
+			case "foreignobject", "desc", "title",
+				"mi", "mo", "mn", "ms", "mtext", "annotation-xml":
+				w.foreignObjectAt = 0
 			}
 			w.write(off, len(raw), raw)
 		case html.TextToken:
@@ -699,7 +782,26 @@ func (w *HTML) Read(p []byte) (int, error) {
 			case "style":
 				w.write(off, len(raw), w.rewriteValue(SurfaceInlineStyle, nil, off, raw))
 			default:
-				w.write(off, len(raw), w.rewriteValue(SurfaceRawText, nil, off, raw))
+				// A `<style>` the tokenizer swallowed into a raw-text token.
+				//
+				// `<title>` and `<desc>` are raw-text elements by name, and the
+				// tokenizer is context-free — but inside `<svg>` they are HTML
+				// integration points, so the parser builds a *real* `<style>`
+				// element in them and runs its CSS tokenizer. hostshift saw one
+				// token named `title` and withheld the CSS view, so
+				// `<svg><title><style>@import url(https\3a \2f \2f canonical/x)`
+				// went out untouched — an `@import` the browser fetches, which
+				// is test 28 with an authenticated request behind it.
+				//
+				// Gated on the token actually containing a `<style`: running the
+				// CSS decode over every title would over-rewrite bytes a reader
+				// sees, which is the defect round 60 fixed for text/plain.
+				surface := SurfaceRawText
+				if w.foreign > 0 && integrationPoint(w.rawText) &&
+					bytes.Contains(bytes.ToLower(raw), []byte("<style")) {
+					surface = SurfaceInlineStyle
+				}
+				w.write(off, len(raw), w.rewriteValue(surface, nil, off, raw))
 			}
 		case html.CommentToken:
 			// Not dereferenceable by the browser, but the fleet puts real URLs
