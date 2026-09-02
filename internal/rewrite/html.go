@@ -46,7 +46,15 @@ type HTML struct {
 	// foreignNS is the open <svg>/<math> elements, innermost last. Its length is
 	// the old `foreign` depth; its last entry is the vocabulary an element name
 	// has to be read in.
-	foreignNS []string
+	//
+	// Each entry carries both, because the two differ: inside foreign content a
+	// start tag is inserted *in the namespace of the adjusted current node*
+	// (13.2.6.5), so the `<math>` in `<svg><math>` is an SVG element and its
+	// `<mi>` is not a MathML text integration point. Round 62 pushed the tag
+	// name as the vocabulary and read `<svg><math><mi><script>` as HTML rules,
+	// withholding a decode the browser performs. The name is kept because end
+	// tags match on it.
+	foreignNS []foreignEl
 	// foreignObjectAt is the <svg>/<math> depth at which an HTML integration
 	// point resumed HTML rules, or 0 when none has.
 	//
@@ -246,12 +254,135 @@ func integrationPointIn(name, ns string) bool {
 	return false
 }
 
+// foreignEl is one open <svg>/<math>: the name its end tag has to match, and
+// the vocabulary its children are read in. They are not the same thing.
+type foreignEl struct {
+	name string
+	ns   string
+}
+
 // currentNS is the vocabulary of the innermost open <svg>/<math>, or "".
 func (w *HTML) currentNS() string {
 	if len(w.foreignNS) == 0 {
 		return ""
 	}
-	return w.foreignNS[len(w.foreignNS)-1]
+	return w.foreignNS[len(w.foreignNS)-1].ns
+}
+
+// inForeignContent reports whether the parser is in foreign content here: an
+// <svg>/<math> is open and no integration point below this depth has resumed
+// HTML rules. An <svg> *inside* a foreignObject is foreign again, which a count
+// could not express.
+func (w *HTML) inForeignContent() bool {
+	return len(w.foreignNS) > 0 &&
+		(w.foreignObjectAt == 0 || len(w.foreignNS) > w.foreignObjectAt)
+}
+
+// popForeign applies 13.2.6.5's end-tag walk to the open vocabularies: look
+// from the innermost outward for one whose name matches, and pop through it.
+//
+// A mismatch pops *nothing*. Round 62 popped the innermost unconditionally, so
+// a stray `</math>` inside an open `<svg>` closed the svg in the model while the
+// parser — which walks down, finds no match, reaches an HTML element and
+// reprocesses the token under HTML rules, where it is dropped — stayed in
+// foreign content and kept decoding. One unbalanced tag was a leak.
+//
+// The walk still has to look past the innermost, because a match deeper down
+// does pop everything above it: `<math><svg></math>` closes both, and the
+// `<script>` after it is an HTML element outside the math.
+func (w *HTML) popForeign(name string) {
+	for i := len(w.foreignNS) - 1; i >= 0; i-- {
+		if w.foreignNS[i].name != name {
+			continue
+		}
+		w.foreignNS = w.foreignNS[:i]
+		// `</svg>` closes an open foreignObject implicitly (13.2.6.5). Without
+		// this the mark outlived the element it belonged to and disarmed the
+		// rest of the document.
+		if len(w.foreignNS) < w.foreignObjectAt {
+			w.foreignObjectAt = 0
+		}
+		return
+	}
+}
+
+// breakoutNames is 13.2.6.5's list of HTML start tags that end foreign content.
+//
+// Taken from the spec and checked name by name against html.Parse: every one of
+// these puts a following `<script>` in the HTML namespace, and the near misses
+// that are *not* on it — `section`, `article`, `aside`, and any SVG element —
+// leave the parser foreign. `font` is on the list only with a color, face or
+// size attribute, which is the one entry that is not a name test.
+var breakoutNames = map[string]bool{
+	"b": true, "big": true, "blockquote": true, "body": true, "br": true,
+	"center": true, "code": true, "dd": true, "div": true, "dl": true, "dt": true,
+	"em": true, "embed": true, "h1": true, "h2": true, "h3": true, "h4": true,
+	"h5": true, "h6": true, "head": true, "hr": true, "i": true, "img": true,
+	"li": true, "listing": true, "menu": true, "meta": true, "nobr": true,
+	"ol": true, "p": true, "pre": true, "ruby": true, "s": true, "small": true,
+	"span": true, "strong": true, "strike": true, "sub": true, "sup": true,
+	"table": true, "tt": true, "u": true, "ul": true, "var": true,
+}
+
+// breaksOutOfForeign reports whether this start tag ends foreign content.
+func breaksOutOfForeign(name string, raw []byte) bool {
+	if breakoutNames[name] {
+		return true
+	}
+	if name != "font" {
+		return false
+	}
+	z := html.NewTokenizer(bytes.NewReader(raw))
+	if z.Next() == html.ErrorToken {
+		return false
+	}
+	for {
+		k, _, more := z.TagAttr()
+		switch {
+		case bytes.EqualFold(k, []byte("color")),
+			bytes.EqualFold(k, []byte("face")),
+			bytes.EqualFold(k, []byte("size")):
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+// writeRawTextAroundStyles writes a raw-text token that the parser would have
+// split into real elements: the content of each `<style>` gets the CSS view, and
+// everything else gets the raw-text view.
+//
+// The tokenizer hands back `<title>` as one opaque token, so both live in the
+// same bytes. Only the stylesheet is a stylesheet; treating the whole token as
+// CSS unescaped `\3a ` runs in text a reader sees.
+func (w *HTML) writeRawTextAroundStyles(off int, raw []byte) {
+	low := bytes.ToLower(raw)
+	pos := 0
+	for pos < len(raw) {
+		i := bytes.Index(low[pos:], []byte("<style"))
+		if i < 0 {
+			break
+		}
+		i += pos
+		gt := bytes.IndexByte(raw[i:], '>')
+		if gt < 0 {
+			break
+		}
+		// The start tag stays with the surrounding text: it is markup, not CSS.
+		start := i + gt + 1
+		end := len(raw)
+		if j := bytes.Index(low[start:], []byte("</style")); j >= 0 {
+			end = start + j
+		}
+		w.write(off+pos, start-pos, w.rewriteValue(SurfaceRawText, nil, off+pos, raw[pos:start]))
+		w.write(off+start, end-start, w.rewriteValue(SurfaceInlineStyle, nil, off+start, raw[start:end]))
+		pos = end
+	}
+	if pos < len(raw) {
+		w.write(off+pos, len(raw)-pos, w.rewriteValue(SurfaceRawText, nil, off+pos, raw[pos:]))
+	}
 }
 
 // htmlEncoding reports whether a MathML <annotation-xml> start tag carries an
@@ -417,12 +548,19 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	out = w.foldedHostLeak(surface, base, out, value)
 	// An XML parser decodes references inside script and style; an HTML parser
 	// does not. Attribute values are already handled by decodeEntityLeak on both.
-	// Foreign content unless an integration point below this depth resumed HTML
-	// rules. An <svg> *inside* a foreignObject is foreign again, which a count
-	// could not express.
-	inForeign := len(w.foreignNS) > 0 &&
-		(w.foreignObjectAt == 0 || len(w.foreignNS) > w.foreignObjectAt)
-	if (w.xmlEnt || inForeign || (surface == SurfaceRawText && rcdataElement(w.rawText))) &&
+	//
+	// Body prose is the exception that needs no condition: an HTML parser always
+	// decodes references there, so `<p>https:&#47;&#47;canonical/x` renders as a
+	// URL a developer copy-pastes and lands on live production — the hazard §4.4
+	// opens with, and the one the M6 pilot's privacy-policy paragraph was. The
+	// gate had it firing only in foreign content, so the same bytes were
+	// rewritten inside `<title>` and shipped inside `<p>`. This branch is reached
+	// only from the HTML writer; a `text/plain` body never gets here, which is
+	// what makes always-on right — decoding references in one really would be
+	// round 60's over-rewrite.
+	inForeign := w.inForeignContent()
+	if (w.xmlEnt || inForeign || surface == SurfaceText ||
+		(surface == SurfaceRawText && rcdataElement(w.rawText))) &&
 		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
 			surface == SurfaceRawText || surface == SurfaceText) {
 		// refsLeak alone, deliberately. The composed refs-then-CSS view would
@@ -732,6 +870,19 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// inlined in a page was not.
 			if tt == html.StartTagToken {
 				n := string(bytes.ToLower(tagNameOf(raw)))
+				// An HTML tag from 13.2.6.5's breakout list ends foreign content
+				// wherever it appears in it: the parser pops back to the nearest
+				// integration point or HTML element and carries on under HTML
+				// rules. So `<svg><p>` — an unclosed `<svg>` and any ordinary
+				// markup after it, which is what a malformed inline icon looks
+				// like — leaves a later `<script>` an HTML one, where references
+				// are not decoded. Without this the model stayed foreign to the
+				// end of the document and rewrote the value of a string no
+				// browser resolves. Over-decode, so it never shipped a canonical
+				// origin, but it changed bytes that had nothing to do with a URL.
+				if w.inForeignContent() && breaksOutOfForeign(n, raw) {
+					w.foreignNS = w.foreignNS[:w.foreignObjectAt]
+				}
 				// The namespace decides, not the name.
 				//
 				// An HTML integration point is an *SVG* foreignObject/desc/
@@ -748,7 +899,16 @@ func (w *HTML) Read(p []byte) (int, error) {
 				// count cannot answer it.
 				switch n {
 				case "svg", "math":
-					w.foreignNS = append(w.foreignNS, n)
+					// In foreign content the namespace comes from the adjusted
+					// current node, not the tag name — `<svg><math>` is an SVG
+					// element. Only where HTML rules are in force does `<math>`
+					// open MathML. Reading the name as the vocabulary made every
+					// interleaved subtree the wrong one.
+					ns := n
+					if w.inForeignContent() {
+						ns = w.currentNS()
+					}
+					w.foreignNS = append(w.foreignNS, foreignEl{name: n, ns: ns})
 				case "annotation-xml":
 					// An integration point only when its encoding is an HTML
 					// one (13.2.6). Without that it is ordinary MathML and the
@@ -782,15 +942,7 @@ func (w *HTML) Read(p []byte) (int, error) {
 			w.rawText = ""
 			switch n := string(bytes.ToLower(endTagNameOf(raw))); n {
 			case "svg", "math":
-				if len(w.foreignNS) > 0 {
-					w.foreignNS = w.foreignNS[:len(w.foreignNS)-1]
-				}
-				// `</svg>` closes an open foreignObject implicitly (13.2.6.5).
-				// Without this the mark outlived the element it belonged to and
-				// disarmed the rest of the document.
-				if len(w.foreignNS) < w.foreignObjectAt {
-					w.foreignObjectAt = 0
-				}
+				w.popForeign(n)
 			case "foreignobject", "desc", "title",
 				"mi", "mo", "mn", "ms", "mtext", "annotation-xml":
 				w.foreignObjectAt = 0
@@ -848,12 +1000,18 @@ func (w *HTML) Read(p []byte) (int, error) {
 				// Gated on the token actually containing a `<style`: running the
 				// CSS decode over every title would over-rewrite bytes a reader
 				// sees, which is the defect round 60 fixed for text/plain.
-				surface := SurfaceRawText
+				// …and only over the `<style>` element itself. Switching the
+				// whole token to CSS put the escape view over the text beside
+				// it, where `https\3a \2f \2f canonical/x` is bytes a reader
+				// sees and not a stylesheet — round 60's text/plain over-rewrite
+				// again, in one element. The text keeps the raw-text view, which
+				// still decodes character references in foreign content.
 				if len(w.foreignNS) > 0 && integrationPointIn(w.rawText, w.currentNS()) &&
 					bytes.Contains(bytes.ToLower(raw), []byte("<style")) {
-					surface = SurfaceInlineStyle
+					w.writeRawTextAroundStyles(off, raw)
+					break
 				}
-				w.write(off, len(raw), w.rewriteValue(surface, nil, off, raw))
+				w.write(off, len(raw), w.rewriteValue(SurfaceRawText, nil, off, raw))
 			}
 		case html.CommentToken:
 			// Not dereferenceable by the browser, but the fleet puts real URLs

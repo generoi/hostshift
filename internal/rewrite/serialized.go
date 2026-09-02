@@ -2,6 +2,7 @@ package rewrite
 
 import (
 	"bytes"
+	"net/url"
 	"sort"
 	"strconv"
 	"unicode/utf8"
@@ -190,6 +191,45 @@ func UnreadSerialized(b []byte, rw func([]byte) []byte) bool {
 	return false
 }
 
+// peelFormField takes one layer of form encoding off a field's value, repairs
+// and rewrites what is underneath, and puts the layer back.
+//
+// A form encodes what it is given. When the page already held a percent-encoded
+// origin — which the response direction happily rewrites, because
+// `https%3A%2F%2Fh` is one of the three spellings §4.4 requires — the browser
+// posts it back with the `%` itself encoded, as `https%253A%252F%252Fh`. No
+// spelling in the table matches that, so the request direction could not take it
+// back: a *variant* hostname reached the app and went into the shared database,
+// which is §4.3's whole subject and has no undo. Round 63's daily audit read one
+// out of a real database, and `check` and `diff` were both silent — `diff` has
+// no request-direction assertion at all.
+//
+// Chasing spellings is the losing move here: a form can wrap a form. Peeling the
+// one layer the content type *declares* is the fix, and the three spellings then
+// handle what is inside.
+//
+// The peel applies only when re-encoding reproduces the original bytes exactly.
+// That guard is what makes it safe: a value this cannot round-trip is left to
+// the existing path untouched, so no body can be reshaped in passing — and where
+// it does apply, an unchanged value re-encodes to itself, byte for byte.
+func peelFormField(b []byte, rw func([]byte) []byte) ([]byte, bool) {
+	eq := bytes.IndexByte(b, '=')
+	if eq < 0 || !bytes.ContainsRune(b[eq+1:], '%') {
+		return nil, false
+	}
+	val := string(b[eq+1:])
+	dec, err := url.QueryUnescape(val)
+	if err != nil || url.QueryEscape(dec) != val {
+		return nil, false
+	}
+	rep := RepairSerialized([]byte(dec), rw)
+	if string(rep) == dec {
+		return nil, false
+	}
+	out := append([]byte(nil), b[:eq+1]...)
+	return append(out, url.QueryEscape(string(rep))...), true
+}
+
 // RepairSerializedFields is RepairSerialized for an
 // application/x-www-form-urlencoded body, whose `&` really are separators.
 //
@@ -210,7 +250,19 @@ func RepairSerializedFields(b []byte, rw func([]byte) []byte) []byte {
 	found := false
 	for start := 0; start <= len(b); {
 		end := fieldBreak(b, start)
-		rep, ok := repairField(b[start:end], rw)
+		field := b[start:end]
+		rep, ok := repairField(field, rw)
+		// Strictly additive, in the sense repairAt's position arm already uses:
+		// the peel is offered only a field that came back byte-identical, so a
+		// field the existing spellings touch at all keeps exactly the bytes it
+		// had before. Round 44's `font-family:"Inter"` inside a percent-encoded
+		// `custom_css` is why — decoded, its embedded quotes are the same byte as
+		// the delimiters, and the peel re-emitted a length six bytes short.
+		if !ok && bytes.Equal(rep, field) {
+			if prep, pok := peelFormField(field, rw); pok {
+				rep, ok = prep, true
+			}
+		}
 		out = append(out, rep...)
 		found = found || ok
 		if end < len(b) {

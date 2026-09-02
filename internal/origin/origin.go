@@ -204,7 +204,23 @@ func HostFold(h string) (string, error) { return hostFold.ToASCII(h) }
 
 // NormalisePort returns "" for a scheme's default port, so that
 // https://h and https://h:443 compare equal (PLAN §5.5).
+//
+// Leading zeros are stripped first, because a URL parser reads the port as a
+// *number*: ada resolves `https://h:0443/x` and `https://h:0000000443/x` to
+// `https://h/x`, and there is no bound on the zeros. Comparing the digits as a
+// string matched `:443` and missed every padded spelling of it, so a
+// dereferenceable production origin went to the browser unrewritten while the
+// map named exactly that origin — test 28. All zeros is the port 0, which is a
+// real and distinct port, not the default.
 func NormalisePort(scheme, port string) string {
+	if port != "" {
+		if trimmed := strings.TrimLeft(port, "0"); trimmed != port {
+			port = trimmed
+			if port == "" {
+				port = "0"
+			}
+		}
+	}
 	switch {
 	case port == "":
 		return ""
