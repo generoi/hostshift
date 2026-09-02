@@ -84,7 +84,13 @@ func TestReportingHeadersAreRewritten(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := []string{"Report-To", "Reporting-Endpoints", "Timing-Allow-Origin",
-		"Permissions-Policy", "SourceMap", "X-SourceMap"}
+		// Permissions-Policy and the predecessor several WordPress
+		// security-header plugins still emit. PLAN §5.2 says this list is the
+		// whole guarantee for the header surface — there is no straggler sweep
+		// behind it — so a spelling that is still written is one that has to be
+		// on it.
+		"Permissions-Policy", "Feature-Policy",
+		"SourceMap", "X-SourceMap"}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, n := range names {
 			w.Header().Set(n, canon+"/x")

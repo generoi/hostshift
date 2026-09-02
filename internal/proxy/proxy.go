@@ -87,6 +87,12 @@ var originHeaders = []string{
 	// a feature off on the variant, which is worse to diagnose than a leak.
 	"Timing-Allow-Origin",
 	"Permissions-Policy",
+	// And its predecessor, which carries origins in the same grammar and is
+	// still what several WordPress security-header plugins emit. PLAN §5.2 says
+	// this list is the whole guarantee for the header surface — there is no
+	// straggler sweep behind it — so a spelling a plugin still writes is a
+	// spelling that has to be on it.
+	"Feature-Policy",
 
 	// Source maps: a dereferenceable production URL the browser fetches on its
 	// own as soon as devtools is open.
@@ -274,7 +280,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 				ev = append(ev, nev...)
 				return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceHeader, 0)
 			})
-			p.Stats.Record(rewrite.SurfaceResponseHeader, 0, ev)
+			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun {
 				vs[i] = string(out)
 			}
@@ -324,8 +330,17 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	skipLocation := false
 	if st != nil && isRedirect(resp.StatusCode) && safeMethod(resp.Request) {
 		if loc := resp.Header.Get("Location"); loc != "" {
-			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceHeader, false)
-			rewritten = rewrite.HostLeaksCounted(fwd, rewritten, true, p.Stats, rewrite.SurfaceHeader, 0)
+			// The surface the emission pass below answers on, not a different
+			// one. They differ in exactly one thing — whether a CSS tokenizer
+			// runs — so a guard reading CSS escapes decides "this Location is
+			// the URL the browser just asked for" about values that go
+			// somewhere else entirely: ada resolves `https://www.exampl\65.fi/x`
+			// to `www.exampl`, and 52 of the 56 one-character CSS escapes of a
+			// canonical host tripped it. Under --strict-origins that blanks a
+			// working off-site redirect to 404 while claiming test 28.
+			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceResponseHeader, false)
+			rewritten = rewrite.HostLeaksCounted(fwd, rewritten, true, p.Stats,
+				rewrite.SurfaceResponseHeader, 0)
 			if sameURL(string(rewritten), st.url) {
 				if p.StrictOrigins {
 					p.log().Warn("self-redirect suppressed by --strict-origins", "url", st.url)
@@ -364,7 +379,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 				return rewrite.HostLeaksCounted(fwd, nv, true, p.Stats,
 					rewrite.SurfaceResponseHeader, 0)
 			})
-			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
+			p.Stats.Record(rewrite.SurfaceResponseHeader, 0, ev)
 			if !p.DryRun && string(out) != v {
 				vs[i] = string(out)
 				changed = true
@@ -786,7 +801,17 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 func (p *Proxy) dropCookieDomain(c string) string {
 	parts := strings.Split(c, ";")
 	out := parts[:0]
-	for _, part := range parts {
+	for i, part := range parts {
+		// The first `;`-part is the cookie's own name=value, never an
+		// attribute — RFC 6265 §4.1.1 — so a cookie *named* `domain` was read
+		// as one and dropped, taking the cookie with it and leaving the browser
+		// a new cookie named after whatever attribute followed:
+		// `Set-Cookie: domain=www.example.fi; Path=/; HttpOnly` came out as
+		// ` Path=/; HttpOnly`.
+		if i == 0 {
+			out = append(out, part)
+			continue
+		}
 		k, v, ok := strings.Cut(part, "=")
 		if ok && strings.EqualFold(strings.TrimSpace(k), "domain") {
 			d := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(v)), ".")

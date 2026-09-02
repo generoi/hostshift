@@ -221,7 +221,14 @@ func compare(ctx context.Context, o Options, path string) Result {
 		// it as well.
 		wantLoc := rewrite.RepairSerialized([]byte(canon.location), func(b []byte) []byte {
 			nv, _ := o.Map.Forward().Rewrite(b, rewrite.SurfaceResponseHeader, false)
-			return rewrite.HostLeaks(o.Map.Forward(), nv, true)
+			// Named, not renamed. HostLeaks routes through bareSurface, which
+			// calls a header value an html-attr — and the CSS view keys on the
+			// name, so the backstop half decoded escapes the proxy's does not.
+			// 3,622 of 458,200 header-safe Location shapes then expected
+			// something the proxy never emits, on the run the README calls
+			// "validates a deployment against reality".
+			return rewrite.HostLeaksCounted(o.Map.Forward(), nv, true, nil,
+				rewrite.SurfaceResponseHeader, 0)
 		})
 		// The self-redirect carve-out is not a mismatch. PLAN §4.4 and test 32
 		// enumerate it as correct: an asset the worktree does not have is

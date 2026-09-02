@@ -43,13 +43,13 @@ func TestR58DiffScoresTheLocationTheProxyActuallyEmits(t *testing.T) {
 	st := rewrite.NewStats(false)
 	// modifyResponse's Tier 1 header expression, verbatim.
 	served := string(rewrite.RepairSerialized([]byte(loc), func(b []byte) []byte {
-		nv, _ := fwd.Rewrite(b, rewrite.SurfaceHeader, false)
-		return rewrite.HostLeaksCounted(fwd, nv, true, st, rewrite.SurfaceHeader, 0)
+		nv, _ := fwd.Rewrite(b, rewrite.SurfaceResponseHeader, false)
+		return rewrite.HostLeaksCounted(fwd, nv, true, st, rewrite.SurfaceResponseHeader, 0)
 	}))
 	if served == loc {
 		t.Fatalf("fixture is not a rewrite: the proxy leaves %q alone", loc)
 	}
-	if bs, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceHeader, false); string(bs) != loc {
+	if bs, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceResponseHeader, false); string(bs) != loc {
 		t.Fatalf("fixture is not locator-only: the byte matcher already rewrites %q", loc)
 	}
 

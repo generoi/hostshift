@@ -1733,12 +1733,37 @@ printf 'time=x level=WARN msg="request body exceeds the size cap, passing throug
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 contains "a request over the cap is reported as a request" "reached" "$out"
 contains "and it names the direction's own harm" "shared database" "$out"
+# ...and the sweep it prints looks where the write actually lands. The message
+# names a media upload and a block-editor save, and neither writes to
+# wp_options: a save lands in post content, an upload in post meta. Measured —
+# a 33 KB REST save put the variant in wp_posts while the printed query returned
+# nothing and exit 0, which a developer reads as "nothing was written".
+contains "and the sweep looks in post content" "wp_posts" "$out"
+contains "and in post meta" "wp_postmeta" "$out"
+contains "and says a subsite keeps its own tables" "wp_2_posts" "$out"
 case "$out" in
   *"went to"*"the browser unrewritten"*)
     fail "and it is not described as a response" "$out" ;;
   *) pass "and it is not described as a response" ;;
 esac
 [ "$rc" = 2 ] && pass "and it refuses" || fail "and it refuses" "exit $rc"
+
+# Both directions at once are two failures, and a developer needs to hear both.
+#
+# The request branch exited first, so a deployment over the cap in both
+# directions was told only about the request — and the subtraction computing the
+# response count was dead arithmetic, since it only ran when the request count
+# was already zero.
+writefake
+printf 'time=x level=WARN msg="request body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
+  >> "$HS_FAKE_DIR/logs"
+printf 'time=x level=WARN msg="JSON body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
+  >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+contains "both cap directions are reported" "1 request(s) reached" "$out"
+contains "and the response one too" "1 response(s) went to" "$out"
+[ "$rc" = 2 ] && pass "and it still refuses" || fail "and it still refuses" "exit $rc"
+writefake
 
 # ...and a page that merely quotes the phrase is not a cap event.
 #
@@ -2624,6 +2649,45 @@ case "$up" in
   *//web:*) fail "the upstream is not the bare alias" "got $up" ;;
   *) pass "the upstream is not the bare alias" ;;
 esac
+
+echo "== the post-start marker check in config.hostshift.yaml"
+
+# The guard that tells a developer their command file was not upgraded.
+#
+# Nothing exercised the yaml at all, so its `grep -q '#ddev-generated'` searched
+# a 2,700-line file whose own prose names the marker three times — and a
+# developer who removed line 2, which is exactly what DDEV's "Remove unexpected
+# #ddev-generated comments" advice says to do, silenced the warning about having
+# done it. The command is extracted from the yaml rather than restated here,
+# because a copy of it in this file would be the same defect one layer over.
+# The condition only: the line in the yaml ends `|| { …`, which opens the
+# warning block and cannot be evaluated on its own.
+hook="$(awk '/^        head -5/{sub(/ *\|\| *\{.*/, ""); print; exit}' \
+  "$repo/ddev/config.hostshift.yaml")"
+[ -n "$hook" ] && pass "the yaml still has a marker check to test" \
+  || fail "the yaml still has a marker check to test" "no head -5 line found"
+markerdir="$work/marker/.ddev/commands/host"
+mkdir -p "$markerdir"
+# A file whose *prose* mentions the marker, with no marker on its own line — the
+# shape a hand-edit leaves behind.
+{ printf '#!/usr/bin/env bash\n'
+  # Padding, because the prose that fooled the old check lives at lines 13, 120
+  # and 2033 of the real file — well past the header a marker may occupy.
+  for i in 1 2 3 4 5 6 7 8; do printf '# filler\n'; done
+  printf '# This file carries #ddev-generated so the add-on replaces it.\n'
+  printf 'echo hi\n'; } > "$markerdir/hostshift"
+if (cd "$work/marker" && eval "$hook" >/dev/null 2>&1); then
+  fail "a stripped marker is detected" "the prose satisfied the check"
+else
+  pass "a stripped marker is detected"
+fi
+# ...and a real marker on line 1 is not a false alarm.
+{ printf '#ddev-generated\n'; printf 'echo hi\n'; } > "$markerdir/hostshift"
+if (cd "$work/marker" && eval "$hook" >/dev/null 2>&1); then
+  pass "a real marker is not a false alarm"
+else
+  fail "a real marker is not a false alarm" "the check fired on a generated file"
+fi
 
 if [ "$fails" -gt 0 ]; then echo "$fails failure(s)"; exit 1; fi
 echo "all passed"

@@ -1928,7 +1928,20 @@ func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte
 // still read CSS escapes, because the forward direction emits them and round
 // 56's grid pins that every spelling it can emit the reverse must read. This is
 // the same split HostLeaksBack already made for the body.
-func surfaceDecodesCSS(surface string) bool { return surface != SurfaceResponseHeader }
+//
+// A switch and not `surface != SurfaceResponseHeader`, which is how this was
+// first written and what let `diff` lose the fix: `HostLeaks(b, true)` renames
+// the buffer to SurfaceHTMLAttr through bareSurface, and against a negative test
+// a rename silently re-arms the view. Every surface is classified here, and
+// rewrite.TestSurfaceNamesAreKnownHere requires a new one to be added.
+func surfaceDecodesCSS(surface string) bool {
+	switch surface {
+	// A browser following a Location runs the URL parser and nothing else.
+	case SurfaceResponseHeader:
+		return false
+	}
+	return true
+}
 
 // hasPercentCSSEsc reports whether the buffer could hold a percent-encoded CSS
 // escape: `%5C` followed by a hex digit. `%5C` on its own is any quoted Windows

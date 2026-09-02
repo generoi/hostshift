@@ -378,6 +378,27 @@ func cmdRewrite(args []string) (int, error) {
 	return exitOK, nil
 }
 
+// wantCensus reports whether the proxy should write its census to the log.
+//
+// `--dry-run` as well as `--explain`, because dry-run's own help says it logs
+// "every rewrite it would have made" and for a long time it logged none. Split
+// out so both halves of that claim can be tested without starting a proxy: the
+// wiring was three mutations deep in unpinned code, and nothing failed when the
+// hook was deleted, silenced to Debug, or given a constant surface.
+func wantCensus(explain, dryRun bool) bool { return explain || dryRun }
+
+// censusHook is the callback wantCensus arms.
+//
+// Info and not Debug: the default slog handler drops Debug, and this exists so
+// that `check`'s instruction — add the flag, restart, `| grep census` — is true
+// at the moment of a test-28 refusal.
+func censusHook(log *slog.Logger) func(string, origin.Event) {
+	return func(surface string, e origin.Event) {
+		log.Info("census", "surface", surface, "action", e.Action,
+			"reason", e.Reason, "offset", e.Offset, "text", e.Text)
+	}
+}
+
 func cmdProxy(args []string) (int, error) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	var c common
@@ -417,11 +438,8 @@ func cmdProxy(args []string) (int, error) {
 	// container in the project and grep the log for "rewrote", a word this
 	// process never wrote. `--dry-run`'s own help says it logs "every rewrite it
 	// would have made", and it logged none either. Both are true now.
-	if *explain || *dryRun {
-		st.OnEvent(func(surface string, e origin.Event) {
-			log.Info("census", "surface", surface, "action", e.Action,
-				"reason", e.Reason, "offset", e.Offset, "text", e.Text)
-		})
+	if wantCensus(*explain, *dryRun) {
+		st.OnEvent(censusHook(log))
 	}
 	p := &proxy.Proxy{
 		Upstream:      up,

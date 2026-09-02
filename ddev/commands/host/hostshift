@@ -1639,12 +1639,21 @@ if [ "$cmd" = "check" ]; then
     echo "  them, and over it they are written into the shared database as they" >&2
     echo "  stand. That database is production's, and there is no undo — §4.3." >&2
     echo "  Raise it in HOSTSHIFT_ARGS in .ddev/.env, e.g. --max-body 33554432," >&2
-    echo "  and \`ddev restart\`. Then check what was already written:" >&2
-    echo "    ddev exec -s db mysql -N -B -e \\" >&2
-    echo "      \"select option_name from wp_options where option_value like" >&2
-    echo "       '%${variants%%,*}%'\" db" >&2
+    echo "  and \`ddev restart\`. Then find what was already written. A save" >&2
+    echo "  lands in post content, an upload in post meta, and a subsite keeps" >&2
+    echo "  its own tables, so wp_options alone answers no:" >&2
+    echo "    ddev exec -s db mysql -N -B db -e \"" >&2
+    echo "      select 'post_content', count(*) from wp_posts" >&2
+    echo "        where post_content like '%${variants%%,*}%'" >&2
+    echo "      union select 'guid', count(*) from wp_posts" >&2
+    echo "        where guid like '%${variants%%,*}%'" >&2
+    echo "      union select 'postmeta', count(*) from wp_postmeta" >&2
+    echo "        where meta_value like '%${variants%%,*}%'" >&2
+    echo "      union select 'options', count(*) from wp_options" >&2
+    echo "        where option_value like '%${variants%%,*}%'\"" >&2
+    echo "  On a multisite repeat it per subsite — wp_2_posts, wp_2_postmeta," >&2
+    echo "  wp_2_options — for every blog_id in wp_blogs." >&2
     echo "  The restart clears this log; the rows it wrote are still there." >&2
-    exit 2
   fi
   if [ "$capped" -gt 0 ] 2>/dev/null; then
     echo "hostshift: refusing to call this healthy — $capped response(s) went to" >&2
@@ -1660,6 +1669,9 @@ if [ "$cmd" = "check" ]; then
     echo "    docker logs ddev-$name-hostshift 2>&1 | grep 'size cap'" >&2
     echo "  The restart that applies the new cap also clears this: DDEV recreates" >&2
     echo "  the container, so the log starts empty." >&2
+  fi
+  # After both, so a deployment failing in both directions is told about both.
+  if [ "$capped" -gt 0 ] 2>/dev/null || [ "$capped_req" -gt 0 ] 2>/dev/null; then
     exit 2
   fi
 
