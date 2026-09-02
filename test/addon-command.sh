@@ -1575,7 +1575,45 @@ out="$(cd "$wt" && HS_CURL_BODY='<p>signup</p>' HS_CURL_CODES="302 200 200" \
 [ "$rc" = 2 ] && pass "a page that redirects to wp-signup is not healthy" \
   || fail "a page that redirects to wp-signup is not healthy" "exit $rc"
 contains "and it names the table that actually decides" "wp_blogs" "$out"
-contains "and it does not advise a search-replace" "moves production" "$out"
+
+# ...and in the shared mode it says so, because there the warning is the whole
+# point: the database is production's and a search-replace moves production.
+sharedbin2="$work/sharedbin2"; mkdir -p "$sharedbin2"
+cat > "$sharedbin2/ddev" <<'SHARED2'
+#!/usr/bin/env bash
+case "$*" in
+  *printenv*) echo "DB_HOST=ddev-acme-db" ;;
+esac
+exit 0
+SHARED2
+chmod +x "$sharedbin2/ddev"
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+hs62n="$work/curl-n62"; echo 0 > "$hs62n"
+out="$(cd "$wt" && HS_CURL_BODY='<p>signup</p>' HS_CURL_CODES="302 200 200" \
+  HS_CURL_STATE="$hs62n" \
+  HS_CURL_LOCATION="https://wt-a--acme.ddev.site/wp-signup.php?new=www.acme.example" \
+  PATH="$sharedbin2:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "a shared database is still called production's" "moves production" "$out"
+contains "and the compare command names the shared container" "docker exec ddev-acme-db" "$out"
+# ...and in the un-shared mode the advice is the opposite one, on a fixture of
+# its own so no leftover dotenv decides it. A worktree with its own database may
+# re-copy or search-replace it; forbidding that sends the developer to
+# hostshift.yaml for a problem `copy-db` fixes in seconds.
+rm -f "$wt/.env" "$wt/.ddev/.env.web"
+ownbin="$work/ownbin"; mkdir -p "$ownbin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$ownbin/ddev"; chmod +x "$ownbin/ddev"
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+hs62o="$work/curl-n62o"; echo 0 > "$hs62o"
+own_out="$(cd "$wt" && HS_CURL_BODY='<p>signup</p>' HS_CURL_CODES="302 200 200" \
+  HS_CURL_STATE="$hs62o" \
+  HS_CURL_LOCATION="https://wt-a--acme.ddev.site/wp-signup.php?new=www.acme.example" \
+  PATH="$ownbin:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "an unshared database is not called production's" "its own database" "$own_out"
+case "$own_out" in
+  *"moves production"*)
+    fail "and it does not claim a shared database" "asserted the shared mode" ;;
+  *) pass "and it does not claim a shared database" ;;
+esac
 
 # ...but one absent subsite is not a broken deployment, and must not throw away
 # the leak scans.
@@ -1810,6 +1848,36 @@ chmod +x "$nodbbin/ddev"
 printf 'DB_HOST=ddev-acme-db\n' > "$wt/.env"
 out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "the sweep reads a dotenv the container cannot see" "docker exec ddev-acme-db" "$out"
+
+# ...and a compose override, which copy-db's guard reads and this one did not.
+# The README documents sharing the parent's database through exactly this kind
+# of file.
+rm -f "$wt/.env"
+printf 'services:\n  web:\n    environment:\n      - DATABASE_URL=mysql://db:db@ddev-acme-db:3306/db\n' \
+  > "$wt/.ddev/docker-compose.dbshare.yaml"
+out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "and a compose override, which copy-db also reads" "docker exec ddev-acme-db" "$out"
+rm -f "$wt/.ddev/docker-compose.dbshare.yaml"
+
+# ...and `.ddev/.env.web`, DDEV's own per-service dotenv, which was the only
+# other file in the list and was never exercised.
+printf 'DB_HOST=ddev-acme-db\n' > "$wt/.ddev/.env.web"
+out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "and the per-service dotenv" "docker exec ddev-acme-db" "$out"
+rm -f "$wt/.ddev/.env.web"
+
+# ...and a note *after* a real assignment is still a note. The suite covered a
+# leading `#` and not a trailing one, so a value allowed to run past a comment
+# returned another client's container from a line whose actual value is local.
+printf 'DB_HOST=localhost   # staging import came from ddev-otherclient-db\n' > "$wt/.env"
+out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"docker exec ddev-otherclient-db"*)
+    fail "a trailing comment is not part of the value" \
+      "read a container name out of a comment" ;;
+  *) pass "a trailing comment is not part of the value" ;;
+esac
+rm -f "$wt/.env"
 
 # ...and a *comment* is not an assignment. A stale note sent the sweep to a
 # database the application does not write to, which is round 59's failure

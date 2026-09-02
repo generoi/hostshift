@@ -79,3 +79,33 @@ func TestR61RewriteNamesTheXMLSurfaceTheProxyNames(t *testing.T) {
 			"  json: %s", strings.TrimSpace(errOut))
 	}
 }
+
+// The XML arm's surface reaches the byte matcher too, not only the census.
+//
+// `escapeAlphabetFor` maps `text` and `xml-text` to the same alphabet, so
+// reverting the `RewriteText` call alone leaves the output bytes identical and
+// `HostLeaksXMLCounted` still supplies the CSS view — the earlier assertion is
+// satisfiable without the call it names. What diverges is `--explain`: it
+// reports `surface: text` for events the census block above it files under
+// `xml-text`, on the same body, which is the field `check` tells a developer to
+// read at a test-28 refusal.
+func TestR62ExplainNamesTheSameArmAsTheCensus(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme\n")
+	writeFile(t, dir, "hostshift.yaml",
+		"sites:\n  - canonical: https://www.acme.fi\n"+
+			"    variant: https://wt-a--acme.ddev.site\n")
+
+	body := `<feed><entry><link href="https://www.acme.fi/x"/></entry></feed>`
+	_, _, errOut := run(t, body, cmdRewrite, "-C", dir, "--slug", "wt-a",
+		"--type", "application/rss+xml", "--explain")
+	_, events, ok := strings.Cut(errOut, "explain (")
+	if !ok {
+		t.Fatalf("fixture: --explain printed no event section:\n%s", errOut)
+	}
+	if !strings.Contains(events, "xml-text") {
+		t.Errorf("--explain names the plain-text arm for an XML body, while the "+
+			"counters above it say xml-text — the surface reached Record and not "+
+			"the matcher:\n%s", errOut)
+	}
+}

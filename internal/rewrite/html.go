@@ -43,7 +43,10 @@ type HTML struct {
 	attrs   []Attr // scratch for scanAttrsInto, reused across tags
 	hosts   *hostReplacer
 	xmlEnt  bool
-	foreign int // depth inside <svg>/<math>, where references are decoded
+	// foreignNS is the open <svg>/<math> elements, innermost last. Its length is
+	// the old `foreign` depth; its last entry is the vocabulary an element name
+	// has to be read in.
+	foreignNS []string
 	// foreignObjectAt is the <svg>/<math> depth at which an HTML integration
 	// point resumed HTML rules, or 0 when none has.
 	//
@@ -216,17 +219,39 @@ var rawTextNameBytes = func() [][]byte {
 	return out
 }()
 
-// integrationPoint reports whether an element name is an HTML integration point
-// — a place where a foreign-content parser goes back to HTML rules.
+// integrationPointIn reports whether an element name is an integration point *in
+// the vocabulary it appears in* — a place where a foreign-content parser goes
+// back to HTML rules.
+//
+// The namespace is half the rule and round 61 modelled only the names, so
+// `<svg><mtext>` — an ordinary SVG element the parser stays foreign inside —
+// was read as HTML rules resumed and a reference decode the browser performs was
+// withheld. Chrome builds a live stylesheet from an `@import` there.
 //
 // `annotation-xml` is deliberately absent: it is one only when its encoding says
 // so, which the caller that cares checks with htmlEncoding.
-func integrationPoint(name string) bool {
-	switch name {
-	case "foreignobject", "desc", "title", "mi", "mo", "mn", "ms", "mtext":
-		return true
+func integrationPointIn(name, ns string) bool {
+	switch ns {
+	case "svg":
+		switch name {
+		case "foreignobject", "desc", "title":
+			return true
+		}
+	case "math":
+		switch name {
+		case "mi", "mo", "mn", "ms", "mtext":
+			return true
+		}
 	}
 	return false
+}
+
+// currentNS is the vocabulary of the innermost open <svg>/<math>, or "".
+func (w *HTML) currentNS() string {
+	if len(w.foreignNS) == 0 {
+		return ""
+	}
+	return w.foreignNS[len(w.foreignNS)-1]
 }
 
 // htmlEncoding reports whether a MathML <annotation-xml> start tag carries an
@@ -238,19 +263,27 @@ func integrationPoint(name string) bool {
 // stays in foreign content and decodes references as it does everywhere else
 // inside <math>.
 func htmlEncoding(raw []byte) bool {
-	low := bytes.ToLower(raw)
-	i := bytes.Index(low, []byte("encoding"))
-	if i < 0 {
+	z := html.NewTokenizer(bytes.NewReader(raw))
+	if z.Next() == html.ErrorToken {
 		return false
 	}
-	rest := low[i+len("encoding"):]
-	rest = bytes.TrimLeft(rest, " \t\r\n")
-	if len(rest) == 0 || rest[0] != '=' {
-		return false
+	for {
+		k, v, more := z.TagAttr()
+		if bytes.EqualFold(k, []byte("encoding")) {
+			// The whole value, ASCII case-insensitively. Round 61 took any
+			// attribute *containing* "encoding" and prefix-matched the value,
+			// so `data-encoding="text/html"`, `encoding="text/htmlish"` and
+			// `encoding="text/html; charset=utf-8"` all counted — and each of
+			// them leaves the element ordinary MathML, where the parser stays
+			// foreign and the browser decodes. Measured in Chrome: only the
+			// exact spelling puts the child in the XHTML namespace.
+			return bytes.EqualFold(v, []byte("text/html")) ||
+				bytes.EqualFold(v, []byte("application/xhtml+xml"))
+		}
+		if !more {
+			return false
+		}
 	}
-	rest = bytes.TrimLeft(rest[1:], " \t\r\n\"'")
-	return bytes.HasPrefix(rest, []byte("text/html")) ||
-		bytes.HasPrefix(rest, []byte("application/xhtml+xml"))
 }
 
 // rcdataElement reports whether an element's text is RCDATA rather than RAWTEXT.
@@ -387,7 +420,8 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	// Foreign content unless an integration point below this depth resumed HTML
 	// rules. An <svg> *inside* a foreignObject is foreign again, which a count
 	// could not express.
-	inForeign := w.foreign > 0 && (w.foreignObjectAt == 0 || w.foreign > w.foreignObjectAt)
+	inForeign := len(w.foreignNS) > 0 &&
+		(w.foreignObjectAt == 0 || len(w.foreignNS) > w.foreignObjectAt)
 	if (w.xmlEnt || inForeign || (surface == SurfaceRawText && rcdataElement(w.rawText))) &&
 		(surface == SurfaceInlineScript || surface == SurfaceInlineStyle ||
 			surface == SurfaceRawText || surface == SurfaceText) {
@@ -697,16 +731,32 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// foreign content: the same SVG served standalone was rewritten and
 			// inlined in a page was not.
 			if tt == html.StartTagToken {
-				switch n := string(bytes.ToLower(tagNameOf(raw))); n {
+				n := string(bytes.ToLower(tagNameOf(raw)))
+				// The namespace decides, not the name.
+				//
+				// An HTML integration point is an *SVG* foreignObject/desc/
+				// title; a MathML text integration point is a *MathML*
+				// mi/mo/mn/ms/mtext. `<svg><mtext>` is an ordinary SVG element
+				// with no special meaning, so the parser stays foreign and the
+				// browser decodes references inside it — measured in Chrome,
+				// which built a live stylesheet from an `@import` there and
+				// issued the request. Round 61 matched on the name alone and
+				// withheld the decode, shipping the canonical origin.
+				//
+				// A stack and not a counter, for the reason the previous round's
+				// title gives: the innermost vocabulary is the question, and a
+				// count cannot answer it.
+				switch n {
 				case "svg", "math":
-					w.foreign++
+					w.foreignNS = append(w.foreignNS, n)
 				case "annotation-xml":
 					// An integration point only when its encoding is an HTML
 					// one (13.2.6). Without that it is ordinary MathML and the
 					// parser stays in foreign content, so admitting it
 					// unconditionally withheld a decode the browser performs.
-					if htmlEncoding(raw) && w.foreignObjectAt == 0 {
-						w.foreignObjectAt = w.foreign
+					if w.currentNS() == "math" && htmlEncoding(raw) &&
+						w.foreignObjectAt == 0 {
+						w.foreignObjectAt = len(w.foreignNS)
 					}
 				case "foreignobject", "desc", "title",
 					"mi", "mo", "mn", "ms", "mtext":
@@ -722,8 +772,8 @@ func (w *HTML) Read(p []byte) (int, error) {
 					//
 					// Only the outermost is recorded; a nested pair resolves to
 					// "foreign", which over-decodes.
-					if w.foreignObjectAt == 0 {
-						w.foreignObjectAt = w.foreign
+					if integrationPointIn(n, w.currentNS()) && w.foreignObjectAt == 0 {
+						w.foreignObjectAt = len(w.foreignNS)
 					}
 				}
 			}
@@ -732,13 +782,13 @@ func (w *HTML) Read(p []byte) (int, error) {
 			w.rawText = ""
 			switch n := string(bytes.ToLower(endTagNameOf(raw))); n {
 			case "svg", "math":
-				if w.foreign > 0 {
-					w.foreign--
+				if len(w.foreignNS) > 0 {
+					w.foreignNS = w.foreignNS[:len(w.foreignNS)-1]
 				}
 				// `</svg>` closes an open foreignObject implicitly (13.2.6.5).
 				// Without this the mark outlived the element it belonged to and
 				// disarmed the rest of the document.
-				if w.foreign < w.foreignObjectAt {
+				if len(w.foreignNS) < w.foreignObjectAt {
 					w.foreignObjectAt = 0
 				}
 			case "foreignobject", "desc", "title",
@@ -784,10 +834,12 @@ func (w *HTML) Read(p []byte) (int, error) {
 			default:
 				// A `<style>` the tokenizer swallowed into a raw-text token.
 				//
-				// `<title>` and `<desc>` are raw-text elements by name, and the
-				// tokenizer is context-free — but inside `<svg>` they are HTML
-				// integration points, so the parser builds a *real* `<style>`
-				// element in them and runs its CSS tokenizer. hostshift saw one
+				// `<title>` is a raw-text element by name and the tokenizer is
+				// context-free — but inside `<svg>` it is an HTML integration
+				// point, so the parser builds a *real* `<style>` element in it
+				// and runs its CSS tokenizer. (`desc` is the other SVG
+				// integration point that could hold one, and it is not in
+				// rawTextNames, so it never reaches here.) hostshift saw one
 				// token named `title` and withheld the CSS view, so
 				// `<svg><title><style>@import url(https\3a \2f \2f canonical/x)`
 				// went out untouched — an `@import` the browser fetches, which
@@ -797,7 +849,7 @@ func (w *HTML) Read(p []byte) (int, error) {
 				// CSS decode over every title would over-rewrite bytes a reader
 				// sees, which is the defect round 60 fixed for text/plain.
 				surface := SurfaceRawText
-				if w.foreign > 0 && integrationPoint(w.rawText) &&
+				if len(w.foreignNS) > 0 && integrationPointIn(w.rawText, w.currentNS()) &&
 					bytes.Contains(bytes.ToLower(raw), []byte("<style")) {
 					surface = SurfaceInlineStyle
 				}

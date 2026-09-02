@@ -751,6 +751,23 @@ EOF
 # mode, where "that database is production's" is *true*, the command is wrong;
 # in the mode where the command is right, the sentence is false. copy-db has
 # detected this exact state since round 40 and the remedies never asked it.
+# hs_db_shared reports whether the application reads a database other than this
+# project's own — the question hs_db_command already answers by choosing between
+# `docker exec <other>` and `ddev exec -s db`.
+#
+# Prose has to ask it too. Round 59 recorded the inversion — "in the mode where
+# the command is right, the sentence is false" — and rounds 60 and 61 fixed only
+# the commands, so a worktree with its own copied database was still told the
+# database was "the parent's, shared with production", and forbidden the two
+# things that actually fix it: `copy-db`, or a search-replace on a database
+# entirely its own.
+hs_db_shared() {
+  case "$(hs_db_command)" in
+    "docker exec "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 hs_db_command() {
   _self="ddev-${DDEV_SITENAME:-$(basename "$(pwd -P)")}-db"
   _env="$(ddev exec -s web printenv DB_HOST DATABASE_URL DB_URL 2>/dev/null || true)"
@@ -775,7 +792,22 @@ hs_db_command() {
   if [ -z "$_other" ]; then
     _q='["'"'"']?'
     _assign="^[[:space:]]*-?[[:space:]]*$_q(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*$_q[[:space:]]*[:=][^#]*ddev-[A-Za-z0-9._-]+-db"
-    _other="$(grep -shE "$_assign" .env .ddev/.env.web 2>/dev/null \
+    # The same *files* as copy-db's guard, not only the same expression. Round
+    # 61's comment claimed parity and delivered it for the pattern alone: this
+    # read `.env` and `.ddev/.env.web` where copy-db reads the config and
+    # compose overrides too — and `.ddev/config.worktree.local.yaml` with a
+    # `web_environment:` entry is the way the README documents sharing the
+    # parent's database.
+    _envfiles=""
+    for _f in .ddev/.env.*; do
+      [ -f "$_f" ] || continue
+      case "${_f#.ddev/.env.}" in *.*) continue ;; esac
+      _envfiles="$_envfiles $_f"
+    done
+    # shellcheck disable=SC2086
+    _other="$(grep -shE "$_assign" \
+      .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml \
+      .ddev/.env $_envfiles .env 2>/dev/null \
       | grep -oE 'ddev-[A-Za-z0-9._-]+-db' | grep -vxF "$_self" | head -1 || true)"
   fi
   if [ -n "$_other" ]; then
@@ -2392,8 +2424,15 @@ $extra_body"
     echo "      \"select blog_id, domain, path from wp_blogs\" db" >&2
     echo "  If those hostnames are not the ones hostshift maps, the database" >&2
     echo "  moved and the map did not — fix hostshift.yaml to name what the" >&2
-    echo "  database holds. Do *not* search-replace the database: it is the" >&2
-    echo "  parent's, shared with production, and moving it moves production." >&2
+    echo "  database holds." >&2
+    if hs_db_shared; then
+      echo "  Do *not* search-replace the database: it is the parent's, shared" >&2
+      echo "  with production, and moving it moves production." >&2
+    else
+      echo "  This worktree has its own database, so you may also re-copy it" >&2
+      echo "  (\`ddev hostshift copy-db\`) or search-replace it — nothing outside" >&2
+      echo "  this project reads it." >&2
+    fi
     exit 2
   fi
 

@@ -282,3 +282,60 @@ func TestR61SVGTitleWithholdsTheCSSView(t *testing.T) {
 			"  withheld the CSS view.\n  in:  %s\n  out: %s", doc, out)
 	}
 }
+
+// The outermost integration point wins, and a nested one does not re-arm.
+//
+// The comment calls that deliberate — "a nested pair resolves to foreign, which
+// over-decodes" — and nothing asserted it. Taking the innermost instead is not
+// equivalent and errs toward the leak: in `<svg><desc><svg><mtext><script>` the
+// inner `<mtext>` is an ordinary SVG element, so the parser is foreign there and
+// decodes, and recording it as an integration point withholds the decode.
+func TestR62TheOutermostIntegrationPointWins(t *testing.T) {
+	m := r55Matcher(t)
+	in := `<svg><desc><svg><mtext><script>fetch("https:&#47;&#47;` + r55Canonical +
+		`/x")</script></mtext></svg></desc></svg>`
+	if out := rewriteHTML(t, m, in, NewStats(false)); !strings.Contains(out, r55Variant) {
+		t.Errorf("the inner <mtext> is an ordinary SVG element, so the parser "+
+			"decodes there and this is %s — it was served live:\n  %s",
+			r55Canonical, out)
+	}
+}
+
+// The swallowed-<style> arm is for foreign content only.
+//
+// An ordinary `<title>` in `<head>` is RCDATA and no CSS tokenizer runs over it,
+// so decoding escapes there rewrites bytes a reader sees in the tab — verbatim
+// the over-rewrite round 60 fixed for text/plain, which is why the arm is gated
+// on being inside <svg>/<math> at all. The gate had no test.
+func TestR62TheSwallowedStyleArmIsForeignOnly(t *testing.T) {
+	m := r55Matcher(t)
+	in := `<title>Using &lt;style&gt; with https\3a \2f \2f ` + r55Canonical + `/x</title>`
+	if out := rewriteHTML(t, m, in, NewStats(false)); out != in {
+		t.Errorf("an ordinary <title> is not a stylesheet and nothing decodes a "+
+			"CSS escape there, so these bytes reach the reader as written:\n"+
+			"  in  %s\n  out %s", in, out)
+	}
+}
+
+// A nested integration point does not narrow the outer one.
+//
+// `<svg><desc><svg><desc>` puts the parser back on HTML rules twice, and taking
+// the *innermost* mark would be the more faithful reading — inside the inner
+// `<desc>` the parser really is on HTML rules and decodes nothing. This model
+// takes the outermost deliberately, so the inner subtree resolves to "foreign"
+// and is over-decoded: every error in this model is pushed to the side that
+// rewrites rather than the side that leaks, which is the trade §4.4 makes
+// throughout and the reason an unbalanced `<svg>` is harmless.
+//
+// Asserted because it is a choice, not a consequence: taking the innermost is
+// otherwise invisible to the suite, and it moves this model to the leaking side.
+func TestR62ANestedIntegrationPointDoesNotNarrowTheOuterOne(t *testing.T) {
+	m := r55Matcher(t)
+	in := `<svg><desc><svg><desc><script>fetch("https:&#47;&#47;` + r55Canonical +
+		`/x")</script></desc></svg></desc></svg>`
+	if out := rewriteHTML(t, m, in, NewStats(false)); !strings.Contains(out, r55Variant) {
+		t.Errorf("this model resolves a nested integration point to foreign and "+
+			"over-decodes on purpose; taking the innermost mark instead withholds "+
+			"the decode, which is the leaking direction:\n  %s", out)
+	}
+}
