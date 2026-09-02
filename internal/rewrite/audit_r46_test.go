@@ -89,7 +89,12 @@ func TestR46EveryViewFiresNoLongerFiresEveryView(t *testing.T) {
 	// and passed at 186x against a 200x ceiling with a third of the machinery
 	// never entered. The ceiling is now 400x, which is what the composite
 	// actually costs; this asserts the fixture still earns it.
-	for _, needle := range []string{`\u`, `%5Cu`} {
+	// `%5C3a` is round 56's cell: percent over a CSS escape, which is what
+	// `post.php` posts back after cssEscapeLeak emits one. Its composition is
+	// three views deep, so a fixture that does not arm it makes the ceiling
+	// below fictitious — which is the whole failure this test was written for,
+	// one round on.
+	for _, needle := range []string{`\u`, `%5Cu`, `%5C3a`} {
 		if !strings.Contains(r46CompositeUnit, needle) {
 			t.Errorf("the composite allocation unit no longer contains %q, so the view "+
 				"gated on it is not measured:\n  %s", needle, r46CompositeUnit)

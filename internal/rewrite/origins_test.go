@@ -81,3 +81,42 @@ func TestHostsInReadsAPageAsAPage(t *testing.T) {
 			"alphabet: %v", got["shop.acme.fi"], got)
 	}
 }
+
+// The census must not invent a host.
+//
+// A view can end a host on a byte that leaves nothing behind:
+// `https:&#47;&#47;c.example/0` yielded one named `&`. check prints the census,
+// so it advised adding `&` to hostshift.yaml as an alias — and hostshift
+// accepted it, `map --external-canonical-hosts` listed it, and
+// `ddev hostshift loopback` would have written `- "&:127.0.0.1"` into the
+// compose file. A phantom with a straight path to a broken deployment.
+func TestHostsInInventsNoHosts(t *testing.T) {
+	for name, in := range map[string]string{
+		"numeric reference": `https:&#47;&#47;c.example/0`,
+		"hex reference":     `https:&#x2F;&#x2F;c.example/0`,
+		"named reference":   `https:&sol;&sol;c.example/0`,
+	} {
+		got := HostsIn([]byte(in))
+		if got["c.example"] < 1 {
+			t.Errorf("%s: c.example not found (got %v)", name, got)
+		}
+		for h := range got {
+			if h != "c.example" {
+				t.Errorf("%s: reported a host named %q, which no browser resolves "+
+					"— check prints this and advises adding it to hostshift.yaml", name, h)
+			}
+		}
+	}
+	// And the shapes that must survive the filter, since the census is the only
+	// instrument that can name an origin the map does not.
+	for _, in := range []string{
+		`<a href="https://xn--hmeen-loa.fi/x">`,
+		`<a href="https://hämeen.fi/x">`,
+		`<a href="https://a-b.c_d.example/x">`,
+		`<a href="https://www.example.fi./x">`,
+	} {
+		if got := HostsIn([]byte(in)); len(got) == 0 {
+			t.Errorf("the filter dropped a real host: %s", in)
+		}
+	}
+}

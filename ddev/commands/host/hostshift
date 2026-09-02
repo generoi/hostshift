@@ -609,31 +609,48 @@ if [ "$cmd" = "copy-db" ]; then
     # database dropped and partially reloaded. Saying so is the difference
     # between re-running the command and debugging a site that is now missing
     # half its tables.
-    # Which of the two failures it was, measured rather than assumed.
+    # What the count can and cannot say.
     #
-    # "may be half-replaced … re-run with --force" is written for the
-    # interruption and was printed for every failure mode, so the ordinary "you
-    # forgot to start the parent" case — where mysqldump never connected and
-    # nothing was dropped — ended by naming the one destructive flag. The
-    # database itself can say which happened.
+    # Round 54 printed "may be half-replaced … re-run with --force" for every
+    # failure mode, so the ordinary "you forgot to start the parent" case ended
+    # by naming the one destructive flag. Round 55 replaced that with a table
+    # count and compared it against *zero* rather than against the count taken
+    # before the copy — which this block already has in `$tables` — so it was
+    # confidently wrong in both directions: it announced a half-replaced
+    # database on a fresh empty worktree where mysqldump never connected, and
+    # announced that nothing had changed over a database whose rows had just
+    # been truncated mid-reload.
     #
-    # --force is not the answer to either. It gates overwriting a worktree
-    # database that has content, and re-running meets exactly the same gate this
+    # A table count cannot answer this question in general. `--add-drop-database`
+    # recreates the whole table list early and fills it as the stream arrives, so
+    # the same count before and after is exactly what a copy interrupted late
+    # looks like — 13 tables either side, and 1.2M rows gone. The only state it
+    # can settle is empty-to-empty, where there was nothing to lose. Everywhere
+    # else this says what it does not know, which is the difference between a
+    # developer re-running a command and a developer carrying on against
+    # silently truncated content.
+    #
+    # --force is not the answer to either: it gates overwriting a worktree
+    # database that has content, and re-running meets the same gate this
     # invocation already passed.
     ntables="$(ddev exec -s web bash -c \
-      'mysql -h db -udb -pdb -N -B -e "show tables" db 2>/dev/null | wc -l' \
-      2>/dev/null | tr -cd '0-9')"
+      "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
+      2>/dev/null | tail -1 | tr -dc '0-9' || true)"
     echo "hostshift: the copy failed." >&2
     echo "  Is $from running? \`ddev start $from\`" >&2
-    if [ -n "$ntables" ] && [ "$ntables" -gt 0 ] 2>/dev/null; then
-      echo "  This worktree's database still has $ntables table(s), so the dump" >&2
-      echo "  never got as far as dropping it and nothing here changed. Fix the" >&2
-      echo "  above and re-run the same command." >&2
+    if [ "${tables:-0}" = "0" ] && [ "${ntables:-0}" = "0" ] 2>/dev/null; then
+      echo "  This worktree's database had no tables before this ran and has" >&2
+      echo "  none now, so nothing was lost. Fix the above and re-run the same" >&2
+      echo "  command." >&2
     else
-      echo "  This worktree's database has no tables. --add-drop-database puts" >&2
-      echo "  \`DROP DATABASE\` at the top of the stream, so a copy interrupted" >&2
-      echo "  after that point leaves it half-replaced — which is what this" >&2
-      echo "  looks like. Re-run once $from is up." >&2
+      echo "  This worktree's database had ${tables:-?} table(s) before this ran" >&2
+      echo "  and has ${ntables:-?} now, and that does not settle it:" >&2
+      echo "  --add-drop-database recreates the whole table list at the top of" >&2
+      echo "  the stream and fills it as the dump arrives, so an unchanged count" >&2
+      echo "  is what a copy interrupted late looks like — the tables are all" >&2
+      echo "  there and the rows are not." >&2
+      echo "  Check a table you know the size of before trusting this database," >&2
+      echo "  or re-run the copy once $from is up, which replaces it outright." >&2
     fi
     exit 1; }
   echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
@@ -661,6 +678,45 @@ map_args=()
 parent_declares=""
 parent_declares_msg=""
 db_confirms_map=""
+# refuse_variants_outside_tld refuses variant hostnames nothing local answers to.
+#
+# Entirely static — $variants, the project's own hostnames, $DDEV_TLD and
+# /etc/hosts — which is why it can run before anything is written. It lived
+# inside `check` only, so `init --dry-run`, the step the add-on's own post-install
+# text tells a developer to run first, printed the variant and not one word of
+# warning: the flag whose whole purpose is to avoid a bad deployment could not
+# see the bad deployment. Run for real, the project was deployed and restarted
+# and *then* refused — and on a client domain with wildcard DNS the hostname it
+# had just printed opens production.
+refuse_variants_outside_tld() {
+  _variants="$1"; _hosts="$2"
+  _tld="${DDEV_TLD:-ddev.site}"
+  _outside=""
+  for _v in $(printf '%s' "$_variants" | tr ',' ' '); do
+    _ok=""
+    case "$_v" in *".$_tld") _ok=1 ;; esac
+    if [ -z "$_ok" ]; then
+      while IFS= read -r _h; do
+        [ "$_h" = "$_v" ] && { _ok=1; break; }
+      done <<EOF
+$_hosts
+EOF
+    fi
+    if [ -z "$_ok" ] && grep -qE "^[^#]*[[:space:]]$_v([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+      _ok=1
+    fi
+    [ -n "$_ok" ] || _outside="${_outside:+$_outside }$_v"
+  done
+  [ -n "$_outside" ] || return 0
+  echo "hostshift: these variant hostnames are not under any domain this DDEV" >&2
+  echo "  project registers, so nothing local answers to them:" >&2
+  printf '    %s\n' $_outside >&2
+  echo "  On a client domain with wildcard DNS they resolve to *production*." >&2
+  echo "  Declare \`base:\` on the site, pointing at this project's own" >&2
+  echo "  hostname, so the variant is derived from a name DDEV serves." >&2
+  exit 2
+}
+
 parent_declares_warn() {
   echo "hostshift: warning: $parent_declares declares the hostnames its database" >&2
   echo "  holds, and this worktree's branch predates it — so the map below was" >&2
@@ -1225,7 +1281,16 @@ HOSTSHIFT_WEB_HOSTS=$web"
 # It does not touch hostnames. Whatever is copied still holds the parent's, which
 # is exactly why hostshift is needed afterwards just as much as before.
 if [ "$cmd" = "check" ]; then
-  hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
+  # What web actually answers on, so the canonical-on-production note lists URLs
+  # this project serves and not the parent's. A worktree inherits the parent's
+  # additional_hostnames and the add-on narrows web's VIRTUAL_HOST afterwards, so
+  # DDEV registers `b.acme.ddev.site` here while the parent serves it — and that
+  # note is the only place a developer is told which URLs show unrewritten
+  # production content.
+  web_hosts="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' .ddev/.env 2>/dev/null \
+    | tr -d '\r' || true)"
+  hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+    ${web_hosts:+--served-hosts "$web_hosts"} || exit $?
 
   if [ ! -f .ddev/.env ]; then
     echo "hostshift: nothing deployed yet — run \`ddev hostshift init\`" >&2
@@ -1361,30 +1426,7 @@ if [ "$cmd" = "check" ]; then
   # `local--www.example.com` matched and was accepted — a name with no local
   # entry, which resolves through public DNS to the production server under the
   # wildcard records these domains often carry.
-  tld="${DDEV_TLD:-ddev.site}"
-  outside=""
-  for v in $(printf '%s' "$variants" | tr ',' ' '); do
-    ok=""
-    case "$v" in *".$tld") ok=1 ;; esac
-    if [ -z "$ok" ]; then
-      while IFS= read -r h; do
-        [ "$h" = "$v" ] && { ok=1; break; }
-      done <<<"$hosts"
-    fi
-    if [ -z "$ok" ] && grep -qE "^[^#]*[[:space:]]$v([[:space:]]|$)" /etc/hosts 2>/dev/null; then
-      ok=1
-    fi
-    [ -n "$ok" ] || outside="${outside:+$outside }$v"
-  done
-  if [ -n "$outside" ]; then
-    echo "hostshift: these variant hostnames are not under any domain this DDEV" >&2
-    echo "  project registers, so nothing local answers to them:" >&2
-    printf '    %s\n' $outside >&2
-    echo "  On a client domain with wildcard DNS they resolve to *production*." >&2
-    echo "  Declare \`base:\` on the site, pointing at this project's own" >&2
-    echo "  hostname, so the variant is derived from a name DDEV serves." >&2
-    exit 2
-  fi
+  refuse_variants_outside_tld "$variants" "$hosts"
 
   # web's VIRTUAL_HOST, not only the proxy's.
   #
@@ -1516,6 +1558,41 @@ if [ "$cmd" = "check" ]; then
   norm_map() { awk '{ sub(/^[^ \t]+[ \t]+/, ""); gsub(/[ \t]+/, " "); print }' | LC_ALL=C sort -u; }
   logs="$(docker logs "ddev-$name-hostshift" 2>&1 || true)"
   running_map="$(printf '%s\n' "$logs" | awk "$extract_map" | norm_map || true)"
+
+  # A body over the size cap goes to the browser untouched.
+  #
+  # HTML is streamed and uncapped; JSON and text/* are read whole, and over
+  # `--max-body` the proxy passes them through unrewritten and logs a WARN. That
+  # is by design (§5.8) and `--max-body` is the documented answer — what was
+  # missing is that nothing ever said it had happened. Measured on one ordinary
+  # page-builder post: `/wp-json/wp/v2/posts/8` came back 9.4 MB carrying 19,390
+  # live canonical origins and zero rewrites, the proxy logged the skip, and
+  # `check` said "hostshift is serving" and exited 0. That is test 28, at a scale
+  # nothing else in this file can reach — and the block editor and every REST
+  # collection are exactly the surfaces that get large.
+  #
+  # A warning and not a refusal: the evidence is a log line from some earlier
+  # request, so refusing would block `ddev start` until the logs rotated, and
+  # this file records several rounds of refusals-on-inference that had to be
+  # taken back out. `check` runs on every start, so the count is what makes it
+  # worth reading.
+  capped="$(printf '%s\n' "$logs" \
+    | grep -c 'exceeds the size cap, passing through untouched' 2>/dev/null || true)"
+  [ -n "$capped" ] || capped=0
+  if [ "$capped" -gt 0 ] 2>/dev/null; then
+    cap_now="$(printf '%s\n' "$logs" \
+      | sed -n 's/.*cap=\([0-9][0-9]*\).*/\1/p' | tail -1 || true)"
+    echo "hostshift: warning: $capped response(s) went to the browser unrewritten" >&2
+    echo "  because they were larger than the body cap${cap_now:+ ($cap_now bytes)}." >&2
+    echo "  Those carry whatever origins the database holds — on a" >&2
+    echo "  production-canonical map that is live production links, and one" >&2
+    echo "  large REST response can carry thousands." >&2
+    echo "  HTML is streamed and never capped; this is JSON and text/*, which is" >&2
+    echo "  the block editor and every REST collection." >&2
+    echo "  Raise it in HOSTSHIFT_ARGS in .ddev/.env, e.g. --max-body 33554432," >&2
+    echo "  and \`ddev restart\`. Which paths:" >&2
+    echo "    docker logs ddev-$name-hostshift 2>&1 | grep 'size cap'" >&2
+  fi
 
   # The image's version against this command's.
   #
@@ -1998,6 +2075,24 @@ EOF
         # shell, which is the mistake round 54 took out of the off-map scan.
         *) break ;;
       esac
+      # A redirect to wp-signup.php is WordPress saying it does not recognise
+      # this hostname, which on a multisite means `wp_blogs.domain` does not
+      # hold it. That is the state this file's own comments call the
+      # catastrophe — "the action that silently breaks the site" — and it is
+      # what a `db:pull` landing with mismatched `wp_blogs` produces. Every page
+      # 302s, so nothing is previewable, and it was invisible: the status was
+      # discarded here and the signup page carries only variant origins, so the
+      # leak scans found nothing and `check` exited 0 saying "hostshift is
+      # serving". Evidence rather than inference, which is what this file
+      # prefers — the redirect target says it outright.
+      # Through a file, because every caller invokes this inside `$(...)` — a
+      # subshell, where a variable set here is discarded when it closes.
+      case "$_loc" in
+        *wp-signup.php*)
+          if [ -n "${hs_signup_file:-}" ]; then
+            printf '%s' "$_url" > "$hs_signup_file"
+          fi ;;
+      esac
       _lh="${_loc#*://}"; _lh="${_lh%%/*}"; _lh="${_lh%%:*}"
       case "$local_hosts" in
         *",$_lh,"*) ;;
@@ -2023,6 +2118,12 @@ EOF
   # containing a line that starts with the marker would split a record early,
   # which mis-attributes one message; it cannot crash the scan.
   probe_pages=""
+  # A record marker a served page cannot contain. `=== ` alone splits a record
+  # on any page carrying a line that starts with it — a changelog, a diff, a
+  # code sample — and because `url` then stays set, it mis-attributes every
+  # later message for that page and not just one. SOH is not valid in HTML text
+  # and survives a shell variable.
+  hs_mark="$(printf '\001')=== "
   hs_add_page() {
     [ -n "$2" ] || return 0
     # The bare URL for the list, which is word-split when it is printed — the
@@ -2034,21 +2135,23 @@ EOF
       *) probe_urls="$probe_urls ${1%% *}" ;;
     esac
     probe_pages="$probe_pages
-=== $1
+$hs_mark$1
 $2"
   }
 
   # The probed page that carries a host, for the messages. Falls back to the
   # first variant, which is what every message used to say unconditionally.
   hs_page_carrying() {
-    _u="$(printf '%s\n' "$probe_pages" | awk -v needle="$1" '
-      /^=== / { url = substr($0, 5); next }
+    _u="$(printf '%s\n' "$probe_pages" | awk -v needle="$1" -v m="$hs_mark" '
+      index($0, m) == 1 { url = substr($0, length(m) + 1); next }
       url != "" && index($0, needle) { print url; exit }')"
     [ -n "$_u" ] || _u="https://${probe:-}${port:-}/"
     printf '%s' "$_u"
   }
 
   probe_urls=""
+  hs_signup_at=""
+  hs_signup_file="$(mktemp "${TMPDIR:-/tmp}/hostshift-signup.XXXXXX" 2>/dev/null)" || hs_signup_file=""
   # An `if`, not `[ ] && cmd`: this file runs under `set -e`, where a bare test
   # that comes out false is the script's exit status. Written the short way it
   # ended `check` silently on any deployment with no probe host, and the suite
@@ -2088,6 +2191,39 @@ $red_body" ;;
       probe_body="$probe_body
 $extra_body"
     done
+  fi
+
+  if [ -n "${hs_signup_file:-}" ]; then
+    hs_signup_at="$(cat "$hs_signup_file" 2>/dev/null || true)"
+    rm -f "$hs_signup_file"
+  fi
+
+  # Nothing is previewable if WordPress does not know the hostname.
+  #
+  # This is the one state `check` could not see at all: the reachability verdict
+  # above is single-site — `probe` is `cut -d, -f1` — and the sibling fetches
+  # discarded their status entirely, so a multisite where every page 302s to
+  # wp-signup.php reported "hostshift is serving" and exit 0 on every
+  # `ddev start`. `hostshift diff` went RED on the same deployment in one page.
+  #
+  # A refusal rather than a warning, because there is nothing to preview and the
+  # remedy is not obvious: the instinct is to search-replace the database, which
+  # is the parent's and shared, so doing that moves production.
+  if [ -n "${hs_signup_at:-}" ]; then
+    echo "hostshift: refusing to call this healthy — $hs_signup_at" >&2
+    echo "  redirects to wp-signup.php, which is WordPress saying it does not" >&2
+    echo "  recognise that hostname. On a multisite the hostnames live in" >&2
+    echo "  \`wp_blogs.domain\` and \`wp_site.domain\`, not in \`wp_options.home\`," >&2
+    echo "  so the map can check out against the database and every page still" >&2
+    echo "  302 — nothing here is previewable." >&2
+    echo "  Compare what the database holds with what this map names:" >&2
+    echo "    ddev exec -s db mysql -N -B -e \\" >&2
+    echo "      \"select blog_id, domain, path from wp_blogs\" db" >&2
+    echo "  If those hostnames are not the ones hostshift maps, the database" >&2
+    echo "  moved and the map did not — fix hostshift.yaml to name what the" >&2
+    echo "  database holds. Do *not* search-replace the database: it is the" >&2
+    echo "  parent's, shared with production, and moving it moves production." >&2
+    exit 2
   fi
 
   # The hostnames the parent declares that this map does not name, counted on
@@ -2186,13 +2322,18 @@ $extra_body"
           echo "  The proxy is running with --no-sweep, which disables the" >&2
           echo "  straggler backstop. Remove it from HOSTSHIFT_ARGS in .ddev/.env." >&2 ;;
         *)
+          hs_port="${DDEV_ROUTER_HTTPS_PORT:-443}"
+          [ -n "$hs_port" ] || hs_port=443
           echo "  Run \`hostshift diff\` against this deployment to see which" >&2
           echo "  surface they are on — but under production-canonical its" >&2
           echo "  canonical base is the client's live site, and diff fetches it." >&2
           echo "  Point it somewhere local first:" >&2
-          echo "    hostshift diff --resolve ${canon_list%%,*}:443:127.0.0.1:443" >&2
+          echo "    hostshift diff --slug ${slug:-<slug>} \\" >&2
+          echo "      --resolve ${canon_list%%,*}:$hs_port:127.0.0.1:$hs_port" >&2
           echo "  diff prints the same warning and then crawls anyway, so this is" >&2
-          echo "  not a formality." >&2 ;;
+          echo "  not a formality. \`--slug\` is not optional: there is no" >&2
+          echo "  \`ddev hostshift diff\` wrapper to supply it. On a DDEV-canonical" >&2
+          echo "  worktree add \`--variant-base https://\${DDEV_HOSTNAME%%,*}\`." >&2 ;;
       esac
       # exit 2, the refusal this script uses everywhere else. The first version
       # incremented a `fails` counter declared nowhere and read nowhere — so
@@ -2471,6 +2612,14 @@ fi
 # additional_hostnames is still what drives /etc/hosts, and a VIRTUAL_HOST-only
 # name would get a certificate but no hosts entry. Every project in the fleet is
 # on ddev.site, whose wildcard resolves at any depth.
+# The static guardrails, before the dry-run exit and before anything is written.
+#
+# They are pure inference over what has already been computed, so there is no
+# reason they could not run here — and every reason they should: `--dry-run` is
+# the step the add-on's post-install text tells a developer to run first, and it
+# was printing a variant hostname that resolves to production without a word.
+refuse_variants_outside_tld "$variants" "$hosts"
+
 if [ -n "$dry_run" ]; then
   echo "# .ddev/.env" ; printf '%s\n' "$env_out"
   hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2

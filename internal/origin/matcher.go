@@ -601,24 +601,11 @@ func escTerminates(b []byte, i int) (bool, bool) {
 	case 'u':
 		// `\u{...}` is JavaScript's spelling and has no fixed width.
 		if i+2 < len(b) && b[i+2] == '{' {
-			// Bounded: a code point is at most 0x10FFFF, so six hex digits say
-			// everything. JavaScript allows leading zeros without limit, and
-			// reading them without limit is what let one escape outrun the
-			// carry-over window. Past the bound this is not an escape we read,
-			// which declines.
-			j := i + 3
-			for j < len(b) && j <= i+9 && b[j] != '}' {
-				j++
-			}
-			n, ok := hexRun(b, i+3, j)
-			if j >= len(b) || b[j] != '}' || !ok {
+			n, _, ok := braceEscAt(b, i)
+			if !ok {
 				// An escape we decline to read, not "no escape here". Reported
 				// as absent, the backslash falls through to "not a host byte",
-				// which makes it a *delimiter* and accepts the match — so
-				// bounding the scan turned an unbounded lookahead into a
-				// rewrite of a value the browser resolves elsewhere. It is an
-				// escape; we just cannot say what it is, so the host does not
-				// end here and the match is declined.
+				// which makes it a *delimiter* and accepts the match.
 				return false, true
 			}
 			if n >= 0x80 {
@@ -671,6 +658,53 @@ func escTerminates(b []byte, i int) (bool, bool) {
 	return term(c)
 }
 
+// maxBraceEsc bounds the `\u{...}` scan. The bound is on the *scan*, not on the
+// value: it keeps the walk linear, which is what the unbounded version cost —
+// 410 KB of `\u{` with no closing brace took 7.1 seconds.
+const maxBraceEsc = 72
+
+// braceEscAt decodes JavaScript's `\u{...}` at b[i], returning the code point
+// and the escape's width.
+//
+// Leading zeros are unlimited: `CodePoint :: HexDigits` admits any number of
+// them, so `\u{0000002f}` is `/`. Round 55 stopped the scan after six hex
+// digits on the argument that six is "every code point there is" — six is every
+// code point *value*, and the escape is a different length from the number it
+// spells. Past the bound the escape was reported as unreadable, which declines,
+// so `fetch("https://www.example.fi\u{0000002f}x")` — www.example.fi to a
+// browser — stopped being rewritten and became a live production origin in the
+// preview. The digit limit belongs after the zeros are skipped.
+func braceEscAt(b []byte, i int) (int, int, bool) {
+	j := i + 3 // past `\u{`
+	zeros := 0
+	for j < len(b) && j-i < maxBraceEsc && b[j] == '0' {
+		j++
+		zeros++
+	}
+	n, digits := 0, 0
+	for j < len(b) && j-i < maxBraceEsc {
+		d, ok := hexVal(b[j])
+		if !ok {
+			break
+		}
+		// Six significant digits is 0xFFFFFF, past the last code point; a
+		// seventh cannot be one whatever it spells.
+		if digits == 6 {
+			return 0, 0, false
+		}
+		n = n<<4 | int(d)
+		digits++
+		j++
+	}
+	if j >= len(b) || b[j] != '}' || (digits == 0 && zeros == 0) {
+		return 0, 0, false
+	}
+	if n > 0x10FFFF {
+		return 0, 0, false
+	}
+	return n, j + 1 - i, true
+}
+
 // hexRun reads the hex digits in b[i:end] as one number. It is a helper rather
 // than three copies because every escape family spells its code point in hex
 // and only the delimiters around it differ.
@@ -716,14 +750,8 @@ func escColonLen(b []byte, i int, esc escAlphabet) int {
 		return 2
 	case 'u':
 		if i+2 < len(b) && b[i+2] == '{' {
-			j := i + 3
-			for j < len(b) && j <= i+9 && b[j] != '}' {
-				j++
-			}
-			if j < len(b) && b[j] == '}' {
-				if n, ok := hexRun(b, i+3, j); ok && n == ':' {
-					return j + 1 - i
-				}
+			if n, w, ok := braceEscAt(b, i); ok && n == ':' {
+				return w
 			}
 			return 0
 		}
@@ -788,15 +816,8 @@ func removedEscLen(b []byte, i int, esc escAlphabet) int {
 			return 6
 		}
 		if esc == escJS && i+2 < len(b) && b[i+2] == '{' {
-			// Bounded, for the reason escTerminates gives.
-			j := i + 3
-			for j < len(b) && j <= i+9 && b[j] != '}' {
-				j++
-			}
-			if j < len(b) && b[j] == '}' {
-				if n, ok := hexRun(b, i+3, j); ok && isRemovedRune(n) {
-					return j + 1 - i
-				}
+			if n, w, ok := braceEscAt(b, i); ok && isRemovedRune(n) {
+				return w
 			}
 		}
 	case 'x':

@@ -476,7 +476,26 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		SurfaceJSONString:     true,
 		SurfaceJSONEscape:     false,
 	}
-	for name, value := range surfaceConstants(t) {
+	found := surfaceConstants(t)
+	// Every name in the table must have been seen, or the scanner is narrower
+	// than the thing it guards and the check passes by looking at less. Round 55
+	// wrote the pattern for a `const (…)` block member and missed
+	// `const SurfaceStraggler = "straggler"` on its own line — so the one escJS
+	// surface named below was never actually checked, and a new surface declared
+	// that way would fall through escapeAlphabetFor to escJS with nothing
+	// failing. That is the exact hole this test exists to close.
+	seen := map[string]bool{}
+	for _, value := range found {
+		seen[value] = true
+	}
+	for value := range want {
+		if !seen[value] {
+			t.Errorf("%q is classified here but the scanner did not find it in "+
+				"the package source — the scanner is narrower than the table, so "+
+				"this test is passing by looking at less than it claims", value)
+		}
+	}
+	for name, value := range found {
 		esc, listed := want[value]
 		if !listed {
 			t.Errorf("%s = %q is not classified: decide whether a buffer on that "+
@@ -499,7 +518,9 @@ func surfaceConstants(t *testing.T) map[string]string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	re := regexp.MustCompile(`(?m)^\s*(Surface\w+)\s*=\s*"([^"]+)"`)
+	// `const X = "y"` as well as a `const (…)` block member: sweep.go declares
+	// SurfaceStraggler the first way and the block-only pattern never saw it.
+	re := regexp.MustCompile(`(?m)^\s*(?:const\s+)?(Surface\w+)\s*=\s*"([^"]+)"`)
 	out := map[string]string{}
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {

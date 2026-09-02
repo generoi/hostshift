@@ -616,6 +616,17 @@ func cmdCheck(args []string) (int, error) {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	var c common
 	c.register(fs)
+	// What this project's own `web` actually answers on, which is narrower than
+	// what DDEV registers for it. A worktree inherits the parent's
+	// additional_hostnames, and the add-on then narrows web's VIRTUAL_HOST so the
+	// parent keeps serving its own — so `b.acme.ddev.site` is registered here and
+	// served there. Without this the note below padded its list with hostnames
+	// this project does not serve and `ddev launch` does not open, and that note
+	// is the only place a developer is told which URLs show unrewritten
+	// production content. Padding it is how such a note stops being read.
+	served := fs.String("served-hosts", "",
+		"comma-separated hostnames this project's web actually serves;\n"+
+			"the add-on passes what it wrote to HOSTSHIFT_WEB_HOSTS")
 	if describe(fs, args, "validate the map; exit 2 if it is not usable") {
 		return exitOK, nil
 	}
@@ -658,14 +669,30 @@ func cmdCheck(args []string) (int, error) {
 	// are those hostnames: the database holds `.ddev.site` URLs. Keyed on the
 	// first alone this printed on every `ddev start` of every stock project,
 	// which is how a warning stops being read.
-	if len(res.ExternalCanonicals) > 0 && len(res.DirectlyServed) > 0 {
+	directly := res.DirectlyServed
+	if *served != "" {
+		keep := map[string]bool{}
+		for _, h := range strings.Split(*served, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				keep[h] = true
+			}
+		}
+		filtered := directly[:0:0]
+		for _, h := range directly {
+			if keep[h] {
+				filtered = append(filtered, h)
+			}
+		}
+		directly = filtered
+	}
+	if len(res.ExternalCanonicals) > 0 && len(directly) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"hostshift: note: this map is canonical-on-production (%s), so the\n"+
 				"  hostname(s) DDEV registers here that are not variants serve the\n"+
 				"  database unrewritten — every link on them points at the live site,\n"+
 				"  and `ddev launch` opens one:\n",
 			strings.Join(res.ExternalCanonicals, ", "))
-		for _, h := range res.DirectlyServed {
+		for _, h := range directly {
 			fmt.Fprintf(os.Stderr, "  https://%s\n", h)
 		}
 		// "the variant(s) this map resolves to", not "preview through these":

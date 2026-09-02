@@ -141,3 +141,58 @@ func TestTheNoteNamesAVariantYouCanActuallyReach(t *testing.T) {
 		t.Errorf("the note points the developer at a URL that is not the variant:\n%s", errOut)
 	}
 }
+
+// The canonical-on-production note lists what this project serves.
+//
+// A worktree inherits the parent's additional_hostnames, and the add-on narrows
+// web's VIRTUAL_HOST afterwards so the parent keeps serving its own — so DDEV
+// registers `b.acme.ddev.site` here while the parent answers on it. The note
+// listed it anyway, and `ddev launch` opens no such thing. That note is the only
+// place a developer is told which URLs show unrewritten production content, so
+// padding it with hostnames this project does not serve is how it gets skipped.
+
+// The canonical-on-production note lists what this project serves.
+//
+// A worktree inherits the parent's additional_hostnames, and the add-on narrows
+// web's VIRTUAL_HOST afterwards so the parent keeps serving its own — so DDEV
+// registers `b.acme.ddev.site` here while the parent answers on it. The note
+// listed it anyway, and `ddev launch` opens no such thing. That note is the only
+// place a developer is told which URLs show unrewritten production content, so
+// padding it with hostnames this project does not serve is how it stops being
+// read.
+func TestR56TheNoteListsOnlyWhatThisProjectServes(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml",
+		"name: acme-wt-a\nadditional_hostnames:\n  - b.acme\n")
+	writeFile(t, dir, "hostshift.yaml",
+		"sites:\n  - canonical: https://www.acme.fi\n"+
+			"    variant: https://wt-a--acme.ddev.site\n")
+
+	// Only the canonical-on-production note: `b.acme.ddev.site` legitimately
+	// appears in the uncovered-hostnames warning below it, which is a different
+	// message answering a different question.
+	note := func(out string) string {
+		_, after, ok := strings.Cut(out, "canonical-on-production")
+		if !ok {
+			t.Fatalf("fixture: the note did not fire:\n%s", out)
+		}
+		if before, _, ok := strings.Cut(after, "\nhostshift:"); ok {
+			return before
+		}
+		return after
+	}
+
+	_, _, all := run(t, "", cmdCheck, "-C", dir, "--slug", "wt-a")
+	if !strings.Contains(note(all), "b.acme.ddev.site") {
+		t.Fatalf("fixture: the inherited hostname is not in the note:\n%s", all)
+	}
+	_, _, narrowed := run(t, "", cmdCheck, "-C", dir, "--slug", "wt-a",
+		"--served-hosts", "acme-wt-a.ddev.site")
+	if strings.Contains(note(narrowed), "b.acme.ddev.site") {
+		t.Errorf("the note lists a hostname this project's web does not serve:\n%s",
+			narrowed)
+	}
+	if !strings.Contains(note(narrowed), "acme-wt-a.ddev.site") {
+		t.Errorf("the note dropped a hostname this project does serve:\n%s", narrowed)
+	}
+}

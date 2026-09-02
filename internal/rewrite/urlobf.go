@@ -327,6 +327,18 @@ func stripJSONEsc(v []byte, ctl bool) normalised {
 					i += 2
 					continue
 				}
+				// Legacy octal spelling one of the same three. `jsEscAt` reads
+				// octal but refuses anything below 0x20 — the view must never
+				// *emit* a control — and refusing is not removing, so
+				// `https://www.example\011.fi/x` kept its escape and stopped
+				// matching, while `\t` and a literal tab one spelling over were
+				// both rewritten. Round 55 taught removedEscLen this alphabet
+				// and left the view without it, which is the two-copies drift
+				// that round's own commit is about.
+				if w := octalRemovable(v[i:]); w > 0 {
+					i += w
+					continue
+				}
 			}
 			// `\/` is already handled by the JSON surface, but it reaches here
 			// too on the composed views, and decoding it costs nothing.
@@ -511,6 +523,23 @@ func jsEscAt(b []byte) ([]byte, int, bool) {
 	return nil, 0, false
 }
 
+// octalRemovable is the width of a legacy octal escape at b that spells a
+// character the URL parser removes — tab, LF or CR — and 0 otherwise.
+func octalRemovable(b []byte) int {
+	if len(b) < 2 || b[0] != '\\' || b[1] < '0' || b[1] > '7' {
+		return 0
+	}
+	n, j := 0, 1
+	for j < len(b) && j < 4 && b[j] >= '0' && b[j] <= '7' {
+		n = n<<3 | int(b[j]-'0')
+		j++
+	}
+	if n == 0x09 || n == 0x0A || n == 0x0D {
+		return j
+	}
+	return 0
+}
+
 // jsonEscRune decodes the four hex digits of a `\uXXXX` escape into the bytes
 // it stands for, or reports false.
 //
@@ -660,7 +689,14 @@ func stripForCSS(v []byte) normalised {
 			i += 2
 			continue
 		}
-		if j < len(v) && (v[j] == ' ' || isURLStripped(v[j])) {
+		if j < len(v) && (v[j] == ' ' || v[j] == '+' || isURLStripped(v[j])) {
+			// `+` too, because a form encoding writes a space that way and this
+			// view is composed under the percent decode: `%5C3a+` is `\3a ` and
+			// `%5C3a%20` is the same bytes one spelling over. Both readings end
+			// the escape at the same byte — `+` is not a hex digit — so the only
+			// difference is whether the terminator is consumed, and consuming it
+			// is what lets one percent view serve this composition instead of a
+			// second one built only to turn plusses into spaces.
 			j++ // the one whitespace that terminates an escape
 		}
 		if val == 0 || val > 0x10FFFF {
@@ -1632,24 +1668,71 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value, surface, ev)
 	}
 	// And the percent view, for an encoding composed with another one.
-	if bytes.IndexByte(v, '%') >= 0 {
-		v = h.spliceHostsIn(stripForPercent(v), v, urlTokenStarts, value, surface, ev)
-	}
-	// And percent-then-JSON, which is `post.php` sending a block delimiter as a
-	// urlencoded field: the backslash Gutenberg wrote is `%5C`, so the escape
-	// reads `%5Cu002d%5Cu002d` and no literal backslash is there for the plain
-	// view to find.
 	//
-	// Here, not on the reference path. Moving it there was reasoned as "a
-	// urlencoded body is a request" — but `rewriteAll` is not the request path.
-	// It is what the proxy runs over every Tier 1 response header and over a
-	// non-XML `text/plain` body, in the *forward* direction, so the move left
-	// the two directions disagreeing about one encoding: `HostLeaksBack` read
-	// the spelling and `HostLeaks` no longer did. One copy, because two costs
-	// 455x the body and blows the allocation ceiling.
-	if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
-		v = h.spliceHostsIn(composeView(stripForPercent(v), escView(surface)), v,
-			urlTokenStarts, value, surface, ev)
+	// Built once and shared by all three passes that need it. It was built
+	// separately by each, and a view build is three slices the length of the
+	// body — so adding the percent-then-CSS cell below took the composite
+	// fixture from 382x to 488x against a 400x ceiling, and hoisting this is
+	// what pays for it. `stale` tracks whether a splice has moved the bytes out
+	// from under the view; only then is it rebuilt.
+	if bytes.IndexByte(v, '%') >= 0 {
+		pv := stripForPercent(v)
+		stale := false
+		nv := h.spliceHostsIn(pv, v, urlTokenStarts, value, surface, ev)
+		if len(nv) != len(v) {
+			stale = true
+		}
+		v = nv
+		percentView := func() normalised {
+			if stale {
+				return stripForPercent(v)
+			}
+			return pv
+		}
+		// And percent-then-JSON, which is `post.php` sending a block delimiter as a
+		// urlencoded field: the backslash Gutenberg wrote is `%5C`, so the escape
+		// reads `%5Cu002d%5Cu002d` and no literal backslash is there for the plain
+		// view to find.
+		//
+		// Here, not on the reference path. Moving it there was reasoned as "a
+		// urlencoded body is a request" — but `rewriteAll` is not the request path.
+		// It is what the proxy runs over every Tier 1 response header and over a
+		// non-XML `text/plain` body, in the *forward* direction, so the move left
+		// the two directions disagreeing about one encoding: `HostLeaksBack` read
+		// the spelling and `HostLeaks` no longer did. One copy, because two costs
+		// 455x the body and blows the allocation ceiling.
+		if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
+			nv := h.spliceHostsIn(composeView(percentView(), escView(surface)), v,
+				urlTokenStarts, value, surface, ev)
+			if len(nv) != len(v) {
+				stale = true
+			}
+			v = nv
+		}
+		// And percent-then-*CSS*, which is the cell the gate above was missing.
+		//
+		// The gate reads `%5C` followed by `u` — the JSON escape. A CSS escape is
+		// `%5C` followed by a *hex digit*, and the producer is the one named three
+		// lines up: `cssEscapeLeak` splices the variant into a style attribute that
+		// already spells its URL in CSS escapes, so the page goes out as
+		// `url(https\3a \2f \2f <variant>\2f x)` and `post.php` posts that field
+		// back with the backslash percent-encoded. The percent layer is not extra
+		// obfuscation: it is what PHP undoes before it stores the value. Nothing on
+		// the way in read it, so the *variant* hostname was written into the shared
+		// database — §4.3, the one failure this design exists to prevent, through
+		// the same producer and the same transport the `%5Cu` cell was written for.
+		//
+		// A CSS escape ends at whitespace, and in a form encoding a space is `+` as
+		// often as `%20`, so the plus decode is composed in underneath. It needs no
+		// surface to justify it: the gate is a *percent-encoded* backslash, so
+		// something percent-encoded this value, and in that encoding a plus is a
+		// space. `hasPercentCSSEsc` keeps the gate as narrow as the shape — `%5C`
+		// alone appears in any Windows path a page quotes, and arming a three-view
+		// composition on that would cost every body that mentions one.
+		if hasPercentCSSEsc(v) {
+			v = h.spliceHostsIn(composeView(percentView(), stripForCSS), v,
+				urlTokenStarts, value, surface, ev)
+		}
 	}
 	// And JSON's own escape, which is the same rule again and the sharpest case
 	// of it: Gutenberg escapes `--` to `\u002d\u002d` in every block delimiter,
@@ -1788,6 +1871,21 @@ func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte
 		return v, nil
 	}
 	return append(out, v[prev:]...), events
+}
+
+// hasPercentCSSEsc reports whether the buffer could hold a percent-encoded CSS
+// escape: `%5C` followed by a hex digit. `%5C` on its own is any quoted Windows
+// path, and the composition it gates is three views deep.
+func hasPercentCSSEsc(v []byte) bool {
+	for i := 0; i+3 < len(v); i++ {
+		if v[i] != '%' || v[i+1] != '5' || (v[i+2] != 'C' && v[i+2] != 'c') {
+			continue
+		}
+		if _, ok := hexDigit(v[i+3]); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // composeView applies a second decoder to an already-decoded view, mapping the
@@ -1995,7 +2093,15 @@ func HostLeaksBack(m *origin.Matcher, b []byte) []byte {
 	if m == nil || len(b) == 0 {
 		return b
 	}
-	return hostsFor(m).rewriteAllRefs(b, true, SurfaceHTMLAttr, nil)
+	// The request surface, not an attribute's, because that is what this is.
+	//
+	// Behaviour-neutral today and recorded as such: both names take the path
+	// alphabet, and the plus that a form encoder writes is handled in the CSS
+	// view rather than by surface. It is kept because the alphabet table is
+	// consulted by name and has grown twice already — a rule that reads
+	// "request" would have been wrong here, silently, and the fix for that is
+	// to call the request direction by its own name now.
+	return hostsFor(m).rewriteAllRefs(b, true, SurfaceRequestBody, nil)
 }
 
 func HostLeaksXML(m *origin.Matcher, b []byte, value bool) []byte {
@@ -2086,7 +2192,46 @@ func HostsIn(b []byte) map[string]int {
 	h.rewriteAllRefs(append([]byte(nil), b...), false, SurfaceStraggler, nil)
 	out := make(map[string]int, len(h.collect))
 	for host, at := range h.collect {
+		if !plausibleHost(host) {
+			continue
+		}
 		out[host] = len(at)
 	}
 	return out
+}
+
+// plausibleHost reports whether a scanned host is one a browser could resolve.
+//
+// The scan reads a page with every decoder view at once, and a view can end a
+// host on a byte that leaves nothing behind: `https:&#47;&#47;c.example/0`
+// yielded a host named `&`. That is not cosmetic — `check` prints the census,
+// so it advised adding `&` to hostshift.yaml as an alias; `hostshift` accepted
+// it, `map --external-canonical-hosts` listed it, and `ddev hostshift loopback`
+// would then have written `- "&:127.0.0.1"` into the compose file. A phantom
+// with a straight path to a broken deployment.
+//
+// Deliberately a shape test and not a registry one: this asks whether the
+// characters could be a hostname, which is the question the scan can answer.
+// A single label is refused because the census exists to name *other* origins
+// on a page, and every one of those is dotted.
+func plausibleHost(h string) bool {
+	h = strings.TrimSuffix(h, ".") // the root label is a host, not a spelling
+	if h == "" || !strings.Contains(h, ".") {
+		return false
+	}
+	for _, label := range strings.Split(h, ".") {
+		if label == "" {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			switch c := label[i]; {
+			case c >= 0x80, // an IDN label
+				c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
+				c >= '0' && c <= '9', c == '-', c == '_':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }

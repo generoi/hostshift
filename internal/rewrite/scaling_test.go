@@ -194,7 +194,7 @@ func TestHostLeaksStaysLinear(t *testing.T) {
 // audit test can assert it still reaches every view: two of the six are behind
 // two-byte needles, and a unit that loses one stops measuring a third of the
 // machinery while still passing.
-const r46CompositeUnit = `&#92;u002d %5Cu002d \u002d \3a [http:`
+const r46CompositeUnit = `&#92;u002d %5Cu002d %5C3a+ \u002d \3a [http:`
 
 func TestAllocationStaysBounded(t *testing.T) {
 	if testing.Short() {

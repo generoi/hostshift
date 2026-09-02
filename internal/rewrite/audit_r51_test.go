@@ -150,12 +150,22 @@ func TestR51TheJSONSeparatorArmHasATest(t *testing.T) {
 // TestR51TheOctalDecoderKeepsItsRange: M5/M7 in round 51's survey — the octal
 // arm's printable-range bound and its upper digit were both unasserted.
 //
-// Each case is chosen so the mutation *changes the outcome*. A control byte is
-// not merely refused: stripRemovals deletes tab, LF and CR from the view, so
-// decoding `\11` into it would splice `www.e` and `xample.fi` into a host that
-// matches — the rule "never emit a control character into the view" earning its
-// keep rather than being decoration. And `\56` is a dot whose first digit is
-// above 3, so narrowing the digit range stops it matching at all.
+// Each case is chosen so the mutation *changes the outcome*. `\56` is a dot
+// whose first digit is above 3, so narrowing the digit range stops it matching
+// at all.
+//
+// The `\11` case used to assert the opposite of what it asserts now, on the
+// reasoning that decoding a control "would splice `www.e` and `xample.fi` into
+// a host that matches". It does, and that is the right answer: `\11` is octal
+// for a tab, the URL parser *deletes* tab, and ada resolves
+// `https://www.e<TAB>xample.fi/x` to www.example.fi. So the buffer-unchanged
+// expectation was pinning a live production origin in place — the same defect
+// round 54 corrected in audit_r45, one spelling over, and it survived because
+// `\t` and a literal tab were both handled while the octal spelling was not.
+//
+// The rule it invoked survives untouched: the view must never *emit* a control
+// byte. Removing one is not emitting it, which is what stripForURL has said
+// about the literal spellings all along.
 func TestR51TheOctalDecoderKeepsItsRange(t *testing.T) {
 	m := r51Matcher(t, "https://www.example.fi", "https://wt-a--example.ddev.site")
 	// Through the HTML path, because the octal arm is a *JavaScript* spelling and
@@ -172,13 +182,20 @@ func TestR51TheOctalDecoderKeepsItsRange(t *testing.T) {
 		t.Errorf("an octal escape above digit 3 was not read:\n  %s", out)
 	}
 
-	// `\11` is a tab, which stripRemovals *deletes* from the view — so decoding
-	// it would join `www.e` to `xample.fi` and match a host the document does
-	// not contain.
+	// `\11` is a tab. A browser deletes it before reading the host, so this is
+	// www.example.fi and must be rewritten — and the view must arrive there by
+	// *removing* the escape, never by emitting a 0x09 into its own bytes.
 	tab := `<script>var a="\u002d";fetch("https://www.e\11xample.fi/x")</script>`
-	if out := rw(tab); out != tab {
-		t.Errorf("a control-valued octal escape was decoded into the view and "+
-			"invented a host:\n  %s", out)
+	if out := rw(tab); !strings.Contains(out, "wt-a--example.ddev.site") {
+		t.Errorf("a browser resolves this to www.example.fi and it was served "+
+			"live:\n  %s", out)
+	}
+	for _, c := range stripForJSONEscCtl([]byte(tab)).b {
+		if c < 0x20 || c == 0x7F {
+			t.Errorf("the view emitted control byte %#02x — removing an escape is "+
+				"not the same as decoding one into the view", c)
+			break
+		}
 	}
 
 	// `\8` is not octal: JS reads it as a literal `8`.

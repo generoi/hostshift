@@ -1100,6 +1100,7 @@ printf '<a href="https://acme.ddev.site/a">a</a><link href="https://acme.ddev.si
 
 out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a canonical origin in the served page is reported" "canonical origin" "$out"
+
 # ...and the pages it lists under that are URLs and nothing else. The list is
 # word-split when it is printed, and the redirect page's label reads "(after its
 # redirect)", so storing the label in the list turned it into three more lines
@@ -1271,6 +1272,17 @@ case "$*" in
   # silent no-op on every project without a root wp-cli.yml — while this test
   # went on passing. An instrument that cannot fail on the real defect is not
   # measuring anything.
+  # copy-db's table count, before the dump and again after it fails. Two answers
+  # from one query, because that is the whole question the failure diagnosis
+  # turns on: what was here before, and what is here now.
+  *"information_schema.tables"*)
+    _f="${HS_TBL_STATE:-/tmp/hs-tblcalls}"
+    _n=$(( $(cat "$_f" 2>/dev/null || echo 0) + 1 ))
+    echo "$_n" > "$_f"
+    if [ "$_n" = 1 ]; then printf '%s\n' "${HS_FAKE_TABLES_BEFORE:-0}"
+    else printf '%s\n' "${HS_FAKE_TABLES_AFTER:-0}"; fi ;;
+  # The dump itself, which these tests are here to fail.
+  *mysqldump*) echo "ERROR 2005 (HY000): Unknown server host" >&2; exit 1 ;;
   *"-d /var/www/html/web"*"option_name='home'"*) printf '%s\n\n' "${HS_FAKE_HOME:-}" ;;
   *"option_name='home'"*)
     echo "Error: This does not seem to be a WordPress installation." >&2
@@ -1281,6 +1293,48 @@ exit 0
 FAKEDDEV
 chmod +x "$fakedb/ddev"
 writefake
+
+# What copy-db says after a failed dump, which is a message a developer acts on
+# destructively.
+#
+# Round 54 printed "may be half-replaced … re-run with --force" for every failure
+# mode, so the ordinary "you forgot to start the parent" case ended by naming the
+# one destructive flag. Round 55 replaced that with a table count and compared it
+# against *zero* rather than against the count taken before the copy — which the
+# same block already holds — so it was confidently wrong in both directions.
+#
+# Empty before and empty after: nothing was lost, and saying so is the point,
+# because this is the commonest path there is. A fresh worktree's database is
+# empty, and the parent not running is exactly why the dump failed.
+: > "$work/tblcalls"
+out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
+  HS_FAKE_TABLES_BEFORE=0 HS_FAKE_TABLES_AFTER=0 \
+  PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db 2>&1 || true)"
+contains "an empty database that stayed empty lost nothing" "nothing was lost" "$out"
+case "$out" in
+  *"half-replaced"*) fail "and it does not claim a half-replaced database" "$out" ;;
+  *) pass "and it does not claim a half-replaced database" ;;
+esac
+case "$out" in
+  *"--force"*) fail "and it does not name the destructive flag" "$out" ;;
+  *) pass "and it does not name the destructive flag" ;;
+esac
+
+# The other direction: the table list intact and the rows gone.
+# --add-drop-database recreates the whole list at the top of the stream and fills
+# it as the dump arrives, so an unchanged count is exactly what a copy
+# interrupted late looks like — measured live at 13 tables either side with 1.2M
+# rows gone. A count cannot settle this and the tool must not pretend it can.
+: > "$work/tblcalls"
+out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
+  HS_FAKE_TABLES_BEFORE=13 HS_FAKE_TABLES_AFTER=13 \
+  PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db --force 2>&1 || true)"
+case "$out" in
+  *"nothing here changed"*|*"nothing was lost"*)
+    fail "an unchanged table count does not mean an unchanged database" "$out" ;;
+  *) pass "an unchanged table count does not mean an unchanged database" ;;
+esac
+contains "and it says what a count cannot settle" "does not settle it" "$out"
 # The database still holds a hostname the map does not name.
 # A warning, never a refusal: this gate has been wrong in three consecutive
 # rounds, and PLAN §4.1 says why — the application cannot be interrogated. It
@@ -1454,6 +1508,67 @@ out="$(cd "$wt" && HS_CURL_BODY="$third" \
 # reported as links, and a namespace URI is not one a browser dereferences.
 contains "and it is still counted out loud" "reference(s) to fonts.googleapis.com" "$out"
 
+# A page that 302s to wp-signup.php is WordPress saying it does not know the
+# hostname, and on a multisite that means nothing is previewable at all.
+#
+# check could not see this state: its reachability verdict reads the first
+# variant only, and the sibling fetches discarded their status entirely — so a
+# multisite where every page redirected to wp-signup reported "hostshift is
+# serving" and exit 0 on every `ddev start`, while `hostshift diff` went RED on
+# the same deployment in one page. The signup page carries only variant origins,
+# so the leak scans found nothing either.
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+hs56n="$work/curl-n56"; echo 0 > "$hs56n"
+out="$(cd "$wt" && HS_CURL_BODY='<p>signup</p>' HS_CURL_CODES="302 200 200" \
+  HS_CURL_STATE="$hs56n" \
+  HS_CURL_LOCATION="https://wt-a--acme.ddev.site/wp-signup.php?new=www.acme.example" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "a page that redirects to wp-signup is not healthy" \
+  || fail "a page that redirects to wp-signup is not healthy" "exit $rc"
+contains "and it names the table that actually decides" "wp_blogs" "$out"
+contains "and it does not advise a search-replace" "moves production" "$out"
+
+# The `hostshift diff` a test-28 refusal sends the developer to has to be a
+# command that runs.
+#
+# Round 55 wrote this remedy and never ran it: `diff` requires --slug — the
+# README calls it "not optional here", and there is no `ddev hostshift diff`
+# wrapper to supply it — so the line as printed exited 2 with "no variant". The
+# assertion that was supposed to cover it sat on a fixture whose proxy runs with
+# --dry-run, which takes a different arm and never prints the remedy at all.
+writefake
+leak='<link rel="canonical" href="https://www.acme.example/">
+<a href="https://www.acme.example/x">t</a>'
+out="$(cd "$wt" && HS_CURL_BODY="$leak" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"hostshift diff"*) pass "the leak refusal offers a diff command" ;;
+  *) fail "the leak refusal offers a diff command" "no diff remedy in: $out" ;;
+esac
+contains "and it passes --slug, which diff requires" "hostshift diff --slug" "$out"
+writefake
+
+# A response the proxy passed through untouched is a leak, and only the log
+# knew.
+#
+# JSON and text/* are read whole and skipped over --max-body; HTML is streamed
+# and never capped. Measured on one ordinary page-builder post: a 9.4 MB REST
+# response carried 19,390 live canonical origins and zero rewrites, the proxy
+# logged the skip, and check said "hostshift is serving" and exited 0. check
+# already reads `docker logs` twice and never looked.
+writefake
+printf 'time=x level=WARN msg="JSON body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
+  >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+contains "a body over the size cap is reported" "unrewritten" "$out"
+contains "and the count is measured" "1 response(s)" "$out"
+contains "and the remedy is the flag that fixes it" "--max-body" "$out"
+# A warning, not a refusal: the evidence is a log line from an earlier request,
+# so refusing would block `ddev start` until the logs rotated.
+[ "$rc" = 0 ] && pass "and it is a warning, not a refusal" \
+  || fail "and it is a warning, not a refusal" "exit $rc"
+writefake
+
 # A redirect is followed only while it stays on this deployment.
 #
 # Round 54 added `curl -L` so a `/` that 302s to `/fi/` is still scanned, and
@@ -1544,6 +1659,34 @@ mv "$work/couk-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
 writefake
 
+# --dry-run is the step that is supposed to catch a bad deployment before it is
+# one, and it ran none of the static guardrails.
+#
+# With `base:` omitted — a natural first draft — the variant is derived from the
+# canonical, so it is `wt-a--www.acme.example`: a name DDEV registers nowhere.
+# On a client domain with wildcard DNS that resolves to *production*, and the
+# developer is looking at the live site believing it is a worktree. The guard is
+# pure inference over $variants, the project's hostnames, $DDEV_TLD and
+# /etc/hosts — nothing to write and nothing to start — but it lived inside
+# `check`, so `--dry-run` printed the hostname and no warning, and the refusal
+# came only after the project had been deployed and restarted.
+mv "$wt/hostshift.yaml" "$work/nobase-hs.hold" 2>/dev/null || true
+printf 'sites:\n  - canonical: https://www.acme.example\n' > "$wt/hostshift.yaml"
+out="$(cd "$wt" && "$cmd" init --slug wt-a --dry-run 2>&1)" && rc=0 || rc=$?
+[ "$rc" = 2 ] && pass "init --dry-run refuses a variant nothing local answers to" \
+  || fail "init --dry-run refuses a variant nothing local answers to" "exit $rc"
+contains "and it says why that is dangerous" "resolve to *production*" "$out"
+contains "and it names the remedy" "base:" "$out"
+# ...and nothing was written, which is the other half of the flag's contract.
+case "$(cat "$wt/.ddev/.env" 2>/dev/null || true)" in
+  *"wt-a--www.acme.example"*)
+    fail "and --dry-run still wrote nothing" "the variant reached .ddev/.env" ;;
+  *) pass "and --dry-run still wrote nothing" ;;
+esac
+mv "$work/nobase-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+writefake
+
 # The message names the page that actually carries the finding.
 #
 # `probe_body` is up to nine documents concatenated — the first variant, the
@@ -1553,7 +1696,8 @@ writefake
 # that is leaking. Here the first page is clean and the redirect target is not.
 : > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
 hs55n="$work/curl-n55b"; echo 0 > "$hs55n"
-sibleak='<a href="https://media.acme.example/1">a</a>
+sibleak='=== a line that used to split the record ===
+<a href="https://media.acme.example/1">a</a>
 <a href="https://media.acme.example/2">b</a>
 <a href="https://media.acme.example/3">c</a>
 <a href="https://media.acme.example/4">d</a>
@@ -1565,6 +1709,11 @@ out="$(cd "$wt" && HS_CURL_BODY='<p>clean</p>' HS_CURL_BODY2="$sibleak" \
 [ "$rc" = 2 ] && pass "a leak on the page behind a redirect is found" \
   || fail "a leak on the page behind a redirect is found" "exit $rc"
 contains "and the message names that page, not the first" "after its redirect" "$out"
+# The body above opens with a line starting `=== `, which is what the record
+# marker used to be — a changelog, a diff or a code sample splits the record,
+# and because the URL then stays set it mis-attributes every later message for
+# that page and not just one.
+contains "and a page containing the marker still attributes" "after its redirect" "$out"
 
 # ...and the escaped spellings, which is how WordPress writes URLs by default.
 #
