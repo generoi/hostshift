@@ -120,3 +120,28 @@ func TestHostsInInventsNoHosts(t *testing.T) {
 		}
 	}
 }
+
+// The census filter, in both directions.
+//
+// Requiring a dot dropped every IPv6 literal — a perfectly ordinary origin for a
+// page to carry, and one that could therefore never appear in the list `check`
+// prints — while `-bad.example` went through, because a leading hyphen was not
+// checked. A filter that is uneven in both directions is worse than either.
+func TestHostsInFiltersEvenly(t *testing.T) {
+	got := HostsIn([]byte(`<a href="https://[2001:db8::1]/x">a</a>` +
+		`<a href="https://-bad.example/y">b</a>` +
+		`<a href="https://bad-.example/y">c</a>` +
+		`<a href="https://ok.example/z">d</a>` +
+		`<a href="https://a-b.ok.example/w">e</a>`))
+	for _, want := range []string{"2001:db8::1", "ok.example", "a-b.ok.example"} {
+		if got[want] < 1 {
+			t.Errorf("%s was dropped: %v", want, got)
+		}
+	}
+	for _, bad := range []string{"-bad.example", "bad-.example"} {
+		if _, ok := got[bad]; ok {
+			t.Errorf("%s reached the census, and check tells the developer to "+
+				"paste that into hostshift.yaml: %v", bad, got)
+		}
+	}
+}

@@ -149,7 +149,20 @@ const maxRemovedRun = 64
 // The terminator is a run rather than a byte since round 54, so the window has
 // to cover it: without maxRemovedRun here the sweep decided a match on bytes
 // that had not arrived.
-func (m *Matcher) MaxMatchLen() int { return m.maxPat + 16 + maxRemovedRun }
+//
+// And it has to cover every *escape* the decision reads, which round 56 widened
+// without widening this. The port separator may be an escaped colon
+// (escColonLen), and the delimiter after the removable run may be an escape too
+// (escTerminates) — each up to maxBraceEsc, because JavaScript admits unlimited
+// leading zeros. So the decision reads up to a root dot, a brace-escaped colon,
+// its digits, the removable walk and one more brace escape, against the 16 bytes
+// of slack this line used to promise. Measured before the fix: the same body
+// rewrote or did not depending on where the read boundary fell, which is the
+// exact failure maxRemovedRun's comment claims to have closed — and silently,
+// because the sweep is the thing that warns about stragglers.
+func (m *Matcher) MaxMatchLen() int {
+	return m.maxPat + 16 + maxRemovedRun + 2*maxBraceEsc
+}
 
 // NewMatcher builds the automaton for a set of canonical→variant pairs.
 func NewMatcher(pairs []Pair) (*Matcher, error) {

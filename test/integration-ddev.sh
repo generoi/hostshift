@@ -50,10 +50,49 @@ cleanup() {
   done
   rm -rf "$work"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM HUP
 
 command -v ddev >/dev/null || { echo "ddev is not installed; skipping"; exit 0; }
 docker info >/dev/null 2>&1 || { echo "docker is not running; skipping"; exit 0; }
+
+# Leftovers from an interrupted run.
+#
+# `trap cleanup EXIT` does not survive a process-group kill, and three
+# interrupted runs in one session left seven registered projects behind — each
+# holding a docker network and an address from a pool that is not large, and
+# each one a project a later reader has to decide whether it is safe to delete.
+#
+# They are recognisable without ambiguity: this suite names every project
+# `it<pid>` and creates it under a temp root, so a registered project matching
+# that shape, under a temp root, whose pid is no longer running is this suite's
+# and is dead. All three are required: the name alone would match a live run's
+# projects, the temp root keeps a developer's own project out of scope, and the
+# dead pid is what says the run is over. The approot is not the signal — an
+# interrupted run never reaches the `rm -rf` either, so the directory is still
+# there.
+sweep_stale() {
+  command -v jq >/dev/null || return 0
+  ddev list -j 2>/dev/null \
+    | jq -r '.raw[]? | select(.name | test("^it[0-9]+(-.*)?$")) | "\(.name)\t\(.approot)"' \
+      2>/dev/null \
+    | while IFS=$'\t' read -r name approot; do
+        [ -n "$name" ] || continue
+        # Under a temp root, so a project of the developer's that happens to be
+        # named this way is never in scope.
+        case "$approot" in
+          /tmp/*|/var/folders/*|"${TMPDIR:-/nonexistent}"*) ;;
+          *) continue ;;
+        esac
+        # And the run that made it is gone. The pid is in the name, and the
+        # current run's own pid is alive, so this cannot reach its own projects.
+        pid="${name#it}"; pid="${pid%%-*}"
+        [ -n "$pid" ] || continue
+        kill -0 "$pid" 2>/dev/null && continue
+        echo "  (removing $name, left by an interrupted run)" >&2
+        ddev delete --omit-snapshot -y "$name" >/dev/null 2>&1 || true
+      done
+}
+sweep_stale
 
 mkdir -p "$work/bin"
 "$GO" build -o "$work/bin/hostshift" "$repo/cmd/hostshift"

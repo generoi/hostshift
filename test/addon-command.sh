@@ -1282,7 +1282,9 @@ case "$*" in
     if [ "$_n" = 1 ]; then printf '%s\n' "${HS_FAKE_TABLES_BEFORE:-0}"
     else printf '%s\n' "${HS_FAKE_TABLES_AFTER:-0}"; fi ;;
   # The dump itself, which these tests are here to fail.
-  *mysqldump*) echo "ERROR 2005 (HY000): Unknown server host" >&2; exit 1 ;;
+  *mysqldump*)
+    printf '%s\n' "${HS_FAKE_DUMP_ERR:-ERROR 2005 (HY000): Unknown server host}" >&2
+    exit 1 ;;
   *"-d /var/www/html/web"*"option_name='home'"*) printf '%s\n\n' "${HS_FAKE_HOME:-}" ;;
   *"option_name='home'"*)
     echo "Error: This does not seem to be a WordPress installation." >&2
@@ -1303,11 +1305,25 @@ writefake
 # against *zero* rather than against the count taken before the copy — which the
 # same block already holds — so it was confidently wrong in both directions.
 #
-# Empty before and empty after: nothing was lost, and saying so is the point,
-# because this is the commonest path there is. A fresh worktree's database is
-# empty, and the parent not running is exactly why the dump failed.
+# A connection that never opened cannot have written anything, and the driver
+# says so. This is the commonest failure there is — the parent not running, which
+# is *why* the connect failed — and hedging over it sent the developer to verify
+# a database nothing had touched.
 : > "$work/tblcalls"
 out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
+  HS_FAKE_TABLES_BEFORE=1 HS_FAKE_TABLES_AFTER=1 \
+  PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db --force 2>&1 || true)"
+contains "a dump that never connected touched nothing" "never connected" "$out"
+case "$out" in
+  *"does not settle it"*) fail "and it does not hedge over it" "$out" ;;
+  *) pass "and it does not hedge over it" ;;
+esac
+
+# A failure that is *not* a connect error, on an empty database: nothing was
+# there to lose, and saying so is the point.
+: > "$work/tblcalls"
+out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
+  HS_FAKE_DUMP_ERR="mariadb-dump: Error 2026: TLS/SSL error: unexpected eof" \
   HS_FAKE_TABLES_BEFORE=0 HS_FAKE_TABLES_AFTER=0 \
   PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db 2>&1 || true)"
 contains "an empty database that stayed empty lost nothing" "nothing was lost" "$out"
@@ -1327,6 +1343,7 @@ esac
 # rows gone. A count cannot settle this and the tool must not pretend it can.
 : > "$work/tblcalls"
 out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
+  HS_FAKE_DUMP_ERR="mariadb-dump: Error 2026: TLS/SSL error: unexpected eof" \
   HS_FAKE_TABLES_BEFORE=13 HS_FAKE_TABLES_AFTER=13 \
   PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db --force 2>&1 || true)"
 case "$out" in
@@ -1528,6 +1545,48 @@ out="$(cd "$wt" && HS_CURL_BODY='<p>signup</p>' HS_CURL_CODES="302 200 200" \
 contains "and it names the table that actually decides" "wp_blogs" "$out"
 contains "and it does not advise a search-replace" "moves production" "$out"
 
+# ...but one absent subsite is not a broken deployment, and must not throw away
+# the leak scans.
+#
+# Round 56 refused on *any* page that signed up, though its own comment described
+# "a multisite where every page 302s". One missing `wp_blogs` row — a partial
+# pull, a blog created after the dump, an archived subsite — then declared a
+# healthy preview unpreviewable and failed every `ddev start`. And because the
+# refusal sits before the unmapped-host scan, the canonical-origin scan and the
+# census, `exit 2` threw all three away: measured, a deployment serving four live
+# production origins reported the signup redirect *instead* of the leak.
+mv "$wt/hostshift.yaml" "$work/multi-hs.hold" 2>/dev/null || true
+printf 'sites:\n  - canonical: https://www.acme.example\n    variant: https://wt-a--acme.ddev.site\n  - canonical: https://shop.acme.example\n    variant: https://wt-a--shop.acme.ddev.site\n' \
+  > "$wt/hostshift.yaml"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+hs57n="$work/curl-n57"; echo 0 > "$hs57n"
+# The first variant answers 200 and carries a leak; the sibling — the first call
+# that asks for headers — is the one that signs up.
+out="$(cd "$wt" && HS_CURL_BODY='<a href="https://www.acme.example/x">t</a>' \
+  HS_CURL_CODES="200 200 200" HS_CURL_STATE="$hs57n" \
+  HS_CURL_LOCATION="https://wt-a--shop.acme.ddev.site/wp-signup.php?new=shop.acme.example" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"refusing to call this healthy"*"redirects to wp-signup"*)
+    fail "one absent subsite is a warning, not a refusal" "refused the whole deployment" ;;
+  *"redirect to"*"wp-signup.php"*) pass "one absent subsite is a warning, not a refusal" ;;
+  *) fail "one absent subsite is a warning, not a refusal" "said nothing about it: $out" ;;
+esac
+contains "and it names the hostname that signed up" "wt-a--shop.acme.ddev.site" "$out"
+# The load-bearing half: the scans it used to pre-empt still ran.
+contains "and the leak scan still ran" "canonical origin" "$out"
+mv "$work/multi-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+
 # The `hostshift diff` a test-28 refusal sends the developer to has to be a
 # command that runs.
 #
@@ -1541,11 +1600,18 @@ leak='<link rel="canonical" href="https://www.acme.example/">
 <a href="https://www.acme.example/x">t</a>'
 out="$(cd "$wt" && HS_CURL_BODY="$leak" \
   PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+# Round 56 printed a `hostshift diff` command here. Round 57 ran it: under
+# production-canonical DDEV does not register the canonical hostname, so
+# --resolve reaches the router, gets a 404, and diff compares zero pages —
+# "1 pages, 0 leaks" on the message printed *for* a leak. The remedy now names
+# something that works here and says what diff would need.
+contains "the leak refusal offers a remedy that runs here" "--explain" "$out"
+contains "and it says why diff cannot compare under this map" "additional_fqdns" "$out"
 case "$out" in
-  *"hostshift diff"*) pass "the leak refusal offers a diff command" ;;
-  *) fail "the leak refusal offers a diff command" "no diff remedy in: $out" ;;
+  *"hostshift diff --slug"*)
+    fail "and it does not print a diff command that returns 404" "$out" ;;
+  *) pass "and it does not print a diff command that returns 404" ;;
 esac
-contains "and it passes --slug, which diff requires" "hostshift diff --slug" "$out"
 writefake
 
 # A response the proxy passed through untouched is a leak, and only the log
@@ -1563,10 +1629,14 @@ out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0
 contains "a body over the size cap is reported" "unrewritten" "$out"
 contains "and the count is measured" "1 response(s)" "$out"
 contains "and the remedy is the flag that fixes it" "--max-body" "$out"
-# A warning, not a refusal: the evidence is a log line from an earlier request,
-# so refusing would block `ddev start` until the logs rotated.
-[ "$rc" = 0 ] && pass "and it is a warning, not a refusal" \
-  || fail "and it is a warning, not a refusal" "exit $rc"
+# A refusal, because exiting 0 here told PLAN §3's unattended agent that
+# everything was fine on the largest test-28 breach the tool can produce —
+# measured at 120,001 live production origins in one 9.96 MB response. Refusing
+# is safe because it clears on the fix: raising --max-body needs a `ddev
+# restart`, and DDEV recreates the container, so the log starts empty.
+[ "$rc" = 2 ] && pass "and it refuses rather than exiting 0" \
+  || fail "and it refuses rather than exiting 0" "exit $rc"
+contains "and it says the restart clears it" "log starts empty" "$out"
 writefake
 
 # A redirect is followed only while it stays on this deployment.

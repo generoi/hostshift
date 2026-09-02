@@ -578,7 +578,21 @@ func cmdMap(args []string) (int, error) {
 	if *pairs || *hosts {
 		for _, s := range res.Map.Sites {
 			if *pairs {
-				fmt.Printf("%s=%s\n", s.Canonical.String(), s.Variant.String())
+				// The declared spelling, not String()'s comparison form.
+				//
+				// `init` resolves the map on the host and hands it to the
+				// container flat, through exactly this line: `map --pairs` into
+				// `--from`/`--to`. String() renders HostPort(), which is
+				// punycode — origin.go's own comment says it "is never used to
+				// round-trip input", and this is the one place that does. So an
+				// IDN canonical arrived inside the container with Display empty,
+				// and the request direction then spliced the A-label into a
+				// database whose every other row holds the U-label. §4.3,
+				// through the supported install path, undoing the fix that
+				// added Display one layer up.
+				fmt.Printf("%s://%s=%s://%s\n",
+					s.Canonical.Scheme, s.Canonical.DisplayHostPort(),
+					s.Variant.Scheme, s.Variant.DisplayHostPort())
 			} else {
 				fmt.Println(s.Variant.Host)
 			}

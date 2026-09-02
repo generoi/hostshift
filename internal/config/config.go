@@ -225,15 +225,26 @@ func annotate(res *Resolved, proj *ddev.Project, sites []origin.Site) {
 		}
 		covered[st.Variant.Host] = true
 	}
+	// DDEV keeps a hostname the way it was declared and an Origin keeps the ACE
+	// form, so for an IDN the two sets never met: a map's *own* canonical was
+	// reported as a hostname it does not cover, and landed in DirectlyServed
+	// feeding the canonical-on-production note — on every `ddev start` of a
+	// correct project, which is how a warning stops being read.
+	key := func(h string) string {
+		if n, err := origin.NormaliseHost(h); err == nil {
+			return n
+		}
+		return h
+	}
 	// The project's own primary hostname is exempt. In a worktree it is
 	// supposed to be absent from the map — acmecorp-wt-a.ddev.site is what
 	// web answers to, and web is where mailpit and `ddev launch` live — so
 	// warning about it fires on every correctly configured worktree, which
 	// is how people learn to skip warnings. In a canonical project it is a
 	// canonical host anyway and never reaches here.
-	own := proj.Name + "." + proj.TLD
+	own := key(proj.Name + "." + proj.TLD)
 	for _, h := range proj.Hosts {
-		if !covered[h] && h != own {
+		if !covered[key(h)] && key(h) != own {
 			res.Uncovered = append(res.Uncovered, h)
 		}
 	}
@@ -247,7 +258,7 @@ func annotate(res *Resolved, proj *ddev.Project, sites []origin.Site) {
 		variant[st.Variant.Host] = true
 	}
 	for _, h := range proj.Hosts {
-		if !variant[h] {
+		if !variant[key(h)] {
 			res.DirectlyServed = append(res.DirectlyServed, h)
 		}
 	}

@@ -444,6 +444,11 @@ func hasRefJSONEsc(v []byte) bool {
 	return false
 }
 
+// maxBraceEsc bounds a `\u{...}` scan, matching origin's. The bound is on the
+// scan and not on the value: the value is at most four significant hex digits,
+// and the escape spelling it is any length.
+const maxBraceEsc = 72
+
 // jsEscAt decodes `\xNN` or `\u{...}` at the start of b, returning the bytes and
 // the width consumed.
 //
@@ -498,21 +503,31 @@ func jsEscAt(b []byte) ([]byte, int, bool) {
 	if b[1] != 'u' || b[2] != '{' {
 		return nil, 0, false
 	}
-	// `\u{...}`: up to six hex digits, then a closing brace.
-	for w := 4; w < len(b) && w <= 10; w++ {
+	// `\u{...}`: unlimited leading zeros, then at most four significant hex
+	// digits — the width jsonEscRune reads.
+	//
+	// Round 56 made exactly this correction in origin.braceEscAt and left this
+	// copy reading four *characters* with no zero-skip, so `\u{0002e}` was
+	// refused. The two implementations of one alphabet are the recurring defect
+	// in this file, and the asymmetry bites hardest here: an escape *inside* a
+	// host is invisible to the byte matcher, which cannot match across it, so
+	// this view is the only thing that can see the origin at all. ada resolves
+	// every one of `\u{2e}`, `\u{002e}`, `\u{0002e}` and `\u{0000002e}` to the
+	// same host; three of the four were served byte-identical.
+	for w := 4; w < len(b) && w <= 3+maxBraceEsc; w++ {
 		if b[w] != '}' {
 			continue
 		}
 		h := b[3:w]
-		if len(h) == 0 || len(h) > 6 {
+		for len(h) > 1 && h[0] == '0' {
+			h = h[1:]
+		}
+		if len(h) == 0 || len(h) > 4 {
 			return nil, 0, false
 		}
 		padded := append(make([]byte, 0, 4), h...)
 		for len(padded) < 4 {
 			padded = append([]byte{'0'}, padded...)
-		}
-		if len(padded) > 4 {
-			return nil, 0, false
 		}
 		r, ok := jsonEscRune(padded, true)
 		if !ok {
@@ -1677,9 +1692,28 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 	// from under the view; only then is it rebuilt.
 	if bytes.IndexByte(v, '%') >= 0 {
 		pv := stripForPercent(v)
+		// "did any byte move", not "did the length change".
+		//
+		// Round 56 tested the length, and two splices with cancelling deltas
+		// move every byte between them and leave it identical. Measured on a
+		// legal two-site map and a request body: `%2Fx` deleted from one value
+		// and four characters spliced into the next, because the second pass
+		// read a view whose offsets described the buffer before the first pass
+		// touched it. §4.3 — corrupted bytes upstream into the shared database,
+		// and inside an `s:N:"…"` that is the stale-length corruption
+		// serialized.go exists to prevent.
+		//
+		// spliceHostsIn hands back the identical slice when it splices nothing,
+		// so the identity of the backing array answers the real question.
+		moved := func(a, b []byte) bool {
+			if len(a) != len(b) {
+				return true
+			}
+			return len(a) > 0 && &a[0] != &b[0]
+		}
 		stale := false
 		nv := h.spliceHostsIn(pv, v, urlTokenStarts, value, surface, ev)
-		if len(nv) != len(v) {
+		if moved(nv, v) {
 			stale = true
 		}
 		v = nv
@@ -1704,7 +1738,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 		if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
 			nv := h.spliceHostsIn(composeView(percentView(), escView(surface)), v,
 				urlTokenStarts, value, surface, ev)
-			if len(nv) != len(v) {
+			if moved(nv, v) {
 				stale = true
 			}
 			v = nv
@@ -2216,11 +2250,31 @@ func HostsIn(b []byte) map[string]int {
 // on a page, and every one of those is dotted.
 func plausibleHost(h string) bool {
 	h = strings.TrimSuffix(h, ".") // the root label is a host, not a spelling
-	if h == "" || !strings.Contains(h, ".") {
+	if h == "" {
+		return false
+	}
+	// An IPv6 literal has colons and no dots, and is a perfectly ordinary origin
+	// for a page to carry. The dot rule alone dropped every one of them, so an
+	// IPv6 origin could never appear in the census `check` prints.
+	if strings.Contains(h, ":") {
+		for i := 0; i < len(h); i++ {
+			switch c := h[i]; {
+			case c == ':', c == '.',
+				c >= '0' && c <= '9',
+				c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+			default:
+				return false
+			}
+		}
+		return true
+	}
+	if !strings.Contains(h, ".") {
 		return false
 	}
 	for _, label := range strings.Split(h, ".") {
-		if label == "" {
+		// A label cannot begin or end with a hyphen, which is what let
+		// `-bad.example` through while an IPv6 literal was refused.
+		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
 			return false
 		}
 		for i := 0; i < len(label); i++ {

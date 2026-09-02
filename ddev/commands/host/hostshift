@@ -599,9 +599,12 @@ if [ "$cmd" = "copy-db" ]; then
   # longer has — a removed blog's wp_N_* set, an uninstalled plugin's tables — and
   # was then not in the state the parent is in, which is the whole claim. The
   # refusal message promises a replace; this makes it true.
+  # stderr kept, because it answers the question the table count cannot: a
+  # connect-time failure has not streamed a byte, so nothing was dropped.
+  copy_err="$(mktemp "${TMPDIR:-/tmp}/hostshift-copy.XXXXXX" 2>/dev/null)" || copy_err=""
   ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
     --no-tablespaces --add-drop-database --databases db -h ddev-$from-db -udb -pdb \
-    | mysql -h db -udb -pdb" || {
+    | mysql -h db -udb -pdb" 2>${copy_err:-/dev/null} || {
     # Not "the copy failed", full stop — that reads as "nothing happened", and
     # it is only true if the dump never started. --add-drop-database puts
     # `DROP DATABASE` at the top of the stream, so an interruption after that
@@ -636,9 +639,23 @@ if [ "$cmd" = "copy-db" ]; then
     ntables="$(ddev exec -s web bash -c \
       "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
       2>/dev/null | tail -1 | tr -dc '0-9' || true)"
+    # A connection that never opened cannot have written anything, and the
+    # driver says so in as many words. Without this the diagnosis hedged over
+    # the commonest failure there is — the parent not running, which is *why*
+    # the connect failed — and sent the developer to verify a database nothing
+    # had touched.
+    copy_connect=""
+    if [ -n "$copy_err" ] && grep -qiE "unknown server host|can't connect|connection refused|error: *200[45]" \
+        "$copy_err" 2>/dev/null; then
+      copy_connect=1
+    fi
+    [ -n "$copy_err" ] && rm -f "$copy_err"
     echo "hostshift: the copy failed." >&2
     echo "  Is $from running? \`ddev start $from\`" >&2
-    if [ "${tables:-0}" = "0" ] && [ "${ntables:-0}" = "0" ] 2>/dev/null; then
+    if [ -n "$copy_connect" ]; then
+      echo "  The dump never connected to $from, so it did not stream a byte and" >&2
+      echo "  nothing here was touched. Start $from and re-run the same command." >&2
+    elif [ "${tables:-0}" = "0" ] && [ "${ntables:-0}" = "0" ] 2>/dev/null; then
       echo "  This worktree's database had no tables before this ran and has" >&2
       echo "  none now, so nothing was lost. Fix the above and re-run the same" >&2
       echo "  command." >&2
@@ -712,8 +729,11 @@ EOF
   echo "  project registers, so nothing local answers to them:" >&2
   printf '    %s\n' $_outside >&2
   echo "  On a client domain with wildcard DNS they resolve to *production*." >&2
-  echo "  Declare \`base:\` on the site, pointing at this project's own" >&2
-  echo "  hostname, so the variant is derived from a name DDEV serves." >&2
+  echo "  Declare \`base:\` on the site, pointing at the *parent* project's" >&2
+  echo "  DDEV hostname, so the variant is derived from a name DDEV serves." >&2
+  echo "  The parent's, not this worktree's: hostshift.yaml is committed and" >&2
+  echo "  shared, so a base naming this checkout resolves every other worktree" >&2
+  echo "  to a variant of it — and drops the parent's own hostname from the map." >&2
   exit 2
 }
 
@@ -1571,11 +1591,18 @@ if [ "$cmd" = "check" ]; then
   # nothing else in this file can reach — and the block editor and every REST
   # collection are exactly the surfaces that get large.
   #
-  # A warning and not a refusal: the evidence is a log line from some earlier
-  # request, so refusing would block `ddev start` until the logs rotated, and
-  # this file records several rounds of refusals-on-inference that had to be
-  # taken back out. `check` runs on every start, so the count is what makes it
-  # worth reading.
+  # A refusal. Round 56 made it a warning, reasoning that the evidence is a log
+  # line from some earlier request and that refusing would block `ddev start`
+  # until the logs rotated — which is wrong about this container: raising
+  # `--max-body` requires a `ddev restart`, and DDEV recreates the container, so
+  # `docker logs` is empty again the moment the fix is applied. The refusal
+  # clears on the fix, which is the property that makes refusing safe.
+  #
+  # And exiting 0 here was not defensible. Measured: a 9.96 MB `/api.php`
+  # response put 120,001 live production origins in the browser with zero
+  # rewrites, and `check` printed the warning and then "hostshift is serving"
+  # with exit 0. PLAN §3's unattended agent tests `$?`, so it was told everything
+  # was fine on the largest test 28 breach this tool can produce.
   capped="$(printf '%s\n' "$logs" \
     | grep -c 'exceeds the size cap, passing through untouched' 2>/dev/null || true)"
   [ -n "$capped" ] || capped=0
@@ -1592,6 +1619,9 @@ if [ "$cmd" = "check" ]; then
     echo "  Raise it in HOSTSHIFT_ARGS in .ddev/.env, e.g. --max-body 33554432," >&2
     echo "  and \`ddev restart\`. Which paths:" >&2
     echo "    docker logs ddev-$name-hostshift 2>&1 | grep 'size cap'" >&2
+    echo "  The restart that applies the new cap also clears this: DDEV recreates" >&2
+    echo "  the container, so the log starts empty." >&2
+    exit 2
   fi
 
   # The image's version against this command's.
@@ -2090,7 +2120,7 @@ EOF
       case "$_loc" in
         *wp-signup.php*)
           if [ -n "${hs_signup_file:-}" ]; then
-            printf '%s' "$_url" > "$hs_signup_file"
+            printf '%s\n' "$_url" >> "$hs_signup_file"
           fi ;;
       esac
       _lh="${_loc#*://}"; _lh="${_lh%%/*}"; _lh="${_lh%%:*}"
@@ -2193,10 +2223,15 @@ $extra_body"
     done
   fi
 
+  hs_signup_n=0
   if [ -n "${hs_signup_file:-}" ]; then
-    hs_signup_at="$(cat "$hs_signup_file" 2>/dev/null || true)"
+    hs_signup_at="$(sort -u "$hs_signup_file" 2>/dev/null | tr '\n' ' ' || true)"
+    hs_signup_n="$(sort -u "$hs_signup_file" 2>/dev/null | grep -c . || true)"
+    [ -n "$hs_signup_n" ] || hs_signup_n=0
     rm -f "$hs_signup_file"
   fi
+  hs_probed_n=0
+  for _p in ${probe_urls:-}; do hs_probed_n=$((hs_probed_n + 1)); done
 
   # Nothing is previewable if WordPress does not know the hostname.
   #
@@ -2209,7 +2244,32 @@ $extra_body"
   # A refusal rather than a warning, because there is nothing to preview and the
   # remedy is not obvious: the instinct is to search-replace the database, which
   # is the parent's and shared, so doing that moves production.
-  if [ -n "${hs_signup_at:-}" ]; then
+  #
+  # Refusing only when *every* probed page signs up, which is the state round
+  # 56's own comment described and not the one it coded: firing on any page made
+  # one absent subsite — a partial `db:pull`, a blog created after the dump, an
+  # archived site — declare a healthy preview unpreviewable, fail every
+  # `ddev start`, and print a remedy for a database that had not moved.
+  #
+  # Worse than the false refusal: this sits before the unmapped-host scan, the
+  # canonical-origin scan and the census, so `exit 2` here threw all three away.
+  # Measured: a deployment serving four live production origins reported them,
+  # and with one subsite's row removed reported the signup redirect *instead* —
+  # the leak went unmentioned, and a developer who knows that subsite is missing
+  # reads the whole message as expected noise.
+  if [ "${hs_signup_n:-0}" -gt 0 ] 2>/dev/null &&
+     [ "${hs_signup_n:-0}" -lt "${hs_probed_n:-0}" ] 2>/dev/null; then
+    echo "hostshift: warning: these variant hostname(s) redirect to" >&2
+    echo "  wp-signup.php, so WordPress does not recognise them:" >&2
+    printf '    %s\n' $hs_signup_at >&2
+    echo "  The others serve, so this is not the whole deployment — most likely" >&2
+    echo "  one subsite is absent from the shared database (a partial pull, or a" >&2
+    echo "  blog created after it). Compare what the database holds with what" >&2
+    echo "  this map names:" >&2
+    echo "    ddev exec -s db mysql -N -B -e \\" >&2
+    echo "      \"select blog_id, domain, path from wp_blogs\" db" >&2
+    echo "  The scans below still apply to the pages that do serve." >&2
+  elif [ -n "${hs_signup_at:-}" ]; then
     echo "hostshift: refusing to call this healthy — $hs_signup_at" >&2
     echo "  redirects to wp-signup.php, which is WordPress saying it does not" >&2
     echo "  recognise that hostname. On a multisite the hostnames live in" >&2
@@ -2322,18 +2382,16 @@ $extra_body"
           echo "  The proxy is running with --no-sweep, which disables the" >&2
           echo "  straggler backstop. Remove it from HOSTSHIFT_ARGS in .ddev/.env." >&2 ;;
         *)
-          hs_port="${DDEV_ROUTER_HTTPS_PORT:-443}"
-          [ -n "$hs_port" ] || hs_port=443
-          echo "  Run \`hostshift diff\` against this deployment to see which" >&2
-          echo "  surface they are on — but under production-canonical its" >&2
-          echo "  canonical base is the client's live site, and diff fetches it." >&2
-          echo "  Point it somewhere local first:" >&2
-          echo "    hostshift diff --slug ${slug:-<slug>} \\" >&2
-          echo "      --resolve ${canon_list%%,*}:$hs_port:127.0.0.1:$hs_port" >&2
-          echo "  diff prints the same warning and then crawls anyway, so this is" >&2
-          echo "  not a formality. \`--slug\` is not optional: there is no" >&2
-          echo "  \`ddev hostshift diff\` wrapper to supply it. On a DDEV-canonical" >&2
-          echo "  worktree add \`--variant-base https://\${DDEV_HOSTNAME%%,*}\`." >&2 ;;
+          echo "  To see which surface they are on, turn the census on and" >&2
+          echo "  reload the page:" >&2
+          echo "    add --explain to HOSTSHIFT_ARGS in .ddev/.env, \`ddev restart\`," >&2
+          echo "    then: docker logs ddev-$name-hostshift 2>&1 | grep rewrote" >&2
+          echo "  \`hostshift diff\` shows it too, but it needs *both* sides" >&2
+          echo "  fetchable, and this map is canonical-on-production: DDEV does" >&2
+          echo "  not register ${canon_list%%,*} here, so pointing --resolve at the" >&2
+          echo "  router returns 404 and nothing is compared. Add that hostname to" >&2
+          echo "  additional_fqdns first if you want diff — and note diff would" >&2
+          echo "  otherwise fetch the client's live site." >&2 ;;
       esac
       # exit 2, the refusal this script uses everywhere else. The first version
       # incremented a `fails` counter declared nowhere and read nowhere — so
