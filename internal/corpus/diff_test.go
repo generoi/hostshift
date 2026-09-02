@@ -656,7 +656,7 @@ func TestAPageReportsEveryNoteItEarned(t *testing.T) {
 	}
 	// And the summary names both, so a RED run says what was wrong without
 	// scrolling back up.
-	if !strings.Contains(out, "2 leaks, 3 broken") {
+	if !strings.Contains(out, "2 leaks, 0 write-backs, 3 broken") {
 		t.Errorf("the summary did not count both:\n%s", out)
 	}
 }
@@ -761,5 +761,42 @@ func TestATier2BodyWithARealHeaderIsStillNotScored(t *testing.T) {
 	}, "/style.css")
 	if r.UnreadRewrites != 0 {
 		t.Errorf("a Tier 2 body was scored, which contradicts the Tier 2 arm below it")
+	}
+}
+
+// A variant hostname in the *canonical* response is §4.3's failure, and this
+// report could not see it at all until round 66.
+//
+// `Leaks` counts canonical origins in the variant response — test 28. Its mirror
+// means a save through the worktree wrote the worktree's hostname into
+// production's database, and the canonical site is now serving it to the public.
+// It cannot surface as a byte difference either, because the same variant string
+// then appears on both sides and the row reads `same`.
+//
+// Measured on a real project: a Customizer widget save put the variant host into
+// `wp_options`, `curl` on the canonical host served it, and this report printed
+// "16 pages, 16 byte-identical, 0 leaks" and GREEN.
+func TestAVariantOriginInTheCanonicalResponseIsCounted(t *testing.T) {
+	// The same bytes on both sides: byte-identical, no leak, and wrong.
+	const body = `<a href="https://v.ddev.site/promo/">promo</a>`
+	r := compareBodies(t, body, body)
+	if r.Leaks != 0 {
+		t.Fatalf("this fixture is meant to carry no canonical origin, got %d leaks", r.Leaks)
+	}
+	if !r.Equal {
+		t.Fatalf("this fixture is meant to be byte-identical, so the report has "+
+			"nothing else to notice: %+v", r)
+	}
+	if r.WriteBacks == 0 {
+		t.Error("a variant hostname is in production's response and the report " +
+			"counted nothing — this is the state that printed GREEN on a site " +
+			"whose canonical pages were serving the worktree's hostname")
+	}
+	// And a healthy page stays at zero, so the counter is not simply always on.
+	clean := compareBodies(t,
+		`<a href="https://www.canon.test/promo/">promo</a>`,
+		`<a href="https://v.ddev.site/promo/">promo</a>`)
+	if clean.WriteBacks != 0 {
+		t.Errorf("a healthy page reported %d write-backs", clean.WriteBacks)
 	}
 }

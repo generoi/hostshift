@@ -90,6 +90,11 @@ type Result struct {
 	// so does not cancel against the canonical baseline.
 	UnreadRewrites int
 
+	// WriteBacks counts variant origins in the *canonical* response: production
+	// serving a worktree hostname, which is §4.3 and means the shared database
+	// was written through the proxy. Zero on a healthy site.
+	WriteBacks int
+
 	// Leaks counts canonical origins in the variant response. Any non-zero
 	// value is a test 28 failure and is what this whole exercise is for.
 	Leaks int
@@ -347,6 +352,21 @@ func compare(ctx context.Context, o Options, path string) Result {
 
 	r.ContentType = variant.contentType
 	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
+	// And the other direction, which this could not see at all until round 66.
+	//
+	// Leaks are canonical origins in the *variant* response — test 28. The §4.3
+	// failure is its mirror: a *variant* origin in the *canonical* response,
+	// which means a save through the worktree wrote the worktree's hostname into
+	// production's database and the canonical site is now serving it to the
+	// public. That cannot show up as a byte difference either, because the same
+	// variant string then appears identically on both sides and the row reads
+	// `same`. So a real §4.3 write-back was reported GREEN: 16 pages, 16
+	// byte-identical, 0 leaks.
+	//
+	// On a healthy site this is zero by construction — nothing in production's
+	// database names a worktree — so it costs a scan and answers the question the
+	// whole exercise exists for.
+	r.WriteBacks, _ = countLeaks(o.Map.Reverse(), canon)
 	return r
 }
 
@@ -859,7 +879,7 @@ func WriteReport(w io.Writer, results []Result) bool {
 	// the invariant-28 verdict with exit 0. The same class as the two verdicts
 	// round 43 rescoped: a report asserting what it skipped.
 	green := len(results) > 0
-	var equal, leaks, errs, tier2, broken, unread int
+	var equal, leaks, errs, tier2, broken, unread, writeBacks int
 
 	fmt.Fprintf(w, "%-46s %-8s %-7s %-7s %s\n", "PATH", "BYTES", "LEAKS", "LINES", "NOTE")
 	for _, r := range results {
@@ -876,6 +896,13 @@ func WriteReport(w io.Writer, results []Result) bool {
 		if r.Leaks > 0 {
 			notes = append(notes, "CANONICAL ORIGIN REACHED THE BROWSER")
 			leaks += r.Leaks
+			green = false
+		}
+		if r.WriteBacks > 0 {
+			notes = append(notes, "A VARIANT HOSTNAME IS IN PRODUCTION'S DATABASE — "+
+				"the canonical site is serving it to the public, which means a save "+
+				"through the worktree wrote it there (§4.3, no undo)")
+			writeBacks += r.WriteBacks
 			green = false
 		}
 		if r.UnreadRewrites > 0 {
@@ -1010,8 +1037,13 @@ func WriteReport(w io.Writer, results []Result) bool {
 	// "3 pages, 3 byte-identical, 0 leaks, 0 errors" and then "corpus diff RED",
 	// naming nothing that was wrong — and this summary is what a developer
 	// reads before deciding whether to scroll up.
-	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d broken, %d unread, %d errors\n",
-		len(results), equal, leaks, broken, unread, errs)
+	// `write-backs` belongs on this line for the same reason `broken` does: a
+	// run that found production serving a worktree hostname printed
+	// "16 byte-identical, 0 leaks" and a GREEN verdict, because every counter on
+	// this line asked about the variant response only.
+	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d write-backs, %d broken, "+
+		"%d unread, %d errors\n",
+		len(results), equal, leaks, writeBacks, broken, unread, errs)
 	if tier2 > 0 {
 		fmt.Fprintf(w, "%d origins in Tier 2 types (text/css, JavaScript), which the "+
 			"proxy excludes by design — PLAN's fast path adds them \"only if the "+

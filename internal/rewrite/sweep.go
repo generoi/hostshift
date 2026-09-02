@@ -142,7 +142,12 @@ func (s *Sweep) flush(b []byte, limit int) int {
 		}
 		// Every straggler is a bug in the structured pass, so it is reported
 		// individually and loudly, with enough context to find it.
-		s.log.Warn("straggler swept — a canonical origin survived the structured pass",
+		//
+		// "an origin", not "a canonical origin": this same sweep runs on the
+		// request arm, where the matcher maps variant to canonical and the thing
+		// it finds is a *variant* hostname. The message named the wrong
+		// direction there, and the `origin` field below says which it was anyway.
+		s.log.Warn("straggler swept — an origin survived the structured pass",
 			"offset", events[i].Offset,
 			"origin", events[i].Text,
 			"context", context(b, local))
@@ -192,7 +197,8 @@ func SweepBytes(b []byte, m *origin.Matcher, st *Stats, log *slog.Logger) []byte
 		if e.Action != origin.ActionRewrote {
 			continue
 		}
-		log.Warn("straggler swept — a canonical origin survived the structured pass",
+		// Direction-neutral for the reason the streaming sweeper's copy gives.
+		log.Warn("straggler swept — an origin survived the structured pass",
 			"offset", e.Offset,
 			"origin", e.Text,
 			"context", context(b, e.Offset))

@@ -309,6 +309,15 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 // large responses put production origins in the browser got a content-type
 // histogram. http.Response keeps its Request, and a nil one is only possible in
 // a hand-built response.
+// firstBytes is a log-safe prefix: enough of a decoded blob to recognise which
+// setting it is, never the whole thing.
+func firstBytes(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "…"
+}
+
 func reqPath(resp *http.Response) string {
 	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
 		return ""
@@ -813,7 +822,15 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// Guessing that from the bytes cut serialized values apart at the
 		// `&utm_medium=` inside ordinary tracking URLs.
 		repair := rewrite.RepairSerialized
-		if mediaType(r.Header.Get("Content-Type")) == "application/x-www-form-urlencoded" {
+		// Lowercased, because media types are case-insensitive (RFC 9110 §8.3.1)
+		// and `bodyKind` 165 lines below already lowercases. So
+		// `Application/X-WWW-Form-Urlencoded` was classified as a flat body and
+		// rewritten, but took the non-splitting repair — losing the field split
+		// *and* the form-layer peel, which re-opened round 63's leak verbatim:
+		// a double-encoded variant hostname went upstream into the shared
+		// database. One media type read two ways in one file.
+		if strings.ToLower(mediaType(r.Header.Get("Content-Type"))) ==
+			"application/x-www-form-urlencoded" {
 			repair = rewrite.RepairSerializedFields
 		}
 		out = repair(buf, func(b []byte) []byte {
@@ -823,6 +840,22 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 				rewrite.SurfaceRequestBody, 0)
 		})
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
+		// A variant hostname inside a base64 blob is one no spelling reaches and
+		// none should: the Customizer validates a widget instance with
+		// `wp_hash()` over exactly those bytes, so rewriting it makes WordPress
+		// discard the save. What was wrong was the silence — the save went
+		// through, production's database took the worktree's hostname, the
+		// canonical site served it to the public, and nothing logged a line.
+		if n, sample := rewrite.HiddenInBase64(buf, func(b []byte) []byte {
+			nv, _ := rev.Rewrite(b, rewrite.SurfaceRequestBody, false)
+			return nv
+		}); n > 0 {
+			p.log().Warn("a variant hostname is inside base64 in this request body "+
+				"— it cannot be mapped back without breaking the signature the app "+
+				"checks, so it will reach the shared database as it stands",
+				"blobs", n, "method", r.Method, "path", r.URL.Path,
+				"decoded", firstBytes(sample, 120))
+		}
 	}
 	if p.DryRun {
 		out = buf
