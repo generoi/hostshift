@@ -500,6 +500,30 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		SurfaceJSONString:     true,
 		SurfaceJSONEscape:     true,
 	}
+	// The third axis: whether something will hand this buffer to a URL parser,
+	// which decides whether a tab, LF or CR after a host joins what follows or
+	// ends it. Rounds 70 and 71 each got this wrong on a surface nobody had
+	// classified — round 70 by asking value-vs-prose instead, round 71 by finding
+	// that JSON, the straggler sweep and an inline `<script>` each need a
+	// different answer from the one that gave.
+	wantJoins := map[string]bool{
+		SurfaceHTMLAttr:       true, // an href the URL parser reads
+		SurfaceText:           false,
+		SurfaceXMLText:        false,
+		SurfaceComment:        false,
+		SurfaceHeader:         true, // a Location is a URL
+		SurfaceResponseHeader: true,
+		SurfaceRequestLine:    true,
+		SurfaceRequestBody:    false,
+		SurfaceInlineStyle:    true, // url(…)
+		SurfaceHTMLEntity:     true,
+		SurfaceHTMLObfuscated: true,
+		SurfaceRawText:        false,
+		SurfaceInlineScript:   true,  // string and template literals
+		SurfaceStraggler:      true,  // no surface, and it must not override a pass
+		SurfaceJSONString:     false, // decided per string; see joinsControlsIn
+		SurfaceJSONEscape:     true,
+	}
 
 	found := surfaceConstants(t)
 	// Every name in the table must have been seen, or the scanner is narrower
@@ -521,6 +545,14 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		}
 	}
 	for name, value := range found {
+		joins, classifiedJoins := wantJoins[value]
+		if !classifiedJoins {
+			t.Errorf("%s = %q is not classified for the control axis: decide "+
+				"whether anything will parse a buffer on that surface as a URL, "+
+				"say so in origin.surfaceJoinsControls, and list it here", name, value)
+		} else if got := origin.SurfaceJoinsControls(value); got != joins {
+			t.Errorf("%s (%q): SurfaceJoinsControls = %v, want %v", name, value, got, joins)
+		}
 		css, classified := wantCSS[value]
 		if !classified {
 			t.Errorf("%s = %q is not classified for the CSS axis: decide whether a "+

@@ -464,6 +464,89 @@ const (
 // The names are literals rather than rewrite's Surface constants because that
 // package imports this one. rewrite.TestSurfaceNamesAreKnownHere pins them, so a
 // renamed surface fails a test here rather than silently falling to the default.
+// surfaceJoinsControls reports whether something on this surface will hand the
+// buffer to a URL parser, which is what decides whether a tab, LF or CR after a
+// host joins what follows or ends it.
+//
+// This is the discriminant, and rounds 70 and 71 found it twice by getting it
+// wrong. Round 70 used "is this one value or is it prose", which is a different
+// question: JSON never carries a raw newline — it carries `\n` — so the block
+// editor's own wire format kept leaking, and an inline `<script>` is scanned as
+// prose while its string literals really are parsed as URLs, so making a raw
+// newline a boundary there broke §5.5's case in a template literal.
+//
+// A value, a header, a request line, a CSS `url()` and a script's string
+// literals are all parsed as URLs, so a control in them is removed before the
+// host is read: `https://www.example.fi<TAB>x` is the host `www.example.fix`.
+// Prose is everything else — a text node, a comment, a raw-text element, a
+// request body, a JSON string holding a document — where a control is a line
+// break or a column separator and the origin before it is the whole origin.
+//
+// An explicit table, not a negative test, for the reason escapeAlphabetFor's
+// comment gives at length: a hand-written list is what failed here twice, and
+// rewrite.TestSurfaceNamesAreKnownHere reads the names out of the source and
+// pins this axis with the others.
+func surfaceJoinsControls(surface string) bool {
+	switch surface {
+	case "html-attr", "html-entity", "html-obfuscated",
+		"inline-script", "inline-style", "json-escape",
+		"header", "response-header", "request-line":
+		return true
+	case "text", "xml-text", "comment", "raw-text",
+		"request-body", "json-string":
+		return false
+	case "straggler":
+		// The sweep is a byte matcher with no surface, running behind every
+		// structured pass. Reading prose here would let it rewrite what the
+		// structured pass deliberately declined — measured: it re-rewrote
+		// `fetch("https://www.example.fi<TAB>x")` that the script surface had
+		// correctly left alone. It joins, so it can only ever be more
+		// conservative than the pass it backs up.
+		return true
+	}
+	// An unknown surface reads as prose, which rewrites more rather than less.
+	// Declining is what leaked in both directions in rounds 70 and 71.
+	return false
+}
+
+// SurfaceJoinsControls is surfaceJoinsControls for the views, which have to
+// answer the same question about the same document.
+func SurfaceJoinsControls(surface string) bool { return surfaceJoinsControls(surface) }
+
+// joinsControlsIn is surfaceJoinsControls, except that a JSON string has to be
+// asked about itself.
+//
+// The surface cannot answer for JSON, because both measured cases arrive on it
+// and they need opposite answers. Round 54: `{"u":"https://www.example.fi\tx"}`
+// is a field holding one URL, a browser assigning it resolves `www.example.fix`,
+// and rewriting it changes a value that names nothing in the map. Round 71:
+// `{"content":"…curl https://<variant>\nnext line here…"}` is the block editor
+// posting a document, where `\n` is a line break and the origin before it went
+// into a shared production database.
+//
+// The discriminant that separates them is a literal space. A lone URL field has
+// none; a document — post content, a CSS blob, a title — has one almost by
+// definition. It is a heuristic and it is named as one here, but it is the only
+// property of the two real payloads that differs, and both directions of getting
+// it wrong have now been measured against a real WordPress.
+func joinsControlsIn(surface string, b []byte) bool {
+	if surface != "json-string" {
+		return surfaceJoinsControls(surface)
+	}
+	// The span arrives with its quotes on, which is how the tokenizer hands it
+	// over — reading past them is the difference between "this field is a URL"
+	// and "this field is prose", and getting it wrong here re-broke round 54.
+	t := bytes.Trim(b, `"`)
+	if bytes.IndexByte(t, ' ') >= 0 {
+		return false
+	}
+	if len(t) > 8 {
+		t = t[:8]
+	}
+	l := bytes.ToLower(t)
+	return bytes.HasPrefix(l, []byte("http")) || bytes.HasPrefix(l, []byte("//"))
+}
+
 func escapeAlphabetFor(surface string) escAlphabet {
 	switch surface {
 	case "html-attr", "text", "xml-text", "comment", "header", "response-header",
@@ -515,7 +598,7 @@ func escapeAlphabetFor(surface string) escAlphabet {
 // registrable domain, which this code correctly refuses when the dot is
 // written literally. Treating '%' as an unconditional terminator rewrote it.
 // So the escape is decoded and the same question asked of the byte it denotes.
-func delimAt(b []byte, i int, esc escAlphabet) bool {
+func delimAt(b []byte, i int, esc escAlphabet, joins bool) bool {
 	if i >= len(b) {
 		return true
 	}
@@ -564,7 +647,7 @@ func delimAt(b []byte, i int, esc escAlphabet) bool {
 	// `\/` still terminates, because it decodes to a slash. It is the escapes
 	// that decode to *host* bytes that continue the host.
 	if b[i] == '\\' && esc != escPath {
-		if term, ok := escTerminates(b, i); ok {
+		if term, ok := escTerminates(b, i, joins); ok {
 			return term
 		}
 	}
@@ -595,7 +678,7 @@ func delimAt(b []byte, i int, esc escAlphabet) bool {
 // In every one of those the reference is not this origin, and rewriting it is a
 // byte changed for no reason — or, on the way back, a variant hostname written
 // into the shared database.
-func escTerminates(b []byte, i int) (bool, bool) {
+func escTerminates(b []byte, i int, joins bool) (bool, bool) {
 	if i+1 >= len(b) {
 		return false, false
 	}
@@ -611,7 +694,12 @@ func escTerminates(b []byte, i int) (bool, bool) {
 	case '/', '\\', '"':
 		return term(c)
 	case 'n', 'r', 't', 'b', 'f':
-		return false, true
+		// In a value these decode to bytes the URL parser removes, so the host
+		// runs on. In prose — a JSON string holding `post_content`, which is how
+		// the block editor posts a document — `\n` is a line break and the host
+		// ended at it. Round 71 read variant hostnames out of `wp_posts` through
+		// this branch, which round 70's fix reached only in its literal spelling.
+		return !joins, true
 	case 'u':
 		// `\u{...}` is JavaScript's spelling and has no fixed width.
 		if i+2 < len(b) && b[i+2] == '{' {
@@ -814,12 +902,9 @@ func escColonLen(b []byte, i int, esc escAlphabet) int {
 // boundary in prose cannot break the inline-script case §5.5 exists for, while a
 // raw tab inside a JS string is legal and really is removed before the fetch.
 // That asymmetry is the whole scope of this change.
-func removedEscLen(b []byte, i int, esc escAlphabet, value bool) int {
-	if i < len(b) && b[i] == '\t' {
-		return 1
-	}
-	if i < len(b) && (b[i] == '\n' || b[i] == '\r') {
-		if value {
+func removedEscLen(b []byte, i int, esc escAlphabet, joins bool) int {
+	if i < len(b) && (b[i] == '\t' || b[i] == '\n' || b[i] == '\r') {
+		if joins {
 			return 1
 		}
 		return 0
@@ -829,6 +914,14 @@ func removedEscLen(b []byte, i int, esc escAlphabet, value bool) int {
 	}
 	switch b[i+1] {
 	case 'n', 'r', 't':
+		// The same question in the spelling JSON uses. `m.Rewrite` on a JSON
+		// string is how the block editor posts a document, and `\n` there is a
+		// line break in `post_content`, not a byte a URL parser strips — round 71
+		// read variant hostnames out of `wp_posts` through exactly this branch,
+		// which round 70's fix did not reach because it gated only the literal.
+		if !joins {
+			return 0
+		}
 		return 2
 	// Legacy octal, which escTerminates reads and this did not. Written in the
 	// same commit with two different alphabets: `\011` was reported as "not a
@@ -893,8 +986,7 @@ func SurfaceDecodesEscapes(surface string) bool {
 // Only meaningful when b[i] is a backslash; the caller checks that.
 func EscapeContinuesHost(b []byte, i int, surface string) bool {
 	esc := escapeAlphabetFor(surface)
-	// A locator scan is looking at one value, which is what its callers pass it.
-	return esc != escPath && !hostTerminated(b, i, esc, true)
+	return esc != escPath && !hostTerminated(b, i, esc, surfaceJoinsControls(surface))
 }
 
 // unhex decodes the two hex digits at i.
@@ -959,22 +1051,22 @@ var (
 // M0 counted five of those in acmecorp' database. So the dot terminates the
 // host and stays where it is, and only the endsHost case above — where real
 // URL structure follows, so the dot is genuinely the root label — absorbs it.
-func hostTerminated(b []byte, end int, esc escAlphabet, value bool) bool {
+func hostTerminated(b []byte, end int, esc escAlphabet, joins bool) bool {
 	// Past the characters the URL parser removes, then ask. See removedEscLen:
 	// tab, LF and CR do not end a host, they join what follows to what precedes,
 	// and answering at the control's own position got that backwards.
 	for walked := 0; walked < maxRemovedRun; {
-		n := removedEscLen(b, end, esc, value)
+		n := removedEscLen(b, end, esc, joins)
 		if n == 0 || walked+n > maxRemovedRun {
 			break
 		}
 		end += n
 		walked += n
 	}
-	if delimAt(b, end, esc) {
+	if delimAt(b, end, esc, joins) {
 		return true
 	}
-	return b[end] == '.' && delimAt(b, end+1, esc)
+	return b[end] == '.' && delimAt(b, end+1, esc, joins)
 }
 
 // endsHost reports whether position i is where a URL's host component ends —
@@ -1067,6 +1159,9 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 	if len(b) == 0 {
 		return b, 0, nil
 	}
+	// Whether a control after a host joins what follows or ends it is a property
+	// of the surface, not of value-vs-prose. See surfaceJoinsControls.
+	joins := joinsControlsIn(surface, b)
 	esc := escapeAlphabetFor(surface)
 	var (
 		events []Event
@@ -1228,7 +1323,7 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 		// "not a host byte, so the host ended" and the bare host matched. So a
 		// value no browser resolves was rewritten. Both spellings, since the
 		// escaped separator reaches here too now.
-		if sep > 0 && port == "" && !hostTerminated(b, end+sep, esc, value) {
+		if sep > 0 && port == "" && !hostTerminated(b, end+sep, esc, joins) {
 			emit(start, b[start:end+sep], ActionSkipped, ReasonNotAURL)
 			scanned = end + sep
 			consumed = max(consumed, end+sep)
@@ -1236,7 +1331,7 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 		}
 		scanned = end
 		consumed = max(consumed, end)
-		if !hostTerminated(b, end, esc, value) {
+		if !hostTerminated(b, end, esc, joins) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, b[start:end], ActionSkipped, ReasonNotAURL)
 			continue

@@ -58,15 +58,18 @@ func TestR70ABareOriginAtALineEndIsRewrittenInProse(t *testing.T) {
 	}
 }
 
-// A literal tab keeps joining, in prose and in a value, and so does a newline
-// inside a value. This is the half a plain revert would break.
+// A control keeps joining wherever something will parse the buffer as a URL.
 //
 // `https://www.example.fi<TAB>x` is the host `www.example.fix` to a URL parser,
-// which is §5.5's case, and a raw tab is legal inside a JavaScript string, so an
-// inline `fetch("https://www.example.fi<TAB>x")` really does resolve that way. A
-// raw *newline* cannot appear inside a JS or JSON string literal — both forbid
-// it — which is what makes the prose rule above safe to apply and stops the two
-// halves from being the same question.
+// which is §5.5's case. Round 70 drew the line at value-vs-prose and kept a tab
+// joining *everywhere*, on the reasoning that a raw tab is legal inside a
+// JavaScript string. Round 71 showed that reasoning belongs to the script
+// surface and not to prose: a literal tab between a bare origin and a word in a
+// text node is an ordinary column separator, `wpautop` leaves it alone so it
+// does not even need a `<pre>`, and the origin before it was shipped to the
+// browser and written into the database. The line is drawn by surface now — see
+// origin.surfaceJoinsControls — so this case moved to TestR71B and what is left
+// here is the half that must keep joining.
 func TestR70AControlThatTheURLParserRemovesStillJoins(t *testing.T) {
 	m := obfMatcher(t)
 	const canon = "https://www.example.fi"
@@ -74,7 +77,6 @@ func TestR70AControlThatTheURLParserRemovesStillJoins(t *testing.T) {
 		name, in string
 		value    bool
 	}{
-		{"a tab in prose", "a " + canon + "\tx", false},
 		{"a tab in a value", canon + "\tx", true},
 		{"a newline in a value", canon + "\nx", true},
 		{"a CR in a value", canon + "\rx", true},
@@ -112,5 +114,42 @@ func TestR70ALineEndOriginComesHome(t *testing.T) {
 	if strings.Contains(string(out), "wt-a--example.ddev.site") {
 		t.Errorf("a variant hostname reached the shared database — §4.3, no undo\n"+
 			"  in:  %q\n  out: %q", body, string(out))
+	}
+}
+
+// A JSON string that begins with a URL and keeps going is still prose.
+//
+// `joinsControlsIn` asks a JSON string about itself, because round 54's case (a
+// field holding one URL) and round 71's (the block editor posting a document)
+// arrive on the same surface needing opposite answers. The discriminant is a
+// literal space — and the round-71 fixture happens to begin with `<!-- wp:code`,
+// so it is decided by the scheme test alone and never exercises the space test.
+// A caption or an excerpt that opens with a link does exercise it, and without it
+// the round-71 leak reopens for exactly those values.
+func TestR70AJSONDocumentThatOpensWithAURLIsProse(t *testing.T) {
+	rev, err := origin.NewMatcher([]origin.Pair{{
+		Canonical: origin.MustParse("https://wt-a--example.ddev.site"),
+		Variant:   origin.MustParse("https://www.example.fi"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Opens with the origin, ends the line on it, and carries a space later on.
+	// The space is what makes this a document; the line-end origin is what the
+	// reading then decides. With the scheme test alone this is a "lone URL", the
+	// `\n` joins, the host reads as `…ddev.sitenext` and the origin is declined.
+	in := `{"excerpt":"https://wt-a--example.ddev.site\nnext line here"}`
+	out := string(RewriteJSON([]byte(in), rev, NewStats(false), quiet(), false))
+	if strings.Contains(out, "wt-a--example.ddev.site") {
+		t.Errorf("a variant hostname reached the shared database through a JSON "+
+			"document that happens to open with a URL — §4.3, no undo\n"+
+			"  in:  %s\n  out: %s", in, out)
+	}
+	// And the lone-URL field it must not be confused with still declines: a
+	// browser resolves this to www.example.fix, so nothing may change.
+	lone := `{"u":"https://wt-a--example.ddev.site\tx"}`
+	if got := string(RewriteJSON([]byte(lone), rev, NewStats(false), quiet(), false)); got != lone {
+		t.Errorf("a field holding one URL was rewritten, and the browser resolves "+
+			"it to a host this map does not name\n  in:  %s\n  out: %s", lone, got)
 	}
 }
