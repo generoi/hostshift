@@ -69,3 +69,67 @@ func TestCheckDoesNotCallACoveredHostUncovered(t *testing.T) {
 			"is keyed on punycode and DDEV's hostnames are not:\n%s", errOut)
 	}
 }
+
+// Both sides of the pair, and both loops of the census.
+//
+// Round 58's mutation survey found each of these fixes pinned on one half only:
+// `--pairs` was asserted on the canonical side, so the variant could go back to
+// HostPort(); and `annotate` was asserted on its `covered` loop, so the
+// `variant` loop could go back to comparing spellings that never meet — which
+// puts the map's own variant into DirectlyServed and fires the
+// canonical-on-production note on a correct project, verbatim the failure round
+// 57 fixed one loop over.
+func TestR58BothSidesOfTheIDNSpelling(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml", "name: acme\nadditional_hostnames:\n  - hämeen\n")
+
+	// The canonical side of *every* pair, not just the first. The database holds
+	// canonicals, so this is the side §4.3 is about; the variant is derived and
+	// never appears in the database, so its punycode spelling is a difference in
+	// rendering rather than a round-trip defect, and is left alone deliberately.
+	_, out, _ := run(t, "", cmdMap, "-C", dir, "--slug", "wt", "--pairs")
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		canonical, _, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.Contains(canonical, "xn--") {
+			t.Errorf("`map --pairs` emitted punycode for a canonical, so the\n"+
+				"--from/--to line `init` writes hands the proxy an origin with no\n"+
+				"Display and the request direction splices an A-label into a database\n"+
+				"whose every other row holds the U-label (§4.3):\n%s", out)
+		}
+	}
+
+}
+
+// The census's *second* loop, on a fixture that actually arms the note.
+//
+// The first version of this assertion used an all-`.ddev.site` map, where
+// ExternalCanonicals is empty and the canonical-on-production note never fires
+// — so it passed whatever the loop did. The note needs an external canonical to
+// arm, and the defect needs a DDEV hostname that *is* a variant, declared in the
+// IDN spelling DDEV keeps. Then comparing an ACE variant against a declared one
+// puts the map's own variant into DirectlyServed and the note tells the
+// developer to avoid the very hostname the preview is served on.
+func TestR58TheVariantCensusNormalisesToo(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".ddev/config.yaml",
+		"name: acme\nadditional_hostnames:\n  - wt--hämeen\n")
+	writeFile(t, dir, "hostshift.yaml",
+		"sites:\n  - canonical: https://www.acme.example\n"+
+			"    variant: https://wt--hämeen.ddev.site\n")
+
+	_, _, errOut := run(t, "", cmdCheck, "-C", dir, "--slug", "wt")
+	// Premise: the paragraph under test fired at all.
+	if !strings.Contains(errOut, "canonical-on-production") {
+		t.Fatalf("fixture: the note did not fire, so this asserts nothing:\n%s", errOut)
+	}
+	_, after, _ := strings.Cut(errOut, "canonical-on-production")
+	note, _, _ := strings.Cut(after, "\nhostshift:")
+	if strings.Contains(note, "hämeen") || strings.Contains(note, "xn--hmeen") {
+		t.Errorf("the note names the map's own variant as a hostname that serves\n"+
+			"the database unrewritten, because the variant census compares an ACE\n"+
+			"hostname against the spelling DDEV keeps:\n%s", errOut)
+	}
+}

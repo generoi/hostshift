@@ -54,6 +54,14 @@
 #
 # install.yaml warns about this once, in the middle of a long `add-on get`
 # output, at a moment when nothing is yet broken. That is not enough, and DDEV
+# `head -5`, the way install.yaml does it, and not a search of the whole file.
+# The command is 2,700 lines and its own prose mentions #ddev-generated three
+# times, so an unanchored grep matched the explanation instead of the marker: a
+# developer who removed line 2 — which is exactly what DDEV's own "Remove
+# unexpected '#ddev-generated' comments" advice tells them to do, and what the
+# comment below calls arming the trap — silenced the warning about it. The nag
+# and the trap were disarmed by the same keystroke.
+#
 # itself makes it worse: it prints "unexpected #ddev-generated … Remove
 # unexpected '#ddev-generated' comments" on every restart, so a developer
 # following DDEV's own advice arms the trap on a project that was fine. Nagging
@@ -61,7 +69,7 @@
 hooks:
   post-start:
     - exec-host: |
-        grep -q '#ddev-generated' .ddev/commands/host/hostshift 2>/dev/null || {
+        head -5 .ddev/commands/host/hostshift 2>/dev/null | grep -q '#ddev-generated' || {
           echo "hostshift: .ddev/commands/host/hostshift predates this add-on and was" >&2
           echo "  NOT replaced on upgrade, so the checks added since are not running." >&2
           echo "  rm .ddev/commands/host/hostshift && ddev add-on get <path-to>/hostshift/ddev" >&2

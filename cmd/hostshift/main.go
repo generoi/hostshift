@@ -408,10 +408,25 @@ func cmdProxy(args []string) (int, error) {
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	st := rewrite.NewStats(*explain)
+	// The census, actually written down.
+	//
+	// A proxy is a long-lived process with no end to print a report at, so
+	// `--explain` filled a buffer nothing read and printed nothing — while
+	// `check` told a developer mid-incident to add the flag, restart every
+	// container in the project and grep the log for "rewrote", a word this
+	// process never wrote. `--dry-run`'s own help says it logs "every rewrite it
+	// would have made", and it logged none either. Both are true now.
+	if *explain || *dryRun {
+		st.OnEvent(func(surface string, e origin.Event) {
+			log.Info("census", "surface", surface, "action", e.Action,
+				"reason", e.Reason, "offset", e.Offset, "text", e.Text)
+		})
+	}
 	p := &proxy.Proxy{
 		Upstream:      up,
 		Map:           res.Map,
-		Stats:         rewrite.NewStats(*explain),
+		Stats:         st,
 		DryRun:        *dryRun,
 		StrictOrigins: *strict,
 		NoSweep:       *noSweep,

@@ -42,6 +42,13 @@ const (
 	// storing origins in a form the byte model does not cover.
 	SurfaceHTMLObfuscated = "html-obfuscated"
 	SurfaceHeader         = "header"
+	// SurfaceResponseHeader is a Location/Link/Refresh on the way *out*. It is
+	// not SurfaceHeader, which the request direction uses for the same field
+	// names: what differs is which decoders will run downstream. A browser
+	// following a Location runs the URL parser and nothing else — no CSS
+	// tokenizer, no string decoder — while a header arriving on a request may
+	// carry whatever the page's form encoder wrote.
+	SurfaceResponseHeader = "response-header"
 	SurfaceJSONString     = "json-string"
 	// SurfaceJSONEscape is a JSON string whose origin was only visible after
 	// the string was unquoted — a \uXXXX-escaped IDN host, an HTML character
@@ -58,6 +65,8 @@ const (
 //
 // Safe for concurrent use: one Stats is shared by every in-flight response.
 type Stats struct {
+	// onEvent, when set, is called for every event as it is recorded. See OnEvent.
+	onEvent    func(surface string, e origin.Event)
 	mu         sync.Mutex
 	candidates map[string]int
 	rewrites   map[string]int
@@ -83,6 +92,22 @@ func (s *Stats) SweepSkipped() {
 
 // NewStats returns a Stats. When explain is false only rewrites are recorded,
 // which is what the counters need; the skip trace is the expensive half.
+// OnEvent installs a callback run for every recorded event.
+//
+// The proxy is a long-lived process with no end to print a report at, so
+// `--explain` set the flag, filled a buffer nothing read, and printed nothing.
+// `check` told developers mid-incident to add it, restart every container and
+// grep the log for "rewrote" — a string the proxy never writes. This is what
+// makes that instruction true.
+func (s *Stats) OnEvent(f func(surface string, e origin.Event)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onEvent = f
+}
+
 func NewStats(explain bool) *Stats {
 	return &Stats{
 		candidates: map[string]int{},
@@ -114,6 +139,11 @@ func (s *Stats) Record(surface string, base int, events []origin.Event) {
 		if s.explain && len(s.events) < s.maxEvents {
 			e.Offset += base
 			s.events = append(s.events, e)
+		}
+		if s.onEvent != nil {
+			ev := e
+			ev.Offset += base
+			s.onEvent(surface, ev)
 		}
 	}
 }

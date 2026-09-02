@@ -203,7 +203,26 @@ func compare(ctx context.Context, o Options, path string) Result {
 		return r
 	}
 	if canon.location != "" || variant.location != "" {
-		wantLoc, _ := o.Map.Forward().Rewrite([]byte(canon.location), "header", false)
+		// The pipeline the proxy actually runs, not the byte matcher alone.
+		//
+		// `modifyResponse` puts a Location through RepairSerialized(Rewrite →
+		// HostLeaks), which is twelve views and a length re-emission; this
+		// computed its expectation from `Rewrite` by itself. Measured across
+		// 236,250 Location shapes, 100,863 of them expect something the proxy
+		// does not emit — so the check the README calls "validates a deployment
+		// against reality" red-flagged the *correct* rewrite and printed the
+		// production URL as the wanted value. Worse in the other direction: a
+		// Location the proxy failed to rewrite is byte-identical on both sides
+		// and equal to this expectation too, so it scored GREEN.
+		//
+		// PLAN §566 states the rule this broke — a carve-out must be as narrow
+		// in the check as it is in the code — and redirectsToItself below reads
+		// this same string, so the self-redirect exemption was being decided on
+		// it as well.
+		wantLoc := rewrite.RepairSerialized([]byte(canon.location), func(b []byte) []byte {
+			nv, _ := o.Map.Forward().Rewrite(b, rewrite.SurfaceResponseHeader, false)
+			return rewrite.HostLeaks(o.Map.Forward(), nv, true)
+		})
 		// The self-redirect carve-out is not a mismatch. PLAN §4.4 and test 32
 		// enumerate it as correct: an asset the worktree does not have is
 		// redirected to the canonical origin *on purpose*, which is what

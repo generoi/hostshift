@@ -1679,7 +1679,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 	//
 	// The rule this is an instance of: every spelling the forward direction can
 	// *emit*, the reverse direction must be able to *read*.
-	if bytes.IndexByte(v, '\\') >= 0 {
+	if bytes.IndexByte(v, '\\') >= 0 && surfaceDecodesCSS(surface) {
 		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value, surface, ev)
 	}
 	// And the percent view, for an encoding composed with another one.
@@ -1763,7 +1763,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 		// space. `hasPercentCSSEsc` keeps the gate as narrow as the shape — `%5C`
 		// alone appears in any Windows path a page quotes, and arming a three-view
 		// composition on that would cost every body that mentions one.
-		if hasPercentCSSEsc(v) {
+		if hasPercentCSSEsc(v) && surfaceDecodesCSS(surface) {
 			v = h.spliceHostsIn(composeView(percentView(), stripForCSS), v,
 				urlTokenStarts, value, surface, ev)
 		}
@@ -1786,7 +1786,12 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, surface string, ev *
 	v = h.refsOnly(h.rewriteAll(v, value, surface, ev), value, surface, ev)
 	// And references spelling CSS escapes, which needs both decodes composed.
 	if h.active() && bytes.IndexByte(v, '&') >= 0 {
-		if n, ok := refsThenCSS(v); ok {
+		// The same gate as its two siblings, and today it cannot fire: this is
+		// rewriteAllRefs, which a response header never reaches — the forward
+		// header pass goes through rewriteAll. It is here so the three CSS
+		// compositions answer one question in one way; gating two of three is
+		// the shape that produced the defect it is gating against.
+		if n, ok := refsThenCSS(v); ok && surfaceDecodesCSS(surface) {
 			v = h.spliceHostsIn(n, v, urlTokenStarts, value, surface, ev)
 		}
 		// And references spelling a JSON escape, which is the same composition
@@ -1906,6 +1911,24 @@ func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte
 	}
 	return append(out, v[prev:]...), events
 }
+
+// surfaceDecodesCSS reports whether a CSS tokenizer will run over this buffer
+// before its URLs are resolved.
+//
+// `escView` is surface-aware and `stripForCSS`, eleven lines from it in the same
+// function, never was — so a `Location` on the way out was decoded by a
+// tokenizer that does not run on it. ada resolves `https:/\awww.example.fi/x` to
+// `awww.example.fi`, because `\a` is a CSS hex escape and nothing decodes it in
+// a header; the proxy read it as a newline, matched the canonical behind it and
+// emitted a redirect to a worktree host that does not resolve. 126 raw and 3,876
+// CSS-encoded corpus shapes, all of them correctly left alone in an `<a href>`
+// by the same engine — which is the oracle's definition of a model error.
+//
+// By direction and not by field name: the *request* side of SurfaceHeader must
+// still read CSS escapes, because the forward direction emits them and round
+// 56's grid pins that every spelling it can emit the reverse must read. This is
+// the same split HostLeaksBack already made for the body.
+func surfaceDecodesCSS(surface string) bool { return surface != SurfaceResponseHeader }
 
 // hasPercentCSSEsc reports whether the buffer could hold a percent-encoded CSS
 // escape: `%5C` followed by a hex digit. `%5C` on its own is any quoted Windows

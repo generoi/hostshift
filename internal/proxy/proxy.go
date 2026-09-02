@@ -274,7 +274,7 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 				ev = append(ev, nev...)
 				return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceHeader, 0)
 			})
-			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
+			p.Stats.Record(rewrite.SurfaceResponseHeader, 0, ev)
 			if !p.DryRun {
 				vs[i] = string(out)
 			}
@@ -356,12 +356,13 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 			// changes a byte count the length still describes.
 			var ev []origin.Event
 			out := rewrite.RepairSerialized([]byte(v), func(b []byte) []byte {
-				nv, nev := fwd.Rewrite(b, rewrite.SurfaceHeader, explain)
+				nv, nev := fwd.Rewrite(b, rewrite.SurfaceResponseHeader, explain)
 				ev = append(ev, nev...)
 				// Location, Link, Refresh and CSP had the byte matcher alone, so
 				// every obfuscated and folded spelling passed straight through —
 				// and a Location is followed by the browser through the parser.
-				return rewrite.HostLeaksCounted(fwd, nv, true, p.Stats, rewrite.SurfaceHeader, 0)
+				return rewrite.HostLeaksCounted(fwd, nv, true, p.Stats,
+					rewrite.SurfaceResponseHeader, 0)
 			})
 			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun && string(out) != v {

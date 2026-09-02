@@ -1603,13 +1603,52 @@ if [ "$cmd" = "check" ]; then
   # rewrites, and `check` printed the warning and then "hostshift is serving"
   # with exit 0. PLAN §3's unattended agent tests `$?`, so it was told everything
   # was fine on the largest test 28 breach this tool can produce.
-  capped="$(printf '%s\n' "$logs" \
-    | grep -c 'exceeds the size cap, passing through untouched' 2>/dev/null || true)"
-  [ -n "$capped" ] || capped=0
-  if [ "$capped" -gt 0 ] 2>/dev/null; then
+  # The two directions counted apart, because they are different failures.
+  #
+  # Three WARNs carry this phrase and one of them is the *request* body. Counted
+  # together, a 10 MB block-editor autosave was reported as "responses went to
+  # the browser unrewritten … live production links" — every sentence about the
+  # wrong direction. Measured on the same deployment: under the cap the variant
+  # hostname is rewritten to the canonical before the app sees it; over the cap
+  # it arrives verbatim and is written into the shared production database.
+  # That is §4.3, which this file elsewhere calls as bad as a leak, described to
+  # the developer as its opposite.
+  #
+  # Anchored on the log's own field, for the reason the map extractor forty
+  # lines above gives at length: a straggler WARN carries raw page bytes as
+  # context, so an unanchored grep counts a page that merely quotes the phrase.
+  cap_msg='msg="[A-Za-z ]*body exceeds the size cap, passing through untouched"'
+  capped_req="$(printf '%s\n' "$logs" \
+    | grep -c "msg=\"request body exceeds the size cap, passing through untouched\"" \
+    2>/dev/null || true)"
+  capped_all="$(printf '%s\n' "$logs" | grep -cE "$cap_msg" 2>/dev/null || true)"
+  [ -n "$capped_req" ] || capped_req=0
+  [ -n "$capped_all" ] || capped_all=0
+  capped=$((capped_all - capped_req))
+  [ "$capped" -ge 0 ] 2>/dev/null || capped=0
+  if [ "$capped" -gt 0 ] 2>/dev/null || [ "$capped_req" -gt 0 ] 2>/dev/null; then
     cap_now="$(printf '%s\n' "$logs" \
-      | sed -n 's/.*cap=\([0-9][0-9]*\).*/\1/p' | tail -1 || true)"
-    echo "hostshift: warning: $capped response(s) went to the browser unrewritten" >&2
+      | grep -E "$cap_msg" | sed -n 's/.*cap=\([0-9][0-9]*\).*/\1/p' | tail -1 || true)"
+  fi
+  if [ "$capped_req" -gt 0 ] 2>/dev/null; then
+    echo "hostshift: refusing to call this healthy — $capped_req request(s) reached" >&2
+    echo "  the application unrewritten because they were larger than the body" >&2
+    echo "  cap${cap_now:+ ($cap_now bytes)}. A request that big is a media upload or a" >&2
+    echo "  block-editor save, and what it carries is *variant* hostnames: under" >&2
+    echo "  the cap they are turned back into canonical ones before the app sees" >&2
+    echo "  them, and over it they are written into the shared database as they" >&2
+    echo "  stand. That database is production's, and there is no undo — §4.3." >&2
+    echo "  Raise it in HOSTSHIFT_ARGS in .ddev/.env, e.g. --max-body 33554432," >&2
+    echo "  and \`ddev restart\`. Then check what was already written:" >&2
+    echo "    ddev exec -s db mysql -N -B -e \\" >&2
+    echo "      \"select option_name from wp_options where option_value like" >&2
+    echo "       '%${variants%%,*}%'\" db" >&2
+    echo "  The restart clears this log; the rows it wrote are still there." >&2
+    exit 2
+  fi
+  if [ "$capped" -gt 0 ] 2>/dev/null; then
+    echo "hostshift: refusing to call this healthy — $capped response(s) went to" >&2
+    echo "  the browser unrewritten" >&2
     echo "  because they were larger than the body cap${cap_now:+ ($cap_now bytes)}." >&2
     echo "  Those carry whatever origins the database holds — on a" >&2
     echo "  production-canonical map that is live production links, and one" >&2
@@ -2074,7 +2113,7 @@ EOF
   # `web`. The body then came back attributed to the variant, so `check` refused
   # a preview by name over links that were on somebody else's page.
   hs_fetch_local() {
-    _url="$1"; _max="${2:-8}"; _hop=0
+    _url="$1"; _entry="$1"; _max="${2:-8}"; _hop=0
     # An explicit template: GNU mktemp rejects `-t hostshift-hdr` for having too
     # few X's, and the `|| return 0` beside it turned that into a silent
     # fail-open — every sibling variant went unprobed and `check` passed on a
@@ -2120,7 +2159,7 @@ EOF
       case "$_loc" in
         *wp-signup.php*)
           if [ -n "${hs_signup_file:-}" ]; then
-            printf '%s\n' "$_url" >> "$hs_signup_file"
+            printf '%s\n' "$_entry" >> "$hs_signup_file"
           fi ;;
       esac
       _lh="${_loc#*://}"; _lh="${_lh%%/*}"; _lh="${_lh%%:*}"
@@ -2181,12 +2220,24 @@ $2"
 
   probe_urls=""
   hs_signup_at=""
+  # Pages *attempted*, which is not the same as pages that came back with one.
+  #
+  # hs_add_page returns early on an empty body, and a `wp_redirect()` to a
+  # hostname this map does not name is exactly that: the proxy leaves the
+  # Location alone, hs_fetch_local declines to follow off the deployment, and
+  # the body is empty. So the page that signed up was removed from the
+  # denominator at the same moment it was added to the numerator, "fewer than
+  # all" came out false, and round 57's refusal fired on the one state its own
+  # comment says it was written to stop refusing. The off-map target is the
+  # ordinary case on the production-canonical multisite this tool exists for.
+  hs_attempted_n=0
   hs_signup_file="$(mktemp "${TMPDIR:-/tmp}/hostshift-signup.XXXXXX" 2>/dev/null)" || hs_signup_file=""
   # An `if`, not `[ ] && cmd`: this file runs under `set -e`, where a bare test
   # that comes out false is the script's exit status. Written the short way it
   # ended `check` silently on any deployment with no probe host, and the suite
   # saw it as "probed 1 host(s)".
   if [ -n "${probe:-}" ]; then
+    hs_attempted_n=$((hs_attempted_n + 1))
     hs_add_page "https://$probe${port:-}/" "${probe_body:-}"
   fi
 
@@ -2216,6 +2267,7 @@ $red_body" ;;
       [ "$extra" = "${probe:-}" ] && continue
       [ "$n_extra" -ge 8 ] && break
       n_extra=$((n_extra + 1))
+      hs_attempted_n=$((hs_attempted_n + 1))
       extra_body="$(hs_fetch_local "https://$extra$port/" 5)"
       hs_add_page "https://$extra$port/" "$extra_body"
       probe_body="$probe_body
@@ -2230,8 +2282,7 @@ $extra_body"
     [ -n "$hs_signup_n" ] || hs_signup_n=0
     rm -f "$hs_signup_file"
   fi
-  hs_probed_n=0
-  for _p in ${probe_urls:-}; do hs_probed_n=$((hs_probed_n + 1)); done
+  hs_probed_n="$hs_attempted_n"
 
   # Nothing is previewable if WordPress does not know the hostname.
   #
@@ -2385,7 +2436,7 @@ $extra_body"
           echo "  To see which surface they are on, turn the census on and" >&2
           echo "  reload the page:" >&2
           echo "    add --explain to HOSTSHIFT_ARGS in .ddev/.env, \`ddev restart\`," >&2
-          echo "    then: docker logs ddev-$name-hostshift 2>&1 | grep rewrote" >&2
+          echo "    then: docker logs ddev-$name-hostshift 2>&1 | grep census" >&2
           echo "  \`hostshift diff\` shows it too, but it needs *both* sides" >&2
           echo "  fetchable, and this map is canonical-on-production: DDEV does" >&2
           echo "  not register ${canon_list%%,*} here, so pointing --resolve at the" >&2

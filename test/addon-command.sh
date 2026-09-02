@@ -1041,6 +1041,7 @@ echo "$n" > "$f"
 # The body too, since check now reads what the page says about itself.
 hdr=""
 prev=""
+_redirected=""
 for a in "$@"; do
   case "$a" in https://*) printf '%s\n' "$a" >> "${HS_FAKE_DIR}/curl-hosts" ;; esac
   [ "$prev" = "-D" ] && hdr="$a"
@@ -1053,11 +1054,30 @@ done
 if [ -n "$hdr" ]; then
   if [ -n "${HS_CURL_LOCATION:-}" ] && [ ! -f "${HS_FAKE_DIR}/curl-redirected" ]; then
     : > "${HS_FAKE_DIR}/curl-redirected"
+    _redirected=now
     printf 'HTTP/1.1 302 Found\r\nLocation: %s\r\n\r\n' "$HS_CURL_LOCATION" > "$hdr"
+  elif [ -n "${HS_CURL_LOCATION2:-}" ] && [ ! -f "${HS_FAKE_DIR}/curl-redirected2" ]; then
+    # A second hop, so a test can drive a chain. Which URL a chain is *recorded*
+    # under is the whole question: the one that set out, or the one that
+    # happened to be current when the redirect arrived.
+    : > "${HS_FAKE_DIR}/curl-redirected2"
+    _redirected=now
+    printf 'HTTP/1.1 302 Found\r\nLocation: %s\r\n\r\n' "$HS_CURL_LOCATION2" > "$hdr"
   else
     printf 'HTTP/1.1 200 OK\r\n\r\n' > "$hdr"
   fi
 fi
+# An empty body on the call that carries the redirect, which is what a real
+# `wp_redirect()` to a hostname the map does not name produces: the proxy leaves
+# the Location alone, hostshift declines to follow off the deployment, and what
+# comes back is a 302 with nothing in it.
+if [ -n "${HS_CURL_EMPTY_ON_REDIRECT:-}" ] && [ -n "$hdr" ] && [ "$_redirected" = "now" ]; then
+  # Nothing at all, not even the status code this fake appends elsewhere: the
+  # caller here reads stdout *as the body*, and printing "302" into it made the
+  # body non-empty, which is precisely the condition under test.
+  exit 0
+fi
+
 # A second body from the second call on, so a test can put the leak on a page
 # other than the first — which is where it is on a multisite.
 if [ -n "${HS_CURL_BODY2:-}" ] && [ "$n" -ge 2 ]; then
@@ -1580,6 +1600,61 @@ esac
 contains "and it names the hostname that signed up" "wt-a--shop.acme.ddev.site" "$out"
 # The load-bearing half: the scans it used to pre-empt still ran.
 contains "and the leak scan still ran" "canonical origin" "$out"
+
+# ...and the same, with the signup page returning an *empty* body.
+#
+# That is what a real `wp_redirect()` to a hostname this map does not name
+# produces: the proxy leaves the Location alone, hs_fetch_local declines to
+# follow off the deployment, and the 302 carries nothing. hs_add_page returns
+# early on an empty body, so the page that signed up was removed from the
+# denominator at the same moment it was added to the numerator — "fewer than
+# all" came out false and the refusal fired anyway, on the one state round 57
+# was written to stop refusing. The off-map target is the ordinary case on the
+# production-canonical multisite this tool exists for.
+: > "$HS_FAKE_DIR/curl-hosts"; rm -f "$HS_FAKE_DIR/curl-redirected"
+hs58n="$work/curl-n58"; echo 0 > "$hs58n"
+out="$(cd "$wt" && HS_CURL_BODY='<a href="https://www.acme.example/x">t</a>' \
+  HS_CURL_CODES="200 200 200" HS_CURL_STATE="$hs58n" \
+  HS_CURL_EMPTY_ON_REDIRECT=1 \
+  HS_CURL_LOCATION="https://network.elsewhere.example/wp-signup.php?new=shop" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"refusing to call this healthy"*"redirects to wp-signup"*)
+    fail "an empty signup body still counts as a page probed" \
+      "refused the whole deployment" ;;
+  *) pass "an empty signup body still counts as a page probed" ;;
+esac
+contains "and the leak on the page that serves is still reported" \
+  "canonical origin" "$out"
+
+# ...and a chain is recorded under the page that set out, not the hop it was on.
+#
+# hs_fetch_local follows a redirect while it stays on the deployment, so a
+# sibling can 302 to another variant and *that* can 302 to wp-signup. Recording
+# the current hop names a page that is serving perfectly well — here the healthy
+# first variant — as the one WordPress does not recognise, and sends the
+# developer to inspect the wrong site. The entry URL is also the only one
+# commensurable with the count of pages probed.
+: > "$HS_FAKE_DIR/curl-hosts"
+rm -f "$HS_FAKE_DIR/curl-redirected" "$HS_FAKE_DIR/curl-redirected2"
+hs58c="$work/curl-n58c"; echo 0 > "$hs58c"
+out="$(cd "$wt" && HS_CURL_BODY='<p>fine</p>' \
+  HS_CURL_CODES="200 200 200 200" HS_CURL_STATE="$hs58c" \
+  HS_CURL_LOCATION="https://wt-a--acme.ddev.site/fi/" \
+  HS_CURL_LOCATION2="https://network.elsewhere.example/wp-signup.php?new=shop" \
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"wp-signup.php"*) ;;
+  *) fail "a redirect chain is blamed on the page that set out" \
+       "the chain was not followed to the signup at all" ;;
+esac
+case "$out" in
+  *"/fi/"*)
+    fail "a redirect chain is blamed on the page that set out" \
+      "named the hop it was on, not the page probed" ;;
+  *) pass "a redirect chain is blamed on the page that set out" ;;
+esac
+
 mv "$work/multi-hs.hold" "$wt/hostshift.yaml" 2>/dev/null || true
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
 env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
@@ -1606,6 +1681,12 @@ out="$(cd "$wt" && HS_CURL_BODY="$leak" \
 # "1 pages, 0 leaks" on the message printed *for* a leak. The remedy now names
 # something that works here and says what diff would need.
 contains "the leak refusal offers a remedy that runs here" "--explain" "$out"
+# ...and it greps for a word the proxy actually writes. Round 57 pointed at
+# `grep rewrote`, which appears nowhere in the proxy's output: `--explain` set a
+# flag, filled a buffer nothing read, and printed nothing at all. A developer
+# mid test-28 incident recreated every container in the project on the tool's own
+# instruction and learned nothing.
+contains "and the remedy greps a word the proxy writes" "grep census" "$out"
 contains "and it says why diff cannot compare under this map" "additional_fqdns" "$out"
 case "$out" in
   *"hostshift diff --slug"*)
@@ -1637,6 +1718,45 @@ contains "and the remedy is the flag that fixes it" "--max-body" "$out"
 [ "$rc" = 2 ] && pass "and it refuses rather than exiting 0" \
   || fail "and it refuses rather than exiting 0" "exit $rc"
 contains "and it says the restart clears it" "log starts empty" "$out"
+
+# A *request* over the cap is the opposite failure, and was reported as this one.
+#
+# Three proxy WARNs carry the same phrase and one is the request direction.
+# Counted together, a 10 MB block-editor save was reported as "responses went to
+# the browser unrewritten … live production links". Measured: under the cap the
+# variant hostname is turned back into the canonical before the app sees it;
+# over it the variant reaches the application verbatim and is written into the
+# shared production database. §4.3, described as its inverse.
+writefake
+printf 'time=x level=WARN msg="request body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
+  >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+contains "a request over the cap is reported as a request" "reached" "$out"
+contains "and it names the direction's own harm" "shared database" "$out"
+case "$out" in
+  *"went to"*"the browser unrewritten"*)
+    fail "and it is not described as a response" "$out" ;;
+  *) pass "and it is not described as a response" ;;
+esac
+[ "$rc" = 2 ] && pass "and it refuses" || fail "and it refuses" "exit $rc"
+
+# ...and a page that merely quotes the phrase is not a cap event.
+#
+# A straggler WARN carries raw page bytes as context. The map extractor forty
+# lines above this one defends against exactly that ("a page that merely
+# mentions `https://old -> https://new` within 64 bytes of a straggler injected
+# a phantom pair, check exited 2 on every start"); the cap count did not, so a
+# page quoting this message produced a refusal naming a cap that was never hit.
+writefake
+printf 'time=x level=WARN msg="straggler" context="...body exceeds the size cap, passing through untouched..."\n' \
+  >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+case "$out" in
+  *"larger than the body cap"*)
+    fail "a page quoting the message is not a cap event" "refused on page content" ;;
+  *) pass "a page quoting the message is not a cap event" ;;
+esac
+writefake
 writefake
 
 # A redirect is followed only while it stays on this deployment.

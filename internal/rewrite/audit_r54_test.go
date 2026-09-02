@@ -465,6 +465,7 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		SurfaceText:           false,
 		SurfaceComment:        false,
 		SurfaceHeader:         false,
+		SurfaceResponseHeader: false,
 		SurfaceRequestLine:    false,
 		SurfaceRequestBody:    false,
 		SurfaceInlineStyle:    false,
