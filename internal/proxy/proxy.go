@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
@@ -53,6 +54,16 @@ type Proxy struct {
 	// nothing, and it exists for performance work where transfer size and
 	// Content-Encoding must resemble production (PLAN §5.2).
 	Compress bool
+
+	// RewriteTypes adds media types to the flat arm, from --rewrite-type. It is
+	// how §5.2's Tier 2 exclusion is overridden per deployment: a site running
+	// Elementor or Autoptimize needs text/css and text/javascript, and pays the
+	// buffering for them. Nil is the default and adds nothing.
+	//
+	// It applies to both directions. A type rewritten on the way out and not on
+	// the way back in is a body that reaches the shared database in variant
+	// space, which is §4.3.
+	RewriteTypes TypeSet
 
 	Log *slog.Logger
 }
@@ -635,7 +646,7 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			return nil
 		}
 
-	case rewritableText(ct):
+	case rewritableText(ct, p.RewriteTypes):
 		// Buffered and swept like JSON, without a grammar.
 		//
 		// These were streaming through untouched, and one of them is the single
@@ -805,7 +816,7 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		return
 	}
 	ct := r.Header.Get("Content-Type")
-	kind := bodyKind(ct)
+	kind := bodyKind(ct, p.RewriteTypes)
 	if kind == bodyOther {
 		return
 	}
@@ -836,7 +847,7 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 	var out []byte
 	switch kind {
 	case bodyMultipart:
-		out = rewriteMultipart(buf, ct, rev, p.Stats, explain)
+		out = rewriteMultipart(buf, ct, rev, p.Stats, explain, p.RewriteTypes)
 	case bodyJSON:
 		// The same span-aware rewriter the response side uses. Running the raw
 		// matcher over a request body instead would rewrite origins in JSON
@@ -1012,23 +1023,78 @@ func isAttachment(h http.Header) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(d)), "attachment")
 }
 
+// TypeSet is an operator-supplied addition to the flat arm, from
+// `--rewrite-type`. A nil set is the default and adds nothing.
+type TypeSet map[string]bool
+
+// ParseTypes normalises and validates media types for --rewrite-type. It
+// refuses a type with parameters, because the gate compares a bare media type
+// and `text/css; charset=utf-8` would silently never match.
+func ParseTypes(vals []string) (TypeSet, error) {
+	if len(vals) == 0 {
+		return nil, nil
+	}
+	s := TypeSet{}
+	for _, v := range vals {
+		mt := strings.ToLower(strings.TrimSpace(v))
+		if mt == "" {
+			return nil, fmt.Errorf("--rewrite-type: empty value")
+		}
+		if strings.ContainsAny(mt, ";") {
+			return nil, fmt.Errorf("--rewrite-type %q: give a bare media type, "+
+				"without parameters — the gate compares %q", v, mediaType(mt))
+		}
+		t, sub, ok := strings.Cut(mt, "/")
+		if !ok || t == "" || sub == "" {
+			return nil, fmt.Errorf("--rewrite-type %q: want type/subtype", v)
+		}
+		s[mt] = true
+	}
+	return s, nil
+}
+
+// Has reports whether ct's media type is in the set.
+func (s TypeSet) Has(ct string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	return s[strings.ToLower(mediaType(ct))]
+}
+
 // rewritableText is the set that carries origins in no grammar the rewriter
 // models: plain text, and the XML family.
 //
 // text/plain because wp-admin/async-upload.php sends JSON under it — the one
 // endpoint every media upload goes through. The XML family because a feed and a
 // sitemap are full of absolute URLs, a browser renders both, and a reader
-// dereferences them. Excluded, deliberately and as §5.2 already decides: CSS and
-// JavaScript, where the fleet's themes have zero absolute URLs, and every binary
-// type, where the Content-Type answers the question for free.
-func rewritableText(ct string) bool {
+// dereferences them.
+//
+// CSS and JavaScript are excluded by default, as §5.2's Tier 2 decides, and
+// `extra` is how an operator overrides that. The measurement behind the default
+// surveyed *theme* files — 88 CSS and 185 JS with zero absolute URLs, because a
+// theme that hardcodes an origin breaks when it moves environments. It could not
+// see the files a plugin generates at runtime, which is where the leaks turned
+// out to be: Elementor writes a production origin into wp-content/uploads/*.css,
+// and Autoptimize's inline-JS aggregation pulls Contact Form 7's REST root into
+// a text/javascript bundle, where clicking Submit on the variant POSTs to
+// production — a write, on the live site.
+//
+// It stays off by default because the cost is real and falls on every response
+// of that type: a type in this set is buffered to the size cap instead of
+// streamed, and stylesheets and script bundles are the large static responses
+// the fast path exists to leave alone.
+// RewritableText exposes the set to `hostshift rewrite`, which is documented as
+// running the same engine on the same bytes and has to gate on the same answer.
+func RewritableText(ct string, extra TypeSet) bool { return rewritableText(ct, extra) }
+
+func rewritableText(ct string, extra TypeSet) bool {
 	mt := strings.ToLower(mediaType(ct))
 	switch mt {
 	case "text/plain", "text/xml", "application/xml",
 		"application/rss+xml", "application/atom+xml", "image/svg+xml":
 		return true
 	}
-	return strings.HasSuffix(mt, "+xml")
+	return strings.HasSuffix(mt, "+xml") || extra.Has(mt)
 }
 
 // rewritableJSON covers the REST API and everything modelled on it. JSON-LD
@@ -1073,7 +1139,7 @@ const (
 	bodyMultipart
 )
 
-func bodyKind(ct string) bodyClass {
+func bodyKind(ct string, extra TypeSet) bodyClass {
 	mt := strings.ToLower(mediaType(ct))
 	switch {
 	// text/json alongside the registered spellings, or the two directions
@@ -1095,7 +1161,15 @@ func bodyKind(ct string) bodyClass {
 	case mt == "application/x-www-form-urlencoded",
 		mt == "application/xml", mt == "application/xhtml+xml",
 		strings.HasSuffix(mt, "+xml"),
-		strings.HasPrefix(mt, "text/"):
+		strings.HasPrefix(mt, "text/"),
+		// And whatever --rewrite-type added, for the third time in this
+		// function's history: a type the response arm rewrites and this one does
+		// not is a body that goes out mapped and comes back unmapped. Note the
+		// `text/` prefix above already claims text/css and text/javascript on
+		// the request side, so before the flag existed those two were rewritten
+		// inbound and excluded outbound — the asymmetry this arm keeps being
+		// fixed for. --rewrite-type application/javascript closes the last of it.
+		extra.Has(mt):
 		return bodyFlat
 	case mt == "multipart/form-data":
 		return bodyMultipart

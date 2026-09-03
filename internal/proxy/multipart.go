@@ -56,7 +56,7 @@ func boundaryOf(ct string) string {
 // bytes — the same class of silent divergence that ruled out lol-html in §5.7.
 // Locating spans and splicing keeps file parts, boundaries and headers
 // byte-identical, which is what "file parts pass through byte-identical" means.
-func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Stats, explain bool) []byte {
+func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Stats, explain bool, extra TypeSet) []byte {
 	boundary := boundaryOf(ct)
 	if boundary == "" {
 		return body
@@ -119,7 +119,7 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 		}
 		headers := body[p : p+hdrEnd]
 		bodyStart := p + hdrEnd + sep
-		if !rewritablePart(headers) {
+		if !rewritablePart(headers, extra) {
 			continue
 		}
 
@@ -196,7 +196,7 @@ func headerEnd(b []byte) (int, int) {
 // rewritablePart reports whether a part's body may be rewritten: only parts
 // whose Content-Disposition carries no filename= and whose type is text (or
 // absent, which is the norm for a plain form field).
-func rewritablePart(headers []byte) bool {
+func rewritablePart(headers []byte, extra TypeSet) bool {
 	var disposition, ctype string
 	// Split on LF and drop a trailing CR, so a header block written with either
 	// line ending parses the same way.
@@ -258,7 +258,7 @@ func rewritablePart(headers []byte) bool {
 	// client does, and this file has now declared the same disagreement closed
 	// twice.
 	mt := strings.ToLower(mediaType(strings.TrimSpace(ctype)))
-	switch bodyKind(mt) {
+	switch bodyKind(mt, extra) {
 	case bodyOther, bodyMultipart:
 		return false
 	}

@@ -158,6 +158,36 @@ func TestRewriteFilter(t *testing.T) {
 		}
 	})
 
+	t.Run("--rewrite-type puts that type in the set, and nothing else", func(t *testing.T) {
+		css := "body{background:url(https://acmecorp.ddev.site/a.png)}"
+		_, out, _ := run(t, css, cmdRewrite, "-C", dir, "--slug", "wt-a",
+			"--type", "text/css", "--rewrite-type", "text/css", "--quiet")
+		want := "body{background:url(https://wt-a--acmecorp.ddev.site/a.png)}"
+		if out != want {
+			t.Errorf("--rewrite-type text/css did not rewrite a stylesheet:\n got %s\nwant %s", out, want)
+		}
+
+		// The filter and the proxy are documented as the same engine on the
+		// same bytes, and this used to be two copies of one set. Naming CSS
+		// must not move JavaScript.
+		js := `fetch("https://acmecorp.ddev.site/wp-json/")`
+		_, out, _ = run(t, js, cmdRewrite, "-C", dir, "--slug", "wt-a",
+			"--type", "text/javascript", "--rewrite-type", "text/css", "--quiet")
+		if out != js {
+			t.Errorf("naming text/css also rewrote text/javascript:\n%s", out)
+		}
+	})
+
+	t.Run("--rewrite-type refuses a value that would never match", func(t *testing.T) {
+		code, _, _ := run(t, "x", cmdRewrite, "-C", dir, "--slug", "wt-a",
+			"--rewrite-type", "text/css; charset=utf-8", "--quiet")
+		if code != exitConfig {
+			t.Errorf("exit %d for a media type with parameters; want %d — the gate "+
+				"compares a bare type, so this would look enabled and do nothing",
+				code, exitConfig)
+		}
+	})
+
 	t.Run("json is rewritten and stays valid", func(t *testing.T) {
 		_, out, _ := run(t, `{"link":"https:\/\/acmecorp.ddev.site\/x"}`, cmdRewrite,
 			"-C", dir, "--slug", "wt-a", "--type", "application/json", "--quiet")

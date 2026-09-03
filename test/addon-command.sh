@@ -487,6 +487,22 @@ for tag in $(cd "$repo" && git tag -l 'v*'); do
   # ...and it warns, on every start, that the old command is still in place —
   # one line in an `add-on get` output is not enough, and DDEV itself tells
   # developers to strip the marker that keeps the command replaceable.
+  #
+  # Only for a tag that is actually older. The loop takes every tag there is,
+  # and the newest one is usually the command in the working tree byte for byte
+  # — cutting a release is what makes that true. Such a copy is not stale and
+  # must not warn, so asserting the warning against it fails the moment a
+  # release is tagged, which is exactly when this suite most needs to be green.
+  # The discriminant is the bytes, not the version: a tag whose command differs
+  # from the current one is an old command, whatever it is called.
+  if cmp -s "$old_cmd" "$repo/ddev/commands/host/hostshift"; then
+    case "$out" in
+      *"predates this add-on"*)
+        fail "$tag's command is the current one and must not call itself stale" "$out" ;;
+      *) pass "$tag's command is the current one and does not call itself stale" ;;
+    esac
+    continue
+  fi
   case "$out" in
     *"predates this add-on"*) pass "and says the command was not replaced" ;;
     *) fail "and says the command was not replaced" "$out" ;;

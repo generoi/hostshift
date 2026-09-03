@@ -121,17 +121,6 @@ func main() {
 // subcommand is for, and sends an explicitly requested help to stdout with exit
 // 0 rather than to stderr with exit 2. `hostshift check --help` printed nine
 // flags and not one word about what it checks.
-// rewritableText mirrors the proxy's set, so `rewrite --type` and the proxy
-// cannot disagree about the same bytes.
-func rewritableText(mt string) bool {
-	switch mt {
-	case "text/plain", "text/xml", "application/xml",
-		"application/rss+xml", "application/atom+xml", "image/svg+xml":
-		return true
-	}
-	return strings.HasSuffix(mt, "+xml")
-}
-
 func describe(fs *flag.FlagSet, args []string, what string) (helped bool) {
 	fs.Usage = func() {
 		w := fs.Output()
@@ -146,6 +135,13 @@ func describe(fs *flag.FlagSet, args []string, what string) (helped bool) {
 		}
 	}
 	return false
+}
+
+// rewritableText asks the proxy rather than mirroring it. The mirror is why
+// this function existed and why it was wrong once already: two copies of a set
+// that must not disagree about the same bytes is a copy that will.
+func rewritableText(mt string, extra proxy.TypeSet) bool {
+	return proxy.RewritableText(mt, extra)
 }
 
 // repeatable collects a flag that may be given more than once.
@@ -237,11 +233,22 @@ func cmdRewrite(args []string) (int, error) {
 	asJSON := fs.Bool("json", false, "emit counters as JSON on stderr")
 	quiet := fs.Bool("quiet", false, "suppress the counter report")
 	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
+	var rwTypes repeatable
+	fs.Var(&rwTypes, "rewrite-type", "media type to rewrite beyond the default set, repeatable.\n"+
+		"§5.2 excludes text/css and JavaScript by default: a theme that hardcodes\n"+
+		"an origin breaks when it moves environments, so themes do not. Plugins that\n"+
+		"generate assets at runtime do — Elementor into wp-content/uploads/*.css,\n"+
+		"Autoptimize into a text/javascript bundle. Naming a type here buffers every\n"+
+		"response of it to --max-body instead of streaming it.")
 	if describe(fs, args, "the whole engine as a Unix filter: bytes on stdin, rewritten bytes on stdout") {
 		return exitOK, nil
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
+	}
+	rwExtra, err := proxy.ParseTypes(rwTypes)
+	if err != nil {
+		return exitConfig, err
 	}
 	res, err := c.load()
 	if err != nil {
@@ -288,7 +295,7 @@ func cmdRewrite(args []string) (int, error) {
 		}
 		src = bytes.NewReader(out)
 
-	case rewritableText(mt):
+	case rewritableText(mt, rwExtra):
 		// The same set the proxy rewrites. `rewrite` is documented as "the same
 		// engine", and it was not: text/plain, XML, RSS and SVG streamed through
 		// byte-identical with no counters and nothing from --explain, while the
@@ -457,6 +464,13 @@ func cmdProxy(args []string) (int, error) {
 	noSweep := fs.Bool("no-sweep", false, "disable §4.4's straggler backstop, to measure the structured pass")
 	compress := fs.Bool("compress", false, "re-encode responses per the client's Accept-Encoding, for performance work")
 	maxBody := fs.Int64("max-body", proxy.DefaultMaxBody, "request-body buffering cap in bytes")
+	var rwTypes repeatable
+	fs.Var(&rwTypes, "rewrite-type", "media type to rewrite beyond the default set, repeatable.\n"+
+		"§5.2 excludes text/css and JavaScript by default: a theme that hardcodes\n"+
+		"an origin breaks when it moves environments, so themes do not. Plugins that\n"+
+		"generate assets at runtime do — Elementor into wp-content/uploads/*.css,\n"+
+		"Autoptimize into a text/javascript bundle. Naming a type here buffers every\n"+
+		"response of it to --max-body instead of streaming it.")
 	if describe(fs, args, "the same rewriting in front of an upstream") {
 		return exitOK, nil
 	}
@@ -488,6 +502,11 @@ func cmdProxy(args []string) (int, error) {
 	if wantCensus(*explain, *dryRun) {
 		st.OnEvent(censusHookFor(log, *dryRun))
 	}
+	extra, err := proxy.ParseTypes(rwTypes)
+	if err != nil {
+		return exitConfig, err
+	}
+
 	p := &proxy.Proxy{
 		Upstream:      up,
 		Map:           res.Map,
@@ -497,6 +516,7 @@ func cmdProxy(args []string) (int, error) {
 		NoSweep:       *noSweep,
 		Compress:      *compress,
 		MaxBody:       clampBody(*maxBody, log),
+		RewriteTypes:  extra,
 		Log:           log,
 	}
 

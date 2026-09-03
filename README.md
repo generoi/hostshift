@@ -207,6 +207,33 @@ After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
   them on its `Tier 2` line rather than failing the run, which is the trigger
   PLAN's fast path names for rewriting them.
 
+  **`--rewrite-type` is the override.** Repeatable, and it names a bare media
+  type:
+
+  ```
+  --rewrite-type text/css --rewrite-type text/javascript
+  ```
+
+  Through the add-on, add it to `HOSTSHIFT_ARGS` in `.ddev/.env` — `init`
+  preserves flags it did not write — then `ddev restart`.
+
+  It stays off by default because the cost is real and falls on every response
+  of that type. A type in the set is buffered to `--max-body` rather than
+  streamed, and stylesheets and script bundles are exactly the large static
+  responses the `Content-Type` fast path exists to leave alone. Turn it on when
+  `diff`'s `Tier 2` line is non-zero, not before.
+
+  It moves both directions at once, deliberately: a type rewritten on the way
+  out and not on the way back in puts variant hostnames into the shared
+  database, which is the one failure with no undo.
+
+  The JavaScript case is worth naming separately, because it is a write rather
+  than a broken image. With an aggregation plugin that inlines scripts,
+  a REST root can land in a `text/javascript` bundle — and then a form on the
+  variant submits to production: mail sent, entry stored, on the live site.
+  `image/svg+xml` and the XML family are already rewritten by default and need
+  no flag.
+
 [ddev/ddev#5486]: https://github.com/ddev/ddev/issues/5486
 
 

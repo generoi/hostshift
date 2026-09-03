@@ -56,8 +56,8 @@ func TestR75TopLevelArmRewritesWhatTheMultipartArmDoesNot(t *testing.T) {
 		"image/svg+xml",
 		"application/x-www-form-urlencoded",
 	} {
-		if got := bodyKind(ct); got != bodyFlat {
-			t.Errorf("bodyKind(%q) = %v, want bodyFlat", ct, got)
+		if got := bodyKind(ct, nil); got != bodyFlat {
+			t.Errorf("bodyKind(%q, nil) = %v, want bodyFlat", ct, got)
 		}
 	}
 
@@ -115,7 +115,7 @@ func rewriteR75Multipart(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(rewriteMultipart(body, "multipart/form-data; boundary="+b,
-		mp.Reverse(), rewrite.NewStats(false), false))
+		mp.Reverse(), rewrite.NewStats(false), false, nil))
 }
 
 // A part of a type nothing classifies stays byte-identical.

@@ -62,12 +62,12 @@ func TestXPingbackIsRewritten(t *testing.T) {
 // prevent.
 func TestTextJSONRequestUsesTheJSONPath(t *testing.T) {
 	for _, ct := range []string{"text/json", "application/json", "application/ld+json"} {
-		if got := bodyKind(ct); got != bodyJSON {
-			t.Errorf("bodyKind(%q) = %v, want bodyJSON", ct, got)
+		if got := bodyKind(ct, nil); got != bodyJSON {
+			t.Errorf("bodyKind(%q, nil) = %v, want bodyJSON", ct, got)
 		}
 	}
-	if got := bodyKind("text/plain"); got != bodyFlat {
-		t.Errorf("bodyKind(text/plain) = %v, want bodyFlat", got)
+	if got := bodyKind("text/plain", nil); got != bodyFlat {
+		t.Errorf("bodyKind(text/plain, nil) = %v, want bodyFlat", got)
 	}
 }
 
