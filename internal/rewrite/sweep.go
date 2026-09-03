@@ -12,6 +12,21 @@ import (
 // not a success — it is a list of bugs in the structured pass.
 const SurfaceStraggler = "straggler"
 
+// SurfaceSweep is the sweep when it is not backing anything up.
+//
+// `SurfaceStraggler` reads URL semantics so the streaming backstop can never
+// override a structured pass that deliberately declined. But `SweepBytes` is
+// reached from the JSON arm's *decline* path — a duplicate object member is
+// legal JSON and jsontext rejects it, as json.go's header records — and there
+// the sweep is the only pass that touches the body. Reading URL semantics there
+// declines an origin nothing else will look at: round 72 measured a plain
+// `https://host` at a line end surviving in both directions through a duplicate
+// member, silently.
+//
+// Events are still recorded under SurfaceStraggler, so the census keeps one name
+// for the backstop.
+const SurfaceSweep = "sweep"
+
 // Sweep is PLAN §4.4's straggler sweep: a re-scan of already-rewritten output
 // for canonical origins the structured pass missed.
 //
@@ -192,7 +207,7 @@ func SweepBytes(b []byte, m *origin.Matcher, st *Stats, log *slog.Logger) []byte
 	if log == nil {
 		log = slog.Default()
 	}
-	out, events := m.Rewrite(b, SurfaceStraggler, st.Explain())
+	out, events := m.Rewrite(b, SurfaceSweep, st.Explain())
 	for _, e := range events {
 		if e.Action != origin.ActionRewrote {
 			continue

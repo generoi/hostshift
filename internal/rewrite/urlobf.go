@@ -125,7 +125,35 @@ func (h *hostReplacer) key(b []byte) string {
 	return strings.TrimSuffix(s, ".")
 }
 
-func isURLStripped(c byte) bool { return c == '\t' || c == '\n' || c == '\r' }
+// isURLStripped reports whether the URL parser deletes this byte before it
+// reads the host — but only where something will parse this buffer as a URL.
+//
+// Round 71 gave `internal/origin` that axis and stopped at the package boundary.
+// The locator kept round 70's "always a value" reading, so every spelling only it
+// can see — a character reference, a `\`-obfuscated separator, a JSON escape, an
+// IDN fold — still joined across a line break. Round 72 measured
+// `https:&#47;&#47;<canonical>` and `https:\\<canonical>` at a line end going out
+// as production in a page, in `content.rendered` and in the feed, and the variant
+// spellings going into `wp_posts` on the way back. Round 53's two-halves-disagree,
+// in a new place.
+func isURLStripped(c byte, joins bool) bool {
+	// A tab is stripped everywhere. The ada oracle is unambiguous: it resolves
+	// `https:www.example<TAB>.fi` to `www.example.fi` on every surface, so the
+	// locator has to normalise it away or it cannot see the host at all — and
+	// gating it on the surface broke 30-odd oracle rows on text, comment and
+	// svg-text at once. That is the *normalisation* question, and it is not the
+	// same as the boundary question the matcher asks about a control that
+	// follows a complete host.
+	//
+	// A newline and a CR are the surface question, which is what round 72
+	// measured: `https:&#47;&#47;<canonical>` at a line end went out as
+	// production, in a page, in `content.rendered` and in the feed, because the
+	// locator joined the lines before anything could ask.
+	if c == '\t' {
+		return true
+	}
+	return joins && (c == '\n' || c == '\r')
+}
 
 func isSlashish(c byte) bool { return c == '/' || c == '\\' }
 
@@ -178,7 +206,7 @@ type normalised struct {
 // rather than in decodeURLRefs because that decoder must never *emit* a control
 // character — doing so was one of the XSS holes this file sits next to. Removing
 // one is not emitting one.
-func stripForURL(v []byte) normalised {
+func stripForURL(v []byte, joins bool) normalised {
 	lo, hi := 0, len(v)
 	for lo < hi && v[lo] <= 0x20 {
 		lo++
@@ -188,7 +216,7 @@ func stripForURL(v []byte) normalised {
 	}
 	n := normalised{b: make([]byte, 0, hi-lo), pos: make([]int, 0, hi-lo), end: make([]int, 0, hi-lo)}
 	for i := lo; i < hi; {
-		if isURLStripped(v[i]) {
+		if isURLStripped(v[i], joins) {
 			i++
 			continue
 		}
@@ -219,9 +247,9 @@ func stripForURL(v []byte) normalised {
 // Nothing is re-serialised: the decoded bytes exist only in the view, and the
 // splice replaces the host's original byte range, so `&#47;&#47;` survives
 // untouched beside a rewritten host and an XML document keeps its `&amp;`.
-func stripForRefs(v []byte) normalised {
+func stripForRefs(v []byte, joins bool) normalised {
 	if bytes.IndexByte(v, '&') < 0 {
-		return stripForURL(v)
+		return stripForURL(v, joins)
 	}
 	dec := make([]byte, 0, len(v))
 	pos := make([]int, 0, len(v))
@@ -243,7 +271,7 @@ func stripForRefs(v []byte) normalised {
 		end = append(end, i+1)
 		i++
 	}
-	n := stripRemovals(dec, pos, end)
+	n := stripRemovals(dec, pos, end, joins)
 	return n
 }
 
@@ -274,7 +302,7 @@ func stripForRefs(v []byte) normalised {
 // exactly, and it also keeps the view from inventing a byte the authority
 // scanner would read as a separator. Surrogate pairs and everything above 0x7E
 // are left as written, because no authority byte lives there.
-func stripForJSONEsc(v []byte) normalised { return stripJSONEsc(v, false) }
+func stripForJSONEsc(v []byte, joins bool) normalised { return stripJSONEsc(v, false, joins) }
 
 // stripForJSONEscCtl is stripForJSONEsc for a surface whose escapes are real: it
 // also removes `\t`, `\n`, `\r` and their `\uXXXX` spellings, because the string
@@ -288,10 +316,10 @@ func stripForJSONEsc(v []byte) normalised { return stripJSONEsc(v, false) }
 // backslash is a path separator: `https://www.example\u0009.fi/x` is the host
 // www.example with the path `/u0009.fi/x`, and folding it removed six bytes from
 // a value nothing should have touched. See origin.SurfaceDecodesEscapes.
-func stripForJSONEscCtl(v []byte) normalised { return stripJSONEsc(v, true) }
+func stripForJSONEscCtl(v []byte, joins bool) normalised { return stripJSONEsc(v, true, joins) }
 
 // escView picks between them.
-func escView(surface string) func([]byte) normalised {
+func escView(surface string) func([]byte, bool) normalised {
 	if origin.SurfaceDecodesEscapes(surface) {
 		return stripForJSONEscCtl
 	}
@@ -307,11 +335,11 @@ func hasEsc(v []byte, surface string) bool {
 	return origin.SurfaceDecodesEscapes(surface) && bytes.IndexByte(v, '\\') >= 0
 }
 
-func stripJSONEsc(v []byte, ctl bool) normalised {
+func stripJSONEsc(v []byte, ctl, joins bool) normalised {
 	// The ctl view also decodes two-byte spellings, which carry no `\u` for
 	// hasJSONEsc's cheap gate to find.
 	if !hasJSONEsc(v) && !(ctl && bytes.IndexByte(v, '\\') >= 0) {
-		return stripForURL(v)
+		return stripForURL(v, joins)
 	}
 	dec := make([]byte, 0, len(v))
 	pos := make([]int, 0, len(v))
@@ -384,7 +412,7 @@ func stripJSONEsc(v []byte, ctl bool) normalised {
 		end = append(end, i+1)
 		i++
 	}
-	return stripRemovals(dec, pos, end)
+	return stripRemovals(dec, pos, end, joins)
 }
 
 // hasJSONEsc reports whether the buffer holds an escape this view decodes.
@@ -632,9 +660,9 @@ func jsonEscRune(h []byte, ctl bool) ([]byte, bool) {
 // the locator finds the authority once the escapes are gone, and the splice
 // replaces only the host's original byte range — the percent-encoding around it
 // survives exactly as written.
-func stripForPercent(v []byte) normalised {
+func stripForPercent(v []byte, joins bool) normalised {
 	if bytes.IndexByte(v, '%') < 0 {
-		return stripForURL(v)
+		return stripForURL(v, joins)
 	}
 	dec := make([]byte, 0, len(v))
 	pos := make([]int, 0, len(v))
@@ -656,7 +684,7 @@ func stripForPercent(v []byte) normalised {
 		end = append(end, i+1)
 		i++
 	}
-	n := stripRemovals(dec, pos, end)
+	n := stripRemovals(dec, pos, end, joins)
 	return n
 }
 
@@ -671,9 +699,9 @@ func stripForPercent(v []byte) normalised {
 //
 // One escape is a backslash, one to six hex digits, and an optional single
 // trailing whitespace which is part of the escape rather than of the value.
-func stripForCSS(v []byte) normalised {
+func stripForCSS(v []byte, joins bool) normalised {
 	if bytes.IndexByte(v, '\\') < 0 {
-		return stripForURL(v)
+		return stripForURL(v, joins)
 	}
 	dec := make([]byte, 0, len(v))
 	pos := make([]int, 0, len(v))
@@ -704,7 +732,7 @@ func stripForCSS(v []byte) normalised {
 			i += 2
 			continue
 		}
-		if j < len(v) && (v[j] == ' ' || v[j] == '+' || isURLStripped(v[j])) {
+		if j < len(v) && (v[j] == ' ' || v[j] == '+' || isURLStripped(v[j], true)) {
 			// `+` too, because a form encoding writes a space that way and this
 			// view is composed under the percent decode: `%5C3a+` is `\3a ` and
 			// `%5C3a%20` is the same bytes one spelling over. Both readings end
@@ -726,7 +754,7 @@ func stripForCSS(v []byte) normalised {
 	}
 	// Now the URL parser's own removals, over the decoded bytes, carrying the
 	// map through.
-	n := stripRemovals(dec, pos, end)
+	n := stripRemovals(dec, pos, end, joins)
 	return n
 }
 
@@ -742,10 +770,10 @@ func stripForCSS(v []byte) normalised {
 // every origin in that buffer: a Windows path in an `<desc>`, a `\201c` in a
 // stylesheet, a regex in a sitemap. The trigger is buffer-wide, and for the XML
 // entry points the buffer is the whole body.
-func stripRemovals(dec []byte, pos, end []int) normalised {
+func stripRemovals(dec []byte, pos, end []int, joins bool) normalised {
 	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
 	for i := 0; i < len(dec); {
-		if isURLStripped(dec[i]) {
+		if isURLStripped(dec[i], joins) {
 			i++
 			continue
 		}
@@ -1514,6 +1542,7 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 	if !w.hosts.active() {
 		return v
 	}
+	joins := origin.JoinsControlsIn(surface, v)
 	nonASCII := false
 	for _, c := range v {
 		if c >= 0x80 {
@@ -1525,7 +1554,7 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 		return v
 	}
 
-	n := stripForURL(v)
+	n := stripForURL(v, joins)
 	var out []byte
 	prev := 0
 	for i := 0; i+1 < len(n.b); i++ {
@@ -1605,7 +1634,8 @@ func (w *HTML) normaliseURLLeak(surface string, base int, v []byte, value bool) 
 	if !w.hosts.active() {
 		return v
 	}
-	n := stripForURL(v)
+	joins := origin.JoinsControlsIn(surface, v)
+	n := stripForURL(v, joins)
 	var out []byte
 	prev := 0
 	for _, off := range urlTokenStarts(n.b) {
@@ -1650,6 +1680,11 @@ func hostsFor(m *origin.Matcher) *hostReplacer {
 // has no HTML tokenizer around it. Counters are the caller's business; the
 // events this would emit duplicate the ones RewriteJSON already records.
 func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]origin.Event) []byte {
+	// The same axis origin.surfaceJoinsControls answers for the byte matcher.
+	// The locator is the only pass that sees a reference, a `\`-obfuscated
+	// separator, a JSON escape or an IDN fold, so round 71 threading this into
+	// origin alone left every one of those spellings joining across a line break.
+	joins := origin.JoinsControlsIn(surface, v)
 	if !h.active() {
 		return v
 	}
@@ -1680,7 +1715,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 	// The rule this is an instance of: every spelling the forward direction can
 	// *emit*, the reverse direction must be able to *read*.
 	if bytes.IndexByte(v, '\\') >= 0 && surfaceDecodesCSS(surface) {
-		v = h.spliceHostsIn(stripForCSS(v), v, urlTokenStarts, value, surface, ev)
+		v = h.spliceHostsIn(stripForCSS(v, joins), v, urlTokenStarts, value, surface, ev)
 	}
 	// And the percent view, for an encoding composed with another one.
 	//
@@ -1691,7 +1726,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 	// what pays for it. `stale` tracks whether a splice has moved the bytes out
 	// from under the view; only then is it rebuilt.
 	if bytes.IndexByte(v, '%') >= 0 {
-		pv := stripForPercent(v)
+		pv := stripForPercent(v, joins)
 		// "did any byte move", not "did the length change".
 		//
 		// Round 56 tested the length, and two splices with cancelling deltas
@@ -1719,7 +1754,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 		v = nv
 		percentView := func() normalised {
 			if stale {
-				return stripForPercent(v)
+				return stripForPercent(v, joins)
 			}
 			return pv
 		}
@@ -1736,7 +1771,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 		// the spelling and `HostLeaks` no longer did. One copy, because two costs
 		// 455x the body and blows the allocation ceiling.
 		if bytes.Contains(v, []byte("%5Cu")) || bytes.Contains(v, []byte("%5cu")) {
-			nv := h.spliceHostsIn(composeView(percentView(), escView(surface)), v,
+			nv := h.spliceHostsIn(composeView(percentView(), escView(surface), joins), v,
 				urlTokenStarts, value, surface, ev)
 			if moved(nv, v) {
 				stale = true
@@ -1764,7 +1799,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 		// alone appears in any Windows path a page quotes, and arming a three-view
 		// composition on that would cost every body that mentions one.
 		if hasPercentCSSEsc(v) && surfaceDecodesCSS(surface) {
-			v = h.spliceHostsIn(composeView(percentView(), stripForCSS), v,
+			v = h.spliceHostsIn(composeView(percentView(), stripForCSS, joins), v,
 				urlTokenStarts, value, surface, ev)
 		}
 	}
@@ -1775,7 +1810,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 	// this spelling is emitted by *WordPress*, not by us, and the failure it
 	// causes is the variant hostname landing in the shared database.
 	if hasEsc(v, surface) {
-		v = h.spliceHostsIn(escView(surface)(v), v, urlTokenStarts, value, surface, ev)
+		v = h.spliceHostsIn(escView(surface)(v, joins), v, urlTokenStarts, value, surface, ev)
 	}
 	return v
 }
@@ -1783,6 +1818,7 @@ func (h *hostReplacer) rewriteAll(v []byte, value bool, surface string, ev *[]or
 // rewriteAllRefs is rewriteAll for a consumer that decodes character references
 // — the XML family, XHTML's script and style, and every request body.
 func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, surface string, ev *[]origin.Event) []byte {
+	joins := origin.JoinsControlsIn(surface, v)
 	v = h.refsOnly(h.rewriteAll(v, value, surface, ev), value, surface, ev)
 	// And references spelling CSS escapes, which needs both decodes composed.
 	if h.active() && bytes.IndexByte(v, '&') >= 0 {
@@ -1791,7 +1827,7 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, surface string, ev *
 		// header pass goes through rewriteAll. It is here so the three CSS
 		// compositions answer one question in one way; gating two of three is
 		// the shape that produced the defect it is gating against.
-		if n, ok := refsThenCSS(v); ok && surfaceDecodesCSS(surface) {
+		if n, ok := refsThenCSS(v, joins); ok && surfaceDecodesCSS(surface) {
 			v = h.spliceHostsIn(n, v, urlTokenStarts, value, surface, ev)
 		}
 		// And references spelling a JSON escape, which is the same composition
@@ -1802,7 +1838,7 @@ func (h *hostReplacer) rewriteAllRefs(v []byte, value bool, surface string, ev *
 		// parser decodes references, which includes every request body. A
 		// spelling is a family; this is the member the family was missing.
 		if hasRefJSONEsc(v) {
-			v = h.spliceHostsIn(composeView(stripForRefs(v), escView(surface)), v,
+			v = h.spliceHostsIn(composeView(stripForRefs(v, joins), escView(surface), joins), v,
 				urlTokenStarts, value, surface, ev)
 		}
 	}
@@ -1816,7 +1852,8 @@ func (h *hostReplacer) refsOnly(v []byte, value bool, surface string, ev *[]orig
 	if !h.active() || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
-	return h.spliceHostsIn(stripForRefs(v), v, urlTokenStarts, value, surface, ev)
+	return h.spliceHostsIn(stripForRefs(v, origin.JoinsControlsIn(surface, v)), v,
+		urlTokenStarts, value, surface, ev)
 }
 
 // slashRunStarts yields the first byte of each run of two or more slashes, which
@@ -1848,7 +1885,8 @@ func slashRunStarts(b []byte) []int {
 }
 
 func (h *hostReplacer) spliceHosts(v []byte, starts func([]byte) []int, value bool, surface string, ev *[]origin.Event) []byte {
-	return h.spliceHostsIn(stripForURL(v), v, starts, value, surface, ev)
+	return h.spliceHostsIn(stripForURL(v, origin.JoinsControlsIn(surface, v)), v,
+		starts, value, surface, ev)
 }
 
 // spliceHostsIn splices, and appends what it did to ev when the caller has a
@@ -1980,8 +2018,8 @@ func hasPercentCSSEsc(v []byte) bool {
 // way and none of them ever saw another's output. So a spelling that needs two
 // decodes to become a URL went out byte-identical, and the census called the page
 // clean.
-func composeView(outer normalised, f func([]byte) normalised) normalised {
-	inner := f(outer.b)
+func composeView(outer normalised, f func([]byte, bool) normalised, joins bool) normalised {
+	inner := f(outer.b, joins)
 	n := normalised{
 		b:   inner.b,
 		pos: make([]int, len(inner.b)),
@@ -2023,8 +2061,8 @@ func composeView(outer normalised, f func([]byte) normalised) normalised {
 // reference view then unescapes. Any sanitiser or editor that entity-encodes a
 // backslash in an inline style produces it, and inline styles are where a page
 // builder's background images live.
-func stripForRefsCSS(v []byte) normalised {
-	return composeView(stripForRefs(v), stripForCSS)
+func stripForRefsCSS(v []byte, joins bool) normalised {
+	return composeView(stripForRefs(v, joins), stripForCSS, joins)
 }
 
 // refsThenCSS is stripForRefsCSS for the two callers that skip on no match.
@@ -2045,8 +2083,8 @@ func stripForRefsCSS(v []byte) normalised {
 // The allocation this bought back (118x to 85x on ampersand-only shapes) is not
 // worth a leak, and the remaining cost is tracked by TestAllocationStaysBounded
 // rather than traded against correctness.
-func refsThenCSS(v []byte) (normalised, bool) {
-	return composeView(stripForRefs(v), stripForCSS), true
+func refsThenCSS(v []byte, joins bool) (normalised, bool) {
+	return composeView(stripForRefs(v, joins), stripForCSS, joins), true
 }
 
 // percentLeak is the percent-decoded view, for an encoding composed with
@@ -2056,7 +2094,8 @@ func (w *HTML) percentLeak(surface string, base int, v []byte, value bool) []byt
 	if !w.hosts.active() || bytes.IndexByte(v, '%') < 0 {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForPercent(v), v, urlTokenStarts, value, surface)
+	out, events := w.hosts.spliceHostsLog(stripForPercent(v, origin.JoinsControlsIn(surface, v)), v,
+		urlTokenStarts, value, surface)
 	w.record(surface, base, events)
 	return out
 }
@@ -2067,7 +2106,8 @@ func (w *HTML) jsonEscLeak(surface string, base int, v []byte, value bool) []byt
 	if !w.hosts.active() || !hasEsc(v, surface) {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(escView(surface)(v), v, urlTokenStarts, value, surface)
+	out, events := w.hosts.spliceHostsLog(escView(surface)(v, origin.JoinsControlsIn(surface, v)), v,
+		urlTokenStarts, value, surface)
 	w.record(surface, base, events)
 	return out
 }
@@ -2096,7 +2136,8 @@ func (w *HTML) refsLeak(surface string, base int, v []byte, value bool) []byte {
 	if !w.hosts.active() || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForRefs(v), v, urlTokenStarts, value, surface)
+	out, events := w.hosts.spliceHostsLog(stripForRefs(v, origin.JoinsControlsIn(surface, v)), v,
+		urlTokenStarts, value, surface)
 	w.record(surface, base, events)
 	return out
 }
@@ -2107,7 +2148,7 @@ func (w *HTML) refsCSSLeak(surface string, base int, v []byte) []byte {
 	if !w.hosts.active() || bytes.IndexByte(v, '&') < 0 {
 		return v
 	}
-	n, ok := refsThenCSS(v)
+	n, ok := refsThenCSS(v, origin.JoinsControlsIn(surface, v))
 	if !ok {
 		return v
 	}
@@ -2121,7 +2162,8 @@ func (w *HTML) cssEscapeLeak(surface string, base int, v []byte) []byte {
 	if !w.hosts.active() || bytes.IndexByte(v, '\\') < 0 {
 		return v
 	}
-	out, events := w.hosts.spliceHostsLog(stripForCSS(v), v, urlTokenStarts, true, surface)
+	out, events := w.hosts.spliceHostsLog(stripForCSS(v, origin.JoinsControlsIn(surface, v)), v,
+		urlTokenStarts, true, surface)
 	w.record(surface, base, events)
 	return out
 }

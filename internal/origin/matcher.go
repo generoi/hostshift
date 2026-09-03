@@ -495,6 +495,10 @@ func surfaceJoinsControls(surface string) bool {
 	case "text", "xml-text", "comment", "raw-text",
 		"request-body", "json-string":
 		return false
+	case "sweep":
+		// The sole-pass sweep. See rewrite.SurfaceSweep: with nothing in front
+		// of it, URL semantics decline an origin no other pass will look at.
+		return false
 	case "straggler":
 		// The sweep is a byte matcher with no surface, running behind every
 		// structured pass. Reading prose here would let it rewrite what the
@@ -509,9 +513,17 @@ func surfaceJoinsControls(surface string) bool {
 	return false
 }
 
-// SurfaceJoinsControls is surfaceJoinsControls for the views, which have to
-// answer the same question about the same document.
+// SurfaceJoinsControls is surfaceJoinsControls for the surface-name pin test.
+//
+// Callers deciding what to do with an actual buffer want JoinsControlsIn: on
+// `json-string` this answer is only half of it, and round 72 measured the two
+// halves disagreeing about one document — the byte matcher asking per buffer
+// while the locator asked the table.
 func SurfaceJoinsControls(surface string) bool { return surfaceJoinsControls(surface) }
+
+// JoinsControlsIn is joinsControlsIn for the views, which have to answer the
+// same question about the same buffer that the byte matcher answered.
+func JoinsControlsIn(surface string, b []byte) bool { return joinsControlsIn(surface, b) }
 
 // joinsControlsIn is surfaceJoinsControls, except that a JSON string has to be
 // asked about itself.
@@ -524,13 +536,22 @@ func SurfaceJoinsControls(surface string) bool { return surfaceJoinsControls(sur
 // posting a document, where `\n` is a line break and the origin before it went
 // into a shared production database.
 //
-// The discriminant that separates them is a literal space. A lone URL field has
-// none; a document — post content, a CSS blob, a title — has one almost by
-// definition. It is a heuristic and it is named as one here, but it is the only
-// property of the two real payloads that differs, and both directions of getting
-// it wrong have now been measured against a real WordPress.
+// The discriminant is a literal space, or a second `://`. A lone URL field has
+// neither; a document — post content, a CSS blob, a title, a newline-separated
+// list — has one almost by definition.
+//
+// It is a heuristic and it is named as one. The residue it still gets wrong is a
+// single URL followed by a control and a bare word, with no space anywhere in
+// the value: that is read as one URL and its origin declined. Both directions of
+// getting this wrong have been measured against a real WordPress, which is why
+// the rule is here rather than a guess.
 func joinsControlsIn(surface string, b []byte) bool {
-	if surface != "json-string" {
+	// Both JSON surfaces: `json-string` is the raw span and `json-escape` is the
+	// same value after jsontext unquoted it, so they are one question asked of
+	// two spellings of one buffer. Round 72 measured a reference-encoded origin
+	// at a line end surviving in `content.rendered` because only the raw span was
+	// asked.
+	if surface != "json-string" && surface != "json-escape" {
 		return surfaceJoinsControls(surface)
 	}
 	// The span arrives with its quotes on, which is how the tokenizer hands it
@@ -538,6 +559,15 @@ func joinsControlsIn(surface string, b []byte) bool {
 	// and "this field is prose", and getting it wrong here re-broke round 54.
 	t := bytes.Trim(b, `"`)
 	if bytes.IndexByte(t, ' ') >= 0 {
+		return false
+	}
+	// A second scheme means a second URL, so this is a list and the control
+	// between them is what separates them. Counted on the scheme rather than on
+	// `://`, because the separator has as many spellings as §4.4 enumerates —
+	// the payload round 72 measured spells it `:\/\/`. A query parameter
+	// carrying another URL counts twice too, which reads the value as prose and
+	// rewrites more; that is the direction to fail in.
+	if bytes.Count(bytes.ToLower(t), []byte("http")) > 1 {
 		return false
 	}
 	if len(t) > 8 {
@@ -986,7 +1016,7 @@ func SurfaceDecodesEscapes(surface string) bool {
 // Only meaningful when b[i] is a backslash; the caller checks that.
 func EscapeContinuesHost(b []byte, i int, surface string) bool {
 	esc := escapeAlphabetFor(surface)
-	return esc != escPath && !hostTerminated(b, i, esc, surfaceJoinsControls(surface))
+	return esc != escPath && !hostTerminated(b, i, esc, joinsControlsIn(surface, b))
 }
 
 // unhex decodes the two hex digits at i.

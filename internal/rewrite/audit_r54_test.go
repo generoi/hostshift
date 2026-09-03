@@ -475,6 +475,7 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		SurfaceRawText:        false,
 		SurfaceInlineScript:   true,
 		SurfaceStraggler:      true,
+		SurfaceSweep:          true,
 		SurfaceJSONString:     true,
 		SurfaceJSONEscape:     false,
 	}
@@ -497,6 +498,7 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		SurfaceRawText:        true,
 		SurfaceInlineScript:   true,
 		SurfaceStraggler:      true,
+		SurfaceSweep:          true,
 		SurfaceJSONString:     true,
 		SurfaceJSONEscape:     true,
 	}
@@ -521,6 +523,7 @@ func TestSurfaceNamesAreKnownHere(t *testing.T) {
 		SurfaceRawText:        false,
 		SurfaceInlineScript:   true,  // string and template literals
 		SurfaceStraggler:      true,  // no surface, and it must not override a pass
+		SurfaceSweep:          false, // sometimes there is no pass to override
 		SurfaceJSONString:     false, // decided per string; see joinsControlsIn
 		SurfaceJSONEscape:     true,
 	}

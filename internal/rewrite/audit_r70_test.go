@@ -153,3 +153,30 @@ func TestR70AJSONDocumentThatOpensWithAURLIsProse(t *testing.T) {
 			"it to a host this map does not name\n  in:  %s\n  out: %s", lone, got)
 	}
 }
+
+// A lone-URL JSON field keeps its escapes joined, in the obfuscated spelling too.
+//
+// The heuristic decides a JSON string is one URL or a document; these pin the
+// "one URL" side against the spellings §4.4 enumerates, so widening the rule
+// cannot quietly start over-rewriting a field a browser resolves elsewhere. ada
+// resolves each of these to `www.example.finx`/`www.example.fix`, which this map
+// does not name.
+func TestR70ALoneURLJSONFieldKeepsItsEscapes(t *testing.T) {
+	m := obfMatcher(t)
+	for _, in := range []string{
+		`{"u":"https:\/\/www.example.fi\nx"}`,
+		`{"u":"https:\/\/www.example.fi\tx"}`,
+		`{"u":"https://www.example.fi\nx"}`,
+	} {
+		if got := string(RewriteJSON([]byte(in), m, NewStats(false), quiet(), false)); got != in {
+			t.Errorf("a field holding one URL was rewritten, and a browser resolves "+
+				"it to a host this map does not name\n  in:  %s\n  out: %s", in, got)
+		}
+	}
+	// And the document beside it still comes home, so this is not just "decline
+	// everything with an escape in it".
+	doc := `{"c":"a https:\/\/www.example.fi\nx and more"}`
+	if got := string(RewriteJSON([]byte(doc), m, NewStats(false), quiet(), false)); got == doc {
+		t.Errorf("a document at a line end was left alone: %s", got)
+	}
+}

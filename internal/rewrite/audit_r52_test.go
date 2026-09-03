@@ -151,12 +151,12 @@ type r52Enc struct {
 	omitScheme bool
 }
 
-func r52Dec(f func([]byte) normalised) func(string) string {
-	return func(s string) string { return string(f([]byte(s)).b) }
+func r52Dec(f func([]byte, bool) normalised) func(string) string {
+	return func(s string) string { return string(f([]byte(s), true).b) }
 }
 
-func r52Compose(outer, inner func([]byte) normalised) func(string) string {
-	return func(s string) string { return string(inner(outer([]byte(s)).b).b) }
+func r52Compose(outer, inner func([]byte, bool) normalised) func(string) string {
+	return func(s string) string { return string(inner(outer([]byte(s), true).b, true).b) }
 }
 
 // r52BS is a single backslash, spelled without one.

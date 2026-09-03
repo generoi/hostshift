@@ -97,7 +97,7 @@ func TestR51TheSchemeArmInventsPercentEncodingItDidNotFind(t *testing.T) {
 	// The real question, asked of the decoder that actually runs on this
 	// surface: after the CSS tokenizer unescapes it, is it still an absolute
 	// URL at the variant origin?
-	if dec := string(stripForCSS([]byte(out)).b); !strings.Contains(dec, variant) {
+	if dec := string(stripForCSS([]byte(out), true).b); !strings.Contains(dec, variant) {
 		t.Errorf("CSS-decoded, the rewritten value is not %s — it is a relative path:\n"+
 			"  in:  %s\n  out: %s\n  css-decoded: %s", variant, css, out, dec)
 	}
@@ -112,7 +112,7 @@ func TestR51TheSchemeArmInventsPercentEncodingItDidNotFind(t *testing.T) {
 	if strings.Contains(rout, "%3A%2F%2F") {
 		t.Errorf("percent-encoding was invented for a reference-encoded value:\n  in:  %s\n  out: %s", ref, rout)
 	}
-	if dec := string(stripForRefs([]byte(rout)).b); !strings.Contains(dec, variant) {
+	if dec := string(stripForRefs([]byte(rout), true).b); !strings.Contains(dec, variant) {
 		t.Errorf("reference-decoded, the rewritten value is not %s:\n"+
 			"  in:  %s\n  out: %s\n  ref-decoded: %s", variant, ref, rout, dec)
 	}
@@ -190,7 +190,7 @@ func TestR51TheOctalDecoderKeepsItsRange(t *testing.T) {
 		t.Errorf("a browser resolves this to www.example.fi and it was served "+
 			"live:\n  %s", out)
 	}
-	for _, c := range stripForJSONEscCtl([]byte(tab)).b {
+	for _, c := range stripForJSONEscCtl([]byte(tab), true).b {
 		if c < 0x20 || c == 0x7F {
 			t.Errorf("the view emitted control byte %#02x — removing an escape is "+
 				"not the same as decoding one into the view", c)

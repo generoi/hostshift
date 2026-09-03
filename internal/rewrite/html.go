@@ -78,6 +78,9 @@ type HTML struct {
 	// mathTextPoint records whether the integration point that resumed HTML
 	// rules was a MathML text one, the only kind with a carve-out.
 	mathTextPoint bool
+	// scriptIsJS records whether the open <script> is JavaScript, read from its
+	// type attribute at the start tag.
+	scriptIsJS bool
 	// rawTextForeign records whether the open raw-text element is itself a
 	// foreign one, decided at its start tag.
 	rawTextForeign bool
@@ -424,6 +427,45 @@ func openForeignBefore(b []byte) bool {
 		}
 	}
 	return depth > 0
+}
+
+// scriptIsJavaScript reports whether a `<script>` start tag's type attribute
+// says the element holds JavaScript.
+//
+// Absent, empty, and the legacy JavaScript MIME types are JavaScript; everything
+// else — `application/ld+json`, `text/template`, `text/html`, `importmap` — is a
+// data block whose contents no JavaScript parser reads. The distinction matters
+// because the script surface joins a control after a host, which is right for a
+// string or template literal and wrong for a JSON document or a template.
+func scriptIsJavaScript(raw []byte) bool {
+	z := html.NewTokenizer(bytes.NewReader(raw))
+	if z.Next() == html.ErrorToken {
+		return true
+	}
+	for {
+		k, v, more := z.TagAttr()
+		if bytes.EqualFold(k, []byte("type")) {
+			t := bytes.TrimSpace(v)
+			if i := bytes.IndexByte(t, ';'); i >= 0 {
+				t = bytes.TrimSpace(t[:i])
+			}
+			if len(t) == 0 {
+				return true
+			}
+			switch {
+			case bytes.EqualFold(t, []byte("module")),
+				bytes.EqualFold(t, []byte("text/javascript")),
+				bytes.EqualFold(t, []byte("application/javascript")),
+				bytes.EqualFold(t, []byte("text/ecmascript")),
+				bytes.EqualFold(t, []byte("application/ecmascript")):
+				return true
+			}
+			return false
+		}
+		if !more {
+			return true
+		}
+	}
 }
 
 // rcdataOpensBefore reports whether this already-lowercased span opens an
@@ -1009,6 +1051,9 @@ func (w *HTML) Read(p []byte) (int, error) {
 			// and inline script is where the JS URLs actually are (§5.2).
 			if name := rawTextElement(tagNameOf(raw)); name != "" {
 				w.rawText = name
+				if name == "script" {
+					w.scriptIsJS = scriptIsJavaScript(raw)
+				}
 				// Whether the *element* is a foreign one is decided here, at its
 				// start tag, and not later by whatever the stack says while its
 				// content is being written. `<svg><foreignObject><title>` is an
@@ -1177,7 +1222,19 @@ func (w *HTML) Read(p []byte) (int, error) {
 				// hostname in prose has no scheme and cannot match.
 				w.write(off, len(raw), w.rewriteValue(SurfaceText, nil, off, raw))
 			case "script":
-				w.write(off, len(raw), w.rewriteValue(SurfaceInlineScript, nil, off, raw))
+				// A `<script>` whose type says it is not JavaScript is not
+				// JavaScript, and the tokenizer already has the attribute.
+				// `json-string` got asked about its own buffer because "the
+				// surface cannot answer for JSON"; a script element does not have
+				// to guess. Round 72 measured `application/ld+json` — which every
+				// SEO plugin emits — serving a production origin at a line end,
+				// because the script surface joins for string and template
+				// literals that a JSON document does not have.
+				sf := SurfaceInlineScript
+				if !w.scriptIsJS {
+					sf = SurfaceJSONString
+				}
+				w.write(off, len(raw), w.rewriteValue(sf, nil, off, raw))
 			case "style":
 				w.write(off, len(raw), w.rewriteValue(SurfaceInlineStyle, nil, off, raw))
 			default:
