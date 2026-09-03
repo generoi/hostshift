@@ -4,3 +4,11 @@
 
 # local agent scaffolding, not part of the design record — PLAN.md is authoritative
 /GOAL.md
+
+# The design record and the pilot notes. Kept out of the public repo because
+# they are written against named client deployments; the comments throughout the
+# code cite them by section, and those citations still name the decision even
+# where the document itself is not here to open.
+/PLAN.md
+/docs/m0-preflight.md
+/docs/m6-pilot.md

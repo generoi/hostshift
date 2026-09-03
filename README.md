@@ -352,8 +352,8 @@ canonical=variant list cannot carry aliases.
 
 The same engine pointed further: set `canonical` to the live production
 hostname and a database that was never search-replaced at all can be browsed
-locally. Opt-in per repo, and it is where the hazards live — see
-[`PLAN.md`](PLAN.md) §4.4. Two things become required with it:
+locally. Opt-in per repo, and it is where the hazards live — see PLAN §4.4,
+summarised below. Two things become required with it:
 
 - **Loopback containment.** `ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml`
   writes the site's production hostnames into web's `extra_hosts`, pointed at
@@ -513,6 +513,11 @@ not let it go red.
 
 ## Design
 
-[`PLAN.md`](PLAN.md) is the authoritative design and is not re-decided here.
-[`docs/`](docs/) has the pilot notes and the performance numbers;
+`PLAN.md` is the authoritative design and is not re-decided here. It is written
+against named client deployments and so is not published, which is why comments
+throughout the code cite sections of a document this repo does not contain —
+`PLAN §4.3` is the shared-database invariant, `§4.4` the production-canonical
+hazards, `§5.2` the identity map. The citation still names the decision.
+
+[`docs/performance.md`](docs/performance.md) has the numbers;
 [`spike/`](spike/) is the evidence behind the Go decision. MIT licensed.
