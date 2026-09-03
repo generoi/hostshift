@@ -231,7 +231,7 @@ func TestR57TheCSSEscapeTerminatorSetIsExact(t *testing.T) {
 		{"_", false}, {"-", false}, {"x", false}, {".", false},
 	} {
 		v := []byte(`\3a` + c.after + `y`)
-		got := string(stripForCSS(v, true).b)
+		got := string(stripForCSS(v, ctlJoin).b)
 		want := ":" + c.after + "y"
 		if c.consumed {
 			want = ":y"

@@ -90,6 +90,11 @@ type Result struct {
 	// so does not cancel against the canonical baseline.
 	UnreadRewrites int
 
+	// Literal counts canonical origins found by a plain byte scan of the variant
+	// response, sharing no code with the rewriter. See compare: the engine cannot
+	// be the only witness to its own declines.
+	Literal int
+
 	// WriteBacks counts variant origins in the *canonical* response: production
 	// serving a worktree hostname, which is §4.3 and means the shared database
 	// was written through the proxy. Zero on a healthy site.
@@ -352,6 +357,24 @@ func compare(ctx context.Context, o Options, path string) Result {
 
 	r.ContentType = variant.contentType
 	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
+	// And a check that shares no code with the engine.
+	//
+	// countLeaks scores a served body by re-running the pipeline on it, so an
+	// origin the engine *declines* is declined again and the page is green — the
+	// report confirms itself with the thing it is checking. Round 74 measured a
+	// live instance: two `https://<canonical>` in a served site-health page,
+	// LEAKS 0, "no canonical origin reached the browser".
+	//
+	// A literal scan cannot have that property. Anchored on `//host` rather than
+	// the bare host, because the bare form has a false positive that matters —
+	// network/sites.php prints a site's domain as a row's link *text*, which is
+	// not dereferenceable and is correctly left alone. Measured across 55 pages of
+	// a real WordPress: with the anchor, one hit, and it was the true positive.
+	//
+	// Its own counter rather than folded into Leaks, because it will also see
+	// deliberate declines — an origin PLAN says to leave alone reads the same to a
+	// byte scan as one that got away.
+	r.Literal = literalOrigins(o.Map, variant.body)
 	// Base64 here too, and for the same reason it is below: countLeaks runs the
 	// rewrite pipeline, and the pipeline has no base64 view. That reasoning is
 	// direction-free — it is a property of the pipeline, not of which map is
@@ -395,6 +418,18 @@ func compare(ctx context.Context, o Options, path string) Result {
 		r.WriteBacks += n
 	}
 	return r
+}
+
+// literalOrigins counts `//host` occurrences of each canonical host in a body,
+// with no matcher, no view and no surface — deliberately the dumbest check that
+// can exist, so that it cannot inherit an engine mistake.
+func literalOrigins(m *origin.Map, body []byte) int {
+	n := 0
+	for _, s := range m.Sites {
+		needle := []byte("//" + s.Canonical.HostPort())
+		n += bytes.Count(bytes.ToLower(body), bytes.ToLower(needle))
+	}
+	return n
 }
 
 // countLeaks reports how many canonical origins the matcher still finds in a
@@ -906,7 +941,7 @@ func WriteReport(w io.Writer, results []Result) bool {
 	// the invariant-28 verdict with exit 0. The same class as the two verdicts
 	// round 43 rescoped: a report asserting what it skipped.
 	green := len(results) > 0
-	var equal, leaks, errs, tier2, broken, unread, writeBacks int
+	var equal, leaks, errs, tier2, broken, unread, writeBacks, literal int
 
 	fmt.Fprintf(w, "%-46s %-8s %-7s %-7s %s\n", "PATH", "BYTES", "LEAKS", "LINES", "NOTE")
 	for _, r := range results {
@@ -944,6 +979,19 @@ func WriteReport(w io.Writer, results []Result) bool {
 				"every container around it", r.BrokenSerialized))
 			broken += r.BrokenSerialized
 			green = false
+		}
+		// Reported, not counted against the verdict. A literal scan sees every
+		// canonical origin in the body, including the ones PLAN deliberately
+		// leaves — a Tier 2 stylesheet, an attachment — so making it RED would
+		// make a correct run red. What it is for is the case where it sees more
+		// than the engine did: that difference is the engine declining something,
+		// and the engine is the one witness that cannot report on itself.
+		if r.Literal > r.Leaks {
+			notes = append(notes, fmt.Sprintf("a literal scan finds %d canonical "+
+				"origin(s) here and the engine reported %d — the difference is "+
+				"something the engine declined, and it cannot be the only witness "+
+				"to its own declines", r.Literal, r.Leaks))
+			literal += r.Literal - r.Leaks
 		}
 		if r.Tier2 > 0 {
 			// Not a defect: PLAN's fast path excludes these types "per Tier 2,
@@ -1071,6 +1119,11 @@ func WriteReport(w io.Writer, results []Result) bool {
 	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d write-backs, %d broken, "+
 		"%d unread, %d errors\n",
 		len(results), equal, leaks, writeBacks, broken, unread, errs)
+	if literal > 0 {
+		fmt.Fprintf(w, "%d canonical origin(s) a literal scan found and the engine "+
+			"did not — deliberate declines look the same to it, so this is a "+
+			"pointer rather than a verdict\n", literal)
+	}
 	if tier2 > 0 {
 		fmt.Fprintf(w, "%d origins in Tier 2 types (text/css, JavaScript), which the "+
 			"proxy excludes by design — PLAN's fast path adds them \"only if the "+

@@ -332,10 +332,53 @@ func reqMethod(resp *http.Response) string {
 	return resp.Request.Method
 }
 
+// rewriteOriginHeaders applies the Tier 1 header list to a header set, and
+// reports whether anything changed.
+//
+// Extracted so the 1xx hook can run it too. `httputil.ReverseProxy` forwards an
+// informational response through `httptrace.Got1xxResponse`, copying the header
+// verbatim — `ModifyResponse` is never consulted — so a `103 Early Hints`
+// carrying `Link: <https://canonical/…>; rel=preload` went to the browser as
+// production while the *same* header on the final 200 was rewritten. PLAN §5.2
+// calls this list "the whole guarantee for the header surface"; a preload went
+// through the hole.
+func (p *Proxy) rewriteOriginHeaders(hdr http.Header, skipLocation bool) bool {
+	fwd := p.Map.Forward()
+	explain := p.Stats.Explain()
+	changed := false
+	for _, h := range originHeaders {
+		if skipLocation && h == "Location" {
+			continue
+		}
+		vs := hdr.Values(h)
+		for i, v := range vs {
+			// Through RepairSerialized for the same reason the bodies are: a
+			// `Location: /landing.php?state=<blob>` is built by the application
+			// out of a serialized value, and rewriting the host inside it
+			// changes a byte count the length still describes.
+			var ev []origin.Event
+			out := rewrite.RepairSerialized([]byte(v), func(b []byte) []byte {
+				nv, nev := fwd.Rewrite(b, rewrite.SurfaceResponseHeader, explain)
+				ev = append(ev, nev...)
+				// Location, Link, Refresh and CSP had the byte matcher alone, so
+				// every obfuscated and folded spelling passed straight through —
+				// and a Location is followed by the browser through the parser.
+				return rewrite.HostLeaksCounted(fwd, nv, true, p.Stats,
+					rewrite.SurfaceResponseHeader, 0)
+			})
+			p.Stats.Record(rewrite.SurfaceResponseHeader, 0, ev)
+			if !p.DryRun && string(out) != v {
+				vs[i] = string(out)
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	st, _ := resp.Request.Context().Value(stateKey).(*state)
 	fwd := p.Map.Forward()
-	explain := p.Stats.Explain()
 	changed := false
 
 	// The self-redirect guard (PLAN §4.4, test 32). 55 of the fleet's 63 DDEV
@@ -395,32 +438,8 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		}
 	}
 
-	for _, h := range originHeaders {
-		if skipLocation && h == "Location" {
-			continue
-		}
-		vs := resp.Header.Values(h)
-		for i, v := range vs {
-			// Through RepairSerialized for the same reason the bodies are: a
-			// `Location: /landing.php?state=<blob>` is built by the application
-			// out of a serialized value, and rewriting the host inside it
-			// changes a byte count the length still describes.
-			var ev []origin.Event
-			out := rewrite.RepairSerialized([]byte(v), func(b []byte) []byte {
-				nv, nev := fwd.Rewrite(b, rewrite.SurfaceResponseHeader, explain)
-				ev = append(ev, nev...)
-				// Location, Link, Refresh and CSP had the byte matcher alone, so
-				// every obfuscated and folded spelling passed straight through —
-				// and a Location is followed by the browser through the parser.
-				return rewrite.HostLeaksCounted(fwd, nv, true, p.Stats,
-					rewrite.SurfaceResponseHeader, 0)
-			})
-			p.Stats.Record(rewrite.SurfaceResponseHeader, 0, ev)
-			if !p.DryRun && string(out) != v {
-				vs[i] = string(out)
-				changed = true
-			}
-		}
+	if p.rewriteOriginHeaders(resp.Header, skipLocation) {
+		changed = true
 	}
 
 	// Set-Cookie Domain= is Tier 1 and load-bearing. ms_cookie_constants()

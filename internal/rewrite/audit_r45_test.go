@@ -251,9 +251,9 @@ func TestR45BlockAttributesDoNotComeHome(t *testing.T) {
 // keeps a surrogate pair out of the picture entirely. Everything else is copied
 // through as the six literal bytes it is, so the view stays position-mapped and
 // nothing is re-serialised.
-func stripForJSONUnicodeR45(v []byte, joins bool) normalised {
+func stripForJSONUnicodeR45(v []byte, mode ctlMode) normalised {
 	if !hasJSONUnicodeR45(v) {
-		return stripForURL(v, joins)
+		return stripForURL(v, mode)
 	}
 	dec := make([]byte, 0, len(v))
 	pos := make([]int, 0, len(v))
@@ -271,7 +271,7 @@ func stripForJSONUnicodeR45(v []byte, joins bool) normalised {
 		end = append(end, i+1)
 		i++
 	}
-	return stripRemovals(dec, pos, end, joins)
+	return stripRemovals(dec, pos, end, mode)
 }
 
 func hasJSONUnicodeR45(v []byte) bool {
@@ -315,7 +315,7 @@ func jsonUnicodeAtR45(b []byte) (byte, int) {
 func TestR45TheComposedViewClosesIt(t *testing.T) {
 	h := hostsFor(r45Fwd(t))
 	splice := func(s string) string {
-		return string(h.spliceHostsIn(stripForJSONUnicodeR45([]byte(s), true), []byte(s), urlTokenStarts, true, SurfaceHTMLAttr, nil))
+		return string(h.spliceHostsIn(stripForJSONUnicodeR45([]byte(s), ctlJoin), []byte(s), urlTokenStarts, true, SurfaceHTMLAttr, nil))
 	}
 	for _, c := range []string{
 		"https:" + u("002F") + u("002F") + r45Canon + "/x",
@@ -331,7 +331,7 @@ func TestR45TheComposedViewClosesIt(t *testing.T) {
 	// And the reverse map, which is where the producer lives.
 	hr := hostsFor(r45Rev(t))
 	esc := "https://wt-a" + u("002d") + u("002d") + "example.ddev.site/bg.jpg"
-	got := string(hr.spliceHostsIn(stripForJSONUnicodeR45([]byte(esc), true), []byte(esc), urlTokenStarts, true, SurfaceHTMLAttr, nil))
+	got := string(hr.spliceHostsIn(stripForJSONUnicodeR45([]byte(esc), ctlJoin), []byte(esc), urlTokenStarts, true, SurfaceHTMLAttr, nil))
 	if !strings.Contains(got, r45Canon) {
 		t.Errorf("the block-serializer spelling still does not come home: %s", got)
 	}
@@ -374,7 +374,7 @@ func TestR45TheJSONViewNeverEmitsAControlCharacter(t *testing.T) {
 		"\\u0000", "\\u0009", "\\u000A", "\\u000D", "\\u001F", "\\u007F", "\\u00e4",
 	} {
 		v := []byte("https://www.example" + esc + ".fi/x")
-		n := stripForJSONEsc(v, true)
+		n := stripForJSONEsc(v, ctlJoin)
 		for i, c := range n.b {
 			if c < 0x20 || c == 0x7F {
 				t.Errorf("%s: the view emitted control byte %#02x at %d: %q", esc, c, i, n.b)

@@ -283,7 +283,7 @@ func FuzzR46RepairNeverBreaksMore(f *testing.F) {
 func TestR46JSONEscViewSplicesItsWholeSourceRange(t *testing.T) {
 	hr := hostsFor(r46Rev(t))
 	splice := func(s string) string {
-		return string(hr.spliceHostsIn(stripForJSONEsc([]byte(s), true), []byte(s), urlTokenStarts, true, SurfaceHTMLAttr, nil))
+		return string(hr.spliceHostsIn(stripForJSONEsc([]byte(s), ctlJoin), []byte(s), urlTokenStarts, true, SurfaceHTMLAttr, nil))
 	}
 	e := func(h string) string { return bs + "u" + h }
 	canon := "https://" + r46Canon

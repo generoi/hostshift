@@ -145,7 +145,8 @@ func TestR73AJSONLocatorAsksTheTableAndNotTheBuffer(t *testing.T) {
 // `mysql`: `TABIN https:\\wt-a--r73w-hs.ddev.site<TAB>next` — a variant hostname
 // in the shared database, §4.3 — beside `SPACEIN https:\\www.hostshift-a.example`.
 func TestR73BATabAfterAHostIsABoundaryInProseToo(t *testing.T) {
-	// OPEN FINDING, deliberately skipped rather than deleted. See PLAN §5.5.
+	// Round 74 closed this with a second locator view. The measurement that
+	// forced the design is kept because it is what rules out the shortcut:
 	//
 	// A tab has to be two things at once and the locator's strip-then-scan order
 	// cannot express both: ada removes a tab *inside* a host on every surface —
@@ -156,9 +157,6 @@ func TestR73BATabAfterAHostIsABoundaryInProseToo(t *testing.T) {
 	// flip; it needs the locator to run two views on prose surfaces, one
 	// normalising and one not.
 	//
-	// Left failing-as-skipped so the shape is in the tree with its measurement,
-	// rather than deleted and rediscovered in another three rounds.
-	t.Skip("open: needs a second locator view on prose surfaces; see PLAN §5.5")
 	for _, sp := range []struct{ name, tmpl string }{
 		{"backslash", `https:\\%s`},
 		{"entity-slash", "https:&#47;&#47;%s"},

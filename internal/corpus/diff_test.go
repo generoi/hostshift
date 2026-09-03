@@ -835,3 +835,34 @@ func TestAVariantOriginInsideBase64IsCountedAsAWriteBack(t *testing.T) {
 		t.Errorf("an ordinary base64 blob reported %d write-backs", q.WriteBacks)
 	}
 }
+
+// The independent literal check runs, and it is anchored.
+//
+// `countLeaks` re-runs the engine on the served body, so an origin the engine
+// declines is declined again and the page reads GREEN — the report confirming
+// itself with the thing it is checking. `Literal` is the counter that cannot
+// inherit an engine mistake, so it has to actually run, and it has to be
+// anchored on `//host`: round 74 measured the unanchored form across 55 pages of
+// a real WordPress and its one false positive was `network/sites.php`, which
+// prints a site's domain as a row's link *text* — a bare hostname, correctly
+// left alone.
+func TestTheLiteralCheckRunsAndIsAnchored(t *testing.T) {
+	// An origin the engine declines: a bare host at a line end inside an
+	// attribute, which is round 74's open finding and reads GREEN to countLeaks.
+	served := `<button data-clipboard-text="WP_HOME: https://www.canon.test` + "\n" +
+		`WP_SITEURL: https://www.canon.test"></button>`
+	r := compareBodies(t, served, served)
+	if r.Literal == 0 {
+		t.Error("the independent check did not run, or found nothing in a body " +
+			"that literally contains two canonical origins — it is the only " +
+			"witness here that does not share code with the engine")
+	}
+
+	// And a bare hostname as link text is not an origin. Without the `//` anchor
+	// this scores, and every network-admin page in the fleet would carry a note.
+	text := `<a href="/wp-admin/network/site-info.php?id=1">www.canon.test</a>`
+	if q := compareBodies(t, text, text); q.Literal != 0 {
+		t.Errorf("a bare hostname printed as link text counted as %d origin(s); "+
+			"it is not dereferenceable and the anchor exists to skip it", q.Literal)
+	}
+}
