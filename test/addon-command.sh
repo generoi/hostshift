@@ -895,139 +895,28 @@ chmod +x "$fakebin/docker"
 export HS_FAKE_DIR="$work/fake"
 mkdir -p "$HS_FAKE_DIR"
 
-# A healthy worktree: the proxy is up, answering on the variants, started with
-# the map .ddev/.env asks for, and web holds exactly the narrowed list.
-(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
-env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
-env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
-env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
-writefake() {
-  printf 'true
-proxy %s 
-VIRTUAL_HOST=%s
-' "$env_args" "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
-  printf 'VIRTUAL_HOST=%s
-' "$env_web" > "$HS_FAKE_DIR/web-env"
-  : > "$HS_FAKE_DIR/logs"
-}
-writefake
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" \
-  && pass "check reaches the end and reports what is served" \
-  || fail "check reaches the end and reports what is served" "$out"
-contains "and names the variants" "hostshift is serving" "$out"
-
-# A proxy started with a different map than the file now asks for — the shape
-# that shipped twice as a fleet-wide 421.
-writefake
-printf 'true
-proxy --slug something-else 
-VIRTUAL_HOST=%s
-' "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check catches a proxy running a different map" "different map" "$out"
-
-# A proxy answering on hostnames the file no longer asks for.
-writefake
-printf 'true
-proxy %s 
-VIRTUAL_HOST=stale--acme.ddev.site
-' "$env_args" > "$HS_FAKE_DIR/hostshift-state"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check catches a proxy answering on stale hostnames" "the running proxy answers on" "$out"
-
-# A crashed proxy: the container exists, the env is still there, it is not up.
-writefake
-printf 'false
-proxy %s 
-VIRTUAL_HOST=%s
-' "$env_args" "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check catches a proxy that has exited" "has exited" "$out"
-
-# web serving more than the narrowed list — the inversion that made a worktree
-# steal the parent's blog, and which check could not see until it looked at web.
-writefake
-printf 'VIRTUAL_HOST=%s,b.acme.ddev.site
-' "$env_web" > "$HS_FAKE_DIR/web-env"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check catches web serving hostnames it should not" "web is serving a different set" "$out"
-
-# The running map differing from what hostshift.yaml now resolves to. Only
-# checked when a hostshift.yaml is present, since otherwise the command line is
-# the map and the comparison above already covered it.
-printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
-  > "$wt/hostshift.yaml"
-(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
-env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
-env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
-env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
-writefake
-printf 'hostshift: map from /project/hostshift.yaml\nmain  https://old.example  ->  https://wt-a--acme.ddev.site\nhostshift v1: listening on :80, upstream http://web\n' \
-  > "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-contains "check catches a hostshift.yaml edited without a restart" \
-  "running a different map" "$out"
-
-# The image's version against the command's. `ddev add-on get` installs the
-# command from the repository and the engine from a published image, so a
-# developer can run today's command in front of last week's proxy — measured, a
-# feed came back with eighteen canonical URLs unrewritten while check said
-# "hostshift is serving", because it compared the logged map and never the
-# version.
-writefake
-printf 'hostshift v0.0.1-old: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-case "$out" in
-  *"the proxy image is"*) pass "check notices an image older than the command" ;;
-  *) fail "check notices an image older than the command" "$out" ;;
-esac
-
-# v0.1.0's banner carries no version — the version was added to that line after
-# it — so requiring one made the warning silent on the only skew that exists.
-writefake
-printf 'hostshift: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
-case "$out" in
-  *"predates v0.2.0"*) pass "and one whose banner predates the version" ;;
-  *) fail "and one whose banner predates the version" "$out" ;;
-esac
-contains "and says what that costs" "serialized length prefixes" "$out"
-# ...and the way out. A pull cannot help here — `:latest` is byte-identical to
-# the image being warned about, so the developer loops. The sentence saying so
-# was on the version-*mismatch* branch, where it is unreachable: that branch is
-# entered because the banner carried a version.
-contains "and that a pull may not be enough" "built from the repository" "$out"
-
-# …including when this command is a source build.
-#
-# The version comparison is suppressed when either side says `dev`, so a source
-# build does not warn against every released image. That suppression silenced
-# the one skew that exists: a developer running a source build in front of the
-# published image, which is v0.1.0. Measured on that pair — options.php wrote
-# `s:54:` over a 44-byte string, PHP refused the row, and check exited 0.
-#
-# A bannerless proxy is evidence on its own and needs no comparison.
-writefake
-printf 'hostshift: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
-cat > "$fakebin/hostshift" <<'DEVVER'
+# A poisoned `curl` behind the fake one. $fakecurl comes first on every cell's
+# PATH; this is what a cell that forgets it hits instead of the machine's real
+# curl. Without it such a cell asks the network and passes or fails on whether
+# something happens to be listening on localhost:443 — which is how eleven cells
+# passed on a developer's machine and failed in CI, and would have gone on
+# passing here forever.
+export HS_POISON_LOG="$work/curl-poisoned"
+cat > "$fakebin/curl" <<'POISON'
 #!/usr/bin/env bash
-if [ "$1" = "--version" ]; then echo dev; exit 0; fi
-exec "$HS_REAL_BIN" "$@"
-DEVVER
-chmod +x "$fakebin/hostshift"
-out="$(cd "$wt" && HS_REAL_BIN="$(command -v hostshift)" PATH="$fakebin:$PATH" \
-  "$cmd" check --slug wt-a 2>&1 || true)"
-rm -f "$fakebin/hostshift"
-case "$out" in
-  *"predates v0.2.0"*) pass "a source build does not silence the bannerless warning" ;;
-  *) fail "a source build does not silence the bannerless warning" "$out" ;;
-esac
-# The HTTP probe: a hard routing failure is fatal, an application answering is
-# not, and a cold start is retried rather than refused.
-#
-# It runs inside the post-start hook, the instant after `ddev start` returns,
-# when traefik may not have picked up the new router yet — so a single request
-# would turn an ordinary race into a refusal on a good project.
+printf '%s\n' "$*" >> "${HS_POISON_LOG}"
+echo "test bug: this cell left the real curl on PATH — add \$fakecurl" >&2
+exit 1
+POISON
+chmod +x "$fakebin/curl"
+
+# The fake curl lives here, above the first `check` cell, rather than beside
+# the probe tests that drive it. Every `check` reaches the network to ask
+# whether the variant answers, so a cell that left the real curl on PATH was
+# asking the machine running the suite — and passing only where something
+# happened to be listening on localhost:443. Eleven cells failed in CI and
+# nowhere else for exactly that reason. Defined before anything calls `check`,
+# so no cell can be written without it.
 fakecurl="$work/fakecurl"
 mkdir -p "$fakecurl"
 cat > "$fakecurl/curl" <<'FAKECURL'
@@ -1092,6 +981,140 @@ FAKECURL
 chmod +x "$fakecurl/curl"
 export HS_CURL_STATE="$work/curl-n"
 
+# A healthy worktree: the proxy is up, answering on the variants, started with
+# the map .ddev/.env asks for, and web holds exactly the narrowed list.
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || fail "init exited non-zero" ""
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake() {
+  printf 'true
+proxy %s 
+VIRTUAL_HOST=%s
+' "$env_args" "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
+  printf 'VIRTUAL_HOST=%s
+' "$env_web" > "$HS_FAKE_DIR/web-env"
+  : > "$HS_FAKE_DIR/logs"
+}
+writefake
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" \
+  && pass "check reaches the end and reports what is served" \
+  || fail "check reaches the end and reports what is served" "$out"
+contains "and names the variants" "hostshift is serving" "$out"
+
+# A proxy started with a different map than the file now asks for — the shape
+# that shipped twice as a fleet-wide 421.
+writefake
+printf 'true
+proxy --slug something-else 
+VIRTUAL_HOST=%s
+' "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a proxy running a different map" "different map" "$out"
+
+# A proxy answering on hostnames the file no longer asks for.
+writefake
+printf 'true
+proxy %s 
+VIRTUAL_HOST=stale--acme.ddev.site
+' "$env_args" > "$HS_FAKE_DIR/hostshift-state"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a proxy answering on stale hostnames" "the running proxy answers on" "$out"
+
+# A crashed proxy: the container exists, the env is still there, it is not up.
+writefake
+printf 'false
+proxy %s 
+VIRTUAL_HOST=%s
+' "$env_args" "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a proxy that has exited" "has exited" "$out"
+
+# web serving more than the narrowed list — the inversion that made a worktree
+# steal the parent's blog, and which check could not see until it looked at web.
+writefake
+printf 'VIRTUAL_HOST=%s,b.acme.ddev.site
+' "$env_web" > "$HS_FAKE_DIR/web-env"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches web serving hostnames it should not" "web is serving a different set" "$out"
+
+# The running map differing from what hostshift.yaml now resolves to. Only
+# checked when a hostshift.yaml is present, since otherwise the command line is
+# the map and the comparison above already covered it.
+printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example, base: https://acme.ddev.site}\n' \
+  > "$wt/hostshift.yaml"
+(cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$wt/.ddev/.env")"
+writefake
+printf 'hostshift: map from /project/hostshift.yaml\nmain  https://old.example  ->  https://wt-a--acme.ddev.site\nhostshift v1: listening on :80, upstream http://web\n' \
+  > "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+contains "check catches a hostshift.yaml edited without a restart" \
+  "running a different map" "$out"
+
+# The image's version against the command's. `ddev add-on get` installs the
+# command from the repository and the engine from a published image, so a
+# developer can run today's command in front of last week's proxy — measured, a
+# feed came back with eighteen canonical URLs unrewritten while check said
+# "hostshift is serving", because it compared the logged map and never the
+# version.
+writefake
+printf 'hostshift v0.0.1-old: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"the proxy image is"*) pass "check notices an image older than the command" ;;
+  *) fail "check notices an image older than the command" "$out" ;;
+esac
+
+# v0.1.0's banner carries no version — the version was added to that line after
+# it — so requiring one made the warning silent on the only skew that exists.
+writefake
+printf 'hostshift: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+case "$out" in
+  *"predates v0.2.0"*) pass "and one whose banner predates the version" ;;
+  *) fail "and one whose banner predates the version" "$out" ;;
+esac
+contains "and says what that costs" "serialized length prefixes" "$out"
+# ...and the way out. A pull cannot help here — `:latest` is byte-identical to
+# the image being warned about, so the developer loops. The sentence saying so
+# was on the version-*mismatch* branch, where it is unreachable: that branch is
+# entered because the banner carried a version.
+contains "and that a pull may not be enough" "built from the repository" "$out"
+
+# …including when this command is a source build.
+#
+# The version comparison is suppressed when either side says `dev`, so a source
+# build does not warn against every released image. That suppression silenced
+# the one skew that exists: a developer running a source build in front of the
+# published image, which is v0.1.0. Measured on that pair — options.php wrote
+# `s:54:` over a 44-byte string, PHP refused the row, and check exited 0.
+#
+# A bannerless proxy is evidence on its own and needs no comparison.
+writefake
+printf 'hostshift: listening on :80, upstream http://web\n' >> "$HS_FAKE_DIR/logs"
+cat > "$fakebin/hostshift" <<'DEVVER'
+#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo dev; exit 0; fi
+exec "$HS_REAL_BIN" "$@"
+DEVVER
+chmod +x "$fakebin/hostshift"
+out="$(cd "$wt" && HS_REAL_BIN="$(command -v hostshift)" PATH="$fakecurl:$fakebin:$PATH" \
+  "$cmd" check --slug wt-a 2>&1 || true)"
+rm -f "$fakebin/hostshift"
+case "$out" in
+  *"predates v0.2.0"*) pass "a source build does not silence the bannerless warning" ;;
+  *) fail "a source build does not silence the bannerless warning" "$out" ;;
+esac
+# The HTTP probe: a hard routing failure is fatal, an application answering is
+# not, and a cold start is retried rather than refused.
+#
+# It runs inside the post-start hook, the instant after `ddev start` returns,
+# when traefik may not have picked up the new router yet — so a single request
+# would turn an ordinary race into a refusal on a good project.
+
 echo "== check looks at what came back, not only at the configuration"
 
 # check said "the map is injective and anchored" and exited 0 on a deployment
@@ -1103,13 +1126,17 @@ echo "== check looks at what came back, not only at the configuration"
 # The cause in the report was --dry-run surviving in HOSTSHIFT_ARGS — which the
 # preservation added one round earlier is what let it stick — so the fake proxy
 # here is running with it, and the fake page carries the canonical origin.
-cat > "$fakebin/curl" <<'FAKE'
+# Swapped over the general fake rather than added beside it: $fakecurl comes
+# first on every cell's PATH, so a page fake anywhere else is shadowed and never
+# runs.
+cp "$fakecurl/curl" "$work/curl-general"
+cat > "$fakecurl/curl" <<'FAKE'
 #!/usr/bin/env bash
 # The probe asks for a page and appends the status code; give it both.
 cat "${HS_FAKE_DIR}/page" 2>/dev/null
 printf '\n200\n'
 FAKE
-chmod +x "$fakebin/curl"
+chmod +x "$fakecurl/curl"
 
 writefake
 # The proxy is up, and running with --dry-run.
@@ -1118,7 +1145,7 @@ printf 'true\nproxy %s --dry-run \nVIRTUAL_HOST=%s\n' "$env_args" "$env_variants
 printf '<a href="https://acme.ddev.site/a">a</a><link href="https://acme.ddev.site/b">\n' \
   > "$HS_FAKE_DIR/page"
 
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a canonical origin in the served page is reported" "canonical origin" "$out"
 
 # ...and the pages it lists under that are URLs and nothing else. The list is
@@ -1134,7 +1161,7 @@ case "$out" in
   *) pass "and the pages it lists are URLs" ;;
 esac
 contains "and the cause is named" "--dry-run" "$out"
-if (cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
+if (cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
   fail "check fails when the page carries one" "it exited 0"
 else
   pass "check fails when the page carries one"
@@ -1151,7 +1178,7 @@ fi
 # on every `ddev start`.
 printf '<a href="https://wt-a--acme.ddev.site/a">a</a><a href="https://acme.ddev.site:8026/">mailpit</a>\n' \
   > "$HS_FAKE_DIR/page"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"canonical origin"*) fail "a clean page is not reported" "$out" ;;
   *) pass "a clean page is not reported" ;;
@@ -1176,13 +1203,13 @@ esac
 # the scan was added to close, one line to the side of it.
 printf '<a href="https://acme.ddev.site/a">a</a><link href="https://acme.ddev.site/b">\n' \
   > "$HS_FAKE_DIR/page"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"unbound variable"*)
     fail "check does not abort on its own bookkeeping" "$out" ;;
   *) pass "check does not abort on its own bookkeeping" ;;
 esac
-if (cd "$wt" && fails=0 PATH="$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
+if (cd "$wt" && fails=0 PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a >/dev/null 2>&1); then
   fail "check fails on a canonical origin however \$fails arrives" "it exited 0"
 else
   pass "check fails on a canonical origin however \$fails arrives"
@@ -1206,11 +1233,12 @@ for spelling in json pct refs comma; do
     refs)  printf '<a href="https&#58;&#47;&#47;acme.ddev.site&#47;a">a</a>\n' ;;
     comma) printf '<meta name="x" content="https://acme.ddev.site,https://other.test">\n' ;;
   esac > "$HS_FAKE_DIR/page"
-  out="$(cd "$wt" && fails=0 PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+  out="$(cd "$wt" && fails=0 PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
   contains "a $spelling-encoded canonical origin is reported" "canonical origin" "$out"
 done
 
-rm -f "$fakebin/curl"
+cp "$work/curl-general" "$fakecurl/curl"
+chmod +x "$fakecurl/curl"
 writefake
 
 writefake
@@ -1332,7 +1360,7 @@ writefake
 : > "$work/tblcalls"
 out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
   HS_FAKE_TABLES_BEFORE=1 HS_FAKE_TABLES_AFTER=1 \
-  PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db --force 2>&1 || true)"
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" copy-db --force 2>&1 || true)"
 contains "a dump that never connected touched nothing" "never connected" "$out"
 case "$out" in
   *"does not settle it"*) fail "and it does not hedge over it" "$out" ;;
@@ -1345,7 +1373,7 @@ esac
 out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
   HS_FAKE_DUMP_ERR="mariadb-dump: Error 2026: TLS/SSL error: unexpected eof" \
   HS_FAKE_TABLES_BEFORE=0 HS_FAKE_TABLES_AFTER=0 \
-  PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db 2>&1 || true)"
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" copy-db 2>&1 || true)"
 contains "an empty database that stayed empty lost nothing" "nothing was lost" "$out"
 case "$out" in
   *"half-replaced"*) fail "and it does not claim a half-replaced database" "$out" ;;
@@ -1365,7 +1393,7 @@ esac
 out="$(cd "$wt" && HS_TBL_STATE="$work/tblcalls" \
   HS_FAKE_DUMP_ERR="mariadb-dump: Error 2026: TLS/SSL error: unexpected eof" \
   HS_FAKE_TABLES_BEFORE=13 HS_FAKE_TABLES_AFTER=13 \
-  PATH="$fakedb:$fakebin:$PATH" "$cmd" copy-db --force 2>&1 || true)"
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" copy-db --force 2>&1 || true)"
 case "$out" in
   *"nothing here changed"*|*"nothing was lost"*)
     fail "an unchanged table count does not mean an unchanged database" "$out" ;;
@@ -1378,7 +1406,7 @@ contains "and it says what a count cannot settle" "does not settle it" "$out"
 # keeps the signal and gives up the authority, so a wrong answer costs a line of
 # noise rather than a failed start.
 if out="$(cd "$wt" && HS_FAKE_HOME="https://www.somewhere-else.test" \
-  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)"; then
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)"; then
   pass "a database the map does not name does not fail the start"
 else
   fail "a database the map does not name does not fail the start" "$out"
@@ -1408,7 +1436,7 @@ contains "and counts the links it found" "links to www.somewhere-else.test" "$ou
 contains "and points at hostshift.yaml, not at the database" "Name www.somewhere-else.test in hostshift.yaml" "$out"
 # ...and says nothing when it agrees.
 out="$(cd "$wt" && HS_FAKE_HOME="https://acme.ddev.site" \
-  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"the database says its home is"*) fail "and passes when the database agrees with the map" "$out" ;;
   *) pass "and passes when the database agrees with the map" ;;
@@ -1763,7 +1791,7 @@ writefake
 writefake
 printf 'time=x level=WARN msg="JSON body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
   >> "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 contains "a body over the size cap is reported" "unrewritten" "$out"
 contains "and the count is measured" "1 response(s)" "$out"
 contains "and the remedy is the flag that fixes it" "--max-body" "$out"
@@ -1787,7 +1815,7 @@ contains "and it says the restart clears it" "log starts empty" "$out"
 writefake
 printf 'time=x level=WARN msg="request body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
   >> "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 contains "a request over the cap is reported as a request" "reached" "$out"
 contains "and it names the direction's own harm" "shared database" "$out"
 # ...and the sweep it prints looks where the write actually lands. The message
@@ -1820,7 +1848,7 @@ esac
 exit 0
 SHAREDDEV
 chmod +x "$sharedbin/ddev"
-out="$(cd "$wt" && PATH="$sharedbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$sharedbin:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"ddev exec -s db"*)
     fail "the sweep names the database the application writes to" \
@@ -1846,7 +1874,7 @@ exit 0
 NODBDDEV
 chmod +x "$nodbbin/ddev"
 printf 'DB_HOST=ddev-acme-db\n' > "$wt/.env"
-out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$nodbbin:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "the sweep reads a dotenv the container cannot see" "docker exec ddev-acme-db" "$out"
 
 # ...and a compose override, which copy-db's guard reads and this one did not.
@@ -1855,14 +1883,14 @@ contains "the sweep reads a dotenv the container cannot see" "docker exec ddev-a
 rm -f "$wt/.env"
 printf 'services:\n  web:\n    environment:\n      - DATABASE_URL=mysql://db:db@ddev-acme-db:3306/db\n' \
   > "$wt/.ddev/docker-compose.dbshare.yaml"
-out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$nodbbin:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "and a compose override, which copy-db also reads" "docker exec ddev-acme-db" "$out"
 rm -f "$wt/.ddev/docker-compose.dbshare.yaml"
 
 # ...and `.ddev/.env.web`, DDEV's own per-service dotenv, which was the only
 # other file in the list and was never exercised.
 printf 'DB_HOST=ddev-acme-db\n' > "$wt/.ddev/.env.web"
-out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$nodbbin:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "and the per-service dotenv" "docker exec ddev-acme-db" "$out"
 rm -f "$wt/.ddev/.env.web"
 
@@ -1870,7 +1898,7 @@ rm -f "$wt/.ddev/.env.web"
 # leading `#` and not a trailing one, so a value allowed to run past a comment
 # returned another client's container from a line whose actual value is local.
 printf 'DB_HOST=localhost   # staging import came from ddev-otherclient-db\n' > "$wt/.env"
-out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$nodbbin:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"docker exec ddev-otherclient-db"*)
     fail "a trailing comment is not part of the value" \
@@ -1884,7 +1912,7 @@ rm -f "$wt/.env"
 # returning through the other door — and in the worst shape it named another
 # client's container.
 printf '# was: DB_HOST=ddev-otherclient-db  # disabled, we have our own now\n' > "$wt/.env"
-out="$(cd "$wt" && PATH="$nodbbin:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$nodbbin:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"docker exec ddev-otherclient-db"*)
     fail "a commented-out DB_HOST is not an assignment" \
@@ -1895,7 +1923,7 @@ esac
 
 # ...and a project does not mistake its own container for a rival.
 printf 'DB_HOST=ddev-acme-wt-a-db\n' > "$wt/.env"
-out="$(cd "$wt" && DDEV_SITENAME=acme-wt-a PATH="$nodbbin:$fakebin:$PATH" \
+out="$(cd "$wt" && DDEV_SITENAME=acme-wt-a PATH="$nodbbin:$fakecurl:$fakebin:$PATH" \
   "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"docker exec ddev-acme-wt-a-db"*)
@@ -1923,7 +1951,7 @@ printf 'time=x level=WARN msg="request body exceeds the size cap, passing throug
   >> "$HS_FAKE_DIR/logs"
 printf 'time=x level=WARN msg="JSON body exceeds the size cap, passing through untouched" cap=8388608 content-type=application/json\n' \
   >> "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 contains "both cap directions are reported" "1 request(s) reached" "$out"
 contains "and the response one too" "1 response(s) went to" "$out"
 [ "$rc" = 2 ] && pass "and it still refuses" || fail "and it still refuses" "exit $rc"
@@ -1937,7 +1965,7 @@ writefake
 writefake
 printf 'time=x level=WARN msg="a variant hostname is inside base64 in this request body — it cannot be mapped back without breaking the signature the app checks, so it will reach the shared database as it stands" blobs=1 method=POST path=/wp-admin/admin-ajax.php\n' \
   >> "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 check "a base64 write-back refuses to call the deployment healthy" "2" "$rc"
 contains "and says it reached the database" "reached the database" "$out"
 contains "and says why it cannot be rewritten" "wp_hash()" "$out"
@@ -1946,7 +1974,7 @@ contains "and says the restart clears the log, not the rows" "rows it wrote are 
 
 # And a clean log still passes, so the grep is anchored and not matching prose.
 writefake
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 check "a clean log does not trip the base64 refusal" "0" "$rc"
 
 # ...and a page that merely quotes the phrase is not a cap event.
@@ -1959,7 +1987,7 @@ check "a clean log does not trip the base64 refusal" "0" "$rc"
 writefake
 printf 'time=x level=WARN msg="straggler" context="...body exceeds the size cap, passing through untouched..."\n' \
   >> "$HS_FAKE_DIR/logs"
-out="$(cd "$wt" && PATH="$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
+out="$(cd "$wt" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" && rc=0 || rc=$?
 case "$out" in
   *"larger than the body cap"*)
     fail "a page quoting the message is not a cap event" "refused on page content" ;;
@@ -2372,7 +2400,7 @@ printf 'version: 1\nsites:\n  - {name: main, canonical: https://www.acme.example
 # own status ends the script first.
 rc=0
 out="$(cd "$wt" && HS_FAKE_HOME="https://acme.ddev.site" \
-  PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" || rc=$?
+  PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1)" || rc=$?
 check "a parent-declares mismatch no longer fails the start" "0" "$rc"
 # The row qualifies the warning; it does not cancel it.
 #
@@ -2389,7 +2417,7 @@ contains "but the unmapped canonical is still named" \
   "Declared there and not in this map" "$out"
 # But with no database answer, the warning still gets printed.
 rc2=0
-out="$(cd "$wt" && HS_FAKE_HOME="" PATH="$fakedb:$fakebin:$PATH" \
+out="$(cd "$wt" && HS_FAKE_HOME="" PATH="$fakedb:$fakecurl:$fakebin:$PATH" \
   "$cmd" check --slug wt-a 2>&1)" || rc2=$?
 contains "with no database answer the warning still stands" \
   "declares the hostnames its database" "$out"
@@ -2424,12 +2452,12 @@ esac
 # printed "hostshift is serving" and exited 0. A running container carries its
 # own identity, so asking Docker needs no directory to exist.
 printf 'ddev-acme-wt-renamed-hostshift\n' > "$HS_FAKE_DIR/ps"
-out="$(cd "$wt" && PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 contains "a renamed project's containers still claiming the variant are caught" \
   "no longer exists under that name" "$out"
 # And the project must not find *itself*, or every healthy check refuses.
 printf 'ddev-acme-wt-a-hostshift\n' > "$HS_FAKE_DIR/ps"
-out="$(cd "$wt" && PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"no longer exists under that name"*)
     fail "a project does not mistake its own container for a rival" "$out" ;;
@@ -2445,7 +2473,7 @@ esac
 # lines down, this same file already carries a comment about making exactly that
 # mistake. A test that only drives the fallback is not testing the real path.
 printf 'ddev-acme-wt-real-hostshift\n' > "$HS_FAKE_DIR/ps"
-out="$(cd "$wt" && DDEV_SITENAME=acme-wt-real PATH="$fakedb:$fakebin:$PATH" \
+out="$(cd "$wt" && DDEV_SITENAME=acme-wt-real PATH="$fakedb:$fakecurl:$fakebin:$PATH" \
   "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"no longer exists under that name"*)
@@ -2461,7 +2489,7 @@ esac
 # the advice was wrong while it lasted.
 printf 'ddev-acme-wt-renamed-hostshift\n' > "$HS_FAKE_DIR/ps"
 printf '%s\n' "$(cd "$wt" && pwd -P)" > "$HS_FAKE_DIR/approot"
-out="$(cd "$wt" && PATH="$fakedb:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
+out="$(cd "$wt" && PATH="$fakedb:$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-a 2>&1 || true)"
 case "$out" in
   *"no longer exists under that name"*)
     fail "a container sharing this project's approot is not a rival" "$out" ;;
@@ -2871,6 +2899,14 @@ if (cd "$work/marker" && eval "$hook" >/dev/null 2>&1); then
   pass "a real marker is not a false alarm"
 else
   fail "a real marker is not a false alarm" "the check fired on a generated file"
+fi
+
+if [ -s "$HS_POISON_LOG" ]; then
+  fail "no cell reaches the network" \
+    "$(wc -l < "$HS_POISON_LOG") call(s) fell through to the poisoned curl:
+$(head -5 "$HS_POISON_LOG")"
+else
+  pass "no cell reaches the network"
 fi
 
 if [ "$fails" -gt 0 ]; then echo "$fails failure(s)"; exit 1; fi
