@@ -1134,9 +1134,20 @@ func WriteReport(w io.Writer, results []Result) bool {
 			"pointer rather than a verdict\n", literal)
 	}
 	if tier2 > 0 {
+		// And name the flag. This line is the moment an operator learns Tier 2
+		// leaked on their deployment, and for one release it described the
+		// exclusion, quoted the condition for lifting it, said "this is that" —
+		// and left them to find the override themselves. A trigger that does
+		// not say what to pull is a note, not a report.
 		fmt.Fprintf(w, "%d origins in Tier 2 types (text/css, JavaScript), which the "+
 			"proxy excludes by design — PLAN's fast path adds them \"only if the "+
-			"corpus diff shows a leak\", and this is that\n", tier2)
+			"corpus diff shows a leak\", and this is that.\n"+
+			"  Turn them on with --rewrite-type, repeatable, on `proxy` (in "+
+			"HOSTSHIFT_ARGS for the add-on):\n"+
+			"    --rewrite-type text/css --rewrite-type text/javascript "+
+			"--rewrite-type application/javascript\n"+
+			"  Those responses are then buffered to --max-body rather than "+
+			"streamed, which is why it is not the default.\n", tier2)
 	}
 	// Whether anything in this run is a type the leak scan actually reads. "At
 	// least one row" is weaker than the verdict's sentence: a table of nothing
