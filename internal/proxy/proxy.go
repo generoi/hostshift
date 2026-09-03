@@ -65,6 +65,11 @@ type Proxy struct {
 	// space, which is §4.3.
 	RewriteTypes TypeSet
 
+	// Transport is the RoundTripper used upstream. Nil means
+	// http.DefaultTransport. It is always wrapped, so the Tier 1 header list
+	// runs on informational responses too — see hintRewriter.
+	Transport http.RoundTripper
+
 	Log *slog.Logger
 }
 
@@ -155,6 +160,9 @@ func (p *Proxy) Handler() http.Handler {
 	rp := &httputil.ReverseProxy{
 		Rewrite:        p.rewriteRequest,
 		ModifyResponse: p.modifyResponse,
+		// Not for connection tuning: this is what puts the header pass in front
+		// of httputil's own 1xx forwarding. See hintRewriter.
+		Transport: p.transport(),
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// Test 14: upstream failure is surfaced, not swallowed.
 			p.log().Error("upstream request failed", "url", r.URL.String(), "err", err)

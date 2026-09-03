@@ -45,7 +45,13 @@ func TestR74EarlyHintsBypassModifyResponse(t *testing.T) {
 	// Ranked SMALL by the audit that found it because nothing in a stock
 	// WordPress/nginx stack emits 103; the mechanism is real, the realism is what
 	// limits it.
-	t.Skip("open: needs a 1xx-aware transport, not a trace hook; see PLAN §5.2")
+	// CLOSED. The hook is installed by a RoundTripper rather than on the inbound
+	// request, which is the whole fix: httptrace.WithClientTrace *composes*, and
+	// the trace added last runs first. Setting it in the handler put it behind
+	// httputil's — which copies the header and calls WriteHeader — so the
+	// mutation landed after the bytes were on the wire. Inside the transport,
+	// httputil's trace is already on the context, so ours is the later one and
+	// runs before it, mutating the header map httputil then copies.
 	const canon = "https://www.r74a.example/wp-content/style.css"
 
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
