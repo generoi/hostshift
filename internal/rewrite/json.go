@@ -231,7 +231,22 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 		// re-emitted — the corruption this file's header is about, at the one
 		// call site that reached for the views after the walk instead of from
 		// within it. Every other surface wraps them.
-		return hostsFor(m).rewriteAllRefs(nv, true, bareSurface(true), nil)
+		// SurfaceJSONEscape, not bareSurface(true).
+		//
+		// `bareSurface(true)` is SurfaceHTMLAttr, which answers the
+		// escape-alphabet question identically — both are escPath — and the
+		// *control* question differently: an attribute always joins, while this
+		// buffer is a decoded JSON string that has to be asked about itself. So
+		// the byte matcher one line above asked `joinsControlsIn` and got "this is
+		// a document" while the locator asked the table and got "always a value",
+		// on the one path that exists to catch spellings the matcher cannot see.
+		//
+		// Only `https:\\host` reaches it — an entity origin is decoded by
+		// decodeURLRefs first and `%2F` is in the matcher's prefilter — and Node
+		// resolves that to the bare host. Round 73 measured it both ways on a real
+		// WordPress: served in `content.raw` at the variant, and written into
+		// `wp_posts` on the way back.
+		return hostsFor(m).rewriteAllRefs(nv, true, SurfaceJSONEscape, nil)
 	})
 	// The same two catchers the HTML surfaces get. Without them the REST body
 	// was the one surface with neither: `{"u":"https:\\h/x"}` and an NFD host in
@@ -289,7 +304,22 @@ func serializedJSONValue(m *origin.Matcher, v []byte, explain bool) ([]byte, []o
 		// payload that it could not. `https:\\host` next to an ordinary URL in
 		// one blob went out live, and the detector said nothing, because a value
 		// nobody rewrote still parses.
-		return hostsFor(m).rewriteAllRefs(nv, true, bareSurface(true), nil)
+		// SurfaceJSONEscape, not bareSurface(true).
+		//
+		// `bareSurface(true)` is SurfaceHTMLAttr, which answers the
+		// escape-alphabet question identically — both are escPath — and the
+		// *control* question differently: an attribute always joins, while this
+		// buffer is a decoded JSON string that has to be asked about itself. So
+		// the byte matcher one line above asked `joinsControlsIn` and got "this is
+		// a document" while the locator asked the table and got "always a value",
+		// on the one path that exists to catch spellings the matcher cannot see.
+		//
+		// Only `https:\\host` reaches it — an entity origin is decoded by
+		// decodeURLRefs first and `%2F` is in the matcher's prefilter — and Node
+		// resolves that to the bare host. Round 73 measured it both ways on a real
+		// WordPress: served in `content.raw` at the variant, and written into
+		// `wp_posts` on the way back.
+		return hostsFor(m).rewriteAllRefs(nv, true, SurfaceJSONEscape, nil)
 	})
 	// Only a value that actually carries a span belongs on this path. Routing
 	// on "did anything change" instead sent every rewritten value here and

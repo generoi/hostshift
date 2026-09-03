@@ -452,13 +452,10 @@ func scriptIsJavaScript(raw []byte) bool {
 			if len(t) == 0 {
 				return true
 			}
-			switch {
-			case bytes.EqualFold(t, []byte("module")),
-				bytes.EqualFold(t, []byte("text/javascript")),
-				bytes.EqualFold(t, []byte("application/javascript")),
-				bytes.EqualFold(t, []byte("text/ecmascript")),
-				bytes.EqualFold(t, []byte("application/ecmascript")):
-				return true
+			for _, js := range javaScriptTypes {
+				if bytes.EqualFold(t, js) {
+					return true
+				}
 			}
 			return false
 		}
@@ -466,6 +463,35 @@ func scriptIsJavaScript(raw []byte) bool {
 			return true
 		}
 	}
+}
+
+// javaScriptTypes is HTML's list of JavaScript MIME type essences, plus
+// `module`.
+//
+// All sixteen, because a browser runs every one of them and round 72 shipped
+// nine: the legacy spellings a script tag can still carry got the JSON-string
+// surface, where a script body's spaces read as prose. Over-rewrite rather than
+// leak, but the same list is already enumerated a package away in
+// corpus.isTier2, and two hand-written copies of one list is what
+// escapeAlphabetFor's comment warns about.
+var javaScriptTypes = [][]byte{
+	[]byte("module"),
+	[]byte("application/ecmascript"),
+	[]byte("application/javascript"),
+	[]byte("application/x-ecmascript"),
+	[]byte("application/x-javascript"),
+	[]byte("text/ecmascript"),
+	[]byte("text/javascript"),
+	[]byte("text/javascript1.0"),
+	[]byte("text/javascript1.1"),
+	[]byte("text/javascript1.2"),
+	[]byte("text/javascript1.3"),
+	[]byte("text/javascript1.4"),
+	[]byte("text/javascript1.5"),
+	[]byte("text/jscript"),
+	[]byte("text/livescript"),
+	[]byte("text/x-ecmascript"),
+	[]byte("text/x-javascript"),
 }
 
 // rcdataOpensBefore reports whether this already-lowercased span opens an
