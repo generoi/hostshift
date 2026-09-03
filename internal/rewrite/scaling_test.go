@@ -223,15 +223,40 @@ func TestAllocationStaysBounded(t *testing.T) {
 		// fixture's construction. Realistic single-needle bodies measure 85x and
 		// 135x, inside the old ceiling. The structural halving named below
 		// (`pos`/`end` as []int32) is the lever if this ever needs to come down.
-		{"every view fires", r46CompositeUnit, 400},
+		{"every view fires", r46CompositeUnit, 230},
+		// The same composite with a tab in it, which is the actual worst case
+		// since round 74.
+		//
+		// A tab arms a second locator view on prose surfaces — one normalising,
+		// one not — because ada removes a tab *inside* a host and a tab *after*
+		// one ends it, and strip-then-scan cannot do both in a single pass. The
+		// fixture above carries every escape spelling and no tab, so it measured
+		// 391x against a 400 ceiling while the real worst case was 445x and over
+		// it. Exactly the failure this file's own comment describes one case
+		// earlier: a budget that had quietly stopped bounding what it names.
+		//
+		// []int32 took this from 445x to 248x and the run-length map to 230x, and
+		// every ceiling here came down with each of them rather than being left
+		// as slack — leaving a budget above what the code costs is the failure
+		// this file's own comment describes twice.
+		{"every view fires, with a tab", r46CompositeUnit + "\t", 255},
 		// A CSS escape beside an ampersand, which is the shape a gate on
 		// `\`-plus-digit armed the whole JSON view for. `\3a` is a colon and
 		// `\2014` a dash, so this is an ordinary themed page, and it measured
 		// 287x while no fixture here looked at it. The gate is two-byte needles
 		// again, and this is what pins that.
-		{"css escapes beside ampersands", `\3a &amp;#91;http:`, 200},
-		{"ampersands alone", `&`, 128},
-		{"references and brackets", `&#91;http:`, 115},
+		{"css escapes beside ampersands", `\3a &amp;#91;http:`, 85},
+		{"ampersands alone", `&`, 30},
+		// The one fixture the run-length map costs rather than saves, and it is
+		// the worst case for any run encoding by construction: every `&#91;`
+		// decodes to a single view byte five source bytes wide, so no two bytes
+		// are ever contiguous and every one of them is its own run. 12 bytes a
+		// run against a dense map's 8 a byte, so 61x became 75x. The crossover is
+		// 1.5 view bytes per run; real pages measure 272, and the byte-weighted
+		// corpus cost fell from 26.6x to 15.2x. Recorded rather than tuned around
+		// — a body made entirely of reference-encoded brackets is a fixture, not
+		// a page.
+		{"references and brackets", `&#91;http:`, 80},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			// At the shipped cap, not a convenient megabyte. Measuring at 1 MiB
@@ -245,10 +270,22 @@ func TestAllocationStaysBounded(t *testing.T) {
 			HostLeaksBack(m, b)
 			runtime.ReadMemStats(&after)
 			ratio := float64(after.TotalAlloc-before.TotalAlloc) / float64(len(b))
-			t.Logf("%s: %.0fx the body — %.0f MB churned, %.0f MB peak heap for one "+
-				"%d MiB request", c.name, ratio,
+			// Live heap held across the call, not HeapSys.
+			//
+			// HeapSys is a process-monotonic high-water mark, so run in sequence
+			// every subtest after the first printed the *first* one's figure —
+			// three of five reported an identical "399 MB peak" that belonged to
+			// a fixture they had nothing to do with. The one number this test
+			// prints and does not assert on was the contaminated one, in a test
+			// whose own comment warns the reader against multiplying wrong.
+			held := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+			if held < 0 {
+				held = 0
+			}
+			t.Logf("%s: %.0fx the body — %.0f MB churned, %.0f MB still held after "+
+				"one %d MiB request", c.name, ratio,
 				float64(after.TotalAlloc-before.TotalAlloc)/(1<<20),
-				float64(after.HeapSys)/(1<<20), len(b)>>20)
+				float64(held)/(1<<20), len(b)>>20)
 			if ratio > c.ceiling {
 				t.Errorf("%s: transient allocation is %.0fx the body, ceiling %.0fx",
 					c.name, ratio, c.ceiling)

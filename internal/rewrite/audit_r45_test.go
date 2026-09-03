@@ -256,19 +256,19 @@ func stripForJSONUnicodeR45(v []byte, mode ctlMode) normalised {
 		return stripForURL(v, mode)
 	}
 	dec := make([]byte, 0, len(v))
-	pos := make([]int, 0, len(v))
-	end := make([]int, 0, len(v))
+	pos := make([]int32, 0, len(v))
+	end := make([]int32, 0, len(v))
 	for i := 0; i < len(v); {
 		if c, k := jsonUnicodeAtR45(v[i:]); k > 0 {
 			dec = append(dec, c)
-			pos = append(pos, i)
-			end = append(end, i+k)
+			pos = append(pos, int32(i))
+			end = append(end, int32(i+k))
 			i += k
 			continue
 		}
 		dec = append(dec, v[i])
-		pos = append(pos, i)
-		end = append(end, i+1)
+		pos = append(pos, int32(i))
+		end = append(end, int32(i+1))
 		i++
 	}
 	return stripRemovals(dec, pos, end, mode)

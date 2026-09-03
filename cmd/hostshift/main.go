@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -424,6 +425,27 @@ func censusHookFor(log *slog.Logger, dryRun bool) func(string, origin.Event) {
 	}
 }
 
+// clampBody bounds --max-body at MaxInt32.
+//
+// A view's position map is int32, and offsets are within one buffered value — so
+// the guarantee that they cannot overflow has to be this clamp, not the 8 MiB
+// default. `--max-body` takes an int64 and caps the JSON and text/XML *response*
+// paths as well as request bodies, each of which hands the whole buffer to a
+// view. A wrapped-negative offset does not fail loudly either: one call site
+// checks `from < 0`, the rest either panic on a slice bound or silently skip the
+// host, which is a §4.3 leak with no log line.
+//
+// Unreachable in practice — a 2 GiB buffer needs ~18 GiB of RAM for one view and
+// OOMs first — which is exactly why it should be a clamp and not a comment.
+func clampBody(n int64, log *slog.Logger) int64 {
+	if n > math.MaxInt32 {
+		log.Warn("--max-body clamped: a buffered value's offsets are int32",
+			"asked", n, "using", int64(math.MaxInt32))
+		return math.MaxInt32
+	}
+	return n
+}
+
 func cmdProxy(args []string) (int, error) {
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	var c common
@@ -474,7 +496,7 @@ func cmdProxy(args []string) (int, error) {
 		StrictOrigins: *strict,
 		NoSweep:       *noSweep,
 		Compress:      *compress,
-		MaxBody:       *maxBody,
+		MaxBody:       clampBody(*maxBody, log),
 		Log:           log,
 	}
 

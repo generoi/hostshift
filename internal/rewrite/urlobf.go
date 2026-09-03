@@ -230,12 +230,135 @@ func isAuthorityByte(c byte) bool {
 }
 
 // normalised is v with the bytes the URL parser removes taken out, and a map
-// back to where each surviving byte came from.
+// back to where each surviving byte came from, so a rewrite can be spliced into
+// the original without re-serialising it.
+//
+// `pos` and `end` are int32, not int. They are offsets *within one value* — an
+// attribute value, a text token, a whole request body — and `--max-body` is
+// clamped to MaxInt32 so one cannot exceed what an int32 holds. That clamp is
+// the guarantee; the 8 MiB default is only a default, and `hostshift rewrite`
+// reads stdin with no cap at all.
+//
+// Two of these are built per view and several views run per value, so on a
+// 64-bit host halving them halves the dominant allocation — the views are ~76%
+// of it. Measured: the pathological composite fixture 391x the body to 217x, and
+// with a tab 445x to 248x; fifteen real captured pages, byte-weighted, 44.8x to
+// 26.6x; peak heap for one 7 MiB body 715 MB to 367 MB.
+//
+// It is not a latency win. `allocs/op` is unchanged — only the bytes moved — and
+// interleaved runs on one core measure −5% at the minimum and +0.2% at the
+// median, inside the noise. Where it pays is concurrency: eight concurrent 4 MiB
+// form posts peak at 638 MB instead of 1426 MB, and eight 7 MiB composites at
+// 2327 MB in 1.4 s instead of 4870 MB in 9.3 s.
+//
+// This is the lever the ceiling test's comment has named for several rounds. The
+// larger one is still untaken: the map carries one discontinuity every 62-189
+// bytes, so a run-length encoding costs ~0.1 B/byte instead of 4.
 type normalised struct {
-	b   []byte
-	pos []int // pos[i] is where b[i] came from in the original
-	end []int // end[i] is one past the *end* of what b[i] came from
+	b    []byte
+	runs []mapRun
+
+	// densePos/denseEnd are the old one-entry-per-byte map, recorded only when
+	// denseCheck is set. Nothing in production reads them; TestTheViewMapAnswers
+	// compares them against what the runs answer, which is the only thing
+	// standing between this compression and a splice landing on the wrong byte.
+	densePos []int32
+	denseEnd []int32
 }
+
+// mapRun is a stretch of view bytes that map to a contiguous stretch of source
+// bytes, one for one.
+//
+// The map used to be two int32 per view byte. Measured across the fifteen
+// captured pages it carries one discontinuity every 62 to 189 bytes, so almost
+// all of it was derivable: a run costs 16 bytes however long it is, which is
+// 0.06-0.20 B/byte against 8.
+//
+// A run is *simple* when `end == pos+n`, meaning byte k of it came from source
+// byte pos+k and is one byte wide. Anything else — a decoded escape, where one
+// view byte came from several source bytes — is its own run with n == 1 and an
+// explicit end.
+// Three fields, not four: the run's length is the next run's `view` minus this
+// one's, with the view length as the final sentinel, so storing it would be
+// storing the same number twice. 12 bytes against a dense map's 8 per *byte*,
+// which puts the crossover at 1.5 view bytes per run — real pages measure 272.
+type mapRun struct {
+	view  int32 // first view index in this run
+	pos   int32 // source offset that view byte came from
+	width int32 // for a simple run, equals its length; for a decoded escape, the
+	// source width of its single byte
+}
+
+// denseCheck makes the builders record the old dense map alongside the runs, for
+// the differential test. Off in production; it costs one predictable branch per
+// appended byte and no allocation.
+var denseCheck bool
+
+// push appends one view byte and the source range it came from, coalescing into
+// the current run where it can.
+func (n *normalised) push(c byte, pos, end int32) {
+	if denseCheck {
+		n.densePos = append(n.densePos, pos)
+		n.denseEnd = append(n.denseEnd, end)
+	}
+	if k := len(n.runs) - 1; k >= 0 {
+		r := &n.runs[k]
+		// Extend only a simple run, and only where this byte continues it: the
+		// next source byte, one byte wide. A decoded escape breaks the run by
+		// construction, which is what keeps `width` unambiguous.
+		if length := int32(len(n.b)) - r.view; r.width == length &&
+			pos == r.pos+length && end == pos+1 {
+			r.width++
+			n.b = append(n.b, c)
+			return
+		}
+	}
+	n.runs = append(n.runs, mapRun{view: int32(len(n.b)), pos: pos, width: end - pos})
+	n.b = append(n.b, c)
+}
+
+// runFor is the run covering view index i, and how long it is.
+func (n normalised) runFor(i int) (mapRun, int32) {
+	lo, hi := 0, len(n.runs)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if int(n.runs[mid].view) <= i {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return mapRun{}, 0
+	}
+	r := n.runs[lo-1]
+	next := int32(len(n.b))
+	if lo < len(n.runs) {
+		next = n.runs[lo].view
+	}
+	return r, next - r.view
+}
+
+// at and endAt are the only way the position map is read.
+//
+// Every caller went through `n.pos[i]` directly, which pinned the map to one
+// entry per view byte. Behind these two the storage is a run list, and the map
+// is the dominant allocation in the package — measured at ~76% of it.
+func (n normalised) at(i int) int32 {
+	r, _ := n.runFor(i)
+	return r.pos + int32(i) - r.view
+}
+
+func (n normalised) endAt(i int) int32 {
+	r, length := n.runFor(i)
+	if r.width == length {
+		return r.pos + int32(i) - r.view + 1
+	}
+	return r.pos + r.width
+}
+
+// length is the number of view bytes, which is what the map is indexed by.
+func (n normalised) length() int { return len(n.b) }
 
 // stripForURL removes what the parser removes before it parses: leading and
 // trailing C0 controls and spaces, then tab, LF and CR wherever they appear.
@@ -252,7 +375,7 @@ func stripForURL(v []byte, mode ctlMode) normalised {
 	for hi > lo && v[hi-1] <= 0x20 {
 		hi--
 	}
-	n := normalised{b: make([]byte, 0, hi-lo), pos: make([]int, 0, hi-lo), end: make([]int, 0, hi-lo)}
+	n := normalised{b: make([]byte, 0, hi-lo), runs: make([]mapRun, 0, 1+(hi-lo)/48)}
 	for i := lo; i < hi; {
 		if isURLStripped(v[i], mode) {
 			i++
@@ -264,9 +387,7 @@ func stripForURL(v []byte, mode ctlMode) normalised {
 				continue
 			}
 		}
-		n.b = append(n.b, v[i])
-		n.pos = append(n.pos, i)
-		n.end = append(n.end, i+1)
+		n.push(v[i], int32(i), int32(i+1))
 		i++
 	}
 	return n
@@ -290,23 +411,23 @@ func stripForRefs(v []byte, mode ctlMode) normalised {
 		return stripForURL(v, mode)
 	}
 	dec := make([]byte, 0, len(v))
-	pos := make([]int, 0, len(v))
-	end := make([]int, 0, len(v))
+	pos := make([]int32, 0, len(v))
+	end := make([]int32, 0, len(v))
 	for i := 0; i < len(v); {
 		if v[i] == '&' {
 			if c, n := parseURLRef(v[i:]); n > 0 {
 				for k := 0; k < len(c); k++ {
 					dec = append(dec, c[k])
-					pos = append(pos, i)
-					end = append(end, i+n)
+					pos = append(pos, int32(i))
+					end = append(end, int32(i+n))
 				}
 				i += n
 				continue
 			}
 		}
 		dec = append(dec, v[i])
-		pos = append(pos, i)
-		end = append(end, i+1)
+		pos = append(pos, int32(i))
+		end = append(end, int32(i+1))
 		i++
 	}
 	n := stripRemovals(dec, pos, end, mode)
@@ -380,8 +501,8 @@ func stripJSONEsc(v []byte, ctl bool, mode ctlMode) normalised {
 		return stripForURL(v, mode)
 	}
 	dec := make([]byte, 0, len(v))
-	pos := make([]int, 0, len(v))
-	end := make([]int, 0, len(v))
+	pos := make([]int32, 0, len(v))
+	end := make([]int32, 0, len(v))
 	for i := 0; i < len(v); {
 		if v[i] == '\\' && i+1 < len(v) {
 			// The letter spellings of the three the URL parser removes. Same
@@ -410,8 +531,8 @@ func stripJSONEsc(v []byte, ctl bool, mode ctlMode) normalised {
 			// too on the composed views, and decoding it costs nothing.
 			if v[i+1] == '/' {
 				dec = append(dec, '/')
-				pos = append(pos, i)
-				end = append(end, i+2)
+				pos = append(pos, int32(i))
+				end = append(end, int32(i+2))
 				i += 2
 				continue
 			}
@@ -423,8 +544,8 @@ func stripJSONEsc(v []byte, ctl bool, mode ctlMode) normalised {
 			if r, w, ok := jsEscAt(v[i:]); ok && ctl {
 				for k := 0; k < len(r); k++ {
 					dec = append(dec, r[k])
-					pos = append(pos, i)
-					end = append(end, i+w)
+					pos = append(pos, int32(i))
+					end = append(end, int32(i+w))
 				}
 				i += w
 				continue
@@ -437,8 +558,8 @@ func stripJSONEsc(v []byte, ctl bool, mode ctlMode) normalised {
 					// source bytes.
 					for k := 0; k < len(r); k++ {
 						dec = append(dec, r[k])
-						pos = append(pos, i)
-						end = append(end, i+6)
+						pos = append(pos, int32(i))
+						end = append(end, int32(i+6))
 					}
 					i += 6
 					continue
@@ -446,8 +567,8 @@ func stripJSONEsc(v []byte, ctl bool, mode ctlMode) normalised {
 			}
 		}
 		dec = append(dec, v[i])
-		pos = append(pos, i)
-		end = append(end, i+1)
+		pos = append(pos, int32(i))
+		end = append(end, int32(i+1))
 		i++
 	}
 	return stripRemovals(dec, pos, end, mode)
@@ -703,23 +824,23 @@ func stripForPercent(v []byte, mode ctlMode) normalised {
 		return stripForURL(v, mode)
 	}
 	dec := make([]byte, 0, len(v))
-	pos := make([]int, 0, len(v))
-	end := make([]int, 0, len(v))
+	pos := make([]int32, 0, len(v))
+	end := make([]int32, 0, len(v))
 	for i := 0; i < len(v); {
 		if v[i] == '%' && i+2 < len(v) {
 			hi, ok1 := digitVal(v[i+1], 16)
 			lo, ok2 := digitVal(v[i+2], 16)
 			if ok1 && ok2 {
 				dec = append(dec, byte(hi*16+lo))
-				pos = append(pos, i)
-				end = append(end, i+3)
+				pos = append(pos, int32(i))
+				end = append(end, int32(i+3))
 				i += 3
 				continue
 			}
 		}
 		dec = append(dec, v[i])
-		pos = append(pos, i)
-		end = append(end, i+1)
+		pos = append(pos, int32(i))
+		end = append(end, int32(i+1))
 		i++
 	}
 	n := stripRemovals(dec, pos, end, mode)
@@ -742,13 +863,13 @@ func stripForCSS(v []byte, mode ctlMode) normalised {
 		return stripForURL(v, mode)
 	}
 	dec := make([]byte, 0, len(v))
-	pos := make([]int, 0, len(v))
-	end := make([]int, 0, len(v))
+	pos := make([]int32, 0, len(v))
+	end := make([]int32, 0, len(v))
 	for i := 0; i < len(v); {
 		if v[i] != '\\' || i+1 >= len(v) {
 			dec = append(dec, v[i])
-			pos = append(pos, i)
-			end = append(end, i+1)
+			pos = append(pos, int32(i))
+			end = append(end, int32(i+1))
 			i++
 			continue
 		}
@@ -765,8 +886,8 @@ func stripForCSS(v []byte, mode ctlMode) normalised {
 		if digits == 0 {
 			// An escaped literal: the next character stands for itself.
 			dec = append(dec, v[i+1])
-			pos = append(pos, i)
-			end = append(end, i+2)
+			pos = append(pos, int32(i))
+			end = append(end, int32(i+2))
 			i += 2
 			continue
 		}
@@ -785,8 +906,8 @@ func stripForCSS(v []byte, mode ctlMode) normalised {
 		}
 		for _, c := range []byte(string(rune(val))) {
 			dec = append(dec, c)
-			pos = append(pos, i)
-			end = append(end, j)
+			pos = append(pos, int32(i))
+			end = append(end, int32(j))
 		}
 		i = j
 	}
@@ -808,8 +929,8 @@ func stripForCSS(v []byte, mode ctlMode) normalised {
 // every origin in that buffer: a Windows path in an `<desc>`, a `\201c` in a
 // stylesheet, a regex in a sitemap. The trigger is buffer-wide, and for the XML
 // entry points the buffer is the whole body.
-func stripRemovals(dec []byte, pos, end []int, mode ctlMode) normalised {
-	n := normalised{b: make([]byte, 0, len(dec)), pos: make([]int, 0, len(dec)), end: make([]int, 0, len(dec))}
+func stripRemovals(dec []byte, pos, end []int32, mode ctlMode) normalised {
+	n := normalised{b: make([]byte, 0, len(dec)), runs: make([]mapRun, 0, 1+len(dec)/48)}
 	for i := 0; i < len(dec); {
 		if isURLStripped(dec[i], mode) {
 			i++
@@ -821,9 +942,7 @@ func stripRemovals(dec []byte, pos, end []int, mode ctlMode) normalised {
 				continue
 			}
 		}
-		n.b = append(n.b, dec[i])
-		n.pos = append(n.pos, pos[i])
-		n.end = append(n.end, end[i])
+		n.push(dec[i], pos[i], end[i])
 		i++
 	}
 	return n
@@ -1290,8 +1409,8 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, 
 	// The byte matcher answers the same question at the same position, and round
 	// 53 gave it a second implementation that then drifted; both halves call
 	// origin.EscapeContinuesHost now.
-	if he < len(n.pos) && n.pos[he] < len(v) && v[n.pos[he]] == '\\' &&
-		origin.EscapeContinuesHost(v, n.pos[he], surface) {
+	if he < n.length() && int(n.at(he)) < len(v) && v[int(n.at(he))] == '\\' &&
+		origin.EscapeContinuesHost(v, int(n.at(he)), surface) {
 		return 0, 0, "", false
 	}
 	// A port written behind an escaped colon.
@@ -1303,9 +1422,9 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, 
 	// runs first wins, and the plain one does. Reading the port here makes both
 	// passes agree, and it has to be read rather than refused: `\x3a443` is
 	// https's default, which a browser drops, so that one *is* the canonical.
-	if port == "" && he < len(n.pos) && n.pos[he] < len(v) {
-		if w := origin.EscColonLen(v, n.pos[he], surface); w > 0 {
-			d := n.pos[he] + w
+	if port == "" && he < n.length() && int(n.at(he)) < len(v) {
+		if w := origin.EscColonLen(v, int(n.at(he)), surface); w > 0 {
+			d := int(n.at(he)) + w
 			e := d
 			for e < len(v) && v[e] >= '0' && v[e] <= '9' {
 				e++
@@ -1334,11 +1453,11 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, 
 	// So the answer comes from here, where every view already runs. Recording
 	// and declining leaves the buffer untouched, which is what a scan wants.
 	if h.collect != nil {
-		at := n.pos[hs]
+		at := n.at(hs)
 		if h.collect[host] == nil {
 			h.collect[host] = map[int]struct{}{}
 		}
-		h.collect[host][at] = struct{}{}
+		h.collect[host][int(at)] = struct{}{}
 		return 0, 0, "", false
 	}
 	// host:port first, and the bare host only when the port is the scheme's
@@ -1374,7 +1493,7 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, 
 	// Whatever the original spelled the host with — a tab, a reference, a
 	// percent escape — the replaced range covers all of it, because pos maps
 	// every surviving byte back and the removed ones lie between them.
-	from, until = n.pos[hs], n.end[he-1]
+	from, until = int(n.at(hs)), int(n.endAt(he-1))
 
 	// The port, and the scheme, when the variant's differ from what is written.
 	//
@@ -1421,12 +1540,12 @@ func (h *hostReplacer) locateHostIn(v []byte, n normalised, at int, value bool, 
 		// on whether the schemes agreed, against a contract this file states
 		// outright a hundred lines down.
 		if sep, ok := verbatimSep(v, n, at, hs); ok {
-			return n.pos[at], authorityEnd(n, he, end),
+			return int(n.at(at)), authorityEnd(n, he, end),
 				to.Scheme + sep + to.DisplayHostPort(), true
 		}
 		// Zero or one slash: there is no separator run to copy, so the target's
 		// own separator belongs — but the userinfo still does not disappear.
-		return n.pos[at], authorityEnd(n, he, end),
+		return int(n.at(at)), authorityEnd(n, he, end),
 			to.Scheme + schemeSepAt(v, n, at, hs) + userinfoAt(v, n, at, hs) +
 				to.DisplayHostPort(), true
 	case hasPort:
@@ -1461,10 +1580,10 @@ func userinfoAt(v []byte, n normalised, at, hs int) string {
 		for j < hs && j < len(n.b) && isSlashish(n.b[j]) {
 			j++
 		}
-		if j >= hs || hs >= len(n.pos) || n.pos[j] >= n.pos[hs] {
+		if j >= hs || hs >= n.length() || n.at(j) >= n.at(hs) {
 			return ""
 		}
-		return string(v[n.pos[j]:n.pos[hs]])
+		return string(v[n.at(j):n.at(hs)])
 	}
 	return ""
 }
@@ -1488,13 +1607,13 @@ func verbatimSep(v []byte, n normalised, at, hs int) (string, bool) {
 			}
 			slashes++
 		}
-		if slashes < 2 || hs >= len(n.pos) {
+		if slashes < 2 || hs >= n.length() {
 			return "", false
 		}
-		if n.pos[i] >= n.pos[hs] || n.pos[hs] > len(v) {
+		if int(n.at(i)) >= int(n.at(hs)) || int(n.at(hs)) > len(v) {
 			return "", false
 		}
-		return string(v[n.pos[i]:n.pos[hs]]), true
+		return string(v[n.at(i):n.at(hs)]), true
 	}
 	return "", false
 }
@@ -1521,8 +1640,8 @@ func schemeSepAt(v []byte, n normalised, at, hs int) string {
 		if n.b[i] != ':' {
 			continue
 		}
-		if len(v[n.pos[i]:n.end[i]]) == 3 {
-			if src := v[n.pos[i]:n.end[i]]; src[0] == '%' && src[1] == '3' &&
+		if len(v[n.at(i):n.endAt(i)]) == 3 {
+			if src := v[n.at(i):n.endAt(i)]; src[0] == '%' && src[1] == '3' &&
 				(src[2] == 'A' || src[2] == 'a') {
 				return "%3A%2F%2F"
 			}
@@ -1531,8 +1650,8 @@ func schemeSepAt(v []byte, n normalised, at, hs int) string {
 		// backslash anywhere in it is JSON's `\/` — the view cannot show this,
 		// because stripForURL reads a backslash as a slash and the escape
 		// disappears into the authority run.
-		if hs < len(n.pos) && n.end[i] <= n.pos[hs] {
-			if bytes.IndexByte(v[n.end[i]:n.pos[hs]], '\\') >= 0 {
+		if hs < n.length() && n.endAt(i) <= n.at(hs) {
+			if bytes.IndexByte(v[n.endAt(i):n.at(hs)], '\\') >= 0 {
 				return ":" + `\/` + `\/`
 			}
 		}
@@ -1549,9 +1668,9 @@ func isURLDelim(c byte) bool {
 
 func authorityEnd(n normalised, he, end int) int {
 	if end > he && n.b[he] == ':' {
-		return n.end[end-1]
+		return int(n.endAt(end - 1))
 	}
-	return n.end[he-1]
+	return int(n.endAt(he - 1))
 }
 
 // portOf reports the port text between the host end and the authority end.
@@ -1616,7 +1735,7 @@ func (w *HTML) foldedHostLeak(surface string, base int, v []byte, value bool) []
 		// segment rewritten, while the plain ASCII spelling of the same URL was
 		// correctly left alone. The two spellings disagreeing is the model error;
 		// the oracle's second half calls it a false positive.
-		if run-i < 2 || n.pos[i] < prev || !tokenBoundary(n.b, i) {
+		if run-i < 2 || int(n.at(i)) < prev || !tokenBoundary(n.b, i) {
 			i = run - 1
 			continue
 		}
@@ -1691,7 +1810,7 @@ func (w *HTML) normaliseURLLeakIn(surface string, base int, v []byte, value bool
 	var out []byte
 	prev := 0
 	for _, off := range urlTokenStarts(n.b) {
-		if off < len(n.pos) && n.pos[off] < prev {
+		if off < n.length() && int(n.at(off)) < prev {
 			continue // inside a host already replaced
 		}
 		from, until, repl, ok := w.hosts.locateHostIn(v, n, off, value, surface)
@@ -1999,7 +2118,7 @@ func (h *hostReplacer) spliceHostsLog(n normalised, v []byte, starts func([]byte
 	var events []origin.Event
 	prev := 0
 	for _, off := range starts(n.b) {
-		if off < len(n.pos) && n.pos[off] < prev {
+		if off < n.length() && int(n.at(off)) < prev {
 			continue
 		}
 		from, until, repl, ok := h.locateHostIn(v, n, off, value, surface)
@@ -2094,14 +2213,13 @@ func hasPercentCSSEsc(v []byte) bool {
 // clean.
 func composeView(outer normalised, f func([]byte, ctlMode) normalised, mode ctlMode) normalised {
 	inner := f(outer.b, mode)
-	n := normalised{
-		b:   inner.b,
-		pos: make([]int, len(inner.b)),
-		end: make([]int, len(inner.b)),
-	}
+	// Rebuilt through push rather than indexed, so the composition coalesces into
+	// runs like any other builder — a composed view is otherwise the one place
+	// that would keep a dense map alive.
+	n := normalised{b: make([]byte, 0, len(inner.b)), runs: make([]mapRun, 0, 1+len(inner.b)/48)}
 	for i := range inner.b {
-		from, until := inner.pos[i], inner.end[i]-1
-		if from < 0 || from >= len(outer.pos) {
+		from, until := int(inner.at(i)), int(inner.endAt(i))-1
+		if from < 0 || from >= outer.length() {
 			// An empty view, not `inner`. Returning inner was labelled "decline
 			// rather than corrupt" and did the opposite: inner's positions index
 			// the *intermediate* buffer, so spliceHostsLog would splice at
@@ -2115,10 +2233,10 @@ func composeView(outer normalised, f func([]byte, ctlMode) normalised, mode ctlM
 		if until < from {
 			until = from
 		}
-		if until >= len(outer.end) {
-			until = len(outer.end) - 1
+		if until >= outer.length() {
+			until = outer.length() - 1
 		}
-		n.pos[i], n.end[i] = outer.pos[from], outer.end[until]
+		n.push(inner.b[i], outer.at(from), outer.endAt(until))
 	}
 	return n
 }
