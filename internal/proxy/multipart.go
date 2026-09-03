@@ -241,6 +241,26 @@ func rewritablePart(headers []byte) bool {
 	if ctype == "" {
 		return true
 	}
+	// Derived from bodyKind rather than restated, so the two arms cannot drift.
+	//
+	// They already had. bodyKind was widened to route a top-level
+	// `application/xml`, `*+xml`, `image/svg+xml` and
+	// `application/x-www-form-urlencoded` body through the flat arm — its own
+	// comment says why, "the two directions must not disagree about the same
+	// body … an arm nobody enumerated" — and this list was left behind. So the
+	// same payload mapped back as a whole body and reached the application with
+	// the variant hostname in it as a multipart part. §4.3, unrecoverable, no
+	// warning. Round 75 measured all five part types against what the
+	// application received off disk.
+	//
+	// No browser produces such a part — a text field carries no Content-Type,
+	// and `FormData.append(name, blob)` makes a file part — but a scripted
+	// client does, and this file has now declared the same disagreement closed
+	// twice.
 	mt := strings.ToLower(mediaType(strings.TrimSpace(ctype)))
-	return strings.HasPrefix(mt, "text/") || mt == "application/json" || strings.HasSuffix(mt, "+json")
+	switch bodyKind(mt) {
+	case bodyOther, bodyMultipart:
+		return false
+	}
+	return true
 }

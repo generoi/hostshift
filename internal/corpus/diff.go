@@ -986,7 +986,16 @@ func WriteReport(w io.Writer, results []Result) bool {
 		// make a correct run red. What it is for is the case where it sees more
 		// than the engine did: that difference is the engine declining something,
 		// and the engine is the one witness that cannot report on itself.
-		if r.Literal > r.Leaks {
+		// Not on a Tier 2 body. countLeaks short-circuits at isTier2 and returns
+		// zero *before the engine runs at all*, so `Literal > Leaks` holds for
+		// every stylesheet carrying an origin — and the note would say "the engine
+		// declined this" when the engine was never asked. Round 75 measured it on
+		// a real deployment: all eight pointer hits were Tier 2 CSS, and eight of
+		// the ten Tier 2 origins were the same origins counted twice, while the
+		// declines this pointer exists to catch were zero. A check that fires on
+		// every page carrying the thing it is meant to be quiet about carries no
+		// information — the rule mayHoldSerialized's own comment states.
+		if r.Literal > r.Leaks && !isTier2(r.ContentType) {
 			notes = append(notes, fmt.Sprintf("a literal scan finds %d canonical "+
 				"origin(s) here and the engine reported %d — the difference is "+
 				"something the engine declined, and it cannot be the only witness "+
