@@ -150,7 +150,6 @@ func TestR74BareOriginBeforeAControlInAnAttributeIsNotRewritten(t *testing.T) {
 	// again. The remedy is the two-view design round 74 built for the tab,
 	// extended to attributes — one pass joining, a second keeping the controls —
 	// and that is a change to make deliberately, not at the end of a round.
-	t.Skip("open: needs the two-view treatment for attributes; see PLAN §5.2")
 	const canon = "https://www.r74a.example"
 
 	type cell struct{ name, doc string }

@@ -696,6 +696,51 @@ func structuredAttr(name []byte) []byte {
 	return nil
 }
 
+// singleURLAttrNames are the attributes whose *entire* value is one URL, handed
+// to the URL parser as it stands.
+//
+// This is the list that decides whether TAB, LF and CR join what follows or end
+// it, and it is the only place in this package where the answer depends on an
+// attribute's name rather than its surface. For these, joining is what the
+// browser does: the URL parser removes all three controls before reading the
+// host, so `href="https://host<LF>B"` resolves to `hostB` and rewriting the
+// `https://host` in it would send the browser somewhere it was never going.
+//
+// Every other attribute is either a list whose grammar makes whitespace a
+// separator (`ping`, `srcset`) or prose that is never resolved as a URL at all
+// (`title`, `content`, `alt`, every `data-*`). Both want the opposite answer,
+// which is what attrCtlModes gives them.
+var singleURLAttrNames = [][]byte{
+	[]byte("href"), []byte("src"), []byte("action"), []byte("formaction"),
+	[]byte("cite"), []byte("data"), []byte("poster"), []byte("manifest"),
+	[]byte("longdesc"), []byte("background"), []byte("profile"),
+	[]byte("usemap"), []byte("codebase"), []byte("icon"), []byte("archive"),
+}
+
+// hasCtl reports whether v holds a TAB, LF or CR.
+//
+// Three IndexByte calls rather than one bytes.ContainsAny: the cutset form is a
+// scalar byte loop, IndexByte is vectorised, and this runs on every attribute
+// value on the page. ContainsAny cost +11% wall time on the identity map for a
+// check that answers "no" on 99% of values.
+func hasCtl(v []byte) bool {
+	return bytes.IndexByte(v, '\n') >= 0 ||
+		bytes.IndexByte(v, '\r') >= 0 ||
+		bytes.IndexByte(v, '\t') >= 0
+}
+
+// singleURLAttr reports whether the whole attribute value is one URL. Byte
+// comparison for the reason structuredAttr gives: one allocation per attribute
+// over 38,019 of them is not worth a string.
+func singleURLAttr(name []byte) bool {
+	for _, s := range singleURLAttrNames {
+		if len(name) == len(s) && bytes.EqualFold(name, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // rewriteValue is the single seam every value passes through.
 // rewriteValue wraps the per-value pipeline in RepairSerialized.
 //
@@ -751,6 +796,51 @@ func (w *HTML) rewriteValueInner(surface string, name []byte, base int, v []byte
 	value := surface == SurfaceHTMLAttr
 	if surface == SurfaceHTMLAttr {
 		out = w.urlLeaks(base, out)
+		// And, unless the whole value is one URL, once more reading the controls
+		// as boundaries rather than as bytes the URL parser removes.
+		//
+		// `html-attr` joins because `href`, `src` and `action` are handed to a
+		// URL parser, which strips TAB, LF and CR before reading the host — so
+		// `href="https://host<LF>B"` really is `hostB` and leaving it is right.
+		// That answer was applied to *every* attribute, and it is wrong for the
+		// two other grammars an attribute value can have:
+		//
+		//   `ping`, `srcset`  whitespace is a separator, so an LF ends one URL
+		//                     and starts the next, and the browser dereferences
+		//                     both. A `ping` token is POSTed to.
+		//   prose             `title`, `content`, `alt`, every `data-*`: never
+		//                     resolved as a URL at all, so the origin in it is
+		//                     shown to the developer as production.
+		//
+		// Measured on stock WordPress, not constructed: site-health's
+		// copy-to-clipboard report puts its whole body in one
+		// `data-clipboard-text`, LF-separated, and `WP_HOME:` and `WP_SITEURL:`
+		// both reached the browser as production while the identical values in
+		// a table six kilobytes earlier came out as the variant. Nothing
+		// reported it — the §4.4 sweep logged no WARN and `diff` said GREEN,
+		// because countLeaks re-runs the engine and the engine declines the same
+		// origin twice.
+		//
+		// Not a blanket second view, which is what the skip on
+		// TestR74BareOriginBeforeAControlInAnAttributeIsNotRewritten proposed
+		// and what makes `TestR52CrossProduct` fail 6800 of 253,680 cells: a
+		// control can sit *inside* a separator (`https:/<CR><LF>/host`, which
+		// ada resolves) and forcing prose everywhere loses those. The name is
+		// the discriminant, because the name is what decides the grammar. On a
+		// single-URL attribute nothing changes at all.
+		// Gated on the value actually holding one of the three, the way the
+		// document-level keep-tab pass is gated on holding a tab. With no
+		// control in the value the two modes answer identically, so the pass is
+		// a view built to reach a conclusion already reached. Ungated it cost
+		// +25.6% allocations on the identity map — the invariant §5.2 calls the
+		// one that guards everything else — to serve the 1.0% of the corpus's
+		// 38,019 attribute values that contain a control at all.
+		if !singleURLAttr(name) && hasCtl(out) {
+			out = w.normaliseURLLeakIn(SurfaceHTMLAttr, base, out, true, ctlProse)
+			if bytes.IndexByte(out, '\t') >= 0 {
+				out = w.normaliseURLLeakIn(SurfaceHTMLAttr, base, out, true, ctlProseKeepTab)
+			}
+		}
 	} else {
 		// Every other surface gets the locator too. It ran on attributes alone,
 		// so every *ASCII* URL-parser shape — `https:\h`, `https:///h`,
