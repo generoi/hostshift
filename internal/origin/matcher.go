@@ -54,14 +54,27 @@ func (e encoding) relSep() string {
 
 // hostPort renders host[:port] for this encoding. Only the port colon needs
 // encoding; hosts are ASCII after punycode.
+// hostPort renders an origin as replacement text, in the spelling it was
+// declared with. §5.5: compare on punycode, preserve the original form on
+// output — this is the output side, and the patterns above are the comparison
+// side, which stays on Host.
 func (e encoding) hostPort(o Origin) string {
+	// Brackets for an IPv6 literal — url.Hostname() strips them on the way in,
+	// and without them the replacement is a URL ada refuses to parse at all.
+	h := o.Host
+	if o.Display != "" {
+		h = o.Display
+	}
+	if strings.ContainsRune(h, ':') {
+		h = "[" + h + "]"
+	}
 	if o.Port == "" {
-		return o.Host
+		return h
 	}
 	if e == encPercent {
-		return o.Host + "%3A" + o.Port
+		return h + "%3A" + o.Port
 	}
-	return o.Host + ":" + o.Port
+	return h + ":" + o.Port
 }
 
 // pattern is one automaton entry: a left-anchored origin prefix plus a host.
@@ -113,11 +126,43 @@ type Matcher struct {
 // construction its Build costs.
 var acFinder func(*Matcher, []byte) func() (candidate, bool)
 
+// maxRemovedRun bounds how far hostTerminated will walk over characters the URL
+// parser removes before it gives up and asks at that position.
+//
+// The bound is what makes the answer independent of where a read boundary fell.
+// Round 54 replaced the one-byte delimiter with a *run*, and neither the run nor
+// `\u{...}`'s width had a limit — so the same body was rewritten or not
+// depending on where the 32 KiB chunk ended, which is the failure RewritePrefix's
+// comment on prev calls "not optional" from the other side. Both paths stop at
+// the same byte now, so both give the same answer; that matters more than which
+// answer it is, and stopping declines, which is the safe direction.
+//
+// 64 is far past anything a producer emits — a minifier writes one `\t`, not
+// twenty — and small enough to stay inside the carry-over window below.
+const maxRemovedRun = 64
+
 // MaxMatchLen is the longest run of bytes a single match can span: the longest
 // pattern, plus room for a trailing root dot, ":port" and the delimiter that
 // terminates it. The streaming straggler sweep uses it to size its carry-over
 // window, so that no match can straddle a chunk boundary.
-func (m *Matcher) MaxMatchLen() int { return m.maxPat + 16 }
+//
+// The terminator is a run rather than a byte since round 54, so the window has
+// to cover it: without maxRemovedRun here the sweep decided a match on bytes
+// that had not arrived.
+//
+// And it has to cover every *escape* the decision reads, which round 56 widened
+// without widening this. The port separator may be an escaped colon
+// (escColonLen), and the delimiter after the removable run may be an escape too
+// (escTerminates) — each up to maxBraceEsc, because JavaScript admits unlimited
+// leading zeros. So the decision reads up to a root dot, a brace-escaped colon,
+// its digits, the removable walk and one more brace escape, against the 16 bytes
+// of slack this line used to promise. Measured before the fix: the same body
+// rewrote or did not depending on where the read boundary fell, which is the
+// exact failure maxRemovedRun's comment claims to have closed — and silently,
+// because the sweep is the thing that warns about stragglers.
+func (m *Matcher) MaxMatchLen() int {
+	return m.maxPat + 16 + maxRemovedRun + 2*maxBraceEsc
+}
 
 // NewMatcher builds the automaton for a set of canonical→variant pairs.
 func NewMatcher(pairs []Pair) (*Matcher, error) {
@@ -235,9 +280,15 @@ func (m *Matcher) Identity() bool { return m.ident }
 // substring ban: it is that running this automaton over each *variant* origin
 // yields zero matches. That is what permits a variant host to contain a
 // canonical host, which the leftmost-label prefix scheme requires.
+type hostTarget struct {
+	to   Origin
+	name string
+}
+
 func (m *Matcher) Validate() error {
 	seen := map[Origin]string{}
 	rev := map[Origin]string{}
+	byHost := map[string]hostTarget{}
 	for _, p := range m.pairs {
 		if prev, dup := seen[p.Canonical]; dup {
 			return fmt.Errorf("origin: canonical %s declared by both %q and %q", p.Canonical, prev, p.Name)
@@ -252,6 +303,24 @@ func (m *Matcher) Validate() error {
 			return fmt.Errorf("origin: variant %s produced by both %q and %q — map is not injective", p.Variant, prev, p.Name)
 		}
 		rev[p.Variant] = p.Name
+
+		// One canonical *host* cannot map two ways.
+		//
+		// The scan deliberately ignores the scheme when choosing a pair, and the
+		// rewriter's host table is keyed on host:port with the scheme discarded,
+		// so a map declaring http://h → one and https://h → two is a
+		// configuration the engine cannot represent. It accepted it and reported
+		// "injective and anchored": the byte matcher then sent both spellings to
+		// whichever pair came first, and the locator sent them to whichever was
+		// written last — two blogs' content served from each other's worktree,
+		// with the two halves of the engine disagreeing about which.
+		if prev, dup := byHost[p.Canonical.HostPort()]; dup && prev.to != p.Variant {
+			return fmt.Errorf(
+				"origin: canonical host %s maps to both %s (%q) and %s (%q) — "+
+					"the scan does not distinguish schemes, so only one can win (PLAN §5.4)",
+				p.Canonical.HostPort(), prev.to, prev.name, p.Variant, p.Name)
+		}
+		byHost[p.Canonical.HostPort()] = hostTarget{to: p.Variant, name: p.Name}
 	}
 	if m.ident {
 		return nil // an identity map is trivially anchored against itself
@@ -282,12 +351,22 @@ const (
 	ActionRewrote = "rewrote"
 	ActionSkipped = "skipped"
 
-	ReasonNotAURL       = "not-a-url"       // no delimiter after the host: it is a longer host, or prose
-	ReasonHostNotInMap  = "host-not-in-map" // anchored origin, but its port makes it a different origin
-	ReasonIdentityMap   = "identity-map"    // canonical == variant, so there is nothing to change
-	ReasonUnanchored    = "unanchored"      // protocol-relative match that is a path segment, not an origin
-	ReasonSelfRedirect  = "self-redirect"   // PLAN §4.4 / test 32, used by the proxy
-	ReasonSizeCap       = "size-cap-exceeded"
+	ReasonNotAURL      = "not-a-url"       // no delimiter after the host: it is a longer host, or prose
+	ReasonHostNotInMap = "host-not-in-map" // anchored origin, but its port makes it a different origin
+	ReasonIdentityMap  = "identity-map"    // canonical == variant, so there is nothing to change
+	ReasonUnanchored   = "unanchored"      // protocol-relative match that is a path segment, not an origin
+	ReasonSelfRedirect = "self-redirect"   // PLAN §4.4 / test 32, used by the proxy
+	ReasonSizeCap      = "size-cap-exceeded"
+	ReasonAttachment   = "attachment" // a download: its hostnames outlive this machine
+	// ReasonEventStream: an event stream is unbounded, so buffering it to
+	// rewrite it is the one thing it must not do (PLAN §5.8). The origins in it
+	// go out as written; this makes that visible to --explain instead of leaving
+	// the response with no record at all.
+	ReasonEventStream = "event-stream"
+	// ReasonSerialized: a PHP-serialized payload is length-prefixed, so a
+	// rewrite that changes a byte count leaves `s:33:` over a 24-byte string and
+	// PHP refuses the whole structure.
+	ReasonSerialized    = "serialized"
 	ReasonNotDecodable  = "encoding-not-decodable"
 	ReasonDepthExceeded = "depth-limit"
 )
@@ -315,14 +394,226 @@ type Event struct {
 // untouched and the delivered policy named only the canonical host, blocking
 // every resource on the variant. ')' closes `@import url(…)`. ']' and '|' and
 // '=' were missing too. Asking what a hostname *can* contain has no tail.
+// IsHostByte is exported so the locator's authority scan can be defined in terms
+// of it rather than repeating it. Round 54 taught delimAt that `&` continues a
+// host and left rewrite.isAuthorityByte stopping there, so the locator rewrote
+// what the matcher had just declined — the same two-copies drift the escape
+// alphabet was consolidated to end, in the table next door.
+func IsHostByte(c byte) bool { return isHostByte(c) }
+
 func isHostByte(c byte) bool {
 	switch {
 	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
 		return true
 	case c == '-' || c == '.' || c == '_':
 		return true
+	// Non-ASCII is a host byte, because an IDN label is made of it. Treating it
+	// as a terminator meant a canonical host followed by any non-ASCII character
+	// matched its ASCII prefix and was rewritten in place — and the whole host is
+	// then a *different* host: `https://www.example.fi—now` resolves to
+	// www.example.xn--finow-5u3b, not the canonical, so rewriting it changed a
+	// URL that never pointed at production, and `https://www.example.fi。:80`
+	// came out as a mangled `variant。:80`. Leaving them to the fold pass, which
+	// folds the whole host and checks the port, gets all of them right.
+	case c >= 0x80:
+		return true
 	}
 	return false
+}
+
+// escAlphabet is which string-escape alphabet the surface's own decoder applies
+// to a backslash before the URL parser ever sees the value.
+//
+// A backslash means two different things and the byte cannot tell which. In an
+// HTML attribute, a header, prose, or any value a decoder has already unquoted,
+// it is a *path separator*: WHATWG folds it to '/', so it ends the host. In a
+// buffer still carrying its source escapes — an inline <script>, a JSON body
+// still spelling `https:\/\/`, the straggler sweep — it opens JavaScript's
+// alphabet, which is
+// JSON's plus `\xNN`, `\u{...}`, legacy octal, and the rule that an unrecognised
+// escape stands for the character itself: `\A` is `A`, which is more host.
+//
+// Round 53 taught the boundary test one alphabet and applied it everywhere, so
+// the same document was read as JSON in an attribute (finding 4: a live origin
+// in a plain <a href> left unrewritten) and as JSON-only in a script (findings 2
+// and 3: `\xe4` and `\x09` read as boundaries, so a URL that never pointed at
+// production was rewritten and the variant went out glued to a letter). PLAN
+// §5.2 recorded a surface-aware view as "not needed until now"; this is now.
+type escAlphabet int
+
+const (
+	// escPath: a backslash is a path separator and ends the host.
+	escPath escAlphabet = iota
+	// escJS: JSON's alphabet plus `\xNN`, `\u{...}`, legacy octal, and `\c` -> c.
+	escJS
+)
+
+// escapeAlphabetFor maps a surface to the alphabet its decoder runs.
+//
+// escPath is the positive list because the buffers that have *already* been
+// unquoted are the enumerable ones: an attribute value, a header, a request
+// line, a decoded form field, a run of prose. Everything else the engine looks
+// at is source bytes with their escapes intact — an inline script or style, the
+// JSON body still spelling `https:\/\/`, the straggler sweeping
+// all of them at once — and there is no end to that list to enumerate.
+//
+// Callers holding a value some other decoder already unquoted name it with
+// bareSurface, which is how RepairSerialized's two sites say "no escapes left"
+// even though the payload around them is JSON.
+//
+// The names are literals rather than rewrite's Surface constants because that
+// package imports this one. rewrite.TestSurfaceNamesAreKnownHere pins them, so a
+// renamed surface fails a test here rather than silently falling to the default.
+// surfaceJoinsControls reports whether something on this surface will hand the
+// buffer to a URL parser, which is what decides whether a tab, LF or CR after a
+// host joins what follows or ends it.
+//
+// This is the discriminant, and rounds 70 and 71 found it twice by getting it
+// wrong. Round 70 used "is this one value or is it prose", which is a different
+// question: JSON never carries a raw newline — it carries `\n` — so the block
+// editor's own wire format kept leaking, and an inline `<script>` is scanned as
+// prose while its string literals really are parsed as URLs, so making a raw
+// newline a boundary there broke §5.5's case in a template literal.
+//
+// A value, a header, a request line, a CSS `url()` and a script's string
+// literals are all parsed as URLs, so a control in them is removed before the
+// host is read: `https://www.example.fi<TAB>x` is the host `www.example.fix`.
+// Prose is everything else — a text node, a comment, a raw-text element, a
+// request body, a JSON string holding a document — where a control is a line
+// break or a column separator and the origin before it is the whole origin.
+//
+// An explicit table, not a negative test, for the reason escapeAlphabetFor's
+// comment gives at length: a hand-written list is what failed here twice, and
+// rewrite.TestSurfaceNamesAreKnownHere reads the names out of the source and
+// pins this axis with the others.
+func surfaceJoinsControls(surface string) bool {
+	switch surface {
+	case "html-attr", "html-entity", "html-obfuscated",
+		"inline-script", "inline-style", "json-escape",
+		"header", "response-header", "request-line":
+		return true
+	case "text", "xml-text", "comment", "raw-text",
+		"request-body", "json-string":
+		return false
+	case "sweep":
+		// The sole-pass sweep. See rewrite.SurfaceSweep: with nothing in front
+		// of it, URL semantics decline an origin no other pass will look at.
+		return false
+	case "straggler":
+		// The sweep is a byte matcher with no surface, running behind every
+		// structured pass. Reading prose here would let it rewrite what the
+		// structured pass deliberately declined — measured: it re-rewrote
+		// `fetch("https://www.example.fi<TAB>x")` that the script surface had
+		// correctly left alone. It joins, so it can only ever be more
+		// conservative than the pass it backs up.
+		return true
+	}
+	// An unknown surface reads as prose, which rewrites more rather than less.
+	// Declining is what leaked in both directions in rounds 70 and 71.
+	return false
+}
+
+// SurfaceJoinsControls is surfaceJoinsControls for the surface-name pin test.
+//
+// Callers deciding what to do with an actual buffer want JoinsControlsIn: on
+// `json-string` this answer is only half of it, and round 72 measured the two
+// halves disagreeing about one document — the byte matcher asking per buffer
+// while the locator asked the table.
+func SurfaceJoinsControls(surface string) bool { return surfaceJoinsControls(surface) }
+
+// JoinsControlsIn is joinsControlsIn for the views, which have to answer the
+// same question about the same buffer that the byte matcher answered.
+func JoinsControlsIn(surface string, b []byte) bool { return joinsControlsIn(surface, b) }
+
+// joinsControlsIn is surfaceJoinsControls, except that a JSON string has to be
+// asked about itself.
+//
+// The surface cannot answer for JSON, because both measured cases arrive on it
+// and they need opposite answers. Round 54: `{"u":"https://www.example.fi\tx"}`
+// is a field holding one URL, a browser assigning it resolves `www.example.fix`,
+// and rewriting it changes a value that names nothing in the map. Round 71:
+// `{"content":"…curl https://<variant>\nnext line here…"}` is the block editor
+// posting a document, where `\n` is a line break and the origin before it went
+// into a shared production database.
+//
+// The discriminant is a literal space, or a second `://`. A lone URL field has
+// neither; a document — post content, a CSS blob, a title, a newline-separated
+// list — has one almost by definition.
+//
+// It is a heuristic and it is named as one. The residue it still gets wrong is a
+// single URL followed by a control and a bare word, with no space anywhere in
+// the value: that is read as one URL and its origin declined. Both directions of
+// getting this wrong have been measured against a real WordPress, which is why
+// the rule is here rather than a guess.
+func joinsControlsIn(surface string, b []byte) bool {
+	// Both JSON surfaces: `json-string` is the raw span and `json-escape` is the
+	// same value after jsontext unquoted it, so they are one question asked of
+	// two spellings of one buffer. Round 72 measured a reference-encoded origin
+	// at a line end surviving in `content.rendered` because only the raw span was
+	// asked.
+	if surface != "json-string" && surface != "json-escape" {
+		return surfaceJoinsControls(surface)
+	}
+	// The span arrives with its quotes on, which is how the tokenizer hands it
+	// over — reading past them is the difference between "this field is a URL"
+	// and "this field is prose", and getting it wrong here re-broke round 54.
+	t := bytes.Trim(b, `"`)
+	if bytes.IndexByte(t, ' ') >= 0 {
+		return false
+	}
+	// A second scheme means a second URL, so this is a list and the control
+	// between them is what separates them. Counted on the scheme rather than on
+	// `://`, because the separator has as many spellings as §4.4 enumerates —
+	// the payload round 72 measured spells it `:\/\/`. A query parameter
+	// carrying another URL counts twice too, which reads the value as prose and
+	// rewrites more; that is the direction to fail in.
+	if bytes.Count(bytes.ToLower(t), []byte("http")) > 1 {
+		return false
+	}
+	if len(t) > 8 {
+		t = t[:8]
+	}
+	l := bytes.ToLower(t)
+	return bytes.HasPrefix(l, []byte("http")) || bytes.HasPrefix(l, []byte("//"))
+}
+
+func escapeAlphabetFor(surface string) escAlphabet {
+	switch surface {
+	case "html-attr", "text", "xml-text", "comment", "header", "response-header",
+		"request-line", "request-body":
+		return escPath
+	// The three round 54 missed, and they are all attribute values or markup.
+	//
+	// `html-obfuscated` and `html-entity` are `<a href>` after the reference
+	// decode, and `raw-text` is what is inside <noscript>, <iframe>, <textarea>
+	// and <title> — markup, which no string decoder touches. Giving them
+	// JavaScript's alphabet meant the same `<a href>` was read as a path by the
+	// first pass and as a script by the fallback, and the fallback is the only
+	// pass that can see an obfuscated separator: `https:\\www.example.fi\wp-admin/`
+	// is www.example.fi to a browser and went out live and uncounted.
+	//
+	// 82 leaks, all of them introduced by the fix that was supposed to close
+	// this class. The list was hand-written and six names long against fourteen
+	// the caller can pass; rewrite.TestSurfaceNamesAreKnownHere now reads the
+	// names out of the source instead of repeating them, because a hand-written
+	// list is what failed here twice.
+	case "html-entity", "html-obfuscated", "raw-text":
+		return escPath
+	// `json-escape` is what RepairSerialized labels a value it has already run
+	// through jsontext.AppendUnquote — one line above the bareSurface(true) that
+	// exists for exactly this. `json-string` is the raw buffer and keeps escJS.
+	case "json-escape":
+		return escPath
+	// A stylesheet spells its escapes in hex — `\3a ` is a colon, `\2f ` a slash
+	// — and reading `\2f ` as JavaScript's legacy octal makes it U+0002, which is
+	// not a delimiter, so the whole origin goes out unrewritten. That is test 28,
+	// not a safe decline. stripForCSS knows the CSS alphabet and has already
+	// decoded it into the view by the time the guard runs; escPath is how the
+	// guard says "the view decided this, leave it alone".
+	case "inline-style":
+		return escPath
+	}
+	return escJS
 }
 
 // delimAt implements PLAN §4.4's right-hand anchor: a match is only an origin if
@@ -337,9 +628,18 @@ func isHostByte(c byte) bool {
 // registrable domain, which this code correctly refuses when the dot is
 // written literally. Treating '%' as an unconditional terminator rewrote it.
 // So the escape is decoded and the same question asked of the byte it denotes.
-func delimAt(b []byte, i int) bool {
+func delimAt(b []byte, i int, esc escAlphabet, joins bool) bool {
 	if i >= len(b) {
 		return true
+	}
+	// '@' is not one. It is not a host byte, so it read as a delimiter and
+	// terminated the match — but in a URL '@' *starts* userinfo, so what
+	// precedes it is credentials and the real host comes after:
+	// https://www.example.fi@evil.com names evil.com, not the canonical, and
+	// rewriting it changed bytes on a value that never pointed at production.
+	// §4.4's delimiter list does not include it either.
+	if b[i] == '@' {
+		return false
 	}
 	if b[i] == '%' {
 		if c, ok := unhex(b, i+1); ok {
@@ -347,7 +647,376 @@ func delimAt(b []byte, i int) bool {
 		}
 		return true // a stray '%' is not a host byte either
 	}
+	// An ampersand does not end a host, in either reading of it.
+	//
+	// Raw, it is not a URL delimiter — a host ends at `/ \ ? #` — so
+	// `https://www.acme.fi&x` names `www.acme.fi&x`. As a character reference it
+	// is whatever it decodes to, and `&#65;` is `A`, `&period;` a dot; both
+	// continue the host. Either way the match is a prefix of a longer name, and
+	// the locator's reference view already concludes exactly that once it has
+	// decoded. Declining is also the safe direction: it can stop a rewrite,
+	// never invent one.
+	if b[i] == '&' {
+		return false
+	}
+	// A backslash inside a JSON string introduces an escape, and the character
+	// it stands for is what follows the host.
+	//
+	// Read as a plain delimiter, `{"u":"https:\/\/www.acme.fi\u00a0x"}` matched
+	// `www.acme.fi` and was rewritten — but `wp_json_encode` writes every
+	// non-ASCII rune that way, so this is an ordinary non-breaking space after
+	// the site's own URL, and ada resolves the decoded form to a parse error or
+	// to `www.acme.xn--fix-rla`, never to the canonical origin. The oracle's own
+	// contract is that a reference resolving anywhere else must not be touched.
+	//
+	// Worse than a false positive: the browser decodes the escape, so what the
+	// page then posts back is the variant host followed by a letter, which the
+	// reverse direction reads correctly and finds no origin in — the variant
+	// hostname is written into the shared database and stays there.
+	//
+	// `\/` still terminates, because it decodes to a slash. It is the escapes
+	// that decode to *host* bytes that continue the host.
+	if b[i] == '\\' && esc != escPath {
+		if term, ok := escTerminates(b, i, joins); ok {
+			return term
+		}
+	}
 	return !isHostByte(b[i])
+}
+
+// escTerminates reports whether the string escape at b[i] ends the host, and
+// whether b[i] opens an escape at all.
+//
+// It takes no alphabet because delimAt calls it only on an escPath-free surface,
+// where the alphabet is JavaScript's: JSON's escapes are a subset of it, and a
+// spelling JSON cannot write is not valid JSON anyway. The surface question is
+// asked once, in delimAt, rather than again here.
+//
+// Only a decoded *delimiter* ends it — `/`, `\`, `?`, `#`, `:`. Everything else
+// continues the host, and the ways it can are all the same defect:
+//
+//   - a letter or a non-ASCII byte simply is more host, which is how
+//     `wp_json_encode`'s `ä` made `www.acme.fi x` match a canonical
+//     the browser never resolves;
+//   - a control the URL parser *strips* joins what follows to what precedes, so
+//     `www.example.fi\tx` is the host `www.example.fix` — those are reported as
+//     non-terminating here and skipped over by hostTerminated, which is the only
+//     caller that can see what comes after them;
+//   - and any other control makes the URL unparseable, which resolves to
+//     nothing at all.
+//
+// In every one of those the reference is not this origin, and rewriting it is a
+// byte changed for no reason — or, on the way back, a variant hostname written
+// into the shared database.
+func escTerminates(b []byte, i int, joins bool) (bool, bool) {
+	if i+1 >= len(b) {
+		return false, false
+	}
+	term := func(c byte) (bool, bool) {
+		switch c {
+		case '/', '\\', '?', '#', ':':
+			return true, true
+		}
+		return false, true
+	}
+	c := b[i+1]
+	switch c {
+	case '/', '\\', '"':
+		return term(c)
+	case 'n', 'r', 't', 'b', 'f':
+		// In a value these decode to bytes the URL parser removes, so the host
+		// runs on. In prose — a JSON string holding `post_content`, which is how
+		// the block editor posts a document — `\n` is a line break and the host
+		// ended at it. Round 71 read variant hostnames out of `wp_posts` through
+		// this branch, which round 70's fix reached only in its literal spelling.
+		return !joins, true
+	case 'u':
+		// `\u{...}` is JavaScript's spelling and has no fixed width.
+		if i+2 < len(b) && b[i+2] == '{' {
+			n, _, ok := braceEscAt(b, i)
+			if !ok {
+				// An escape we decline to read, not "no escape here". Reported
+				// as absent, the backslash falls through to "not a host byte",
+				// which makes it a *delimiter* and accepts the match.
+				return false, true
+			}
+			if n >= 0x80 {
+				return false, true
+			}
+			return term(byte(n))
+		}
+		if i+6 > len(b) {
+			return false, false
+		}
+		n, ok := hexRun(b, i+2, i+6)
+		if !ok {
+			return false, false
+		}
+		if n >= 0x80 {
+			return false, true
+		}
+		return term(byte(n))
+	}
+	switch {
+	// `\xNN` — what a minifier run with `ascii_only` writes for every byte
+	// above 0x7E, which is the same IDN authority round 53 widened `ä` for.
+	case c == 'x':
+		if i+4 > len(b) {
+			return false, false
+		}
+		n, ok := hexRun(b, i+2, i+4)
+		if !ok {
+			return false, false
+		}
+		if n >= 0x80 {
+			return false, true
+		}
+		return term(byte(n))
+	// Legacy octal, up to three digits.
+	case c >= '0' && c <= '7':
+		n, j := 0, i+1
+		for j < len(b) && j < i+4 && b[j] >= '0' && b[j] <= '7' {
+			n = n<<3 | int(b[j]-'0')
+			j++
+		}
+		if n >= 0x80 {
+			return false, true
+		}
+		return term(byte(n))
+	}
+	// An escape JavaScript does not recognise stands for the character itself:
+	// `\A` is `A`, `\U0041` is `U` followed by four literal digits. Both are
+	// host bytes, so the host runs on — which is the answer that declines.
+	return term(c)
+}
+
+// maxBraceEsc bounds the `\u{...}` scan. The bound is on the *scan*, not on the
+// value: it keeps the walk linear, which is what the unbounded version cost —
+// 410 KB of `\u{` with no closing brace took 7.1 seconds.
+const maxBraceEsc = 72
+
+// braceEscAt decodes JavaScript's `\u{...}` at b[i], returning the code point
+// and the escape's width.
+//
+// Leading zeros are unlimited: `CodePoint :: HexDigits` admits any number of
+// them, so `\u{0000002f}` is `/`. Round 55 stopped the scan after six hex
+// digits on the argument that six is "every code point there is" — six is every
+// code point *value*, and the escape is a different length from the number it
+// spells. Past the bound the escape was reported as unreadable, which declines,
+// so `fetch("https://www.example.fi\u{0000002f}x")` — www.example.fi to a
+// browser — stopped being rewritten and became a live production origin in the
+// preview. The digit limit belongs after the zeros are skipped.
+func braceEscAt(b []byte, i int) (int, int, bool) {
+	j := i + 3 // past `\u{`
+	zeros := 0
+	for j < len(b) && j-i < maxBraceEsc && b[j] == '0' {
+		j++
+		zeros++
+	}
+	n, digits := 0, 0
+	for j < len(b) && j-i < maxBraceEsc {
+		d, ok := hexVal(b[j])
+		if !ok {
+			break
+		}
+		// Six significant digits is 0xFFFFFF, past the last code point; a
+		// seventh cannot be one whatever it spells.
+		if digits == 6 {
+			return 0, 0, false
+		}
+		n = n<<4 | int(d)
+		digits++
+		j++
+	}
+	if j >= len(b) || b[j] != '}' || (digits == 0 && zeros == 0) {
+		return 0, 0, false
+	}
+	if n > 0x10FFFF {
+		return 0, 0, false
+	}
+	return n, j + 1 - i, true
+}
+
+// hexRun reads the hex digits in b[i:end] as one number. It is a helper rather
+// than three copies because every escape family spells its code point in hex
+// and only the delimiters around it differ.
+func hexRun(b []byte, i, end int) (int, bool) {
+	if i >= end || end > len(b) {
+		return 0, false
+	}
+	n := 0
+	for k := i; k < end; k++ {
+		d, ok := hexVal(b[k])
+		if !ok {
+			return 0, false
+		}
+		n = n<<4 | int(d)
+	}
+	return n, true
+}
+
+// EscColonLen is escColonLen for the locator, which has to read the same port
+// through the same escape. `stripForURL` folds a backslash to `/`, which is the
+// path reading hardcoded into a view that also runs on script surfaces, so the
+// plain pass saw no port at all and matched the bare host.
+func EscColonLen(b []byte, i int, surface string) int {
+	return escColonLen(b, i, escapeAlphabetFor(surface))
+}
+
+// escColonLen is the width of the escape at b[i] when it spells a colon, and 0
+// otherwise.
+//
+// A decoded colon ends the host — escTerminates has said so since round 54 —
+// and the port scan reads only `:` and `%3A`, so the digits after it were never
+// taken. `fetch("https://www.example.fi\x3a8443/x")` is the origin
+// www.example.fi:8443, which §5.4 says is a *different* origin from
+// www.example.fi and which this map does not name; the port went unread, the
+// bare host matched, and a URL that never pointed at production was rewritten.
+// The plain `:8443` spelling one character over was already correct.
+func escColonLen(b []byte, i int, esc escAlphabet) int {
+	if esc == escPath || i+1 >= len(b) || b[i] != '\\' {
+		return 0
+	}
+	switch b[i+1] {
+	case ':':
+		return 2
+	case 'u':
+		if i+2 < len(b) && b[i+2] == '{' {
+			if n, w, ok := braceEscAt(b, i); ok && n == ':' {
+				return w
+			}
+			return 0
+		}
+		if n, ok := hexRun(b, i+2, i+6); ok && n == ':' {
+			return 6
+		}
+	case 'x':
+		if n, ok := hexRun(b, i+2, i+4); ok && n == ':' {
+			return 4
+		}
+	case '0', '1', '2', '3', '4', '5', '6', '7':
+		n, j := 0, i+1
+		for j < len(b) && j < i+4 && b[j] >= '0' && b[j] <= '7' {
+			n = n<<3 | int(b[j]-'0')
+			j++
+		}
+		if n == ':' {
+			return j - i
+		}
+	}
+	return 0
+}
+
+// removedEscLen is the width of the escape at b[i] when it spells a character
+// the URL parser deletes — tab, LF or CR — and 0 otherwise.
+//
+// Those do not end a host: they are removed before it is read, so they join what
+// follows to what precedes. `https://www.example.fi\tx` is the host
+// `www.example.fix` and must not be rewritten; `https://www.example.fi\n<` is
+// `www.example.fi` and must be. Only the caller can tell those apart, and only
+// by looking past the escape.
+// value says the buffer is one URL-bearing value rather than prose, and it
+// decides what a *literal* newline means.
+//
+// Inside a value the URL parser really does strip it, so
+// `href="https://www.example.fi&#10;x"` is the host `www.example.fix`. In prose
+// it is a line break, and joining across it made
+// "https://variant\nnext line" a host called `…ddev.sitenext` that no map
+// names — so the origin was declined and left alone, in *both* directions.
+// Measured in round 70: five variant hostnames written into a shared database
+// through ordinary admin saves, and a production origin served inside a `<pre>`
+// block, with `check` and `diff` both green because both ask this same code.
+//
+// A literal tab stays removed either way. A raw newline cannot appear inside a
+// JavaScript or JSON string literal — both forbid it — so treating it as a
+// boundary in prose cannot break the inline-script case §5.5 exists for, while a
+// raw tab inside a JS string is legal and really is removed before the fetch.
+// That asymmetry is the whole scope of this change.
+func removedEscLen(b []byte, i int, esc escAlphabet, joins bool) int {
+	if i < len(b) && (b[i] == '\t' || b[i] == '\n' || b[i] == '\r') {
+		if joins {
+			return 1
+		}
+		return 0
+	}
+	if esc == escPath || i+1 >= len(b) || b[i] != '\\' {
+		return 0
+	}
+	switch b[i+1] {
+	case 'n', 'r', 't':
+		// The same question in the spelling JSON uses. `m.Rewrite` on a JSON
+		// string is how the block editor posts a document, and `\n` there is a
+		// line break in `post_content`, not a byte a URL parser strips — round 71
+		// read variant hostnames out of `wp_posts` through exactly this branch,
+		// which round 70's fix did not reach because it gated only the literal.
+		if !joins {
+			return 0
+		}
+		return 2
+	// Legacy octal, which escTerminates reads and this did not. Written in the
+	// same commit with two different alphabets: `\011` was reported as "not a
+	// delimiter, the host continues" and then never stepped over, so
+	// `fetch("https://www.example.fi\011")` — www.example.fi to a browser —
+	// went out live.
+	case '0', '1', '2', '3', '4', '5', '6', '7':
+		if esc != escJS {
+			return 0
+		}
+		n, j := 0, i+1
+		for j < len(b) && j < i+4 && b[j] >= '0' && b[j] <= '7' {
+			n = n<<3 | int(b[j]-'0')
+			j++
+		}
+		if isRemovedRune(n) {
+			return j - i
+		}
+		return 0
+	case 'u':
+		if n, ok := hexRun(b, i+2, i+6); ok && isRemovedRune(n) {
+			return 6
+		}
+		if esc == escJS && i+2 < len(b) && b[i+2] == '{' {
+			if n, w, ok := braceEscAt(b, i); ok && isRemovedRune(n) {
+				return w
+			}
+		}
+	case 'x':
+		if esc == escJS {
+			if n, ok := hexRun(b, i+2, i+4); ok && isRemovedRune(n) {
+				return 4
+			}
+		}
+	}
+	return 0
+}
+
+func isRemovedRune(n int) bool { return n == 0x09 || n == 0x0A || n == 0x0D }
+
+// SurfaceDecodesEscapes reports whether a buffer on this surface still carries
+// string escapes that a decoder will turn into characters before the URL parser
+// runs. It is escapeAlphabetFor's answer, exported for the views: whether `\t`
+// is a tab or two characters is the same question at every layer, and answering
+// it twice is what let round 53's two halves disagree.
+func SurfaceDecodesEscapes(surface string) bool {
+	return escapeAlphabetFor(surface) != escPath
+}
+
+// EscapeContinuesHost reports whether the string escape at b[i], immediately
+// after a host, is one the page's decoder turns into *more host* rather than a
+// delimiter that ends it.
+//
+// It is exported because the locator has to answer exactly the question the byte
+// matcher answers, and round 53 answered it twice — jsonEscHostByte here,
+// jsonEscChar there — so the two halves of one fix drifted apart and disagreed
+// about the same document. There is one implementation now.
+//
+// The surface picks the alphabet through escapeAlphabetFor, the same table the
+// matcher reads, so the two halves cannot disagree about one document again.
+//
+// Only meaningful when b[i] is a backslash; the caller checks that.
+func EscapeContinuesHost(b []byte, i int, surface string) bool {
+	esc := escapeAlphabetFor(surface)
+	return esc != escPath && !hostTerminated(b, i, esc, joinsControlsIn(surface, b))
 }
 
 // unhex decodes the two hex digits at i.
@@ -412,11 +1081,22 @@ var (
 // M0 counted five of those in acmecorp' database. So the dot terminates the
 // host and stays where it is, and only the endsHost case above — where real
 // URL structure follows, so the dot is genuinely the root label — absorbs it.
-func hostTerminated(b []byte, end int) bool {
-	if delimAt(b, end) {
+func hostTerminated(b []byte, end int, esc escAlphabet, joins bool) bool {
+	// Past the characters the URL parser removes, then ask. See removedEscLen:
+	// tab, LF and CR do not end a host, they join what follows to what precedes,
+	// and answering at the control's own position got that backwards.
+	for walked := 0; walked < maxRemovedRun; {
+		n := removedEscLen(b, end, esc, joins)
+		if n == 0 || walked+n > maxRemovedRun {
+			break
+		}
+		end += n
+		walked += n
+	}
+	if delimAt(b, end, esc, joins) {
 		return true
 	}
-	return b[end] == '.' && delimAt(b, end+1)
+	return b[end] == '.' && delimAt(b, end+1, esc, joins)
 }
 
 // endsHost reports whether position i is where a URL's host component ends —
@@ -509,6 +1189,10 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 	if len(b) == 0 {
 		return b, 0, nil
 	}
+	// Whether a control after a host joins what follows or ends it is a property
+	// of the surface, not of value-vs-prose. See surfaceJoinsControls.
+	joins := joinsControlsIn(surface, b)
+	esc := escapeAlphabetFor(surface)
 	var (
 		events []Event
 		buf    []byte
@@ -650,6 +1334,8 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 			if c, ok := unhex(b, end+1); ok && c == ':' {
 				sep = 3
 			}
+		} else if n := escColonLen(b, end, esc); n > 0 {
+			sep = n
 		}
 		if sep > 0 {
 			j := end + sep
@@ -660,9 +1346,22 @@ func (m *Matcher) rewrite(b []byte, limit int, prev int, value bool, surface str
 				port, end = string(b[end+sep:j]), j
 			}
 		}
+		// A port separator with no digits after it is only a URL when the
+		// authority ends there. `https://h:/x` and `https://h:` are both the
+		// host `h` to a browser, but `https://h:x` is a parse error — and with
+		// no digits taken the scan left `end` on the colon, where delimAt says
+		// "not a host byte, so the host ended" and the bare host matched. So a
+		// value no browser resolves was rewritten. Both spellings, since the
+		// escaped separator reaches here too now.
+		if sep > 0 && port == "" && !hostTerminated(b, end+sep, esc, joins) {
+			emit(start, b[start:end+sep], ActionSkipped, ReasonNotAURL)
+			scanned = end + sep
+			consumed = max(consumed, end+sep)
+			continue
+		}
 		scanned = end
 		consumed = max(consumed, end)
-		if !hostTerminated(b, end) {
+		if !hostTerminated(b, end, esc, joins) {
 			// The host is a prefix of a longer host, or this is prose.
 			emit(start, b[start:end], ActionSkipped, ReasonNotAURL)
 			continue

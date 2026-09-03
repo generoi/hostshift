@@ -9,6 +9,44 @@ import (
 	"github.com/generoi/hostshift/internal/rewrite"
 )
 
+// boundaryOf extracts the multipart boundary the way the application will.
+//
+// `mime.ParseMediaType` wants Go's parameter grammar, which is RFC 9110's
+// `token`. RFC 2046 §5.1.1's `bchars` is wider — it admits `( ) , / : = ?` and
+// space — so a producer that leaves such a boundary unquoted, which
+// `----=_Part_0_12345.67890` and every base64-derived boundary with `=` padding
+// does, gets an error and a nil params map here. PHP's `php_rfc1867.c` does not
+// tokenise at all: it finds `boundary`, takes the next `=`, and reads to the
+// next `,` or `;`. So the body PHP happily parses and stores was the one
+// hostshift passed through untouched, with the worktree hostname in it (§4.3,
+// unrecoverable).
+//
+// The strict parser is tried first, so every well-formed body keeps exactly the
+// behaviour it had. The lenient read is a fallback, matching what the receiver
+// will do rather than what the sender should have done.
+func boundaryOf(ct string) string {
+	if _, params, err := mime.ParseMediaType(ct); err == nil {
+		if b := params["boundary"]; b != "" {
+			return b
+		}
+	}
+	i := strings.Index(strings.ToLower(ct), "boundary")
+	if i < 0 {
+		return ""
+	}
+	rest := ct[i+len("boundary"):]
+	eq := strings.Index(rest, "=")
+	if eq < 0 {
+		return ""
+	}
+	b := rest[eq+1:]
+	if j := strings.IndexAny(b, ",;"); j >= 0 {
+		b = b[:j]
+	}
+	b = strings.TrimSpace(b)
+	return strings.Trim(b, `"`)
+}
+
 // rewriteMultipart rewrites only the bodies of non-file text parts, splicing
 // them in place (PLAN §5.1).
 //
@@ -19,11 +57,7 @@ import (
 // Locating spans and splicing keeps file parts, boundaries and headers
 // byte-identical, which is what "file parts pass through byte-identical" means.
 func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Stats, explain bool) []byte {
-	_, params, err := mime.ParseMediaType(ct)
-	if err != nil {
-		return body
-	}
-	boundary := params["boundary"]
+	boundary := boundaryOf(ct)
 	if boundary == "" {
 		return body
 	}
@@ -89,7 +123,27 @@ func rewriteMultipart(body []byte, ct string, m *origin.Matcher, st *rewrite.Sta
 			continue
 		}
 
-		nv, ev := m.Rewrite(body[bodyStart:end], rewrite.SurfaceRequestBody, explain)
+		// Through RepairSerialized for the same reason the flat arm is: a part
+		// can carry a PHP-serialized blob, and a stale length prefix makes PHP
+		// refuse the whole structure.
+		var ev []origin.Event
+		nv := rewrite.RepairSerialized(body[bodyStart:end], func(b []byte) []byte {
+			out, nev := m.Rewrite(b, rewrite.SurfaceRequestBody, explain)
+			ev = append(ev, nev...)
+			return out
+		})
+		// HostLeaksBack, not HostLeaks: this is a *request* body, and the two
+		// directions are not symmetric surfaces. HostLeaks has no reference view
+		// and no composed refs→CSS view, so a part carrying
+		// `style="background:url(https&#92;3a &#92;2f &#92;2f<variant>/a.png)"` —
+		// which is exactly what the forward pass emits into a style attribute —
+		// went upstream with the variant hostname in it and into the shared
+		// database. Every other request-direction call site was moved; this one
+		// was missed, and a multipart POST is what any form with a file field
+		// sends: the media library, an editor with an attachment, Gravity Forms.
+		nv = rewrite.RepairSerialized(nv, func(b []byte) []byte {
+			return rewrite.HostLeaksBackCounted(m, b, st, rewrite.SurfaceRequestBody, bodyStart)
+		})
 		st.Record(rewrite.SurfaceRequestBody, bodyStart, ev)
 		if bytes.Equal(nv, body[bodyStart:end]) {
 			continue
@@ -168,16 +222,45 @@ func rewritablePart(headers []byte) bool {
 	}
 	if _, params, err := mime.ParseMediaType(strings.TrimSpace(disposition)); err == nil {
 		// Presence, not non-emptiness. filename="" still means a file part;
-		// testing the value let an empty file input through.
+		// testing the value let an empty file input through. ParseMediaType
+		// folds RFC 2231's filename*= into "filename" itself.
 		if _, isFile := params["filename"]; isFile {
 			return false
 		}
-	} else if strings.Contains(strings.ToLower(disposition), "filename=") {
-		return false
+	} else {
+		// The parse failed, so this is a hand-rolled scan over a disposition
+		// that is already malformed — which is exactly when it must be
+		// pessimistic. "filename=" alone missed RFC 2231's extended form,
+		// `filename*=UTF-8''photo.jpg`, so a file part with a malformed
+		// disposition had its bytes rewritten.
+		lower := strings.ToLower(disposition)
+		if strings.Contains(lower, "filename=") || strings.Contains(lower, "filename*=") {
+			return false
+		}
 	}
 	if ctype == "" {
 		return true
 	}
+	// Derived from bodyKind rather than restated, so the two arms cannot drift.
+	//
+	// They already had. bodyKind was widened to route a top-level
+	// `application/xml`, `*+xml`, `image/svg+xml` and
+	// `application/x-www-form-urlencoded` body through the flat arm — its own
+	// comment says why, "the two directions must not disagree about the same
+	// body … an arm nobody enumerated" — and this list was left behind. So the
+	// same payload mapped back as a whole body and reached the application with
+	// the variant hostname in it as a multipart part. §4.3, unrecoverable, no
+	// warning. Round 75 measured all five part types against what the
+	// application received off disk.
+	//
+	// No browser produces such a part — a text field carries no Content-Type,
+	// and `FormData.append(name, blob)` makes a file part — but a scripted
+	// client does, and this file has now declared the same disagreement closed
+	// twice.
 	mt := strings.ToLower(mediaType(strings.TrimSpace(ctype)))
-	return strings.HasPrefix(mt, "text/") || mt == "application/json" || strings.HasSuffix(mt, "+json")
+	switch bodyKind(mt) {
+	case bodyOther, bodyMultipart:
+		return false
+	}
+	return true
 }

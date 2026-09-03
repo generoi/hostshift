@@ -25,7 +25,12 @@ const (
 	// paragraph quoting its own URL, and sage-cachetags emitting one per cached
 	// page — and anchoring is what keeps a bare hostname in prose untouched
 	// (test 28).
-	SurfaceText    = "text"
+	SurfaceText = "text"
+	// SurfaceXMLText is a whole XML-family body — a feed, a sitemap, an SVG.
+	// It is not SurfaceText, because the two differ in what will decode them:
+	// an XML parser reads character references, and an SVG's `<style>` is
+	// genuinely CSS, while nothing at all decodes either in text/plain.
+	SurfaceXMLText = "xml-text"
 	SurfaceComment = "comment"
 	// SurfaceHTMLEntity is an attribute value whose origin was only visible
 	// after character references were decoded — the browser decodes before it
@@ -33,8 +38,23 @@ const (
 	// count is worth looking at: it means content is storing origins in a form
 	// §5.3's three encodings do not model.
 	SurfaceHTMLEntity = "html-entity"
-	SurfaceHeader     = "header"
-	SurfaceJSONString = "json-string"
+	// SurfaceHTMLObfuscated is an attribute value whose origin was only visible
+	// after the value was normalised the way the WHATWG URL parser normalises
+	// it: tab, LF and CR removed, and the run of '/' and '\' after the scheme
+	// collapsed. `https:\\h`, `https:///h` and a tab inside the host all
+	// dereference to production in a browser while matching none of §5.3's
+	// three encodings. Like html-entity, a non-zero count means content is
+	// storing origins in a form the byte model does not cover.
+	SurfaceHTMLObfuscated = "html-obfuscated"
+	SurfaceHeader         = "header"
+	// SurfaceResponseHeader is a Location/Link/Refresh on the way *out*. It is
+	// not SurfaceHeader, which the request direction uses for the same field
+	// names: what differs is which decoders will run downstream. A browser
+	// following a Location runs the URL parser and nothing else — no CSS
+	// tokenizer, no string decoder — while a header arriving on a request may
+	// carry whatever the page's form encoder wrote.
+	SurfaceResponseHeader = "response-header"
+	SurfaceJSONString     = "json-string"
 	// SurfaceJSONEscape is a JSON string whose origin was only visible after
 	// the string was unquoted — a \uXXXX-escaped IDN host, an HTML character
 	// reference inside content.rendered, or double-escaped JSON-in-JSON. Like
@@ -50,6 +70,8 @@ const (
 //
 // Safe for concurrent use: one Stats is shared by every in-flight response.
 type Stats struct {
+	// onEvent, when set, is called for every event as it is recorded. See OnEvent.
+	onEvent    func(surface string, e origin.Event)
 	mu         sync.Mutex
 	candidates map[string]int
 	rewrites   map[string]int
@@ -75,6 +97,22 @@ func (s *Stats) SweepSkipped() {
 
 // NewStats returns a Stats. When explain is false only rewrites are recorded,
 // which is what the counters need; the skip trace is the expensive half.
+// OnEvent installs a callback run for every recorded event.
+//
+// The proxy is a long-lived process with no end to print a report at, so
+// `--explain` set the flag, filled a buffer nothing read, and printed nothing.
+// `check` told developers mid-incident to add it, restart every container and
+// grep the log for "rewrote" — a string the proxy never writes. This is what
+// makes that instruction true.
+func (s *Stats) OnEvent(f func(surface string, e origin.Event)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onEvent = f
+}
+
 func NewStats(explain bool) *Stats {
 	return &Stats{
 		candidates: map[string]int{},
@@ -95,7 +133,6 @@ func (s *Stats) Record(surface string, base int, events []origin.Event) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, e := range events {
 		s.candidates[surface]++
 		if e.Action == origin.ActionRewrote {
@@ -107,6 +144,26 @@ func (s *Stats) Record(surface string, base int, events []origin.Event) {
 			e.Offset += base
 			s.events = append(s.events, e)
 		}
+	}
+	hook := s.onEvent
+	s.mu.Unlock()
+
+	// Outside the lock, and deliberately.
+	//
+	// One Stats is shared by every in-flight response, and the callback the
+	// proxy installs is a blocking write to the container's log driver. Called
+	// under the lock it stalls every *other* response's counters, not only its
+	// own: measured at 8 goroutines, 447 ns/op with no hook, 13,100 ns/op with
+	// the hook inside the lock and 4,889 ns/op with it outside — the lock was
+	// 63% of the cost. It also means a callback that asks this Stats anything
+	// deadlocks the proxy, which is not a thing an exported API should do to a
+	// caller who did what its doc comment says.
+	if hook == nil {
+		return
+	}
+	for _, e := range events {
+		e.Offset += base
+		hook(surface, e)
 	}
 }
 

@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,10 +15,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -89,6 +93,8 @@ func main() {
 		code, err = cmdProxy(os.Args[2:])
 	case "hosts":
 		code, err = cmdHosts(os.Args[2:])
+	case "origins":
+		code, err = cmdOrigins(os.Args[2:])
 	case "map":
 		code, err = cmdMap(os.Args[2:])
 	case "check":
@@ -115,6 +121,17 @@ func main() {
 // subcommand is for, and sends an explicitly requested help to stdout with exit
 // 0 rather than to stderr with exit 2. `hostshift check --help` printed nine
 // flags and not one word about what it checks.
+// rewritableText mirrors the proxy's set, so `rewrite --type` and the proxy
+// cannot disagree about the same bytes.
+func rewritableText(mt string) bool {
+	switch mt {
+	case "text/plain", "text/xml", "application/xml",
+		"application/rss+xml", "application/atom+xml", "image/svg+xml":
+		return true
+	}
+	return strings.HasSuffix(mt, "+xml")
+}
+
 func describe(fs *flag.FlagSet, args []string, what string) (helped bool) {
 	fs.Usage = func() {
 		w := fs.Output()
@@ -240,12 +257,13 @@ func cmdRewrite(args []string) (int, error) {
 
 	var src io.Reader = os.Stdin
 	switch {
-	case mt == "text/html":
+	case mt == "text/html" || mt == "application/xhtml+xml":
 		src = rewrite.NewResponseBody(os.Stdin, m, nil, rewrite.Options{
-			DryRun:  *dryRun,
-			NoSweep: *noSweep,
-			Stats:   st,
-			Log:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+			DryRun:      *dryRun,
+			NoSweep:     *noSweep,
+			Stats:       st,
+			Log:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
+			XMLEntities: mt == "application/xhtml+xml",
 		})
 	case mt == "application/json" || mt == "text/json" || strings.HasSuffix(mt, "+json"):
 		// JSON is buffered, not streamed (PLAN §5.8).
@@ -256,16 +274,110 @@ func cmdRewrite(args []string) (int, error) {
 		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 		out := rewrite.RewriteJSON(body, m, st, log, *explain)
 		if !*noSweep {
-			out = rewrite.SweepBytes(out, m, st, log)
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, m, st, log)
+			})
 		}
 		if *dryRun {
 			out = body
 		}
 		src = bytes.NewReader(out)
-	}
-	// Anything else streams through untouched and never enters a rewriter —
-	// which is what test 25's per-surface counter of zero proves.
 
+	case rewritableText(mt):
+		// The same set the proxy rewrites. `rewrite` is documented as "the same
+		// engine", and it was not: text/plain, XML, RSS and SVG streamed through
+		// byte-identical with no counters and nothing from --explain, while the
+		// proxy rewrote every one of them. A developer debugging why a feed or a
+		// sitemap looks wrong pipes it through here, sees an empty counter block,
+		// and concludes the engine cannot do it — at the moment it just learned.
+		body, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return exitRuntime, err
+		}
+		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		// Wrapped in RepairSerialized, exactly as the proxy's text arm is. This
+		// command documents itself as "the same engine"; it was not, and a
+		// serialized blob piped through it came out with its length prefix stale
+		// — the very corruption the proxy had just been taught to prevent.
+		var ev []origin.Event
+		// The same surface the proxy and the scorer pick, by the same question.
+		// This is the third copy of that arm; round 60 changed two of them, so
+		// the command that documents itself as "the same engine" stopped
+		// rewriting an SVG's `<style>` that the proxy still rewrites, and
+		// answered `"rewrites": {}` — which is the count `check`'s awk reads as
+		// zero leaks.
+		textSurface := rewrite.SurfaceText
+		if strings.HasSuffix(mt, "xml") {
+			textSurface = rewrite.SurfaceXMLText
+		}
+		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
+			nv, nev := m.RewriteText(b, textSurface, *explain)
+			ev = append(ev, nev...)
+			// The XML family's parser decodes character references; plain text
+			// has no parser, so leaving them is correct there. The counted forms
+			// because --json and --dry-run are this command's whole output.
+			if strings.HasSuffix(mt, "xml") {
+				return rewrite.HostLeaksXMLCounted(m, nv, false, st, textSurface, 0)
+			}
+			return rewrite.HostLeaksCounted(m, nv, false, st, textSurface, 0)
+		})
+		st.Record(textSurface, 0, ev)
+		if !*noSweep {
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, m, st, log)
+			})
+		}
+		if *dryRun {
+			out = body
+		}
+		src = bytes.NewReader(out)
+
+	default:
+		// Anything else streams through untouched and never enters a rewriter —
+		// which is what test 25's per-surface counter of zero proves — and says
+		// so, because a mistyped `--type text/htm` otherwise looks exactly like a
+		// clean result.
+		//
+		// In the `default` arm, not after the switch: the rewriting arms only
+		// assign `src`, so a notice placed below them fired on every type,
+		// `text/html` included, and `--json`'s object came out behind three
+		// lines of prose.
+		if !*quiet {
+			fmt.Fprintf(os.Stderr,
+				"hostshift: --type %s is outside the rewritable set, so the input is "+
+					"passed through unchanged.\n  Rewritten types: text/html, "+
+					"application/xhtml+xml, the JSON family, text/plain and the XML "+
+					"family.\n  Tier 2 (text/css, JavaScript) is excluded by design — "+
+					"PLAN §5.2.\n", mt)
+		}
+
+	case mt == "application/x-www-form-urlencoded" || mt == "multipart/form-data":
+		// Refused, not passed through.
+		//
+		// Everything outside the rewritable set streams past untouched, which is
+		// right for the Tier 2 types: §5.2 excludes them by design, and piping a
+		// stylesheet through to see it unchanged is a real question with a true
+		// answer. It is not right for a *request* type. Those are rewritten —
+		// in the other direction, by the proxy — so printing the input back with
+		// an empty counter block reads as "the engine found nothing in your
+		// body" when it means "this command never looked".
+		fmt.Fprintf(os.Stderr,
+			"hostshift: --type %s is a request body, and this command rewrites\n"+
+				"  responses. Request bodies are mapped variant→canonical by the proxy,\n"+
+				"  on the way in; there is no filter mode for them. Passing it through\n"+
+				"  here would print an empty counter block and read like a clean result.\n", mt)
+		return exitConfig, nil
+	}
 	if _, err := io.Copy(os.Stdout, src); err != nil {
 		return exitRuntime, err
 	}
@@ -275,6 +387,63 @@ func cmdRewrite(args []string) (int, error) {
 		}
 	}
 	return exitOK, nil
+}
+
+// wantCensus reports whether the proxy should write its census to the log.
+//
+// `--dry-run` as well as `--explain`, because dry-run's own help says it logs
+// "every rewrite it would have made" and for a long time it logged none. Split
+// out so both halves of that claim can be tested without starting a proxy: the
+// wiring was three mutations deep in unpinned code, and nothing failed when the
+// hook was deleted, silenced to Debug, or given a constant surface.
+func wantCensus(explain, dryRun bool) bool { return explain || dryRun }
+
+// censusHook is the callback wantCensus arms.
+//
+// Info and not Debug: the default slog handler drops Debug, and this exists so
+// that `check`'s instruction — add the flag, restart, `| grep census` — is true
+// at the moment of a test-28 refusal.
+func censusHook(log *slog.Logger) func(string, origin.Event) {
+	return censusHookFor(log, false)
+}
+
+// censusHookFor is censusHook with the dry-run marker.
+func censusHookFor(log *slog.Logger, dryRun bool) func(string, origin.Event) {
+	return func(surface string, e origin.Event) {
+		// `dry-run=true` when nothing was applied. The action says `rewrote`
+		// either way — that is what dry-run means, "every rewrite it would have
+		// made" — so without this a developer grepping the census mid-incident
+		// cannot tell a proxy that is rewriting from one that is only reporting.
+		if dryRun {
+			log.Info("census", "surface", surface, "action", e.Action,
+				"reason", e.Reason, "offset", e.Offset, "text", e.Text,
+				"dry-run", true)
+			return
+		}
+		log.Info("census", "surface", surface, "action", e.Action,
+			"reason", e.Reason, "offset", e.Offset, "text", e.Text)
+	}
+}
+
+// clampBody bounds --max-body at MaxInt32.
+//
+// A view's position map is int32, and offsets are within one buffered value — so
+// the guarantee that they cannot overflow has to be this clamp, not the 8 MiB
+// default. `--max-body` takes an int64 and caps the JSON and text/XML *response*
+// paths as well as request bodies, each of which hands the whole buffer to a
+// view. A wrapped-negative offset does not fail loudly either: one call site
+// checks `from < 0`, the rest either panic on a slice bound or silently skip the
+// host, which is a §4.3 leak with no log line.
+//
+// Unreachable in practice — a 2 GiB buffer needs ~18 GiB of RAM for one view and
+// OOMs first — which is exactly why it should be a clamp and not a comment.
+func clampBody(n int64, log *slog.Logger) int64 {
+	if n > math.MaxInt32 {
+		log.Warn("--max-body clamped: a buffered value's offsets are int32",
+			"asked", n, "using", int64(math.MaxInt32))
+		return math.MaxInt32
+	}
+	return n
 }
 
 func cmdProxy(args []string) (int, error) {
@@ -307,15 +476,27 @@ func cmdProxy(args []string) (int, error) {
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	st := rewrite.NewStats(*explain)
+	// The census, actually written down.
+	//
+	// A proxy is a long-lived process with no end to print a report at, so
+	// `--explain` filled a buffer nothing read and printed nothing — while
+	// `check` told a developer mid-incident to add the flag, restart every
+	// container in the project and grep the log for "rewrote", a word this
+	// process never wrote. `--dry-run`'s own help says it logs "every rewrite it
+	// would have made", and it logged none either. Both are true now.
+	if wantCensus(*explain, *dryRun) {
+		st.OnEvent(censusHookFor(log, *dryRun))
+	}
 	p := &proxy.Proxy{
 		Upstream:      up,
 		Map:           res.Map,
-		Stats:         rewrite.NewStats(*explain),
+		Stats:         st,
 		DryRun:        *dryRun,
 		StrictOrigins: *strict,
 		NoSweep:       *noSweep,
 		Compress:      *compress,
-		MaxBody:       *maxBody,
+		MaxBody:       clampBody(*maxBody, log),
 		Log:           log,
 	}
 
@@ -384,6 +565,49 @@ func cmdHosts(args []string) (int, error) {
 	return exitOK, nil
 }
 
+// cmdOrigins lists the absolute-URL hosts a body carries, with counts, one per
+// line, most frequent first.
+//
+// It answers "what does this page actually link to" using the engine's own
+// decoders rather than a pattern — every escape spelling, every composed
+// encoding. `ddev hostshift check` needs that to subtract what a deployment
+// names and report the rest; asking it with a shell grep saw one spelling out
+// of a dozen, and a JSON-escaped URL is the spelling WordPress emits by default.
+func cmdOrigins(args []string) (int, error) {
+	fs := flag.NewFlagSet("origins", flag.ContinueOnError)
+	if describe(fs, args, "list the absolute-URL hosts a body on stdin carries") {
+		return exitOK, nil
+	}
+	if err := fs.Parse(args); err != nil {
+		return exitConfig, nil
+	}
+	body, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return exitRuntime, err
+	}
+	counts := rewrite.HostsIn(body)
+	type row struct {
+		host string
+		n    int
+	}
+	rows := make([]row, 0, len(counts))
+	for h, n := range counts {
+		rows = append(rows, row{h, n})
+	}
+	// Deterministic: by count, then by name. A caller reading the first line
+	// must get the same answer twice.
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].n != rows[j].n {
+			return rows[i].n > rows[j].n
+		}
+		return rows[i].host < rows[j].host
+	})
+	for _, r := range rows {
+		fmt.Printf("%d %s\n", r.n, r.host)
+	}
+	return exitOK, nil
+}
+
 func cmdMap(args []string) (int, error) {
 	fs := flag.NewFlagSet("map", flag.ContinueOnError)
 	var c common
@@ -391,6 +615,9 @@ func cmdMap(args []string) (int, error) {
 	asJSON := fs.Bool("json", false, "emit the map as JSON")
 	pairs := fs.Bool("pairs", false, "emit canonical=variant, one per line, for --map")
 	hosts := fs.Bool("variant-hosts", false, "emit the variant hostnames, one per line")
+	canon := fs.Bool("canonical-hosts", false, "emit every canonical-side hostname, aliases included, one per line")
+	ext := fs.Bool("external-canonical-hosts", false,
+		"emit the canonical hostnames that are not this project's own, one per line")
 	if describe(fs, args, "print the resolved map, and where it came from") {
 		return exitOK, nil
 	}
@@ -406,10 +633,46 @@ func cmdMap(args []string) (int, error) {
 	// python3 to read --json, an undeclared dependency whose absence produced
 	// "could not resolve a map to hand the proxy" and named neither python3 nor
 	// the cause. Printing its own map flat is as generic as printing it as JSON.
+	// Every hostname the *content* may name, which is the canonical of each site
+	// plus its aliases. The variant side is what the browser uses; this side is
+	// what the application would reach out to, which is what loopback
+	// containment has to cover.
+	if *canon {
+		for _, s := range res.Map.Sites {
+			for _, o := range s.CanonicalSet() {
+				fmt.Println(o.Host)
+			}
+		}
+		return exitOK, nil
+	}
+	// The subset that leaves the machine, which is the set loopback containment
+	// exists for. Under DDEV-canonical it is empty and there is nothing to
+	// contain; the add-on asks for it rather than deciding for itself, so the
+	// two do not drift.
+	if *ext {
+		for _, h := range res.ExternalCanonicals {
+			fmt.Println(h)
+		}
+		return exitOK, nil
+	}
 	if *pairs || *hosts {
 		for _, s := range res.Map.Sites {
 			if *pairs {
-				fmt.Printf("%s=%s\n", s.Canonical.String(), s.Variant.String())
+				// The declared spelling, not String()'s comparison form.
+				//
+				// `init` resolves the map on the host and hands it to the
+				// container flat, through exactly this line: `map --pairs` into
+				// `--from`/`--to`. String() renders HostPort(), which is
+				// punycode — origin.go's own comment says it "is never used to
+				// round-trip input", and this is the one place that does. So an
+				// IDN canonical arrived inside the container with Display empty,
+				// and the request direction then spliced the A-label into a
+				// database whose every other row holds the U-label. §4.3,
+				// through the supported install path, undoing the fix that
+				// added Display one layer up.
+				fmt.Printf("%s://%s=%s://%s\n",
+					s.Canonical.Scheme, s.Canonical.DisplayHostPort(),
+					s.Variant.Scheme, s.Variant.DisplayHostPort())
 			} else {
 				fmt.Println(s.Variant.Host)
 			}
@@ -447,6 +710,17 @@ func cmdCheck(args []string) (int, error) {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	var c common
 	c.register(fs)
+	// What this project's own `web` actually answers on, which is narrower than
+	// what DDEV registers for it. A worktree inherits the parent's
+	// additional_hostnames, and the add-on then narrows web's VIRTUAL_HOST so the
+	// parent keeps serving its own — so `b.acme.ddev.site` is registered here and
+	// served there. Without this the note below padded its list with hostnames
+	// this project does not serve and `ddev launch` does not open, and that note
+	// is the only place a developer is told which URLs show unrewritten
+	// production content. Padding it is how such a note stops being read.
+	served := fs.String("served-hosts", "",
+		"comma-separated hostnames this project's web actually serves;\n"+
+			"the add-on passes what it wrote to HOSTSHIFT_WEB_HOSTS")
 	if describe(fs, args, "validate the map; exit 2 if it is not usable") {
 		return exitOK, nil
 	}
@@ -469,6 +743,65 @@ func cmdCheck(args []string) (int, error) {
 		fmt.Fprintf(os.Stderr, "hostshift: %d site(s) from %s — map is injective and anchored\n", n, res.Source)
 	}
 
+	// The hostname DDEV itself hands the developer.
+	//
+	// Under production-canonical this project's own `<project>.ddev.site` routes
+	// to `web`, and `web` serves the shared production database unrewritten.
+	// That is correct and must stay: a project has to answer at its own name,
+	// and `hostshift diff --canonical-base` reads exactly that baseline.
+	//
+	// What was missing is anyone saying so. `ddev start` ends with "Your project
+	// can be reached at https://<project>.ddev.site", `ddev describe` lists it
+	// under Project URLs, `ddev launch` opens it — and on a production-canonical
+	// project every link, asset and feed on that page is the client's live site.
+	// Loopback containment is container-scoped, so the browser dereferences them
+	// for real. §4.4's first hazard, arriving through a hostname that is never
+	// rewritten rather than through a missed rewrite.
+	//
+	// Both conditions, not either. Under DDEV-canonical the same hostnames are
+	// directly served and there is nothing to warn about, because the canonicals
+	// are those hostnames: the database holds `.ddev.site` URLs. Keyed on the
+	// first alone this printed on every `ddev start` of every stock project,
+	// which is how a warning stops being read.
+	directly := res.DirectlyServed
+	if *served != "" {
+		keep := map[string]bool{}
+		for _, h := range strings.Split(*served, ",") {
+			if h = strings.TrimSpace(h); h != "" {
+				keep[h] = true
+			}
+		}
+		filtered := directly[:0:0]
+		for _, h := range directly {
+			if keep[h] {
+				filtered = append(filtered, h)
+			}
+		}
+		directly = filtered
+	}
+	if len(res.ExternalCanonicals) > 0 && len(directly) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: note: this map is canonical-on-production (%s), so the\n"+
+				"  hostname(s) DDEV registers here that are not variants serve the\n"+
+				"  database unrewritten — every link on them points at the live site,\n"+
+				"  and `ddev launch` opens one:\n",
+			strings.Join(res.ExternalCanonicals, ", "))
+		for _, h := range directly {
+			fmt.Fprintf(os.Stderr, "  https://%s\n", h)
+		}
+		// "the variant(s) this map resolves to", not "preview through these":
+		// these come from the map as recomputed *now*, and what DDEV routes
+		// comes from `.ddev/.env`. After a branch rename the two differ, so the
+		// URL offered here 404s — printed directly above the staleness warning
+		// that explains why, which reads as the tool contradicting itself.
+		fmt.Fprintln(os.Stderr, "  The variant(s) this map resolves to:")
+		for _, st := range res.Map.Sites {
+			fmt.Fprintf(os.Stderr, "  %s\n", st.Variant.String())
+		}
+		fmt.Fprintln(os.Stderr,
+			"  Those serve once `.ddev/.env` names them; `check` says below if it does not.")
+	}
+
 	if len(res.Uncovered) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"hostshift: warning: DDEV registers %d hostname(s) this map does not cover, so they\n"+
@@ -483,6 +816,15 @@ func cmdCheck(args []string) (int, error) {
 
 // cmdDiff is the corpus diff — PLAN §7's only test that validates against
 // reality. Fixtures would not have caught the double-port bug; this would.
+// isLoopbackHost reports whether a crawl of this host stays on the machine.
+func isLoopbackHost(h string) bool {
+	// `.ddev.site` resolves to 127.0.0.1 by wildcard, which is what a worktree
+	// crawl uses and is exactly the case that must not warn. The rest —
+	// loopback names and addresses, and the reserved TLDs — is the same question
+	// the map diagnostics ask, so it is answered in one place.
+	return strings.HasSuffix(h, ".ddev.site") || origin.ResolvesLocally(h)
+}
+
 func cmdDiff(args []string) (int, error) {
 	fs := flag.NewFlagSet("diff", flag.ContinueOnError)
 	var c common
@@ -519,13 +861,74 @@ func cmdDiff(args []string) (int, error) {
 		if len(parts) != 4 {
 			return exitConfig, fmt.Errorf("--resolve %q: want host:port:addr:port", r)
 		}
-		resolveMap[parts[0]+":"+parts[1]] = parts[2] + ":" + parts[3]
+		// Keyed through the same fold the dialer looks up with, so what the
+		// developer typed and what net/http asks for are the same string.
+		resolveMap[corpus.ResolveKey(parts[0]+":"+parts[1])] = parts[2] + ":" + parts[3]
 	}
 	res, err := c.load()
 	if err != nil {
 		return exitConfig, err
 	}
 	site := res.Map.Sites[0]
+
+	// Which site the bases belong to, when --canonical-base names one.
+	//
+	// --canonical-base used to override the canonical side alone, leaving the
+	// variant side at site 1's. On a multisite that compares two different
+	// sites: `--canonical-base https://shop.acme.ddev.site` was crawled against
+	// the *main* site's variant, every page differing for the obvious reason,
+	// and the run printed GREEN. The command the README calls "the check that
+	// validates a deployment against reality" was handing out an all-clear for
+	// a comparison of unrelated pages.
+	//
+	// Pairing by site fixes that. Refusing when nothing matches would not be
+	// right, because the documented production-canonical baseline is the
+	// project's own `<project>.ddev.site` — deliberately not a hostname the map
+	// knows. So an unmatched base is allowed and named: the pair it is actually
+	// comparing is the thing a reader has to be able to check.
+	//
+	// Both directions. The first version paired from the canonical side only, so
+	// `--variant-base <site 2>` left the *canonical* at site 1's — the same two
+	// different sites with the flags swapped, and unwarned. The asymmetry had no
+	// reason behind it: the argument for tolerating an unmatched base is about
+	// the canonical side, where the production-canonical baseline is the
+	// project's own `<project>.ddev.site` and deliberately not in the map. Every
+	// variant is in the map by construction.
+	if given, other := *canonicalBase, *variantBase; (given == "") != (other == "") {
+		fromCanonical := given != ""
+		if !fromCanonical {
+			given = other
+		}
+		if o, err := origin.Parse(given); err == nil && o.Host != "" {
+			matched := false
+			for _, st := range res.Map.Sites {
+				hosts := []string{st.Variant.Host}
+				if fromCanonical {
+					hosts = nil
+					for _, o := range st.CanonicalSet() {
+						hosts = append(hosts, o.Host)
+					}
+				}
+				for _, h := range hosts {
+					if strings.EqualFold(h, o.Host) {
+						site, matched = st, true
+					}
+				}
+			}
+			if !matched && (!fromCanonical || len(res.Map.Sites) > 1 ||
+				len(res.ExternalCanonicals) == 0) {
+				flag, side, fell := "--canonical-base", "canonical", site.Variant.String()
+				if !fromCanonical {
+					flag, side, fell = "--variant-base", "variant", site.Canonical.String()
+				}
+				fmt.Fprintf(os.Stderr,
+					"hostshift: warning: %s %s is not a %s of this %d-site map, so\n"+
+						"  there is nothing to pair it with; comparing against %s.\n"+
+						"  Pass the other base to say which site you mean.\n",
+					flag, o.Host, side, len(res.Map.Sites), fell)
+			}
+		}
+	}
 
 	base := func(flagVal string, def origin.Origin) (*url.URL, error) {
 		if flagVal == "" {
@@ -542,6 +945,30 @@ func cmdDiff(args []string) (int, error) {
 		return exitConfig, fmt.Errorf("--variant-base: %w", err)
 	}
 
+	// Say so before crawling the client's live site.
+	//
+	// Under production-canonical the canonical base *is* the production
+	// hostname, and this fetches `-n` pages from it — on the host, outside the
+	// loopback containment the add-on ships a whole compose file to provide.
+	// `--resolve`'s help text names the hazard; nothing said it at the moment it
+	// happens, which is the only moment it can be acted on.
+	// Whether *this* host is covered, not whether the flag was passed at all.
+	// `--resolve` copies curl's syntax and so inherits curl's classic mistake —
+	// the wrong port, or a host that is not the one being crawled — and the
+	// crawl then falls through to real DNS while the warning stays silent. A
+	// guardrail switched off by a typo is worse than none, because it reads as
+	// confirmation.
+	port := cb.Port()
+	if port == "" {
+		port = map[string]string{"https": "443", "http": "80"}[cb.Scheme]
+	}
+	// The same key the dialer will look up, built by the same function. Asking
+	// this question a second way is what made the guardrail disagree with the
+	// dialer: it folded case where the dialer did not, and did not fold IDNA
+	// where the dialer did, so `--resolve www.hämeenlinna.fi:443:…` connected to
+	// the live site with no warning while the punycode spelling that worked
+	// warned anyway.
+
 	var paths []string
 	if *pathList != "" {
 		b, err := os.ReadFile(*pathList)
@@ -552,6 +979,73 @@ func cmdDiff(args []string) (int, error) {
 			if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
 				paths = append(paths, line)
 			}
+		}
+	}
+
+	// How many will actually be fetched: the supplied list if there is one, and
+	// otherwise the crawl's budget. This used to print `-n` unconditionally, so
+	// a `--paths` file of two lines warned about crawling twenty pages of the
+	// client's live site — in the one sentence written to make a developer stop.
+	want := *n
+	if len(paths) > 0 && (want == 0 || len(paths) < want) {
+		want = len(paths)
+	}
+	_, covered := resolveMap[corpus.ResolveKey(net.JoinHostPort(cb.Hostname(), port))]
+	if !covered && !isLoopbackHost(cb.Hostname()) {
+		fmt.Fprintf(os.Stderr,
+			"hostshift: crawling %d page(s) from %s, which is not pointed anywhere local.\n"+
+				"  Under production-canonical that is the client's live site. Pass --resolve\n"+
+				"  to send these fetches somewhere else, as the loopback containment does for\n"+
+				"  the application's own requests.\n", want, cb.Host)
+	}
+
+	// When both bases are given and the map knows neither, the bases *are* the
+	// map.
+	//
+	// `--canonical-base` and `--variant-base` moved only the crawl; the rewriting
+	// map still came from `-C`/`--slug`. In a worktree that resolves to the
+	// worktree's own DDEV hostnames, which appear on neither side of the
+	// comparison — so `want` was the canonical body unrewritten and the leak scan
+	// looked for an origin that could not occur. Measured: 0 leaks and "no
+	// canonical origin reached the browser" over four pages carrying 193 of
+	// them, on the invocation README documents for worktrees.
+	//
+	// Only when the map knows neither. Under production-canonical the baseline
+	// is deliberately a third hostname and the variant *is* in the map, so that
+	// map is the right one and is left alone.
+	if *canonicalBase != "" && *variantBase != "" {
+		known := func(h string) bool {
+			for _, st := range res.Map.Sites {
+				if strings.EqualFold(st.Variant.Host, h) {
+					return true
+				}
+				for _, o := range st.CanonicalSet() {
+					if strings.EqualFold(o.Host, h) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		if !known(cb.Hostname()) && !known(vb.Hostname()) {
+			co, cerr := origin.Parse(cb.Scheme + "://" + cb.Host)
+			vo, verr := origin.Parse(vb.Scheme + "://" + vb.Host)
+			if cerr != nil || verr != nil {
+				return exitConfig, fmt.Errorf("--canonical-base/--variant-base: %w",
+					cmp.Or(cerr, verr))
+			}
+			m, err := origin.NewMap([]origin.Site{{
+				Name: "bases", Canonical: co, Variant: vo,
+			}})
+			if err != nil {
+				return exitConfig, fmt.Errorf("--canonical-base/--variant-base: %w", err)
+			}
+			fmt.Fprintf(os.Stderr,
+				"hostshift: neither base is in the map from %s, so the comparison is\n"+
+					"  between the two bases themselves — %s and %s — and that is what\n"+
+					"  the leak scan looks for. Pass --map to say otherwise.\n",
+				res.Source, cb.Hostname(), vb.Hostname())
+			res.Map = m
 		}
 	}
 

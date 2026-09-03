@@ -1,6 +1,10 @@
 package rewrite
 
-import "bytes"
+import (
+	"bytes"
+	"html"
+	"unicode/utf8"
+)
 
 // urlNamedRefs is every named character reference that decodes to a character
 // an origin is built from. It is deliberately this short: html.UnescapeString
@@ -8,16 +12,25 @@ import "bytes"
 // so a query string carrying "&copy=1" would come back as "©=1" — a corrupted
 // link on a page that had nothing wrong with it. Numeric references have no
 // such ambiguity and are decoded in full below.
+//
+// Every entry is checked against html.UnescapeString by TestNamedRefsMatchHTML5.
+// "hyphen" was in this table decoding to '-', and it is not: HTML5 defines
+// &hyphen; as U+2010 HYPHEN, not U+002D. Because a decoded value is spliced back
+// whole whenever any origin inside it rewrote, that turned an inert link live —
+// `next=https://staging&hyphen;old.prod.fi/` resolves to a punycode host that
+// does not exist on production, and hostshift served `staging-old.prod.fi`,
+// which does. There is no named reference for U+002D; it is spelled &#45;.
 var urlNamedRefs = map[string]byte{
-	"sol":    '/',
-	"colon":  ':',
-	"period": '.',
-	"quest":  '?',
-	"num":    '#',
-	"percnt": '%',
-	"lowbar": '_',
-	"hyphen": '-',
-	"commat": '@',
+	"sol":      '/',
+	"bsol":     '\\', // the JSON separator's byte
+	"colon":    ':',
+	"period":   '.',
+	"quest":    '?',
+	"num":      '#',
+	"percnt":   '%',
+	"lowbar":   '_',
+	"UnderBar": '_', // a second spelling of the same character
+	"commat":   '@',
 }
 
 // NewLine is deliberately absent. It decodes to a raw 0x0A, which no origin
@@ -105,11 +118,13 @@ func decodeURLRefsOnce(v []byte) ([]byte, bool) {
 		}
 		out = append(out, v[prev:i]...)
 		// Decline the whole value rather than complete a reference out of a
-		// fragment we did not consume — see fusesWithPending.
-		if fusesWithPending(out, c) {
+		// fragment we did not consume — see fusesWithPending. Only the first
+		// byte can fuse, and a multi-byte decode is non-ASCII, which is never a
+		// reference body.
+		if fusesWithPending(out, c[0]) {
 			return v, false
 		}
-		out = append(out, c)
+		out = append(out, c...)
 		prev = i + n
 		i = prev - 1
 	}
@@ -121,21 +136,45 @@ func decodeURLRefsOnce(v []byte) ([]byte, bool) {
 
 // parseURLRef decodes one reference at the start of b, returning the byte and
 // how much of b it spans. n == 0 means "not a reference this cares about".
-func parseURLRef(b []byte) (byte, int) {
+func parseURLRef(b []byte) (string, int) {
 	if len(b) < 3 || b[0] != '&' {
-		return 0, 0
+		return "", 0
 	}
 	if b[1] != '#' {
-		// Named. Bounded lookahead: the longest name here is 7 bytes.
-		lim := min(len(b), 12)
+		// Named. Bounded lookahead: long enough for the accented letters an IDN
+		// host is built from as well as the punctuation table.
+		// Long enough for the whole family. The cap used to be 16, which silently
+		// dropped four of the seven HTML5 names decoding to a character UTS46
+		// deletes inside a host: &NegativeThinSpace; &NegativeVeryThinSpace;
+		// &NegativeMediumSpace; and &NegativeThickSpace;, all U+200B, all live
+		// production links one character away from the &ZeroWidthSpace; spelling
+		// that is caught. The longest name in the HTML5 table is 32 characters.
+		lim := min(len(b), 34)
 		end := bytes.IndexByte(b[1:lim], ';')
 		if end < 0 {
-			return 0, 0
+			return "", 0
 		}
-		if c, ok := urlNamedRefs[string(b[1:1+end])]; ok {
-			return c, end + 2
+		name := string(b[1 : 1+end])
+		if c, ok := urlNamedRefs[name]; ok {
+			return string(rune(c)), end + 2
 		}
-		return 0, 0
+		// A named reference for a non-ASCII letter, which an IDN host is made
+		// of: &auml;meen.fi is hämeen.fi to a browser, and §5.5 calls IDN "real
+		// for .fi client domains". Enumerating them is hopeless — the HTML5
+		// table has hundreds — and html.UnescapeString over a whole value is
+		// what the table above exists to avoid, because it also decodes the
+		// legacy no-semicolon forms and turns a `&copy=1` query into `©=1`.
+		//
+		// Requiring the semicolon removes that ambiguity entirely, so this asks
+		// the HTML5 table about exactly one bounded, semicolon-terminated token.
+		// Non-ASCII only: everything below 0x7f goes through the table above,
+		// where the structural exclusions live.
+		if d := html.UnescapeString("&" + name + ";"); d != "&"+name+";" {
+			if r, size := utf8.DecodeRuneInString(d); size == len(d) && r >= 0x80 && r != utf8.RuneError {
+				return d, end + 2
+			}
+		}
+		return "", 0
 	}
 
 	j, base := 2, 10
@@ -151,12 +190,12 @@ func parseURLRef(b []byte) (byte, int) {
 		}
 		val = val*base + d
 		if val > 0x10FFFF {
-			return 0, 0 // out of range; leave it alone rather than guess
+			return "", 0 // out of range; leave it alone rather than guess
 		}
 		j++
 	}
 	if j == start {
-		return 0, 0
+		return "", 0
 	}
 	if j < len(b) && b[j] == ';' {
 		j++ // browsers accept a numeric reference without one
@@ -176,13 +215,21 @@ func parseURLRef(b []byte) (byte, int) {
 	//
 	// Nothing legitimate is lost. This exists to catch an origin hidden behind
 	// character references, and none of these can appear in one.
+	// Non-ASCII is allowed through — an IDN host is built from it, and a UTF-8
+	// letter spliced between attribute quotes is inert, which is the only thing
+	// the exclusions below are protecting.
 	switch {
-	case val < 0x21 || val > 0x7e:
-		return 0, 0
+	case val >= 0x80:
+		if !utf8.ValidRune(rune(val)) {
+			return "", 0
+		}
+		return string(rune(val)), j
+	case val < 0x21:
+		return "", 0
 	case val == '&' || val == '"' || val == '\'' || val == '<' || val == '>' || val == '=' || val == '`':
-		return 0, 0
+		return "", 0
 	}
-	return byte(val), j
+	return string(rune(val)), j
 }
 
 func digitVal(c byte, base int) (int, bool) {

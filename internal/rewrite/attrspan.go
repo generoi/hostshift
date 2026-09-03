@@ -48,6 +48,21 @@ func tagNameOf(raw []byte) []byte {
 	return raw[1:i]
 }
 
+// endTagNameOf is tagNameOf for `</name>`. tagNameOf stops at the first `/`, so
+// on an end tag it returns nothing — which silently left a foreign-content depth
+// counter never decrementing.
+func endTagNameOf(raw []byte) []byte {
+	i := 1
+	if i < len(raw) && raw[i] == '/' {
+		i++
+	}
+	j := i
+	for j < len(raw) && !isSpace(raw[j]) && raw[j] != '>' && raw[j] != '/' {
+		j++
+	}
+	return raw[i:j]
+}
+
 // scanAttrs returns the attribute spans of a start or self-closing tag.
 // raw must be exactly what Tokenizer.Raw() returned.
 func scanAttrs(raw []byte) []Attr { return scanAttrsInto(nil, raw) }
@@ -70,6 +85,19 @@ func scanAttrsInto(out []Attr, raw []byte) []Attr {
 			continue
 		}
 		a := Attr{NameStart: i, ValueStart: -1, ValueEnd: -1}
+		// 13.2.5.32 *before attribute name state*: an `=` here begins an
+		// attribute *named* `=`. It is not a separator, and treating it as one
+		// put this scanner one token ahead of the tokenizer for the rest of the
+		// tag — the next quote read as a value opener, the real `href`'s value
+		// consumed as part of it, and every span in that tag lost. `<a =" href=…>`
+		// then shipped a production origin the browser dereferences, in every
+		// spelling at once, because the byte sweep rescues only the plain one.
+		//
+		// attrspan.go's differential against the tokenizer is real and did not
+		// find this: its alphabet is corpus pages, which hold no malformed tags.
+		if raw[i] == '=' {
+			i++
+		}
 		for i < len(raw) && !isSpace(raw[i]) && raw[i] != '=' && raw[i] != '>' && raw[i] != '/' {
 			i++
 		}

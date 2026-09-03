@@ -70,6 +70,22 @@ type Resolved struct {
 	// nowhere to be previewed. The project's own primary hostname is exempt:
 	// in a worktree it belongs to web by design.
 	Uncovered []string
+
+	// DirectlyServed lists this project's DDEV hostnames that route to `web`
+	// rather than to the proxy — every registered hostname that is not a variant.
+	// Their responses are whatever the database holds, unrewritten.
+	//
+	// ExternalCanonicals lists canonical hosts that are not hostnames of this
+	// project, which is what separates the two modes. Under DDEV-canonical the
+	// canonicals *are* this project's hostnames and the list is empty: the
+	// database holds `.ddev.site` URLs and nothing dereferences off the machine.
+	// Under production-canonical it is the client's live domains, and then every
+	// DirectlyServed hostname is a page of live production links — reached
+	// through the URL `ddev start`, `ddev describe` and `ddev launch` all
+	// advertise. Together they are the condition for that warning; separately
+	// neither is.
+	DirectlyServed     []string
+	ExternalCanonicals []string
 }
 
 // Load resolves the map for a project directory.
@@ -116,7 +132,13 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Resolved{Map: m, Upstream: f.Upstream, Source: "--from/--to"}, nil
+		res := &Resolved{Map: m, Upstream: f.Upstream, Source: "--from/--to"}
+		// Best-effort: outside a DDEV project there is nothing to compare the
+		// map against, and that is not an error — `hostshift` runs anywhere.
+		if proj, err := ddev.Load(dir); err == nil {
+			annotate(res, proj, m.Sites)
+		}
+		return res, nil
 	}
 
 	var (
@@ -179,28 +201,101 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 	// project whose .ddev/config.yaml registers nine hostnames and whose
 	// hostshift.yaml declares three will 421 the other six with no explanation,
 	// which is a plausible fsi or bravoinc shape. Say so.
-	if proj != nil && len(sites) > 0 {
-		covered := map[string]bool{}
-		for _, st := range sites {
-			for _, o := range st.CanonicalSet() {
-				covered[o.Host] = true
-			}
-			covered[st.Variant.Host] = true
+	annotate(res, proj, sites)
+	return res, nil
+}
+
+// annotate fills in the diagnostic fields — the ones that describe how the map
+// sits against the DDEV project, rather than the map itself.
+//
+// Called from both places a map can come from. `--from/--to` used to return
+// before the project was ever loaded, on the reasoning that an explicit map
+// needs no files; true of the map, false of the diagnostics. A
+// production-canonical map handed over as flags therefore got no uncovered-host
+// warning, no note about the hostname DDEV advertises, and no loopback
+// containment check — three guardrails switched off by how the map was spelled.
+func annotate(res *Resolved, proj *ddev.Project, sites []origin.Site) {
+	if proj == nil || len(sites) == 0 {
+		return
+	}
+	covered := map[string]bool{}
+	for _, st := range sites {
+		for _, o := range st.CanonicalSet() {
+			covered[o.Host] = true
 		}
-		// The project's own primary hostname is exempt. In a worktree it is
-		// supposed to be absent from the map — acmecorp-wt-a.ddev.site is what
-		// web answers to, and web is where mailpit and `ddev launch` live — so
-		// warning about it fires on every correctly configured worktree, which
-		// is how people learn to skip warnings. In a canonical project it is a
-		// canonical host anyway and never reaches here.
-		own := proj.Name + "." + proj.TLD
-		for _, h := range proj.Hosts {
-			if !covered[h] && h != own {
-				res.Uncovered = append(res.Uncovered, h)
-			}
+		covered[st.Variant.Host] = true
+	}
+	// DDEV keeps a hostname the way it was declared and an Origin keeps the ACE
+	// form, so for an IDN the two sets never met: a map's *own* canonical was
+	// reported as a hostname it does not cover, and landed in DirectlyServed
+	// feeding the canonical-on-production note — on every `ddev start` of a
+	// correct project, which is how a warning stops being read.
+	key := func(h string) string {
+		if n, err := origin.NormaliseHost(h); err == nil {
+			return n
+		}
+		return h
+	}
+	// The project's own primary hostname is exempt. In a worktree it is
+	// supposed to be absent from the map — acmecorp-wt-a.ddev.site is what
+	// web answers to, and web is where mailpit and `ddev launch` live — so
+	// warning about it fires on every correctly configured worktree, which
+	// is how people learn to skip warnings. In a canonical project it is a
+	// canonical host anyway and never reaches here.
+	own := key(proj.Name + "." + proj.TLD)
+	for _, h := range proj.Hosts {
+		if !covered[key(h)] && key(h) != own {
+			res.Uncovered = append(res.Uncovered, h)
 		}
 	}
-	return res, nil
+
+	// The exemption above is why this exists. `own` is skipped there because
+	// in a worktree it belongs to web by design — true, and under
+	// production-canonical that design is the hazard, because what web
+	// serves on it is the shared production database, unrewritten.
+	variant := map[string]bool{}
+	for _, st := range sites {
+		variant[st.Variant.Host] = true
+	}
+	for _, h := range proj.Hosts {
+		if !variant[key(h)] {
+			res.DirectlyServed = append(res.DirectlyServed, h)
+		}
+	}
+	// Under the project's TLD or not, which is the question that decides how a
+	// name resolves — and the same test `ddev hostshift loopback` applies when it
+	// writes the containment file, so the check and the fix agree on one set.
+	//
+	// "not one of this project's own hostnames" was the first attempt and is
+	// wrong: in an ordinary DDEV-canonical worktree the canonicals are the
+	// *parent's* `.ddev.site` hostnames, which are not this project's and are
+	// perfectly local. That called every worktree canonical-on-production.
+	// `*.ddev.site` is a real public record pointing at the loopback, so
+	// everything under the TLD stays on the machine with nothing registered
+	// anywhere; a name outside it is one the application can actually reach.
+	for _, st := range sites {
+		for _, o := range st.CanonicalSet() {
+			// Three ways a name cannot reach another machine, and the map has to
+			// clear all of them. Under the project TLD it resolves by wildcard
+			// to the loopback. Registered by DDEV for this project — an
+			// `additional_fqdns` entry — it is in /etc/hosts, which is the case
+			// the add-on's own variant check spends a paragraph on. And a
+			// reserved TLD is never delegated at all.
+			//
+			// The TLD test alone reported `additional_fqdns: [acme.test]` as
+			// canonical-on-production, so `ddev hostshift check` — the
+			// post-start hook — printed a paragraph about live production URLs
+			// on every start of a project that had none. Third wrong answer to
+			// the same question; the first two flagged every stock project and
+			// every ordinary worktree.
+			if strings.HasSuffix(o.Host, "."+proj.TLD) ||
+				origin.ResolvesLocally(o.Host) {
+				continue
+			}
+			res.ExternalCanonicals = append(res.ExternalCanonicals, o.Host)
+		}
+	}
+
 }
 
 func mapFromFlags(f Flags) (*origin.Map, error) {
@@ -363,28 +458,54 @@ func deriveVariant(explicit, base, canonical, pattern, slug, name string) (origi
 			name, slug, host, err)
 	}
 	if v.Host != strings.ToLower(host) || !validHostLabels(v.Host) {
+		// Name the actual problem. "use only letters, digits and hyphens" is
+		// unhelpful advice for a slug that is already only letters, digits and
+		// hyphens and is simply too long — and length is the reachable case,
+		// since the slug prefixes the leftmost label rather than replacing it.
+		hint := "slugs become hostname labels, so use only letters, digits and hyphens"
+		if l := longestLabel(strings.ToLower(host)); l > 63 {
+			hint = fmt.Sprintf(
+				"that host has a %d-character label and DNS allows 63 — "+
+					"the slug prefixes the leftmost label, so shorten the slug", l)
+		}
 		return origin.Origin{}, fmt.Errorf(
-			"site %q: --slug %q derives %q, which is not a usable hostname\n"+
-				"slugs become hostname labels, so use only letters, digits and hyphens",
-			name, slug, host)
+			"site %q: --slug %q derives %q, which is not a usable hostname\n%s",
+			name, slug, host, hint)
 	}
 	return v, nil
 }
 
-// validHostLabels checks each dot-separated label is non-empty and starts and
-// ends alphanumeric. A slug ending in "." derives "wt-a.--acmecorp.ddev.site",
-// whose second label starts with a hyphen — DNS-invalid, and it resolves or not
-// depending on the resolver rather than failing at startup where it belongs.
+// validHostLabels checks each dot-separated label is non-empty, no longer than
+// RFC 1035's 63 octets, and starts and ends alphanumeric.
+//
+// A slug ending in "." derives "wt-a.--acmecorp.ddev.site", whose second label
+// starts with a hyphen — DNS-invalid, and it resolves or not depending on the
+// resolver rather than failing at startup where it belongs. The length is the
+// same class: the variant prefixes the leftmost label, so a 30-character slug on
+// a 32-character label derives a 64-octet one. Nothing rejected it — the map
+// reported "injective and anchored" and exit 0 — and it fails later, as a
+// certificate mkcert will not issue a SAN for, which presents as a browser
+// warning rather than as a naming mistake.
 func validHostLabels(h string) bool {
 	alnum := func(c byte) bool {
 		return c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
 	}
 	for _, l := range strings.Split(h, ".") {
-		if l == "" || !alnum(l[0]) || !alnum(l[len(l)-1]) {
+		if l == "" || len(l) > 63 || !alnum(l[0]) || !alnum(l[len(l)-1]) {
 			return false
 		}
 	}
 	return true
+}
+
+func longestLabel(h string) int {
+	n := 0
+	for _, l := range strings.Split(h, ".") {
+		if len(l) > n {
+			n = len(l)
+		}
+	}
+	return n
 }
 
 func portSuffix(o origin.Origin) string {

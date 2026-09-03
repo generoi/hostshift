@@ -7,10 +7,12 @@
 package corpus
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,6 +35,11 @@ type Options struct {
 	Timeout   time.Duration // per request
 	Paths     []string      // explicit paths; when empty, crawl from "/"
 	Client    *http.Client
+
+	// StrictOrigins mirrors the proxy flag of the same name: with the
+	// self-redirect carve-out turned off there, an unchanged Location is a
+	// mismatch here too.
+	StrictOrigins bool
 
 	// CanonicalHeaders are added to the canonical fetch only.
 	//
@@ -62,13 +69,53 @@ type Result struct {
 	// Equal reports byte equality between the rewritten canonical page and the
 	// page the proxy served.
 	Equal bool
+	// Tier2 counts canonical origins in a body the proxy is documented not to
+	// rewrite — `text/css` and the JavaScript types. PLAN's fast path says they
+	// are "added only if the corpus diff shows a leak", so a non-zero count here
+	// is this tool's designed trigger for adding them rather than a defect.
+	Tier2 int
+
+	// ContentType is what the variant response was labelled, because the proxy
+	// dispatches on it and a verdict that ignores it is scoring a body against a
+	// pipeline that never ran.
+	ContentType string
+
+	// BrokenSerialized counts PHP-serialized values in the variant response
+	// whose declared length does not describe their data. PHP refuses those, or
+	// worse, truncates them silently and keeps parsing.
+	BrokenSerialized int
+	// UnreadRewrites counts spans the rewrite changed inside something
+	// serialized-shaped that no spelling could read. See rewrite.UnreadRewrites:
+	// it reports what BrokenSerialized cannot, because it is host-dependent and
+	// so does not cancel against the canonical baseline.
+	UnreadRewrites int
+
+	// Literal counts canonical origins found by a plain byte scan of the variant
+	// response, sharing no code with the rewriter. See compare: the engine cannot
+	// be the only witness to its own declines.
+	Literal int
+
+	// WriteBacks counts variant origins in the *canonical* response: production
+	// serving a worktree hostname, which is §4.3 and means the shared database
+	// was written through the proxy. Zero on a healthy site.
+	WriteBacks int
+
 	// Leaks counts canonical origins in the variant response. Any non-zero
 	// value is a test 28 failure and is what this whole exercise is for.
 	Leaks int
-	// LinesCanonical and LinesVariant should match even when bytes do not:
-	// splicing never rebuilds whitespace, so a line-count change means
-	// something re-serialised.
+	// LinesCanonical and LinesVariant are close even when bytes are not:
+	// splicing never rebuilds whitespace. They are not identical — the two
+	// fetches carry different Host headers, and WordPress emits Host-dependent
+	// markup — so a small delta is reported and a large one is fatal, per
+	// hostDependentLines.
 	LinesCanonical, LinesVariant int
+	// BytesCanonical and BytesVariant are the same question in a unit every
+	// document has. Lines are not: minified HTML — WP Rocket, Autoptimize,
+	// LiteSpeed and Cloudflare's minifier all emit one — and every JSON body
+	// count zero lines however much or little is in them, so for that whole
+	// class the line counts were equal by construction and the size bound never
+	// ran at all.
+	BytesCanonical, BytesVariant int
 	DiffLines                    int
 	Err                          error
 }
@@ -84,7 +131,15 @@ func Run(ctx context.Context, o Options) ([]Result, error) {
 		if len(o.Resolve) > 0 {
 			base := &net.Dialer{Timeout: timeout}
 			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if to, ok := o.Resolve[addr]; ok {
+				// The keys are folded where they are built, by ResolveKey, and
+				// Through the same fold as the guard. net/http punycodes the
+				// host but does not lowercase it — `idnaASCII` returns an ASCII
+				// host unchanged and `canonicalAddr` folds nothing — so a
+				// mis-cased `--canonical-base` was "covered" by the guard and a
+				// miss for the dialer, which then went to real DNS with nothing
+				// printed. Round 41 keyed the guard and the map through one
+				// function; this is the third side of the same question.
+				if to, ok := o.Resolve[ResolveKey(addr)]; ok {
 					addr = to
 				}
 				return base.DialContext(ctx, network, addr)
@@ -106,13 +161,20 @@ func Run(ctx context.Context, o Options) ([]Result, error) {
 	}
 
 	paths := o.Paths
-	if len(paths) == 0 {
+	crawled := len(paths) == 0
+	if crawled {
 		var err error
 		if paths, err = crawl(ctx, o); err != nil {
 			return nil, err
 		}
 	}
-	if o.N > 0 && len(paths) > o.N {
+	// `-n` bounds a supplied list here, and the crawl there.
+	//
+	// Truncating the crawl's own output undid its budgeting: it returns pages
+	// and subresources, sorted, so `/a0.css` sorts ahead of `/b/` and cutting at
+	// `-n` kept the assets and dropped the pages — the starvation the two
+	// budgets exist to prevent, reintroduced one function up.
+	if !crawled && o.N > 0 && len(paths) > o.N {
 		paths = paths[:o.N]
 	}
 
@@ -137,18 +199,100 @@ func compare(ctx context.Context, o Options, path string) Result {
 		return r
 	}
 
-	// The canonical bytes through the same engine the proxy runs.
-	want, err := io.ReadAll(rewrite.NewResponseBody(
-		strings.NewReader(string(canon)), o.Map.Forward(), nil, rewrite.Options{}))
+	// A redirect verifies nothing about the body, and its Location is the header
+	// this design worries about most.
+	//
+	// Comparing bodies alone scored an all-redirect crawl as "3 pages, 3
+	// byte-identical, 0 leaks — GREEN" with hostshift not in the path at all,
+	// because two empty bodies are equal. The shapes that produce such a crawl
+	// are the documented ones: a worktree whose database is empty redirects every
+	// page to install.php, and a login-walled preview does the same. The README
+	// calls this the check that validates a deployment against reality.
+	if canon.status != variant.status {
+		r.Err = fmt.Errorf("status %d canonical, %d variant", canon.status, variant.status)
+		return r
+	}
+	if canon.location != "" || variant.location != "" {
+		// The pipeline the proxy actually runs, not the byte matcher alone.
+		//
+		// `modifyResponse` puts a Location through RepairSerialized(Rewrite →
+		// HostLeaks), which is twelve views and a length re-emission; this
+		// computed its expectation from `Rewrite` by itself. Measured across
+		// 236,250 Location shapes, 100,863 of them expect something the proxy
+		// does not emit — so the check the README calls "validates a deployment
+		// against reality" red-flagged the *correct* rewrite and printed the
+		// production URL as the wanted value. Worse in the other direction: a
+		// Location the proxy failed to rewrite is byte-identical on both sides
+		// and equal to this expectation too, so it scored GREEN.
+		//
+		// PLAN §566 states the rule this broke — a carve-out must be as narrow
+		// in the check as it is in the code — and redirectsToItself below reads
+		// this same string, so the self-redirect exemption was being decided on
+		// it as well.
+		wantLoc := rewrite.RepairSerialized([]byte(canon.location), func(b []byte) []byte {
+			nv, _ := o.Map.Forward().Rewrite(b, rewrite.SurfaceResponseHeader, false)
+			// Named, not renamed. HostLeaks routes through bareSurface, which
+			// calls a header value an html-attr — and the CSS view keys on the
+			// name, so the backstop half decoded escapes the proxy's does not.
+			// 3,622 of 458,200 header-safe Location shapes then expected
+			// something the proxy never emits, on the run the README calls
+			// "validates a deployment against reality".
+			return rewrite.HostLeaksCounted(o.Map.Forward(), nv, true, nil,
+				rewrite.SurfaceResponseHeader, 0)
+		})
+		// The self-redirect carve-out is not a mismatch. PLAN §4.4 and test 32
+		// enumerate it as correct: an asset the worktree does not have is
+		// redirected to the canonical origin *on purpose*, which is what
+		// redirect-uploads.conf does in 87% of the fleet with 95.2% of referenced
+		// uploads absent locally. Flagging it made a RED verdict the ordinary
+		// outcome on any page linking a PDF or an attachment, which is how a
+		// verdict stops being read.
+		//
+		// Under --strict-origins the guard is off in the proxy too, so the
+		// exemption goes with it.
+		//
+		// And it is the *proxy's* guard, which asks whether rewriting the
+		// Location would yield the URL the browser just requested — PLAN §4.4's
+		// wording, and `sameURL(rewritten, st.url)` in modifyResponse. This
+		// asked only whether the Location came back unchanged, which is a
+		// strictly wider question and, worse, is the exact signature of the
+		// failure it is meant to sit beside: an unrewritten canonical Location
+		// is byte-identical on both sides *by construction*. So the check
+		// switched itself off precisely when it was needed. An all-redirect
+		// crawl with hostshift out of the path — the case the comment above
+		// records this Location comparison as having been added to catch — was
+		// GREEN again, and so was a login redirect that PLAN test 32 names as
+		// one the guard must not cover.
+		unchangedSelfRedirect := !o.StrictOrigins &&
+			variant.location == canon.location && canon.location != "" &&
+			redirectsToItself(string(wantLoc), o, path)
+		if string(wantLoc) != variant.location && !unchangedSelfRedirect {
+			r.Err = fmt.Errorf("Location %q, want %q", variant.location, wantLoc)
+			return r
+		}
+		// A redirect with a matching Location and no body is verified; one with a
+		// body still has its body compared below.
+	}
+	if len(canon.body) == 0 && len(variant.body) == 0 && canon.location == "" {
+		r.Err = fmt.Errorf("empty body and no Location: nothing was verified")
+		return r
+	}
+
+	// The canonical bytes through the same arm the proxy would run for this
+	// content type — not the HTML pipeline regardless, which made `want`
+	// byte-identical to a leaking XML body and scored it "same".
+	want, err := applyLikeTheProxy(o.Map.Forward(), canon.body, variant.contentType, nil)
 	if err != nil {
 		r.Err = err
 		return r
 	}
 
-	r.Equal = string(want) == string(variant)
+	r.Equal = string(want) == string(variant.body)
 	r.LinesCanonical = strings.Count(string(want), "\n")
-	r.LinesVariant = strings.Count(string(variant), "\n")
-	r.DiffLines = countDiffLines(string(want), string(variant))
+	r.LinesVariant = strings.Count(string(variant.body), "\n")
+	r.BytesCanonical = len(want)
+	r.BytesVariant = len(variant.body)
+	r.DiffLines = countDiffLines(string(want), string(variant.body))
 
 	// The safety-critical assertion, independent of byte equality: a live site
 	// differs between two fetches for a dozen innocent reasons (nonces,
@@ -163,34 +307,413 @@ func compare(ctx context.Context, o Options, path string) Result {
 	// definition exactly the set of origins the proxy claims to rewrite, which
 	// makes this assertion say what it means: anything it still finds in the
 	// variant body is one the proxy should have caught and did not.
-	r.Leaks = countLeaks(o.Map.Forward(), variant)
+	// Serialized payloads the browser is served must still parse. This is the
+	// only assertion here that does not compare the two sides: when the proxy
+	// and the scorer are wrong in the same way, comparison says nothing, and
+	// that is exactly how five rounds of silent wp_options destruction went
+	// unreported by the run PLAN §7 calls the only test that validates against
+	// reality.
+	// Against the canonical baseline, so this blames the proxy for what the
+	// proxy did. Real WordPress databases carry broken serialized rows already —
+	// from the careless search-replace hostshift exists to avoid — and counting
+	// the variant alone made every such site RED forever, on bytes the proxy had
+	// passed through untouched.
+	r.BrokenSerialized = rewrite.BrokenSerialized(variant.body) -
+		rewrite.BrokenSerialized(canon.body)
+	if r.BrokenSerialized < 0 {
+		r.BrokenSerialized = 0
+	}
+
+	// And the spellings the walk cannot read at all, which BrokenSerialized is
+	// structurally unable to report: a value it cannot read does not parse on
+	// the canonical page either, so the subtraction above cancels it to zero.
+	//
+	// This asks the other question — did the rewrite change bytes inside
+	// something serialized-shaped that no spelling accounted for — which is
+	// host-dependent, so it is zero on the canonical side by construction and
+	// survives the same subtraction.
+	// Through the same pipeline countLeaks uses, not the bare byte matcher.
+	// Asking Matcher.Rewrite alone is the mistake countLeaks' own comment
+	// records — obfuscated separators, folded hosts, CSS escapes and character
+	// references are invisible to it by construction, so a host spelled any of
+	// those ways was rewritten by the proxy and reported as untouched here.
+	//
+	// No content-type guard of its own. An attachment and a Tier 2 body are ones
+	// the proxy deliberately does not rewrite, so applyLikeTheProxy returns them
+	// unchanged and the "did the rewrite touch this" test below answers no —
+	// which is the same answer a guard would give, from the property that makes
+	// it true rather than from a second list that could drift from the first.
+	{
+		if rewrite.UnreadSerialized(canon.body, func(b []byte) []byte {
+			out, err := applyLikeTheProxy(o.Map.Forward(), b, canon.contentType, nil)
+			if err != nil {
+				return b
+			}
+			return out
+		}) {
+			r.UnreadRewrites = 1
+		}
+	}
+
+	r.ContentType = variant.contentType
+	r.Leaks, r.Tier2 = countLeaks(o.Map.Forward(), variant)
+	// And a check that shares no code with the engine.
+	//
+	// countLeaks scores a served body by re-running the pipeline on it, so an
+	// origin the engine *declines* is declined again and the page is green — the
+	// report confirms itself with the thing it is checking. Round 74 measured a
+	// live instance: two `https://<canonical>` in a served site-health page,
+	// LEAKS 0, "no canonical origin reached the browser".
+	//
+	// A literal scan cannot have that property. Anchored on `//host` rather than
+	// the bare host, because the bare form has a false positive that matters —
+	// network/sites.php prints a site's domain as a row's link *text*, which is
+	// not dereferenceable and is correctly left alone. Measured across 55 pages of
+	// a real WordPress: with the anchor, one hit, and it was the true positive.
+	//
+	// Its own counter rather than folded into Leaks, because it will also see
+	// deliberate declines — an origin PLAN says to leave alone reads the same to a
+	// byte scan as one that got away.
+	r.Literal = literalOrigins(o.Map, variant.body)
+	// Base64 here too, and for the same reason it is below: countLeaks runs the
+	// rewrite pipeline, and the pipeline has no base64 view. That reasoning is
+	// direction-free — it is a property of the pipeline, not of which map is
+	// pointed at it — and round 67 applied it to the write-back column alone. So
+	// the mirror of the fixture it added, a widget instance carrying *production's*
+	// hostname served through the proxy, was still scored GREEN. The widgets
+	// screen and the Customizer decode `instance.encoded` in JavaScript and render
+	// it, so that is a live production URL in an authenticated browser.
+	if n, _ := rewrite.HiddenInBase64(variant.body, func(b []byte) []byte {
+		out, _ := o.Map.Forward().Rewrite(b, rewrite.SurfaceRequestBody, false)
+		return out
+	}); n > 0 {
+		r.Leaks += n
+	}
+	// And the other direction, which this could not see at all until round 66.
+	//
+	// Leaks are canonical origins in the *variant* response — test 28. The §4.3
+	// failure is its mirror: a *variant* origin in the *canonical* response,
+	// which means a save through the worktree wrote the worktree's hostname into
+	// production's database and the canonical site is now serving it to the
+	// public. That cannot show up as a byte difference either, because the same
+	// variant string then appears identically on both sides and the row reads
+	// `same`. So a real §4.3 write-back was reported GREEN: 16 pages, 16
+	// byte-identical, 0 leaks.
+	//
+	// On a healthy site this is zero by construction — nothing in production's
+	// database names a worktree — so it costs a scan and answers the question the
+	// whole exercise exists for.
+	r.WriteBacks, _ = countLeaks(o.Map.Reverse(), canon)
+	// And base64, which countLeaks cannot see: it runs the rewrite pipeline, and
+	// the pipeline has no base64 view — deliberately, because a widget instance
+	// is validated with `wp_hash()` over exactly those bytes and rewriting it
+	// makes the app discard the save. So the very §4.3 write this column was
+	// added for — a Customizer widget carrying the worktree's hostname into
+	// production's `wp_options` — was still reported GREEN by it. Reported, not
+	// rewritten, on the same terms as the proxy's WARN.
+	if n, _ := rewrite.HiddenInBase64(canon.body, func(b []byte) []byte {
+		out, _ := o.Map.Reverse().Rewrite(b, rewrite.SurfaceRequestBody, false)
+		return out
+	}); n > 0 {
+		r.WriteBacks += n
+	}
 	return r
 }
 
-// countLeaks reports how many canonical origins the matcher still finds in a
-// body that has already been through the proxy.
-func countLeaks(m *origin.Matcher, body []byte) int {
-	_, events := m.Rewrite(body, "leak-check", true)
+// literalOrigins counts `//host` occurrences of each canonical host in a body,
+// with no matcher, no view and no surface — deliberately the dumbest check that
+// can exist, so that it cannot inherit an engine mistake.
+func literalOrigins(m *origin.Map, body []byte) int {
 	n := 0
-	for _, e := range events {
-		if e.Action == origin.ActionRewrote {
-			n++
-		}
+	for _, s := range m.Sites {
+		needle := []byte("//" + s.Canonical.HostPort())
+		n += bytes.Count(bytes.ToLower(body), bytes.ToLower(needle))
 	}
 	return n
 }
 
-func fetch(ctx context.Context, o Options, base *url.URL, path string) ([]byte, error) {
+// countLeaks reports how many canonical origins the matcher still finds in a
+// body that has already been through the proxy.
+// countLeaks asks the whole engine, not the byte matcher alone.
+//
+// It used to run `m.Rewrite` and justify that with "the matcher is by definition
+// exactly the set of origins the proxy claims to rewrite". That stopped being
+// true the moment urlobf.go existed: the proxy also runs the URL-parser view,
+// the IDNA fold, the CSS view and the reference views, and this ran none of
+// them. So every leak class found since — obfuscated separators, folded hosts,
+// CSS escapes, character references — was invisible by construction to the one
+// test §7 calls the only one that validates against reality, and it printed
+// GREEN on a page whose `<a href>` a real browser resolved to production.
+//
+// Pushing the served bytes back through the same pipeline the proxy runs answers
+// the actual question: anything it still finds to rewrite is an origin that
+// should already have been rewritten and was not.
+// The second return is the Tier 2 count: origins in a body the proxy is
+// *documented* not to rewrite. PLAN's fast-path section excludes `text/css` and
+// the JavaScript types "per Tier 2, and added only if the corpus diff shows a
+// leak" — so finding one there is this tool doing its job, and reporting it as
+// a proxy defect would be reporting the wrong thing. An attachment is different
+// again: §5 skips it by design, whatever it contains, so it is not counted at
+// all. Scoring every body through the HTML pipeline made a PDF or a WooCommerce
+// download link — which the `<a href>` crawler reaches routinely — read as
+// CANONICAL ORIGIN REACHED THE BROWSER.
+// redirectsToItself reports whether loc — the *rewritten* Location — is the URL
+// the browser asked for. That is the proxy's self-redirect test, asked from the
+// outside.
+//
+// Against a *variant origin from the map*, not the fetch base. Those differ:
+// `--variant-base` and `--resolve` exist so the crawl can be pointed somewhere
+// else, and the URL the browser would have used is the one the map names.
+//
+// Host comparison is case-insensitive and ignores the scheme, like the proxy's:
+// a router that terminates TLS turns an https request into an http one
+// upstream, and the guard has to recognise its own redirect through that.
+func redirectsToItself(loc string, o Options, path string) bool {
+	u, err := url.Parse(loc)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	want, err := url.Parse("https://x" + path)
+	if err != nil {
+		return false
+	}
+	if u.EscapedPath() != want.EscapedPath() || u.RawQuery != want.RawQuery {
+		return false
+	}
+	// *The* variant being crawled, not any variant in the map.
+	//
+	// Accepting any of them exempted a redirect from one site in a multisite
+	// map to another — `www.b.fi` 301ing every path to `www.a.fi` is an
+	// ordinary consolidation redirect, and the browser follows it to production.
+	// The proxy's guard is `sameURL(rewritten, st.url)` against the single URL
+	// the browser asked for; there is only ever one.
+	//
+	// HostPort, not Host: an Origin keeps its port in a separate field, and the
+	// map is origin→origin — scheme, host *and* port. Comparing the host alone
+	// meant a variant on a non-default port could never match its own
+	// self-redirect, so every page linking an upload went RED on a deployment
+	// doing exactly what §4.4 prescribes.
+	crawled := o.Variant
+	for _, site := range o.Map.Sites {
+		if crawled != nil && strings.EqualFold(crawled.Host, site.Variant.HostPort()) {
+			return strings.EqualFold(u.Host, site.Variant.HostPort())
+		}
+	}
+	// The crawl is pointed somewhere that is not a variant in the map — a
+	// `--variant-base` override, or a test harness. Fall back to the primary,
+	// which is what both bases default to.
+	if len(o.Map.Sites) > 0 {
+		return strings.EqualFold(u.Host, o.Map.Sites[0].Variant.HostPort())
+	}
+	return false
+}
+
+// ResolveKey normalises a host:port for the --resolve map, so the guardrail that
+// decides whether to warn and the dialer that decides where to connect cannot
+// disagree about what host they are looking at.
+func ResolveKey(hostPort string) string {
+	h, p, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return hostPort
+	}
+	n, err := origin.NormaliseHost(h)
+	if err != nil {
+		n = strings.ToLower(h)
+	}
+	return net.JoinHostPort(n, p)
+}
+
+func countLeaks(m *origin.Matcher, r response) (leaks, tier2 int) {
+	if r.attachment {
+		return 0, 0
+	}
+	if isTier2(r.contentType) {
+		// Scanned with the text arm on purpose. The proxy does nothing to these
+		// types, so asking "what would the proxy have done" answers "nothing" —
+		// and the whole point of the Tier 2 count is to find the origins it is
+		// leaving behind, which is PLAN's stated trigger for adding them.
+		return 0, originsIn(m, r.body, "text/plain")
+	}
+	return originsIn(m, r.body, r.contentType), 0
+}
+
+// isTier2 reports whether the proxy deliberately leaves this type alone.
+func isTier2(ct string) bool {
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		mt = strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
+	}
+	switch mt {
+	case "text/css", "application/javascript", "text/javascript",
+		"application/x-javascript", "application/ecmascript", "text/ecmascript":
+		return true
+	}
+	return false
+}
+
+// originsIn asks the whole engine, not the byte matcher alone.
+//
+// It used to run `m.Rewrite` and justify that with "the matcher is by definition
+// exactly the set of origins the proxy claims to rewrite". That stopped being
+// true the moment urlobf.go existed: the proxy also runs the URL-parser view,
+// the IDNA fold, the CSS view and the reference views, and this ran none of
+// them. So every leak class found since — obfuscated separators, folded hosts,
+// CSS escapes, character references — was invisible by construction to the one
+// test §7 calls the only one that validates against reality, and it printed
+// GREEN on a page whose `<a href>` a real browser resolved to production.
+func originsIn(m *origin.Matcher, body []byte, ct string) int {
+	st := rewrite.NewStats(false)
+	out, err := applyLikeTheProxy(m, body, ct, st)
+	if err != nil {
+		return 0
+	}
+	if n := st.Total(); n > 0 {
+		return n
+	}
+	// A pass that splices without recording — and one that changes bytes has
+	// found an origin whatever it counted.
+	if string(out) != string(body) {
+		return 1
+	}
+	return 0
+}
+
+// applyLikeTheProxy runs the arm the proxy would run for this content type.
+//
+// This ran NewResponseBody — the HTML pipeline, XMLEntities off — on every body,
+// while proxy.go dispatches every `*xml` media type to HostLeaksXMLCounted,
+// which applies the reference and CSS views over the whole buffer. The HTML
+// pipeline applies the reference view only where an *HTML* parser decodes one:
+// attributes and foreign content. Element content in an ordinary XML element is
+// the gap — and that is where every sitemap `<loc>` and every RSS `<link>`
+// lives. So the one test PLAN §7 calls "the only test that validates against
+// reality" scored an unrewritten feed GREEN, and the byte-equality half
+// positively rewarded the leak, because `want` was computed the same blind way.
+func applyLikeTheProxy(m *origin.Matcher, body []byte, ct string, st *rewrite.Stats) ([]byte, error) {
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		mt = strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
+	}
+	mt = strings.ToLower(mt)
+	switch {
+	case mt == "text/html" || mt == "application/xhtml+xml":
+		return io.ReadAll(rewrite.NewResponseBody(strings.NewReader(string(body)), m, nil,
+			rewrite.Options{Stats: st, XMLEntities: mt == "application/xhtml+xml"}))
+
+	// Ahead of the XML arm, because `application/ld+json` ends in neither and
+	// the proxy tests JSON first.
+	case mt == "application/json", mt == "text/json", strings.HasSuffix(mt, "+json"):
+		out := rewrite.RewriteJSON(body, m, st, nil, false)
+		// Inside the repair: the sweep is a raw byte matcher, so a host it
+		// rewrites inside a serialized string leaves the length stale. On
+		// RewriteJSON's decline path — a duplicate member is legal JSON and
+		// is rejected — the sweep is the only pass that touches the body, so
+		// it corrupted the blob while logging a line that reads like a save.
+		return rewrite.RepairSerialized(out, func(b []byte) []byte {
+			return rewrite.SweepBytes(b, m, st, nil)
+		}), nil
+
+	// The enumerated set plus `+xml`, exactly as rewritableText has it — not
+	// `HasSuffix(mt, "xml")`, which also swallows text/xml-external-parsed-entity
+	// and application/vnd.foo.xml, and not `HasPrefix(mt, "text/")`, which
+	// swallows text/markdown. Either one made the scorer rewrite a body the
+	// proxy passes through, and the run went RED on a healthy deployment.
+	case isTextArm(mt):
+		// The proxy's `{`/`[` sniff first. wp-admin/async-upload.php sets
+		// text/plain before wp_send_json can set application/json, so the body
+		// that reports every media upload arrives on this arm as JSON — and
+		// wp_json_encode writes its origins with \uXXXX escapes, which only
+		// RewriteJSON decodes. Without the sniff the scorer served that body
+		// back unrewritten and called the page clean.
+		if t := bytes.TrimLeft(body, " \t\r\n"); len(t) > 0 && (t[0] == '{' || t[0] == '[') {
+			out := rewrite.RewriteJSON(body, m, st, nil, false)
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			return rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, m, st, nil)
+			}), nil
+		}
+		// All three passes the proxy runs, in order. Running only the middle one
+		// scored a plain, unencoded, dereferenceable origin as clean: stripForURL
+		// *deletes* tab, LF and CR — right for a single URL value, wrong for a
+		// whole document, where those bytes are token separators. Removing the
+		// newline welds the previous word onto `https:`, tokenBoundary is then
+		// false, and no candidate is emitted. The byte matcher and the sweep,
+		// which the proxy runs and this did not, see the raw bytes.
+		// Wrapped in RepairSerialized, exactly as proxy.go's text arm is. Both
+		// were edited in the same commit and only one got the wrapper, so the
+		// scorer disagreed with the proxy on any body carrying an `s:N:"…"` —
+		// which sends the run spuriously RED on a real page.
+		var ev []origin.Event
+		// The same surface the proxy picks, by the same question: an XML body's
+		// `<style>` is CSS and its references are decoded, and nothing decodes
+		// either in text/plain. Naming it `text` on both arms let the scorer read
+		// a plain-text body as a stylesheet exactly as the proxy did.
+		textSurface := rewrite.SurfaceText
+		if strings.HasSuffix(mt, "xml") {
+			textSurface = rewrite.SurfaceXMLText
+		}
+		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
+			nv, nev := m.RewriteText(b, textSurface, false)
+			ev = append(ev, nev...)
+			if strings.HasSuffix(mt, "xml") {
+				return rewrite.HostLeaksXMLCounted(m, nv, false, st, textSurface, 0)
+			}
+			return rewrite.HostLeaksCounted(m, nv, false, st, textSurface, 0)
+		})
+		st.Record(textSurface, 0, ev)
+		// Inside the repair: the sweep is a raw byte matcher, so a host it
+		// rewrites inside a serialized string leaves the length stale. On
+		// RewriteJSON's decline path — a duplicate member is legal JSON and
+		// is rejected — the sweep is the only pass that touches the body, so
+		// it corrupted the blob while logging a line that reads like a save.
+		return rewrite.RepairSerialized(out, func(b []byte) []byte {
+			return rewrite.SweepBytes(b, m, st, nil)
+		}), nil
+	}
+	// Everything else the proxy streams through untouched, so scoring it as a
+	// page would report a leak on a type it never claimed to rewrite.
+	return body, nil
+}
+
+// isTextArm is proxy.rewritableText, and the two must not drift —
+// TestTheScorerMatchesTheProxy asserts they have not.
+func isTextArm(mt string) bool {
+	switch mt {
+	case "text/plain", "text/xml", "application/xml",
+		"application/rss+xml", "application/atom+xml", "image/svg+xml":
+		return true
+	}
+	return strings.HasSuffix(mt, "+xml")
+}
+
+// response is what a comparison needs: the body, and the parts of the response
+// that decide whether the body means anything.
+type response struct {
+	body     []byte
+	status   int
+	location string
+	// The proxy dispatches on Content-Type and Content-Disposition, so a
+	// verdict that ignores them is scoring a body against a pipeline that never
+	// ran on it.
+	contentType string
+	attachment  bool
+}
+
+func fetch(ctx context.Context, o Options, base *url.URL, path string) (response, error) {
 	u := *base
 	ref, err := url.Parse(path)
 	if err != nil {
-		return nil, err
+		return response{}, err
 	}
 	u.Path, u.RawQuery = ref.Path, ref.RawQuery
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
-		return nil, err
+		return response{}, err
 	}
 	// Ask for identity so the comparison is over the bytes the rewriter saw.
 	req.Header.Set("Accept-Encoding", "identity")
@@ -201,10 +724,17 @@ func fetch(ctx context.Context, o Options, base *url.URL, path string) ([]byte, 
 	}
 	res, err := o.Client.Do(req)
 	if err != nil {
-		return nil, err
+		return response{}, err
 	}
 	defer res.Body.Close()
-	return io.ReadAll(res.Body)
+	b, err := io.ReadAll(res.Body)
+	return response{
+		body:        b,
+		status:      res.StatusCode,
+		location:    res.Header.Get("Location"),
+		contentType: res.Header.Get("Content-Type"),
+		attachment:  strings.HasPrefix(strings.ToLower(strings.TrimSpace(res.Header.Get("Content-Disposition"))), "attachment"),
+	}, err
 }
 
 // crawl collects same-host paths from the canonical site, breadth first.
@@ -224,62 +754,152 @@ func crawl(ctx context.Context, o Options) ([]string, error) {
 		}
 	}
 
-	for len(queue) > 0 && (o.N == 0 || len(out) < o.N) {
-		p := queue[0]
-		queue = queue[1:]
+	// Pages before subresources.
+	//
+	// `-n` is a number of pages, and one FIFO made it a number of *fetches*. A
+	// `<head>` is emitted before the `<body>`, so every stylesheet and script
+	// enqueued ahead of the first `<a href>`: measured on a page with 15
+	// stylesheets, 15 scripts and 10 links, `-n 20` fetched the homepage and
+	// nineteen files from its head, and not one other page. The trade is not
+	// neutral — Tier 2 is a note and never fails a run, so that spent nineteen
+	// slots of the only check in the tool that goes RED for invariant 28 to make
+	// one note louder.
+	//
+	// They are still fetched — the Tier 2 count they exist for is read off a
+	// response body, so it needs a request — but they go behind every page the
+	// budget can reach, not in front of them. Ordering is the whole defect:
+	// nothing about reaching a stylesheet requires reaching it first.
+	var subQueue []string
+	enqueue := func(link, from string, isDoc bool) {
+		u, err := url.Parse(link)
+		if err != nil || u.Path == "" {
+			return
+		}
+		// Same site only: a crawl that wanders onto a third-party host is
+		// measuring nothing.
+		if u.Host != "" && !sameSite[strings.ToLower(u.Hostname())] {
+			return
+		}
+		if u.Fragment != "" && u.Path == from {
+			return
+		}
+		key := u.Path
+		if u.RawQuery != "" {
+			key += "?" + u.RawQuery
+		}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if isDoc {
+			queue = append(queue, key)
+			return
+		}
+		subQueue = append(subQueue, key)
+	}
+
+	// Pages up to `-n`, then subresources on top of it, up to `-n` again.
+	//
+	// Two budgets rather than one, because either single budget starves the
+	// other. One FIFO in document order spent it all on assets: a `<head>`
+	// precedes a `<body>`, so every stylesheet was enqueued ahead of the first
+	// `<a href>`, and `-n 20` fetched one page and nineteen files from its head.
+	// Draining pages first fixed that and introduced the mirror — any site whose
+	// linked pages exceed `-n` never empties the page queue, so no subresource
+	// is ever fetched and `Tier2` is structurally zero, which is exactly the
+	// unreachability the subresource-following exists to end.
+	//
+	// The asset budget is the same number the caller chose. It is a bound, not a
+	// target: it exists so a page with a thousand stylesheets cannot run away
+	// with the crawl, and `-n 0` means unbounded for both.
+	pageCap, assetCap := o.N, o.N
+	pages, assets := 0, 0
+	for len(queue) > 0 || len(subQueue) > 0 {
+		var p string
+		switch {
+		case len(queue) > 0 && (pageCap == 0 || pages < pageCap):
+			p, queue = queue[0], queue[1:]
+			pages++
+		case len(subQueue) > 0 && (assetCap == 0 || assets < assetCap):
+			p, subQueue = subQueue[0], subQueue[1:]
+			assets++
+		default:
+			// Both budgets spent, or the only work left is behind a spent one.
+			if len(queue) > 0 && (pageCap == 0 || pages < pageCap) {
+				continue
+			}
+			p = ""
+		}
+		if p == "" {
+			break
+		}
 		out = append(out, p)
 
-		body, err := fetch(ctx, o, o.Canonical, p)
+		res, err := fetch(ctx, o, o.Canonical, p)
 		if err != nil {
 			continue
 		}
-		for _, link := range links(body) {
-			u, err := url.Parse(link)
-			if err != nil || u.Path == "" {
-				continue
-			}
-			// Same site only: a crawl that wanders onto a third-party host is
-			// measuring nothing.
-			if u.Host != "" && !sameSite[strings.ToLower(u.Hostname())] {
-				continue
-			}
-			if u.Fragment != "" && u.Path == p {
-				continue
-			}
-			key := u.Path
-			if u.RawQuery != "" {
-				key += "?" + u.RawQuery
-			}
-			if !seen[key] {
-				seen[key] = true
-				queue = append(queue, key)
-			}
+		docs, subs := links(res.body)
+		for _, link := range docs {
+			enqueue(link, p, true)
+		}
+		for _, link := range subs {
+			enqueue(link, p, false)
 		}
 	}
 	sort.Strings(out)
 	return out, nil
 }
 
-func links(body []byte) []string {
-	var out []string
+// links collects what the crawl should fetch next: the pages a reader can reach,
+// and the subresources the browser fetches whether or not anyone clicks.
+//
+// `<a href>` alone meant the crawl never fetched a stylesheet, and the Tier 2
+// line — the one PLAN's fast path names as its trigger for rewriting CSS — could
+// not fire from a default run. Measured: a page linking its own
+// `<link rel=stylesheet>` whose file carried a live production origin scored
+// "3 pages, 0 leaks" and GREEN, while `curl` on that stylesheet through the
+// proxy returned the canonical URL. The README points at this command for
+// exactly that case, so the evidence it asks for was unreachable by it.
+//
+// Subresources are followed, not just noted, because the point is to *fetch*
+// them: `Result.Tier2` is counted from a response body, which requires a request.
+func links(body []byte) (docs, subs []string) {
 	z := html.NewTokenizer(strings.NewReader(string(body)))
 	for {
 		tt := z.Next()
 		if tt == html.ErrorToken {
-			return out
+			return docs, subs
 		}
-		if tt != html.StartTagToken {
+		if tt != html.StartTagToken && tt != html.SelfClosingTagToken {
 			continue
 		}
 		name, hasAttr := z.TagName()
-		if string(name) != "a" {
+		// The attribute carrying a URL differs by element, and taking `href`
+		// from everything would pull in `<base href>` — which is not a
+		// document — and every `<link rel=alternate>` to another site.
+		var want string
+		doc := false
+		switch string(name) {
+		case "a":
+			want, doc = "href", true
+		case "link":
+			want = "href"
+		case "script", "img", "iframe":
+			want = "src"
+		default:
 			continue
 		}
 		for hasAttr {
 			var k, v []byte
 			k, v, hasAttr = z.TagAttr()
-			if string(k) == "href" {
-				out = append(out, string(v))
+			if string(k) != want {
+				continue
+			}
+			if doc {
+				docs = append(docs, string(v))
+			} else {
+				subs = append(subs, string(v))
 			}
 		}
 	}
@@ -304,29 +924,189 @@ func countDiffLines(a, b string) int {
 }
 
 // WriteReport summarises a run. It returns true when the run is green: no
-// canonical origin reached the browser, and no page lost or gained lines.
+// canonical origin reached the browser, no served value was re-serialised past
+// what PHP will read, and no page lost or gained enough lines to be a different
+// document.
+// hostDependentLines: how many lines of a document may differ between the two
+// fetches purely because they carry different Host headers. WordPress emits one
+// `<link rel="dns-prefetch">` per asset host that is not SERVER_NAME, and a
+// multisite parent can have a few asset hosts; nothing plausible emits eight.
+// Truncation loses far more, which is the point of the bound.
+const hostDependentLines = 8
+
 func WriteReport(w io.Writer, results []Result) bool {
-	green := true
-	var equal, leaks, errs int
+	// A run that compared nothing is not a run that found nothing. `green` is
+	// only ever cleared by a result, so an empty slice — a negative `-n`, a
+	// `--paths` file of comments — walked no rows, cleared nothing, and printed
+	// the invariant-28 verdict with exit 0. The same class as the two verdicts
+	// round 43 rescoped: a report asserting what it skipped.
+	green := len(results) > 0
+	var equal, leaks, errs, tier2, broken, unread, writeBacks, literal int
 
 	fmt.Fprintf(w, "%-46s %-8s %-7s %-7s %s\n", "PATH", "BYTES", "LEAKS", "LINES", "NOTE")
 	for _, r := range results {
-		note := ""
-		switch {
-		case r.Err != nil:
-			note, errs = r.Err.Error(), errs+1
+		// Every note a page has earned, not the first one. This was a switch, so
+		// a page that both leaked an origin *and* served a blob PHP refuses
+		// reported only the leak — and the page most likely to do both is the
+		// one carrying a serialized payload full of URLs, which is the shape
+		// this whole detector exists for.
+		var notes []string
+		if r.Err != nil {
+			notes, errs = append(notes, r.Err.Error()), errs+1
 			green = false
-		case r.Leaks > 0:
-			note = "CANONICAL ORIGIN REACHED THE BROWSER"
+		}
+		if r.Leaks > 0 {
+			notes = append(notes, "CANONICAL ORIGIN REACHED THE BROWSER")
 			leaks += r.Leaks
 			green = false
-		case r.LinesCanonical != r.LinesVariant:
-			note = "line count changed — something re-serialised"
+		}
+		if r.WriteBacks > 0 {
+			notes = append(notes, "A VARIANT HOSTNAME IS IN PRODUCTION'S DATABASE — "+
+				"the canonical site is serving it to the public, which means a save "+
+				"through the worktree wrote it there (§4.3, no undo)")
+			writeBacks += r.WriteBacks
 			green = false
-		case r.Equal:
+		}
+		if r.UnreadRewrites > 0 {
+			notes = append(notes, "a serialized value here was rewritten in an encoding "+
+				"this build cannot read, so no length was re-emitted — look at this page")
+			unread++
+			green = false
+		}
+		if r.BrokenSerialized > 0 {
+			notes = append(notes, fmt.Sprintf("serialized data PHP will refuse or "+
+				"truncate: %d header(s) failed to parse, and one bad length fails "+
+				"every container around it", r.BrokenSerialized))
+			broken += r.BrokenSerialized
+			green = false
+		}
+		// Reported, not counted against the verdict. A literal scan sees every
+		// canonical origin in the body, including the ones PLAN deliberately
+		// leaves — a Tier 2 stylesheet, an attachment — so making it RED would
+		// make a correct run red. What it is for is the case where it sees more
+		// than the engine did: that difference is the engine declining something,
+		// and the engine is the one witness that cannot report on itself.
+		// Not on a Tier 2 body. countLeaks short-circuits at isTier2 and returns
+		// zero *before the engine runs at all*, so `Literal > Leaks` holds for
+		// every stylesheet carrying an origin — and the note would say "the engine
+		// declined this" when the engine was never asked. Round 75 measured it on
+		// a real deployment: all eight pointer hits were Tier 2 CSS, and eight of
+		// the ten Tier 2 origins were the same origins counted twice, while the
+		// declines this pointer exists to catch were zero. A check that fires on
+		// every page carrying the thing it is meant to be quiet about carries no
+		// information — the rule mayHoldSerialized's own comment states.
+		if r.Literal > r.Leaks && !isTier2(r.ContentType) {
+			notes = append(notes, fmt.Sprintf("a literal scan finds %d canonical "+
+				"origin(s) here and the engine reported %d — the difference is "+
+				"something the engine declined, and it cannot be the only witness "+
+				"to its own declines", r.Literal, r.Leaks))
+			literal += r.Literal - r.Leaks
+		}
+		if r.Tier2 > 0 {
+			// Not a defect: PLAN's fast path excludes these types "per Tier 2,
+			// and added only if the corpus diff shows a leak". This is that
+			// showing. It does not turn the run RED, because the proxy is doing
+			// what it says it does — but it is the trigger, so it is loud.
+			notes = append(notes, fmt.Sprintf("%d origins in a Tier 2 type (%s) — "+
+				"the PLAN's trigger for rewriting it", r.Tier2, r.ContentType))
+			tier2 += r.Tier2
+		}
+		if r.LinesCanonical != r.LinesVariant {
+			// Reported, not fatal.
+			//
+			// This was a proxy for "something re-serialised" from before there
+			// was a direct test for it. There is now: `broken` asks PHP's own
+			// question of the served bytes, and `unread` names a value the walk
+			// could not read. Both are exact where this is an inference.
+			//
+			// And under production-canonical the inference is simply wrong. The
+			// canonical hostname is not routed locally — that is the whole point
+			// of the mode — so the canonical fetch carries a different Host than
+			// the proxy sends upstream, and WordPress emits one extra
+			// `<link rel="dns-prefetch">` for every asset host that is not
+			// SERVER_NAME. Exactly one line, on every page, on a site with
+			// nothing wrong with it. Measured: 1825/1824 across a whole stock
+			// Bedrock crawl, every row RED.
+			//
+			// A verdict that is red on every healthy page in the mode its own
+			// README calls "where the hazards live" is one nobody reads, and on
+			// the run that did carry 32 broken values the real signal was a
+			// clause appended to a phrase that fires regardless.
+			//
+			// Demoted, but not deleted: bounded instead. Nothing else in this
+			// report says anything about the *size* of what the proxy served.
+			// `Err` needs a transport failure, `Leaks` needs an origin to
+			// survive, `broken` and `unread` need a serialized value to be
+			// present to be wrong about — so an upstream that answers 200 with
+			// an empty body, or dies mid-stream and serves half the document,
+			// satisfies every one of them. Dropping the assertion outright
+			// scored both GREEN, under a verdict line that goes on saying "no
+			// page re-serialised".
+			//
+			// Two bounds, because the two failures have different shapes. A
+			// Host-dependent line is a handful of lines in a document of any
+			// size, so more than `hostDependentLines` of them is not that. And
+			// on a short page a handful *is* the document, so a variant that
+			// lost or gained a quarter of it is not the same page either.
+			// Measured 1825/1824 passes both; an empty body and a body cut to
+			// five lines of eight fail one each.
+			d := r.LinesCanonical - r.LinesVariant
+			if d < 0 {
+				d = -d
+			}
+			if d > hostDependentLines || d*4 > r.LinesCanonical {
+				green = false
+				notes = append(notes, fmt.Sprintf(
+					"line count %d→%d — too much of the page to be a Host-dependent "+
+						"line; the proxy served a different document",
+					r.LinesCanonical, r.LinesVariant))
+			} else {
+				notes = append(notes, fmt.Sprintf(
+					"line count %d→%d — a Host-dependent line like dns-prefetch does this; "+
+						"`broken` and `unread` are the tests for re-serialisation",
+					r.LinesCanonical, r.LinesVariant))
+			}
+		} else if len(notes) == 0 && !r.Equal {
+			notes = append(notes, fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines))
+		}
+
+		// The same question in bytes, asked unconditionally.
+		//
+		// The bound above is expressed entirely in newlines, and a document with
+		// none counts zero lines however much is in it — so for minified HTML
+		// (WP Rocket, Autoptimize, LiteSpeed and Cloudflare's minifier all emit
+		// one line) and for every JSON body the two counts are equal by
+		// construction, the branch above is never entered, and the size
+		// assertion never ran at all. An upstream answering 200 with nothing in
+		// it scored "1 lines differ (dynamic content?)" and GREEN, under a
+		// verdict line claiming every page was the length it should be.
+		//
+		// Outside both branches rather than inside one, because a page can have
+		// earned a note already — a Tier 2 origin, a self-redirect — and being
+		// half-served is not less true for it.
+		//
+		// A quarter again, and for the same reason: rewriting changes lengths,
+		// since a variant hostname is not the length of the canonical it
+		// replaces, but it changes them by a few bytes per URL and never by a
+		// quarter of the document.
+		db := r.BytesCanonical - r.BytesVariant
+		if db < 0 {
+			db = -db
+		}
+		if db*4 > r.BytesCanonical {
+			green = false
+			notes = append(notes, fmt.Sprintf(
+				"%d→%d bytes — too much of the page to be rewriting; the proxy "+
+					"served a different document",
+				r.BytesCanonical, r.BytesVariant))
+		}
+		note := strings.Join(notes, "; ")
+		// Counted outside the switch. `equal++` used to sit in its last arm, so
+		// a page that *is* byte-identical but carries a note was never counted:
+		// the BYTES column said `same` while the summary said `0 byte-identical`,
+		// which is the line a developer reads.
+		if r.Equal {
 			equal++
-		default:
-			note = fmt.Sprintf("%d lines differ (dynamic content?)", r.DiffLines)
 		}
 		state := "differ"
 		if r.Equal {
@@ -337,11 +1117,65 @@ func WriteReport(w io.Writer, results []Result) bool {
 			fmt.Sprintf("%d/%d", r.LinesCanonical, r.LinesVariant), note)
 	}
 
-	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d errors\n",
-		len(results), equal, leaks, errs)
-	if green {
-		fmt.Fprintln(w, "corpus diff GREEN: no canonical origin reached the browser, no page re-serialised")
-	} else {
+	// `broken` belongs on this line. Without it a run could print
+	// "3 pages, 3 byte-identical, 0 leaks, 0 errors" and then "corpus diff RED",
+	// naming nothing that was wrong — and this summary is what a developer
+	// reads before deciding whether to scroll up.
+	// `write-backs` belongs on this line for the same reason `broken` does: a
+	// run that found production serving a worktree hostname printed
+	// "16 byte-identical, 0 leaks" and a GREEN verdict, because every counter on
+	// this line asked about the variant response only.
+	fmt.Fprintf(w, "\n%d pages, %d byte-identical, %d leaks, %d write-backs, %d broken, "+
+		"%d unread, %d errors\n",
+		len(results), equal, leaks, writeBacks, broken, unread, errs)
+	if literal > 0 {
+		fmt.Fprintf(w, "%d canonical origin(s) a literal scan found and the engine "+
+			"did not — deliberate declines look the same to it, so this is a "+
+			"pointer rather than a verdict\n", literal)
+	}
+	if tier2 > 0 {
+		fmt.Fprintf(w, "%d origins in Tier 2 types (text/css, JavaScript), which the "+
+			"proxy excludes by design — PLAN's fast path adds them \"only if the "+
+			"corpus diff shows a leak\", and this is that\n", tier2)
+	}
+	// Whether anything in this run is a type the leak scan actually reads. "At
+	// least one row" is weaker than the verdict's sentence: a table of nothing
+	// but Tier 2 rows has had no scan run on it, so twenty byte-identical
+	// stylesheets printed "no canonical origin reached the browser" over bytes
+	// nobody looked at. Not a reason to fail the run — Tier 2 must not, and
+	// TestATier2BodyTheProxyNeverRewritesIsNotAnUnreadRewrite holds that — but a
+	// reason not to claim the invariant was tested.
+	scanned := false
+	for _, r := range results {
+		if !isTier2(r.ContentType) {
+			scanned = true
+			break
+		}
+	}
+	switch {
+	case green && !scanned:
+		fmt.Fprintf(w, "corpus diff GREEN, but nothing in this run is a type the proxy "+
+			"rewrites:\n  no canonical origin was looked for, and %d did reach it in Tier 2 "+
+			"types.\n  Crawl a page, not only its assets.\n", tier2)
+	case green && tier2 > 0:
+		// The verdict has to be scoped to what was actually asked.
+		//
+		// "no canonical origin reached the browser" was printed unconditionally,
+		// two lines under a count of origins that had just reached the browser
+		// in an excluded type — a production-canonical run with live URLs inside
+		// Elementor CSS said GREEN and exited 0. The exclusion is designed
+		// (PLAN §5.2 Tier 2) and stays; what could not stay is a sentence
+		// asserting the one thing invariant 28 forbids about bytes it never
+		// looked at, in the command the README calls the check that validates a
+		// deployment against reality.
+		fmt.Fprintf(w, "corpus diff GREEN for the types it rewrites: no canonical origin "+
+			"reached the browser\n  in Tier 1, no page re-serialised, every page the "+
+			"length it should be. %d origin(s)\n  did reach it in Tier 2 types, which "+
+			"this run does not fail on — see the line above.\n", tier2)
+	case green:
+		fmt.Fprintln(w, "corpus diff GREEN: no canonical origin reached the browser, "+
+			"no page re-serialised, every page the length it should be")
+	default:
 		fmt.Fprintln(w, "corpus diff RED")
 	}
 	return green

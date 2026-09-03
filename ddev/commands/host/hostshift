@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #ddev-generated
 ## Description: configure hostshift for this DDEV project
-## Usage: hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--quiet]
+## Usage: hostshift [init|check|copy-db|loopback|env|wp-cli] [--slug NAME]
 ## Example: "ddev hostshift init"
 ##
 ## Scaffolding a DDEV project is opinionated work, and this is where it is
@@ -34,8 +34,47 @@ set -euo pipefail
 # anywhere inside the project.
 [ -n "${DDEV_APPROOT:-}" ] && cd "$DDEV_APPROOT"
 
-cmd="${1:-init}"; shift || true
+# Usage, not init, when no subcommand is given. `init` writes .ddev/.env and
+# restarts every container, so a developer reaching for the usage text took
+# their project down instead — and for a six-subcommand tool the safe default is
+# the one that changes nothing. The post-start hook and every documented
+# invocation name their subcommand explicitly.
+cmd="${1:-}"; shift || true
+# Every flag, because --slug-from-branch is the documented way back from a
+# pinned slug and appeared in neither the usage line nor --help — its only
+# mention anywhere was one line init prints, which is also the only mention of
+# the pinning itself.
+usage() {
+  cat <<'USAGE'
+usage: ddev hostshift <command> [flags]
+
+  init                write .ddev/.env and restart to pick it up
+  check               is what is deployed still what this checkout resolves to?
+  copy-db             replace this worktree's database with the parent's
+  loopback            pin the canonical hostnames to 127.0.0.1 inside web
+  env                 print what init would write
+  wp-cli              write wp-cli.local.yml
+
+  --slug NAME         name this worktree's hostnames; recorded, and it sticks
+  --slug-from-branch  forget a recorded slug and follow the branch again
+  --dry-run, -n       say what would happen, write nothing
+  --force             copy-db: overwrite a database that has tables
+  --quiet, -q         say nothing when there is nothing to check
+USAGE
+}
+
+# Usage is printed here, after the function exists, rather than defaulting `cmd`
+# to `init` — which writes .ddev/.env and restarts every container, so a
+# developer reaching for the usage text took their project down instead. The
+# post-start hook and every documented invocation name their subcommand.
+if [ -z "$cmd" ]; then
+  usage
+  exit 0
+fi
+
 slug=""
+slug_explicit=""
+forget_slug=""
 branch=""
 dry_run=""
 force=""
@@ -43,32 +82,131 @@ quiet=""
 claimed=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --slug) slug="${2:?--slug needs a value}"; shift 2 ;;
-    --slug=*) slug="${1#*=}"; shift ;;
+    --slug) slug="${2:?--slug needs a value}"; slug_explicit=1; shift 2 ;;
+    # Both spellings agree. `--slug ""` was refused and `--slug=` was not, so
+    # the empty value left slug_explicit set, the branch derivation filled the
+    # slug in, and a *branch-derived* name was written to .ddev/.env as a chosen
+    # one — pinning the naming forever, with nothing said and --slug-from-branch
+    # the only way back.
+    --slug=*) slug="${1#*=}"
+       [ -n "$slug" ] || { echo "--slug needs a value" >&2; exit 2; }
+       slug_explicit=1; shift ;;
+    # The way back. A recorded slug outranks the branch — that is the point of
+    # recording it — so without this the only way to return to branch-derived
+    # naming is to hand-edit .ddev/.env.
+    --slug-from-branch) forget_slug=1; shift ;;
     --dry-run|-n) dry_run=1; shift ;;
     --quiet|-q) quiet=1; shift ;;
     --force) force=1; shift ;;
     # Silently discarding an unknown flag is how `--dry-run` came to write the
     # files it was passed to prevent.
     *) echo "unknown argument: $1" >&2
-       echo "usage: ddev hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--force|--quiet]" >&2
+       usage >&2
        exit 2 ;;
   esac
 done
 
 case "$cmd" in
-  init|check|copy-db|env|wp-cli) ;;
-  -h|--help|help)
-    echo "usage: ddev hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--force|--quiet]"; exit 0 ;;
-  *) echo "usage: ddev hostshift [init|check|copy-db|env|wp-cli] [--slug NAME] [--dry-run|--force|--quiet]" >&2; exit 2 ;;
+  init|check|copy-db|loopback|env|wp-cli) ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
 esac
 
 # The post-start hook runs `check` on every start. Between `ddev add-on get` and
 # `ddev hostshift init` — and permanently, for anyone who installed the add-on
 # and never used it — there is nothing to check, and saying so in nine lines plus
 # a `Task failed` is how an add-on stops being inert until it is configured.
-if [ "$cmd" = "check" ] && [ -n "$quiet" ] && ! grep -qs '^HOSTSHIFT_' .ddev/.env 2>/dev/null; then
-  exit 0
+#
+# $HOSTSHIFT_HOOK, not a flag, and that is not a style choice.
+# `config.hostshift.yaml` carries #ddev-generated so `ddev add-on get` replaces
+# it on upgrade. This file only gained that marker *after* v0.1.0, so DDEV
+# refuses to replace it — an upgraded project runs the new hook against the old
+# command, and the old parser exits 2 on any flag it does not know. Measured on a
+# real upgrade: `unknown argument: --quiet`, `Task failed`, `Successfully
+# started`. The proxy kept serving, so nothing looked wrong, and the post-start
+# check was dead from then on: every later drift — a renamed directory, a changed
+# branch, a stale .env, a crashed proxy, a hijacked hostname — went unreported on
+# exactly the projects that had been running longest.
+#
+# `bash -c` runs the hook line (ddev pkg/ddevapp/task.go, ExecHostTask.Execute),
+# so an environment prefix is a plain assignment there, and a parser that only
+# reads "$@" cannot trip over it. The rule the compose file states — anything
+# added must work against what is already deployed — covers the hook line too.
+#
+# Only this short-circuit is gated. `ddev hostshift check` typed by a person on a
+# project with no configuration is a question that deserves an answer, and it
+# still gets one.
+#
+# `[ ! -e ]` or readable-and-empty, not `grep -qs`. -s swallows the difference
+# between "no HOSTSHIFT_ line" and "cannot read the file", so a fully configured
+# project whose .ddev/.env had lost its read permission reported healthy on every
+# start — the one file the whole check is about, silently unread.
+if [ "$cmd" = "check" ] && { [ -n "$quiet" ] || [ -n "${HOSTSHIFT_HOOK:-}" ]; }; then
+  if [ ! -e .ddev/.env ]; then
+    # Inert, but not silent in the one case where installing has already done
+    # harm. `ddev add-on get` tells you to run `ddev restart`, and in a linked
+    # worktree that restart registers every hostname inherited from the parent's
+    # *tracked* config.yaml — a multisite's blog hostnames included — on this
+    # project's web, where the router prefers it over the parent. The parent's
+    # blog is then served by an empty database, `ddev describe` on the parent
+    # still lists the URL, and the moment the add-on could have said so is the
+    # moment it created the hazard.
+    #
+    # The .git file names the parent, and the question is only whether it
+    # declares extra hostnames. That used to be a `grep` for the key — which
+    # matches `additional_hostnames: []`, what `ddev config` writes into every
+    # project, so it fired on every ordinary parent. `hostshift hosts` answers it
+    # exactly and keeps one copy of the parsing; the cost is that this branch now
+    # needs the CLI, and says so when it is missing rather than going quiet.
+    if grep -q '/worktrees/' .git 2>/dev/null; then
+      pdir="$(sed -n 's/^gitdir: //p' .git 2>/dev/null | sed 's|/\.git/worktrees/.*||')"
+      # Does the parent declare any hostname beyond its own name?
+      #
+      # `grep '^additional_hostnames:'` matches `additional_hostnames: []`,
+      # which is what `ddev config` writes into every project — so this fired on
+      # every unconfigured worktree of every ordinary parent, claiming hostnames
+      # were being hijacked when the two projects shared none. install.yaml's
+      # removal path has 25 lines of awk written for exactly that case; rather
+      # than keep a second copy in step with it, ask the binary that already
+      # parses DDEV config. `hostshift hosts` prints one hostname per line, and
+      # more than one means there is something to inherit.
+      extra=""
+      if [ -n "$pdir" ] && ! command -v hostshift >/dev/null 2>&1; then
+        # Say so rather than going quiet.
+        #
+        # This branch short-circuits above the `command -v hostshift` guard, so
+        # when the binary is absent the question simply went unanswered — no
+        # warning and no reason for its absence, in exactly the situation the
+        # warning exists for: `ddev add-on get` followed by `ddev restart`, which
+        # is what registers the parent's hostnames on this project's web.
+        # install.yaml documents the binary as optional for the *proxy*, which it
+        # is; this check is not the proxy.
+        echo "hostshift: this is a worktree, and whether it now answers to the" >&2
+        echo "  parent's hostnames cannot be checked without the hostshift CLI." >&2
+        echo "  https://github.com/generoi/hostshift" >&2
+      elif [ -n "$pdir" ]; then
+        extra="$(hostshift hosts -C "$pdir" 2>/dev/null | sed -n '2,$p' || true)"
+      fi
+      if [ -n "$extra" ]; then
+        # The DDEV project name, not the directory: they differ whenever
+        # `name:` is pinned, which 62 of 66 fleet repos do.
+        pname="$(sed -n 's/^name:[[:space:]]*//p' "$pdir/.ddev/config.yaml" 2>/dev/null \
+          | head -1 | tr -d '"'"'"'"' || true)"
+        echo "hostshift: installed here but not configured, and this is a worktree of" >&2
+        echo "  a project that declares additional hostnames. Until you run" >&2
+        echo "  \`ddev hostshift init\`, this worktree also answers to these, and the" >&2
+        echo "  router prefers it over ${pname:-$(basename "$pdir")} for any they share:" >&2
+        printf '%s\n' "$extra" | sed 's/^/    /' >&2
+      fi
+    fi
+    exit 0
+  elif [ ! -r .ddev/.env ]; then
+    echo "hostshift: .ddev/.env exists but cannot be read, so nothing here can be" >&2
+    echo "  checked. \`chmod u+r .ddev/.env\`." >&2
+    exit 2
+  elif ! grep -q '^HOSTSHIFT_' .ddev/.env; then
+    exit 0
+  fi
 fi
 
 command -v hostshift >/dev/null || {
@@ -86,6 +224,30 @@ command -v hostshift >/dev/null || {
 # copy-db maps nothing, so it needs no slug — and refusing to copy a database
 # because the branch name has no letters in it, or because HEAD is detached
 # during a rebase, is a refusal with no reason behind it.
+# A slug recorded by `init --slug` outranks the branch, for every subcommand
+# that did not get one on the command line. Without this, `check` re-derived from
+# the branch and called a correct deployment stale forever, and `init` run as the
+# advice said reverted the choice.
+if [ -z "$slug" ] && [ -z "$forget_slug" ] && [ "$cmd" != "copy-db" ]; then
+  # HOSTSHIFT_SLUG_CHOSEN, not HOSTSHIFT_SLUG. v0.1.0's init wrote
+  # `HOSTSHIFT_SLUG=$slug` *unconditionally* — for a slug derived from the
+  # branch exactly as for one that was passed — so reading that name as a
+  # deliberate choice pinned the naming on every project that ever ran v0.1.0,
+  # which by this add-on's own history is where the longest-running pilots are.
+  # It then announced "keeping the slug you chose" for a name nobody chose, on a
+  # branch that may no longer exist. A name v0.1.0 never wrote cannot be
+  # misread.
+  slug="$(sed -n '/^HOSTSHIFT_SLUG_CHOSEN=/{s///p;q;}' .ddev/.env 2>/dev/null || true)"
+  if [ -n "$slug" ]; then
+    slug_explicit=1
+    # Said out loud on init, because init is where a developer would expect a
+    # bare invocation to re-derive, and silently keeping the old name is the
+    # kind of helpfulness that reads as a bug.
+    [ "$cmd" = "init" ] && echo "hostshift: keeping the slug you chose, $slug." \
+      "\`--slug NAME\` to change it, \`--slug-from-branch\` to go back to the branch." >&2
+  fi
+fi
+
 if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
   branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
   # Detached HEAD is ordinary — a rebase, a bisect, a checked-out tag — and it
@@ -102,10 +264,17 @@ if [ -z "$slug" ] && [ "$cmd" != "copy-db" ]; then
     # hostshift.yaml is present. On the README's headline path it is
     # `--from … --to …`, and the deployed slug is the prefix of the first
     # variant — wt-a--acme.ddev.site — which is present in both shapes.
-    slug="$(sed -n '/^HOSTSHIFT_ARGS=--slug /{s///p;q;}' .ddev/.env 2>/dev/null)"
+    # `|| true`, because `sed` exits non-zero when .ddev/.env is absent and
+    # `set -e` then ends the script with no output at all — exit 1, nothing on
+    # stdout or stderr, from the very block whose comment says "Detached HEAD is
+    # ordinary … and it must not stop `check`". The line below it was already
+    # guarded; this one was not.
+    slug="$(sed -n '/^HOSTSHIFT_ARGS=--slug /{s///p;q;}' .ddev/.env 2>/dev/null || true)"
     if [ -z "$slug" ]; then
+      # `|| true` on the whole pipeline, not just `2>/dev/null` on its head:
+      # under `pipefail` the first `sed`'s failure is the pipeline's status.
       slug="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' .ddev/.env 2>/dev/null \
-        | cut -d, -f1 | sed -n 's/--.*//p')"
+        | cut -d, -f1 | sed -n 's/--.*//p' || true)"
     fi
     slug="${slug:-wt}"
   fi
@@ -193,7 +362,20 @@ elif [ -n "$linked" ]; then
   case "$ph" in
     # Nothing readable there. Distinct from the case below, and the two must not
     # be confused: this one is a problem and that one is not.
-    "") unreadable_parent="$dir" ;;
+    #
+    # A .ddev/config.yaml that is *present* but not parseable is the common
+    # shape, and mid-rebase it is the common cause: conflict markers make the
+    # YAML invalid, and "no DDEV config could be read there" then reads as
+    # "the parent has no DDEV project", which sends the reader looking in the
+    # wrong place entirely. Say which file, and what is in it.
+    "") unreadable_parent="$dir"
+        if [ -f "$dir/.ddev/config.yaml" ]; then
+          if grep -q '^<<<<<<< ' "$dir/.ddev/config.yaml" 2>/dev/null; then
+            unreadable_parent="$dir (its .ddev/config.yaml has unresolved conflict markers)"
+          else
+            unreadable_parent="$dir (its .ddev/config.yaml could not be parsed)"
+          fi
+        fi ;;
     # A repo that pins `name:` in its tracked config.yaml gives every worktree
     # the *same* DDEV project — same containers, same hostnames. There is nothing
     # to derive from elsewhere and nothing to subtract.
@@ -202,36 +384,212 @@ elif [ -n "$linked" ]; then
   esac
 fi
 
+# ddev_name reads `name:` out of a DDEV config file, the way DDEV reads it.
+#
+# `sed -n 's/^name: *//p'` alone kept the quotes on `name: "acme"` and the
+# comment on `name: acme # local`, and a wrong project name is silent in both
+# places it is used: `docker inspect ddev-"acme"-web` finds nothing, which reads
+# as "the rival is not running" and lets a real hostname collision through, and
+# copy-db streams from a db container that does not exist. CRLF for the same
+# reason — a config.yaml edited on Windows leaves \r on the value.
+ddev_name() {
+  [ -f "$1" ] || return 0
+  v="$(sed -n 's/^name:[[:space:]]*//p' "$1" | sed -n 1p | tr -d '\r')"
+  # A quote delimits the value, so a '#' inside one is not a comment. Stripping
+  # comments first turned `name: "a#b"` into `"a`; stripping them after
+  # unquoting turned it into `a`. Only the unquoted form has a comment to strip.
+  case "$v" in
+    '"'*) printf '%s\n' "$v" | sed 's/^"\([^"]*\)".*$/\1/' ;;
+    "'"*) printf '%s\n' "$v" | sed "s/^'\([^']*\)'.*\$/\1/" ;;
+    *)    printf '%s\n' "$v" | sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' ;;
+  esac
+}
+
+# ddev_docroot prints the project's docroot, from the same merged config
+# ddev_name reads. `ddev exec -s web` lands in /var/www/html, which is the
+# project root and not where WordPress lives, so wp-cli answered "This does not
+# seem to be a WordPress installation" and the `2>/dev/null … || true` swallowed
+# it — the database gate was a silent no-op on every project without a
+# root-level wp-cli.yml supplying `path:`. That includes stock DDEV WordPress
+# with `docroot: web`, and the fixture test/bootstrap-ddev.sh builds.
+ddev_docroot() {
+  for f in "$1"/config.yaml "$1"/config.*.yaml; do
+    [ -f "$f" ] || continue
+    v="$(sed -n 's/^docroot:[[:space:]]*//p' "$f" | sed -n 1p | tr -d '\r' \
+      | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" \
+      -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//')"
+    # An `if`, not `[ -n "$v" ] && …`. With `pipefail` set, a false `&&` on the
+    # loop's last iteration is the whole pipeline's status, so a project whose
+    # final config file declares no docroot made this function *fail* — and
+    # `set -e` then ended the script at the assignment, several blocks before
+    # anything it was called for.
+    if [ -n "$v" ]; then printf '%s\n' "$v"; fi
+  done | sed -n '$p'
+  return 0
+}
+
 if [ "$cmd" = "copy-db" ]; then
   [ -n "$parent" ] || {
     echo "hostshift: no parent checkout to copy from — this is not a linked worktree" >&2
     echo "  of a different DDEV project. Use \`ddev import-db\` or a fresh pull." >&2
     exit 2; }
   from="$(basename "$parent")"
-  [ -f "$parent/.ddev/config.yaml" ] && n="$(sed -n 's/^name: *//p' "$parent/.ddev/config.yaml" | head -1)" && [ -n "$n" ] && from="$n"
+  # Every config.*.yaml, in DDEV's merge order — config.yaml alone is the same
+  # mistake the collision gate two blocks up was fixed for. A parent that names
+  # itself in a config.*.local.yaml made this grep for the wrong ddev-<name>-db
+  # and let a copy through that writes into an idle container while the
+  # application goes on reading the parent's.
+  for pc in "$parent/.ddev/config.yaml" $(LC_ALL=C printf '%s\n' "$parent"/.ddev/config.*.yaml | LC_ALL=C sort); do
+    [ -f "$pc" ] || continue
+    n="$(ddev_name "$pc")"
+    [ -n "$n" ] && from="$n"
+  done
 
   # Sharing the parent's database and copying it are different decisions, and
-  # doing both means importing a database into itself.
-  if grep -rqs 'ddev-'"$from"'-db' .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml .ddev/.env 2>/dev/null; then
-    echo "hostshift: this worktree is configured to *use* $from's database" >&2
-    echo "  (DATABASE_URL points at ddev-$from-db). Copying it into itself is not" >&2
-    echo "  what you want — remove that override and \`ddev restart\` first." >&2
+  # doing both is worse than pointless: the dump goes into this worktree's own
+  # idle `db` container while the application goes on reading and writing the
+  # parent's — and copy-db says "copied", exit 0. The developer who ran it
+  # *specifically to stop writing to the parent* is told they succeeded, and
+  # carries on activating plugins and uploading media into the checkout they
+  # were protecting.
+  #
+  # Ask the container, not the files. This grepped four paths for the parent's
+  # db hostname and missed `.ddev/.env.web`, which is DDEV's own documented
+  # place for per-service environment — measured: DB_HOST=ddev-<parent>-db there,
+  # the worktree live on the parent's database, and copy-db reported success.
+  # `printenv` in the web container sees every mechanism that can set it,
+  # including ones DDEV has not invented yet, and it is what `check` already does
+  # for the same reason.
+  #
+  # The container first, and its answer is final either way — including "no".
+  # Testing `[ -z "$shared" ]` could not tell "the container says it is not
+  # shared" from "there is no container to ask", so a running project that had
+  # been un-shared was still blocked by a file left lying around.
+  #
+  # The file scan is the fallback for when nothing is running, which is exactly
+  # when someone reaches for copy-db. It reads assignments, not any line that
+  # mentions the hostname: a commented-out `# DB_HOST=ddev-<parent>-db` blocked
+  # the copy and printed its own `#` back, with no way past — --force does not
+  # bypass this guard — so a stale note permanently refused a legitimate copy.
+  #
+  # The project's own .env is in the list because that is where Bedrock keeps
+  # DB_HOST. `printenv` in the web container cannot see it (phpdotenv reads it
+  # inside PHP), and the previous list stopped at .ddev/, so the one shape most
+  # likely in this fleet was missed by both halves of the guard.
+  shared=""
+  asked=""
+  dbenv="$(ddev exec -s web printenv DB_HOST DATABASE_URL DB_URL 2>/dev/null || true)"
+  [ -n "$dbenv" ] && asked=1
+  # Any db container that is not this project's own, not only the source's.
+  #
+  # Keying on `ddev-$from-db` asked "does this worktree use the project I am
+  # copying *from*?" — but the harm has nothing to do with which project the
+  # dump comes from. A second worktree pointed at the *first worktree's*
+  # database, which is what running two worktrees of one parent produces once
+  # one has its own copy, walked straight past this: twelve tables written into
+  # a container nothing reads, exit 0, and the success message. That is verbatim
+  # the failure the refusal below describes.
+  #
+  # The question is whether `web` reads a database other than the one `copy-db`
+  # writes to, and `copy-db` writes to this project's own `db`.
+  db_name="${DDEV_SITENAME:-}"
+  if [ -z "$db_name" ]; then
+    db_name="$(ddev_name .ddev/config.yaml)"
+    for oc in .ddev/config.*.yaml; do
+      [ -f "$oc" ] || continue
+      n="$(ddev_name "$oc")"
+      if [ -n "$n" ]; then db_name="$n"; fi
+    done
+  fi
+  if [ -z "$db_name" ]; then db_name="$(basename "$(pwd -P)")"; fi
+  self="ddev-$db_name-db"
+  shared="$(printf '%s\n' "$dbenv" | grep -oE 'ddev-[A-Za-z0-9._-]+-db' \
+    | grep -vxF "$self" | sort -u || true)"
+  if [ -n "$shared" ]; then
+    shared="$(printf '%s\n' "$dbenv" | grep -F "$(printf '%s' "$shared" | head -1)" || true)"
+  fi
+  # ...but the container's environment cannot see a dotenv file the application
+  # reads for itself, so that one is checked either way.
+  if [ -z "$shared" ] && { [ -z "$asked" ] || [ -f .env ]; }; then
+    # An assignment: optional `export`, the name, `=`, and the parent's db host
+    # in the value. `# DB_HOST=...` does not match, and neither does prose.
+    # -E and no -r: a fixed file list, so a directory recursion is not wanted,
+    # and $from goes through sed first because a project name containing `.` or
+    # `+` would otherwise widen the pattern.
+    fromre="$(printf '%s' "$from" | sed 's/[][\.*^$(){}?+|]/\\&/g')"
+    # A shell assignment, a dotenv line, a YAML mapping value or a compose list
+    # item — all of them are NAME, a separator, then the value. What none of them
+    # is, is a comment.
+    # The optional quote is not decoration. Compose's own documentation writes
+    # environment entries as `- "KEY=value"`, and requiring [A-Za-z_] straight
+    # after the `- ` meant every quoted spelling walked past the guard: the dump
+    # then goes into this worktree's idle db container while the application
+    # keeps reading the parent's, and copy-db prints "copied" and exits 0.
+    q='["'"'"']?'
+    assignment="^[[:space:]]*-?[[:space:]]*$q(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*$q[[:space:]]*[:=][^#]*ddev-$fromre-db"
+    if [ -n "$asked" ]; then
+      # The container already answered for its own environment; .env is the one
+      # thing it could not see.
+      shared="$(grep -sEn "$assignment" .env 2>/dev/null || true)"
+    else
+      # DDEV's per-service form is .ddev/.env.<service>, and a service name has
+      # no dot in it. Taking the glob whole made `.ddev/.env.web.disabled` — a
+      # override renamed aside precisely to turn it off — refuse the copy, with
+      # no way past.
+      envfiles=""
+      for f in .ddev/.env.*; do
+        [ -f "$f" ] || continue
+        case "${f#.ddev/.env.}" in *.*) continue ;; esac
+        envfiles="$envfiles $f"
+      done
+      # shellcheck disable=SC2086
+      shared="$(grep -sEn "$assignment" \
+        .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml \
+        .ddev/.env $envfiles .env 2>/dev/null || true)"
+    fi
+  fi
+  if [ -n "$shared" ]; then
+    echo "hostshift: this worktree is configured to *use* $from's database:" >&2
+    printf '%s\n' "$shared" | sed 's/^/    /' >&2
+    echo "  Copying into it would write the dump to this worktree's own db" >&2
+    echo "  container, which nothing reads, and report success. Remove that" >&2
+    echo "  override and \`ddev restart\` first." >&2
     exit 2
+  fi
+
+  tables="$(ddev exec -s web bash -c \
+    "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
+    2>/dev/null | tail -1 | tr -dc '0-9' || true)"
+  has_tables=""
+  [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null && has_tables=1
+
+  # --dry-run stops here, before anything is written, and before the --force
+  # gate below rather than after it.
+  #
+  # The only dry_run test in this file is at the end, after this block has run
+  # and exited 0 — so `copy-db --dry-run` replaced the database it was asked to
+  # describe. copy-db is the one destructive subcommand, which makes it the one
+  # place the flag had to work. And putting it after the gate would not be
+  # enough: the refusal names --force, so the natural second command is
+  # `--dry-run --force`, which is the pair that destroys.
+  if [ -n "$dry_run" ]; then
+    echo "hostshift: --dry-run, nothing written" >&2
+    echo "  would replace this worktree's database with a copy of $from's" >&2
+    if [ -n "$has_tables" ]; then
+      echo "  the $tables table(s) here would be dropped, and there is no undo" >&2
+      [ -n "$force" ] || echo "  without --dry-run this would refuse; pass --force to go ahead" >&2
+    fi
+    exit 0
   fi
 
   # It overwrites. Refuse to do that silently to a database that has something
   # in it — the caller may well have meant `ddev import-db`, or may be in the
   # wrong directory, and there is no undo.
-  if [ -z "$force" ]; then
-    tables="$(ddev exec -s web bash -c \
-      "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
-      2>/dev/null | tail -1 | tr -dc '0-9' || true)"
-    if [ -n "$tables" ] && [ "$tables" -gt 0 ] 2>/dev/null; then
-      echo "hostshift: this worktree's database already has $tables table(s)." >&2
-      echo "  Copying from $from replaces them, and there is no undo." >&2
-      echo "  Pass --force if that is what you want." >&2
-      exit 2
-    fi
+  if [ -z "$force" ] && [ -n "$has_tables" ]; then
+    echo "hostshift: this worktree's database already has $tables table(s)." >&2
+    echo "  Copying from $from replaces them, and there is no undo." >&2
+    echo "  Pass --force if that is what you want." >&2
+    exit 2
   fi
 
   echo "hostshift: copying the database from $from" >&2
@@ -241,10 +599,76 @@ if [ "$cmd" = "copy-db" ]; then
   # longer has — a removed blog's wp_N_* set, an uninstalled plugin's tables — and
   # was then not in the state the parent is in, which is the whole claim. The
   # refusal message promises a replace; this makes it true.
+  # stderr kept, because it answers the question the table count cannot: a
+  # connect-time failure has not streamed a byte, so nothing was dropped.
+  copy_err="$(mktemp "${TMPDIR:-/tmp}/hostshift-copy.XXXXXX" 2>/dev/null)" || copy_err=""
   ddev exec -s web bash -c "set -o pipefail; mysqldump --single-transaction --quick \
     --no-tablespaces --add-drop-database --databases db -h ddev-$from-db -udb -pdb \
-    | mysql -h db -udb -pdb" || {
-    echo "hostshift: the copy failed. Is $from running? \`ddev start $from\`" >&2
+    | mysql -h db -udb -pdb" 2>${copy_err:-/dev/null} || {
+    # Not "the copy failed", full stop — that reads as "nothing happened", and
+    # it is only true if the dump never started. --add-drop-database puts
+    # `DROP DATABASE` at the top of the stream, so an interruption after that
+    # point — the laptop sleeping, the parent stopped mid-copy — leaves this
+    # database dropped and partially reloaded. Saying so is the difference
+    # between re-running the command and debugging a site that is now missing
+    # half its tables.
+    # What the count can and cannot say.
+    #
+    # Round 54 printed "may be half-replaced … re-run with --force" for every
+    # failure mode, so the ordinary "you forgot to start the parent" case ended
+    # by naming the one destructive flag. Round 55 replaced that with a table
+    # count and compared it against *zero* rather than against the count taken
+    # before the copy — which this block already has in `$tables` — so it was
+    # confidently wrong in both directions: it announced a half-replaced
+    # database on a fresh empty worktree where mysqldump never connected, and
+    # announced that nothing had changed over a database whose rows had just
+    # been truncated mid-reload.
+    #
+    # A table count cannot answer this question in general. `--add-drop-database`
+    # recreates the whole table list early and fills it as the stream arrives, so
+    # the same count before and after is exactly what a copy interrupted late
+    # looks like — 13 tables either side, and 1.2M rows gone. The only state it
+    # can settle is empty-to-empty, where there was nothing to lose. Everywhere
+    # else this says what it does not know, which is the difference between a
+    # developer re-running a command and a developer carrying on against
+    # silently truncated content.
+    #
+    # --force is not the answer to either: it gates overwriting a worktree
+    # database that has content, and re-running meets the same gate this
+    # invocation already passed.
+    ntables="$(ddev exec -s web bash -c \
+      "mysql -h db -udb -pdb -N -B -e \"select count(*) from information_schema.tables where table_schema='db'\"" \
+      2>/dev/null | tail -1 | tr -dc '0-9' || true)"
+    # A connection that never opened cannot have written anything, and the
+    # driver says so in as many words. Without this the diagnosis hedged over
+    # the commonest failure there is — the parent not running, which is *why*
+    # the connect failed — and sent the developer to verify a database nothing
+    # had touched.
+    copy_connect=""
+    if [ -n "$copy_err" ] && grep -qiE "unknown server host|can't connect|connection refused|error: *200[45]" \
+        "$copy_err" 2>/dev/null; then
+      copy_connect=1
+    fi
+    [ -n "$copy_err" ] && rm -f "$copy_err"
+    echo "hostshift: the copy failed." >&2
+    echo "  Is $from running? \`ddev start $from\`" >&2
+    if [ -n "$copy_connect" ]; then
+      echo "  The dump never connected to $from, so it did not stream a byte and" >&2
+      echo "  nothing here was touched. Start $from and re-run the same command." >&2
+    elif [ "${tables:-0}" = "0" ] && [ "${ntables:-0}" = "0" ] 2>/dev/null; then
+      echo "  This worktree's database had no tables before this ran and has" >&2
+      echo "  none now, so nothing was lost. Fix the above and re-run the same" >&2
+      echo "  command." >&2
+    else
+      echo "  This worktree's database had ${tables:-?} table(s) before this ran" >&2
+      echo "  and has ${ntables:-?} now, and that does not settle it:" >&2
+      echo "  --add-drop-database recreates the whole table list at the top of" >&2
+      echo "  the stream and fills it as the dump arrives, so an unchanged count" >&2
+      echo "  is what a copy interrupted late looks like — the tables are all" >&2
+      echo "  there and the rows are not." >&2
+      echo "  Check a table you know the size of before trusting this database," >&2
+      echo "  or re-run the copy once $from is up, which replaces it outright." >&2
+    fi
     exit 1; }
   echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
   echo "  hostshift maps — nothing else to do." >&2
@@ -256,6 +680,173 @@ fi
 # other environments, or production ones the database was never search-replaced
 # away from. Passing --from would override it.
 map_args=()
+# The parent declares canonical hostnames this worktree cannot see.
+#
+# `hostshift hosts -C <dir>` reads the parent's *DDEV* config and nothing else,
+# so a parent that has adopted a committed hostshift.yaml — the README's
+# production-canonical path — is invisible from a worktree whose branch predates
+# that commit. The map then rewrote the parent's ddev.site hostnames, which is
+# the wrong side entirely: the shared database holds the canonical names, so
+# nothing is rewritten and every link on the preview points at the client's live
+# site, while `check` reports the map injective and anchored.
+#
+# Adopting production-canonical is exactly the moment worktrees exist on older
+# branches, so this is the common case rather than the odd one.
+parent_declares=""
+parent_declares_msg=""
+db_confirms_map=""
+# refuse_variants_outside_tld refuses variant hostnames nothing local answers to.
+#
+# Entirely static — $variants, the project's own hostnames, $DDEV_TLD and
+# /etc/hosts — which is why it can run before anything is written. It lived
+# inside `check` only, so `init --dry-run`, the step the add-on's own post-install
+# text tells a developer to run first, printed the variant and not one word of
+# warning: the flag whose whole purpose is to avoid a bad deployment could not
+# see the bad deployment. Run for real, the project was deployed and restarted
+# and *then* refused — and on a client domain with wildcard DNS the hostname it
+# had just printed opens production.
+refuse_variants_outside_tld() {
+  _variants="$1"; _hosts="$2"
+  _tld="${DDEV_TLD:-ddev.site}"
+  _outside=""
+  for _v in $(printf '%s' "$_variants" | tr ',' ' '); do
+    _ok=""
+    case "$_v" in *".$_tld") _ok=1 ;; esac
+    if [ -z "$_ok" ]; then
+      while IFS= read -r _h; do
+        [ "$_h" = "$_v" ] && { _ok=1; break; }
+      done <<EOF
+$_hosts
+EOF
+    fi
+    if [ -z "$_ok" ] && grep -qE "^[^#]*[[:space:]]$_v([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+      _ok=1
+    fi
+    [ -n "$_ok" ] || _outside="${_outside:+$_outside }$_v"
+  done
+  [ -n "$_outside" ] || return 0
+  echo "hostshift: these variant hostnames are not under any domain this DDEV" >&2
+  echo "  project registers, so nothing local answers to them:" >&2
+  printf '    %s\n' $_outside >&2
+  echo "  On a client domain with wildcard DNS they resolve to *production*." >&2
+  echo "  Declare \`base:\` on the site, pointing at the *parent* project's" >&2
+  echo "  DDEV hostname, so the variant is derived from a name DDEV serves." >&2
+  echo "  The parent's, not this worktree's: hostshift.yaml is committed and" >&2
+  echo "  shared, so a base naming this checkout resolves every other worktree" >&2
+  echo "  to a variant of it — and drops the parent's own hostname from the map." >&2
+  exit 2
+}
+
+# hs_db_command prints how to reach the database the *application* writes to.
+#
+# `ddev exec -s db` is this project's own database container, and in a worktree
+# sharing the parent's that is not the one anything writes to. Every remedy that
+# told a developer to look for a §4.3 write-back said `-s db`, so the query ran
+# against an idle container and printed zeros — or, where the worktree's own
+# database has no WordPress tables, `Table 'db.wp_posts' doesn't exist`. Either
+# way it answers "nothing was written" about the one thing this file says has no
+# undo, while the rows sit in production's database.
+#
+# The inversion is what makes it a defect rather than a rough edge: in the shared
+# mode, where "that database is production's" is *true*, the command is wrong;
+# in the mode where the command is right, the sentence is false. copy-db has
+# detected this exact state since round 40 and the remedies never asked it.
+# hs_db_shared reports whether the application reads a database other than this
+# project's own — the question hs_db_command already answers by choosing between
+# `docker exec <other>` and `ddev exec -s db`.
+#
+# Prose has to ask it too. Round 59 recorded the inversion — "in the mode where
+# the command is right, the sentence is false" — and rounds 60 and 61 fixed only
+# the commands, so a worktree with its own copied database was still told the
+# database was "the parent's, shared with production", and forbidden the two
+# things that actually fix it: `copy-db`, or a search-replace on a database
+# entirely its own.
+hs_db_shared() {
+  case "$(hs_db_command)" in
+    "docker exec "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+hs_db_command() {
+  _self="ddev-${DDEV_SITENAME:-$(basename "$(pwd -P)")}-db"
+  _env="$(ddev exec -s web printenv DB_HOST DATABASE_URL DB_URL 2>/dev/null || true)"
+  _other="$(printf '%s\n' "$_env" | grep -oE 'ddev-[A-Za-z0-9._-]+-db' \
+    | grep -vxF "$_self" | head -1 || true)"
+  # The container's environment cannot see a dotenv the application reads for
+  # itself, which is where Bedrock keeps it.
+  #
+  # An *assignment*, not any mention. The first version of this grepped for the
+  # container-name shape anywhere in the file, so a commented-out
+  # `# was: DB_HOST=ddev-<parent>-db` — or a note reading "staging import came
+  # from ddev-otherclient-db" — sent the §4.3 sweep to a database the
+  # application does not write to, and it printed zeros about the thing the
+  # message above calls irreversible. That is round 59's failure returning
+  # through a stale note instead of through the mode, and in the worst shape it
+  # told a developer to `docker exec` into *another client's* container.
+  #
+  # copy-db's guard has been assignment-anchored since round 40 for exactly this
+  # reason — its own comment records a commented-out DB_HOST permanently
+  # refusing a legitimate copy — and this is the same expression, not a second
+  # looser one.
+  if [ -z "$_other" ]; then
+    _q='["'"'"']?'
+    _assign="^[[:space:]]*-?[[:space:]]*$_q(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*$_q[[:space:]]*[:=][^#]*ddev-[A-Za-z0-9._-]+-db"
+    # The same *files* as copy-db's guard, not only the same expression. Round
+    # 61's comment claimed parity and delivered it for the pattern alone: this
+    # read `.env` and `.ddev/.env.web` where copy-db reads the config and
+    # compose overrides too — and `.ddev/config.worktree.local.yaml` with a
+    # `web_environment:` entry is the way the README documents sharing the
+    # parent's database.
+    _envfiles=""
+    for _f in .ddev/.env.*; do
+      [ -f "$_f" ] || continue
+      case "${_f#.ddev/.env.}" in *.*) continue ;; esac
+      _envfiles="$_envfiles $_f"
+    done
+    # shellcheck disable=SC2086
+    _other="$(grep -shE "$_assign" \
+      .ddev/config.yaml .ddev/config.*.yaml .ddev/docker-compose.*.yaml \
+      .ddev/.env $_envfiles .env 2>/dev/null \
+      | grep -oE 'ddev-[A-Za-z0-9._-]+-db' | grep -vxF "$_self" | head -1 || true)"
+  fi
+  if [ -n "$_other" ]; then
+    printf 'docker exec %s mysql -udb -pdb -N -B' "$_other"
+  else
+    printf 'ddev exec -s db mysql -N -B'
+  fi
+}
+
+parent_declares_warn() {
+  echo "hostshift: warning: $parent_declares declares the hostnames its database" >&2
+  echo "  holds, and this worktree's branch predates it — so the map below was" >&2
+  echo "  built from that checkout's DDEV hostnames instead, and would rewrite" >&2
+  echo "  nothing. Every link would point at the canonical site." >&2
+  echo "  If the database holds those hostnames, merge the branch that adds" >&2
+  echo "  hostshift.yaml. If it holds this checkout's DDEV hostnames — which is" >&2
+  echo "  what \`copy-db\` and a search-replace leave behind — the map below is" >&2
+  echo "  already right and there is nothing to do. Copying the file in when" >&2
+  echo "  the database has not moved makes every page redirect to wp-signup." >&2
+}
+# Detection only. Whether it is *true* is decided further down, once there is a
+# map to compare the parent's declaration against — see the block after
+# `hostshift map --variant-hosts`.
+if [ ! -f hostshift.yaml ] && [ -n "$parent" ] && [ -f "$parent/hostshift.yaml" ]; then
+  parent_declares="$parent/hostshift.yaml"
+  # Held, not printed, when `check` is the one asking.
+  #
+  # The database is consulted much further down, and it is what decides whether
+  # this warning describes reality. Printing it up here meant a healthy worktree
+  # — 200s, every link rewritten, the database still holding DDEV hostnames —
+  # said "would rewrite nothing, every link would point at the canonical site"
+  # on every start, and recommended the one action this file's own comments call
+  # "the action that silently breaks the site" in that state.
+  # Held in every mode, not just `check`: the comparison that decides whether
+  # this is true has not run yet at this point in the file, and printing first
+  # and comparing afterwards is how it came to be printed over healthy sites.
+  parent_declares_msg=1
+fi
+
 if [ ! -f hostshift.yaml ] && [ -n "$unreadable_parent" ]; then
   # A linked worktree whose parent declares nothing readable. Falling through
   # silently is the failure this whole path exists to prevent: the map gets built
@@ -269,7 +860,12 @@ fi
 if [ ! -f hostshift.yaml ] && [ -n "$parent_hosts" ]; then
   # Said out loud, because "map from --from/--to" does not tell anyone which
   # checkout those origins came from, and that is the one thing worth knowing.
-  echo "hostshift: canonical hostnames from $parent, whose database this shares" >&2
+  # What this line can honestly claim is where the hostnames came from. It used
+  # to add "whose database this shares", which `copy-db` exists to make false —
+  # and it kept printing on every boot afterwards, a factual claim about the
+  # developer's environment contradicted by the command's own closing line.
+  # Asking the container would be discovery, and §4.1 says the map is declared.
+  echo "hostshift: canonical hostnames from $parent, the checkout this was made from" >&2
   while IFS= read -r h; do
     [ -n "$h" ] && map_args+=(--from "https://$h")
   done <<<"$parent_hosts"
@@ -278,6 +874,90 @@ fi
 # The map is the binary's business; parse only what this needs from it.
 variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --variant-hosts \
   | paste -sd, -)"
+
+# Now that there *is* a map, ask whether the parent's declaration disagrees with
+# it — which is the question the warning above claims to answer and never asked.
+#
+# The condition was pure file existence: the parent has a hostshift.yaml this
+# branch does not. That fires in the ordinary case where the worktree's map
+# already names exactly what the parent declares, and it printed "the map would
+# rewrite nothing, every link would point at the canonical site" over a
+# deployment serving 200s with every origin rewritten and `hostshift diff`
+# GREEN — then exited 2, so `ddev start` failed and an unattended check saw a
+# correct deployment fail, permanently, with no way to clear it.
+#
+# Comparing two *declarations* is not the discovery mechanism §4.1 forbids. The
+# database gate was wrong four rounds running because it interrogated the
+# application; this asks two config files what they say, which is what the map
+# is built from in the first place.
+if [ -n "$parent_declares" ]; then
+  # The canonical *origins*, from --pairs, not --canonical-hosts.
+  #
+  # --canonical-hosts is documented as "aliases included", and an alias is one
+  # of exactly two things the README says a hostshift.yaml exists for. So the
+  # parent's set always carried hostnames the worktree's map does not name, the
+  # sets were never equal, and the refusal still stood on the configuration the
+  # comparison was written to clear — while the deployment served every page
+  # with zero canonical origins remaining. The other shape, the one without
+  # aliases, is the hostshift.yaml nobody would write.
+  #
+  # It also drops the port, so a parent declaring `https://h:8443` compared
+  # equal to a map naming `https://h` and the warning was *cleared* — while the
+  # engine, which matches on exact origin equality, correctly served content
+  # holding `:8443` straight through. Wrong in both directions from one flag.
+  #
+  # --pairs emits `canonical=variant` per site, so the left-hand side is the
+  # canonical origin with its scheme and port and without aliases. Whether the
+  # map covers every alias the parent declares is a different question, and it
+  # belongs to the database gate below: this one asks only whether the map is on
+  # the right *side*, which is what the warning's own text claims.
+  #
+  # --slug because `map` refuses to resolve without a variant, even though the
+  # slug cannot affect the canonical side, which is the only side compared.
+  declared="$(hostshift map -C "$parent" --slug "$slug" --pairs 2>/dev/null \
+    | sed 's/=.*$//' | sort -u || true)"
+  mapped="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+    --pairs 2>/dev/null | sed 's/=.*$//' | sort -u || true)"
+  # Every declared canonical must be in the map — subset, not overlap.
+  #
+  # Equality was wrong in both directions. The warning's own text is "the map
+  # was built from that checkout's DDEV hostnames instead, and would rewrite
+  # nothing" — and "would rewrite nothing" is true exactly when the two sets are
+  # *disjoint*, which is the production-canonical case this exists for: the
+  # parent declares https://www.client.fi and the map names acme.ddev.site.
+  #
+  # Anything short of disjoint means the map is on the right side. A parent
+  # declaring one site with an alias, against a worktree mapping two sites
+  # because DDEV lists the alias as an additional hostname, is the same
+  # arrangement written two ways — and demanding equality refused it.
+  #
+  # Only when the parent actually declared something we could read. An empty
+  # answer means the comparison failed, not that the two agree, and silence
+  # there would reintroduce the leak this warning exists for.
+  #
+  # Overlap was too weak in the direction that leaks. A parent declaring a
+  # production canonical *and* a DDEV hostname overlapped on the DDEV one, the
+  # warning cleared, and the production origins were served to the browser
+  # unrewritten — `check` exit 0, and `hostshift diff` GREEN too, because that
+  # origin is not in its map either. This gate was the only thing that was ever
+  # going to catch it.
+  #
+  # What matters is whether the map covers everything the parent declares, so
+  # the leftover is `declared` minus `mapped`. Equality was wrong because the
+  # map legitimately holds more (DDEV lists a declared alias as an additional
+  # hostname); a non-empty leftover is the map holding *less*.
+  unmapped="$(comm -23 <(printf '%s\n' "$declared") <(printf '%s\n' "$mapped") || true)"
+  if [ -n "$declared" ] && [ -n "$mapped" ] && [ -z "$unmapped" ]; then
+    parent_declares=""
+    parent_declares_msg=""
+  fi
+fi
+
+# `check` holds it until it has the container state and the probe; everything
+# else says it here, now that the comparison has decided whether it is true.
+if [ -n "$parent_declares" ] && [ "$cmd" != "check" ]; then
+  parent_declares_warn
+fi
 [ -n "$variants" ] || { echo "hostshift produced no map — run 'hostshift check'" >&2; exit 2; }
 
 # Nothing anywhere checks that two projects do not claim the same hostname —
@@ -290,15 +970,66 @@ variants="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --var
 # prefix. Checking is cheap — every configured project leaves its variants in
 # .ddev/.env — so check.
 here="$(pwd -P)"
-for other in ../*/.ddev/.env; do
+
+# Every project DDEV knows about, not just the directories next door.
+#
+# `../*/.ddev/.env` sees a sibling and nothing else, so two worktrees of one
+# parent in different directories — `git worktree add ~/worktrees/foo`, or two
+# developers with worktrees under their own home directories — collided in total
+# silence: both `.ddev/.env` files carried the same HOSTSHIFT_VARIANTS, both
+# projects were up, and `check` in each printed "hostshift is serving" and exited
+# 0. Meanwhile a *dead* fake sibling — a bare directory with a .ddev/.env and no
+# containers — warned immediately. This is the one check whose job is to stop a
+# developer reviewing someone else's code at their own preview URL, and it was
+# blind to the arrangement where that most easily happens.
+#
+# ~/.ddev/project_list.yaml holds every project's approot. Siblings stay in the
+# list because a project that has never been started is not in the registry yet.
+# `|| true` on the registry read, and newline-delimited iteration.
+#
+# `[ -f "$reg" ] && sed …` was the last command of the group, so a missing
+# project_list.yaml made the group exit 1, pipefail made the pipeline exit 1, the
+# assignment inherited it and `set -e` killed the script — no diagnostic, exit 1
+# rather than the documented 2, on a DDEV install that has never registered a
+# project. That is the same class the block below documents having already fixed
+# once. And `for x in $list` splits on spaces, so an approot under
+# `~/My Projects/` was invisible to the very check that exists for "two
+# developers with worktrees under their own home directories".
+scan_dirs="$(
+  {
+    for d in ../*/; do printf '%s\n' "${d%/}"; done
+    reg="${DDEV_GLOBAL_CONFIG:-$HOME/.ddev}/project_list.yaml"
+    if [ -f "$reg" ]; then
+      sed -n 's/^[[:space:]]*approot:[[:space:]]*//p' "$reg"
+    fi
+  } 2>/dev/null | while IFS= read -r d; do
+    # Resolved, then deduped. `../foo` from the glob and the absolute approot
+    # from the registry are the same directory spelled two ways, and sorting the
+    # raw strings deduped neither — so every sibling that was also registered
+    # warned twice, with the same text, about the same project.
+    [ -d "$d" ] || continue
+    (cd "$d" 2>/dev/null && pwd -P) || true
+  done | LC_ALL=C sort -u || true
+)"
+
+while IFS= read -r other_dir; do
+  [ -n "$other_dir" ] || continue
+  other="$other_dir/.ddev/.env"
   [ -f "$other" ] || continue
-  odir="$(cd "$(dirname "$(dirname "$other")")" && pwd -P)"
+  odir="$(cd "$other_dir" 2>/dev/null && pwd -P)" || continue
   [ "$odir" = "$here" ] && continue
   # No `| head -1`: this script runs under `set -o pipefail`, and a head that
   # exits after one line SIGPIPEs whatever is still writing, failing the whole
   # pipeline. It is timing-dependent, so it passes on a fast small write and
   # fails on a slow one — sed that stops at the first match instead.
-  ovar="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' "$other")"
+  # `|| true`, and stderr discarded: this is the one sed in the file reading a
+  # *foreign* file, and a sibling project whose .ddev/.env the current user
+  # cannot read — the file this codebase says holds credentials — made a failed
+  # command substitution abort everything under `set -e`. That took out init,
+  # check, env, loopback and wp-cli at once, including the check the post-start
+  # hook runs on every start, with a bare `sed: Permission denied` and no
+  # hostshift diagnostic. An unreadable sibling is not this project's problem.
+  ovar="$(sed -n '/^HOSTSHIFT_VARIANTS=/{s///p;q;}' "$other" 2>/dev/null || true)"
   [ -n "$ovar" ] || continue
   for v in $(printf '%s' "$variants" | tr ',' ' '); do
     case ",$ovar," in *",$v,"*)
@@ -306,11 +1037,132 @@ for other in ../*/.ddev/.env; do
       echo "  Two projects answering to one hostname is not an error anywhere in DDEV;" >&2
       echo "  the router picks one and the other is silently unreachable. Pass --slug to" >&2
       echo "  choose a different name." >&2
-      claimed="$v"
-      break 2 ;;
+      # The warning is right either way; the *refusal* is not. A worktree that
+      # was `ddev delete`d but whose directory stayed still has its .ddev/.env,
+      # and `git worktree remove` refuses while untracked files are present, so
+      # the directory staying is the common case rather than the odd one. That
+      # made `check` exit 2 — failing the post-start hook on every single start —
+      # over a claim nothing was making, while routing was perfectly correct, and
+      # the advice to pass --slug was wrong for that case.
+      #
+      # So only a *live* claim is fatal. If the rival is not running there is
+      # nothing to lose a routing tie to today.
+      # Every config.*.yaml, in DDEV's own merge order, not config.yaml alone.
+      # config.yaml is *tracked*, so in a sibling worktree it holds the parent
+      # repo's pinned `name:` while the worktree's own name lives in a
+      # config.*.local.yaml — which is the shape this repo's test harness uses
+      # and the shape a worktree naturally takes. Reading config.yaml alone
+      # therefore asked docker about the *parent*, which is running by
+      # definition, so every stale sibling .ddev/.env was fatal again and the
+      # liveness gate was inert. That is the same mistake this file already
+      # fixed for the current project two blocks down.
+      oname="$(basename "$odir")"
+      for oc in "$odir/.ddev/config.yaml" "$odir"/.ddev/config.*.yaml; do
+        [ -f "$oc" ] || continue
+        n="$(ddev_name "$oc")"
+        [ -n "$n" ] && oname="$n"
+      done
+      # The *hostshift* container, not web. The variant hostnames are served by
+      # the sibling's proxy, so a sibling whose project is up while its proxy is
+      # not claims nothing — and asking about web read every one of those as a
+      # live claimant: an add-on removed but its `.ddev/.env` left behind (which
+      # removal does by design, and says so), a proxy that crashed and stayed
+      # down because the compose service is `restart: "no"`, or a `.ddev/.env`
+      # written and never restarted into. `check` then failed on every start of
+      # a deployment that was entirely correct, and told the developer to rename
+      # a preview URL they may already have shared. This file handles exactly
+      # that crashed-proxy case for the *current* project two blocks down.
+      if [ "$(docker inspect "ddev-$oname-hostshift" --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
+        claimed="$v"
+        break 2
+      fi
+      # Not `break 2`. A dead sibling is not a claim, and stopping at the first
+      # one meant a *live* rival further down the list was never examined —
+      # check then printed "hostshift is serving" and exited 0 while traefik
+      # routed that hostname elsewhere, which is the exact failure this block
+      # exists to catch.
+      echo "  ($oname's proxy is not running, so nothing is serving it right now.)" >&2
+      break ;;
     esac
   done
-done
+done <<<"$scan_dirs"
+
+# The same question asked of Docker, which is the only place a renamed project
+# still exists.
+#
+# Everything above enumerates *directories* — siblings, plus the approots the
+# registry knows. `mv wt-a wt-a-renamed && ddev start` leaves the old project's
+# containers up with the same VIRTUAL_HOST, and the scan cannot see it by
+# construction: the rival's registered approot no longer exists so it is
+# skipped, and its `.ddev/.env` travelled with the directory, so it reads as
+# self. DDEV itself said "Router count mismatch: 122 loaded, 130 expected" and
+# traefik had four routers on one hostname while `check` printed "hostshift is
+# serving" and exited 0.
+#
+# A running container carries its own identity, so this needs no directory to
+# exist. It is the last thing tried because it is the slowest, and it is skipped
+# entirely when a directory-based claim was already found.
+if [ -z "$claimed" ] && command -v docker >/dev/null 2>&1; then
+  # DDEV_SITENAME, for the reason the block below already gives: DDEV merges
+  # config.*.yaml and config.*.local.yaml is where a worktree names itself, so
+  # re-deriving the name from config.yaml alone gets it wrong on exactly the
+  # projects this command exists for. I made that mistake here on the first
+  # attempt and the project reported *itself* as a rival, refusing every healthy
+  # worktree — the same bug, in the same file, two hundred lines apart.
+  self_name="${DDEV_SITENAME:-}"
+  if [ -z "$self_name" ]; then
+    self_name="$(ddev_name .ddev/config.yaml)"
+    for oc in .ddev/config.*.yaml; do
+      [ -f "$oc" ] || continue
+      n="$(ddev_name "$oc")"
+      if [ -n "$n" ]; then self_name="$n"; fi
+    done
+  fi
+  if [ -z "$self_name" ]; then self_name="$(basename "$(pwd -P)")"; fi
+  self="ddev-$self_name-hostshift"
+  running="$(docker ps --filter 'name=-hostshift' --format '{{.Names}}' 2>/dev/null || true)"
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    if [ "$c" = "$self" ]; then continue; fi
+    # And by approot, which identifies a project whatever it is called.
+    #
+    # Editing `name:` and running check before restarting made the running
+    # container's name stop matching $DDEV_SITENAME, so the project reported its
+    # own live proxy as a rival whose directory no longer exists — and the
+    # remedy it printed would stop the very proxy serving the page. DDEV refuses
+    # to complete such a rename, so the state is transient, but the advice was
+    # wrong while it lasted.
+    oa="$(docker inspect "$c" --format '{{index .Config.Labels "com.ddev.approot"}}' \
+      2>/dev/null || true)"
+    if [ -n "$oa" ] && [ "$oa" = "$here" ]; then continue; fi
+    ov="$(docker inspect "$c" --format \
+      '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+      | sed -n 's/^VIRTUAL_HOST=//p' | head -1 || true)"
+    [ -n "$ov" ] || continue
+    while IFS= read -r v; do
+      [ -n "$v" ] || continue
+      case ",$ov," in
+        *",$v,"*)
+          claimed="$v"
+          # Naming the hostname, because nothing above this does. The
+          # directory-scan branch prints "warning: <dir> already claims <host>"
+          # first and this parenthetical elaborates on it; the docker branch has
+          # no such line, so the message opened mid-sentence with no antecedent —
+          # a parenthesis about a claim the reader had not been told about.
+          echo "hostshift: $v is claimed by the running container $c, whose" >&2
+          echo "  project directory no longer exists under that name — a rename" >&2
+          echo "  leaves the old containers up. \`docker stop $c\` or \`ddev stop\` it." >&2
+          # And the route it leaves behind. Stopping the container makes `check`
+          # go green while the stale traefik file still holds the hostname, so
+          # the variant starts 502ing minutes later — two discoveries where the
+          # first remedy can name both.
+          echo "  If the variant then 502s, remove the stale route too:" >&2
+          echo "    .ddev/traefik/config/$(printf '%s' "$c" | sed 's/^ddev-//; s/-hostshift$//').yaml" >&2
+          break 2 ;;
+      esac
+    done <<<"$(printf '%s' "$variants" | tr ',' '\n')"
+  done <<<"$running"
+fi
 
 
 # web keeps this project's own hostnames, minus the variants and minus the
@@ -318,15 +1170,32 @@ done
 # without narrowing it web and hostshift both claim the variants and the router
 # picks web — WordPress then sees a variant host, fails to match
 # wp_blogs.domain, and redirects to wp-signup.php.
+# This project's own primary hostname is never subtracted.
+#
+# A parent that lists the worktree's hostname in its own additional_hostnames —
+# which teams do commit, for the mkcert SANs or as a leftover — made the
+# subtraction remove *everything*, so HOSTSHIFT_WEB_HOSTS came out empty. The
+# compose file read it as `${HOSTSHIFT_WEB_HOSTS:-$DDEV_HOSTNAME}`, and `:-`
+# treats empty as unset, so web fell back to every hostname the worktree
+# registers — the exact inverse of narrowing, permanently, in the configuration
+# where the subtraction has the most to do. Both `init` and `check` reported
+# success, because check compares .ddev/.env against a recomputation of itself
+# and both said the same empty thing.
+#
+# A project must be reachable at its own name regardless of what the parent
+# claims, so that one is kept before the subtraction runs.
+own="$(printf '%s' "$hosts" | sed -n 1p)"
 web=""
 while IFS= read -r h; do
   [ -n "$h" ] || continue
   case ",$variants," in *",$h,"*) continue ;; esac
-  case "
+  if [ "$h" != "$own" ]; then
+    case "
 $parent_hosts
 " in *"
 $h
 "*) continue ;; esac
+  fi
   web="${web:+$web,}$h"
 done <<<"$hosts"
 
@@ -383,7 +1252,39 @@ fi
 # and the post-start hook printed it on every start, including the restart that
 # had just handed those hostnames back to the parent. Four lines of "until
 # `ddev restart`, those serve this worktree" from the hook of that very restart.
-if [ -n "$parent_hosts" ] && [ "$cmd" != "check" ]; then
+# The parent claiming *this* project's own hostname is a collision too, and
+# nothing looked for it.
+#
+# Keeping the own hostname out of the subtraction stops HOSTSHIFT_WEB_HOSTS
+# emptying, but it does not make the project reachable there: both projects then
+# put that name on web's VIRTUAL_HOST, the rules are the same length, and traefik
+# breaks the tie by an ordering neither project controls. Measured, the parent
+# won — so `ddev launch`, `ddev describe` and every `ddev restart` line in the
+# worktree named a URL serving someone else's code and database. The collision
+# scan only ever looked at siblings' *variants*.
+if [ -n "$parent_hosts" ] && [ -n "$own" ]; then
+  case "
+$parent_hosts
+" in *"
+$own
+"*)
+    echo "hostshift: warning: the parent checkout also registers $own," >&2
+    echo "  which is this project's own hostname. Both put it on web, the router" >&2
+    echo "  breaks the tie by an order neither controls, and \`ddev describe\` here" >&2
+    echo "  will name a URL that may serve the parent. Drop it from the parent's" >&2
+    echo "  additional_hostnames, or rename this worktree." >&2
+    ;;
+  esac
+fi
+
+# `init` only, not every subcommand that is not check.
+#
+# The note says those hostnames serve this worktree "until `ddev restart`",
+# which is true when init says it and false ever after — so `env`, `wp-cli` and
+# `loopback` printed it on an already-restarted, entirely healthy worktree,
+# telling the developer their worktree was stealing a hostname it was not and
+# pointing them at remedial action they should not take.
+if [ -n "$parent_hosts" ] && [ "$cmd" = "init" ]; then
   shared=""
   while IFS= read -r h; do
     [ -n "$h" ] || continue
@@ -409,17 +1310,52 @@ fi
 # HOSTSHIFT_MAP_ARGS= line that reads like a bug.
 args="${hsmap:---slug $slug}"
 
-# A digest of hostshift.yaml, so that editing it is drift like any other.
-# The file is mounted and the proxy reads it once, at startup. Nothing else in
-# .ddev/.env moves when it changes — not the args, not the variants, not
-# VIRTUAL_HOST — so adding the alias the file exists for, or repointing
-# canonical at production, left every comparison equal and `check` reporting
-# success while the running proxy used the old map.
+# Whatever else the developer put on the line, kept.
+#
+# `--max-body`, `--strict-origins`, `--compress`, `--no-sweep` and `--explain`
+# are real proxy flags with no hostshift.yaml key, so .ddev/.env is the only
+# place to set them. init used to write HOSTSHIFT_ARGS wholesale and check used
+# to compare the whole line for equality, which made that impossible in both
+# directions at once: adding a flag put the project permanently "out of date",
+# and following the advice that printed — `ddev hostshift init` — deleted the
+# flag without saying so.
+#
+# That is not a papercut. --strict-origins is the documented mitigation for the
+# one enumerated test-28 carve-out, and --max-body is what stops an upload over
+# the cap passing its text fields through unrewritten, which writes variant
+# hostnames into the shared database. Both were unreachable through the
+# supported install path.
+#
+# Anything init itself emits is dropped and regenerated; everything else is
+# carried across in the order it was written.
+if [ -f .ddev/.env ]; then
+  keep="$(sed -n 's/^HOSTSHIFT_ARGS=//p' .ddev/.env | tr -d '\r' | awk '{
+    skip = 0
+    for (i = 1; i <= NF; i++) {
+      if (skip) { skip = 0; continue }
+      if ($i == "--slug" || $i == "--from" || $i == "--to" || $i == "-C") { skip = 1; continue }
+      printf "%s%s", (out++ ? " " : ""), $i
+    }
+  }')"
+  [ -n "$keep" ] && args="$args $keep"
+fi
 
 # #ddev-silent-no-warn, because DDEV otherwise prints a four-line "Custom
 # configuration detected" block naming this file on every single start. It is a
 # legal dotenv comment and DDEV documents the marker in that very message.
-env_out="#ddev-silent-no-warn
+# HOSTSHIFT_SLUG is written only when the slug was *chosen* rather than derived
+# from the branch, and it is what makes --slug stick.
+#
+# `check` re-derives the slug from the current branch, which is right for a slug
+# that came from a branch and wrong for one the developer picked: `init --slug
+# review-42` on branch `main` deployed correctly, served correctly, and then
+# failed the post-start hook on every single start, because check compared the
+# deployed `--slug review-42` against a freshly derived `--slug main`. Worse, the
+# advice it printed — `ddev hostshift init` — silently reverts to the branch
+# slug when run as printed, which in the case that motivates --slug at all is
+# back onto the colliding name the collision warning told you to move off.
+env_out="#ddev-silent-no-warn${slug_explicit:+
+HOSTSHIFT_SLUG_CHOSEN=$slug}
 HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web"
@@ -445,7 +1381,16 @@ HOSTSHIFT_WEB_HOSTS=$web"
 # It does not touch hostnames. Whatever is copied still holds the parent's, which
 # is exactly why hostshift is needed afterwards just as much as before.
 if [ "$cmd" = "check" ]; then
-  hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" || exit $?
+  # What web actually answers on, so the canonical-on-production note lists URLs
+  # this project serves and not the parent's. A worktree inherits the parent's
+  # additional_hostnames and the add-on narrows web's VIRTUAL_HOST afterwards, so
+  # DDEV registers `b.acme.ddev.site` here while the parent serves it — and that
+  # note is the only place a developer is told which URLs show unrewritten
+  # production content.
+  web_hosts="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' .ddev/.env 2>/dev/null \
+    | tr -d '\r' || true)"
+  hostshift check --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+    ${web_hosts:+--served-hosts "$web_hosts"} || exit $?
 
   if [ ! -f .ddev/.env ]; then
     echo "hostshift: nothing deployed yet — run \`ddev hostshift init\`" >&2
@@ -457,7 +1402,14 @@ if [ "$cmd" = "check" ]; then
   # in HOSTSHIFT_VARIANTS, and a hostshift.yaml appearing only in HOSTSHIFT_ARGS
   # — where the deployed flat map goes on beating the file, so its aliases
   # silently never rewrite.
-  deployed="$(grep -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true)"
+  # The same four keys `init` writes and strips, not `^HOSTSHIFT_`. The two
+  # disagreed: init left a v0.1.0 project's leftover HOSTSHIFT_SLUG= and
+  # HOSTSHIFT_MAP_ARGS= lines alone while check counted them, so check reported
+  # "out of date" forever on exactly the upgraded projects. It also swept up any
+  # variable of the developer's own sharing the prefix — and the compose file
+  # reads HOSTSHIFT_* names, so that is how someone arrives at one.
+  deployed="$(grep -e '^HOSTSHIFT_ARGS=' -e '^HOSTSHIFT_VARIANTS=' -e '^HOSTSHIFT_WEB_HOSTS=' \
+    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^#ddev-silent-no-warn' .ddev/.env | tr -d '\r' || true)"
   if [ "$deployed" != "$env_out" ]; then
     echo "hostshift: .ddev/.env is out of date. It says" >&2
     printf '%s\n' "${deployed:-  nothing}" >&2
@@ -536,10 +1488,1223 @@ if [ "$cmd" = "check" ]; then
        exit 2 ;;
   esac
 
+  # Is every variant a name this machine will actually answer to?
+  #
+  # A production-canonical `hostshift.yaml` with no `base:` derives the variant
+  # from the *canonical*, so `canonical: https://www.example.com` becomes
+  # `local--www.example.com` — no DDEV TLD, no mkcert SAN, no DNS. Nothing
+  # rejected it and `check` printed "hostshift is serving" for a hostname that
+  # cannot resolve. Worse on a client domain with wildcard DNS, which is not
+  # rare: the name resolves to the *production server*, so the developer
+  # "reviewing their worktree" is looking at the live site, and loopback
+  # containment does not help — it pins the canonical names, not this one.
+  #
+  # Ask the host file, not the shape of the name.
+  #
+  # A suffix test passes the very case it was written to stop. `hostshift hosts`
+  # includes additional_fqdns verbatim, so a project that points the production
+  # hostname at the box while adopting production-canonical — a natural move —
+  # contributes the suffix `.example.com`, and `local--www.example.com` then
+  # matches it. DDEV registers only the *exact* FQDN in /etc/hosts, so that name
+  # has no local entry at all and resolves through public DNS: under the wildcard
+  # records these domains often carry, straight to the production server, with
+  # the developer believing they are reviewing a worktree.
+  #
+  # $DDEV_TLD is the question, because it is what decides *how* a name resolves.
+  # DDEV sets it for every host command (ddev pkg/ddevapp/ddevapp.go).
+  #
+  # Names under the project TLD resolve by wildcard DNS — `*.ddev.site` is a real
+  # public record pointing at the loopback — so any name under it works without
+  # anything being registered anywhere, which is why variants normally need no
+  # setup at all. Names *outside* it resolve only if DDEV wrote them to
+  # /etc/hosts, and DDEV writes the exact FQDNs from additional_fqdns and nothing
+  # derived from them.
+  #
+  # That distinction is the whole bug in the previous suffix test: a project that
+  # points its production hostname at the box with additional_fqdns while
+  # adopting production-canonical contributed the suffix `.example.com`, so
+  # `local--www.example.com` matched and was accepted — a name with no local
+  # entry, which resolves through public DNS to the production server under the
+  # wildcard records these domains often carry.
+  refuse_variants_outside_tld "$variants" "$hosts"
+
+  # web's VIRTUAL_HOST, not only the proxy's.
+  #
+  # `check` inspected the hostshift container four different ways and never once
+  # looked at web — so when the narrowing failed and web came up serving every
+  # hostname the worktree registers, including the parent's blog, check could not
+  # see it by construction: it compares .ddev/.env against a recomputation of
+  # .ddev/.env, and both said the same wrong thing.
+  #
+  # Only when the file asks for something. An empty HOSTSHIFT_WEB_HOSTS is a real
+  # answer but an unconfigured project has no answer at all, and a container that
+  # is not running tells us nothing either.
+  webenv="$(docker inspect "ddev-$name-web" \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+  webrunning="$(printf '%s' "$webenv" | sed -n '/^VIRTUAL_HOST=/{s///p;q;}')"
+  if [ -n "$webenv" ] && [ "$webrunning" != "$web" ]; then
+    echo "hostshift: web is serving a different set of hostnames than .ddev/.env" >&2
+    echo "  asks for. It has:" >&2
+    echo "    ${webrunning:-(nothing)}" >&2
+    echo "  and this checkout resolves to:" >&2
+    echo "    ${web:-(nothing)}" >&2
+    echo "  Anything there that also belongs to the parent is served by this" >&2
+    echo "  worktree instead, and the router decides which. Run \`ddev restart\`." >&2
+    exit 2
+  fi
+
+  # Is loopback containment actually in place?
+  #
+  # Under production-canonical the add-on ships a whole compose file to point
+  # every canonical hostname at 127.0.0.1 *inside* web, because otherwise
+  # wp-cron, Site Health and any plugin that calls `wp_remote_post` reach the
+  # client's live site from the developer's machine — with `sslverify => false`,
+  # against a database that believes it is production. PLAN §4.4 and the README
+  # both call it required.
+  #
+  # Nothing checked it. `ddev/docker-compose.hostshift-loopback.yaml` ships with
+  # `www.example.com` in it as a placeholder, and a project that never edited
+  # that file passed every guardrail here and reported "hostshift is serving".
+  # The file being present is not the question; what web resolves is.
+  #
+  # Only the canonicals that are not this project's own hostnames — under
+  # DDEV-canonical everything is local already and there is nothing to contain.
+  # `hostshift map` answers that so this does not re-derive it.
+  external="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+    --external-canonical-hosts 2>/dev/null || true)"
+  if [ -n "$external" ] && [ -n "$webenv" ]; then
+    extra="$(docker inspect "ddev-$name-web" \
+      --format '{{range .HostConfig.ExtraHosts}}{{println .}}{{end}}' 2>/dev/null || true)"
+    # Whole entries, not a substring of the blob. `acme.fi:127.0.0.1` is a
+    # substring of `www.acme.fi:127.0.0.1`, so an unanchored match called the
+    # apex domain contained whenever the `www` name was — the commonest hostname
+    # pair WordPress has, and exactly the shape a containment file generated
+    # before the apex alias was added to the map produces.
+    # Comma-delimited on both ends: `$(...)` strips the trailing newline, so
+    # without the closing comma the *last* entry could never match its pattern.
+    extra_list=",$(printf '%s' "$extra" | tr -s '\n' ','),"
+    uncontained=""
+    for h in $external; do
+      case "$extra_list" in
+        *",$h:127.0.0.1,"*) ;;
+        *) uncontained="$uncontained $h" ;;
+      esac
+    done
+    if [ -n "$uncontained" ]; then
+      echo "hostshift: warning: these canonical hostnames are not pinned to the" >&2
+      echo "  loopback inside web, so nothing here stops it reaching them:" >&2
+      for h in $uncontained; do echo "    $h" >&2; done
+      echo "  wp-cron, Site Health and any \`wp_remote_post\` will hit the live site" >&2
+      echo "  from here. Run:" >&2
+      echo "    ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml" >&2
+      echo "    ddev restart" >&2
+      echo "  \`loopback\` prints the file; it does not write it." >&2
+    fi
+  fi
+
+  # The parent-declares verdict is deferred to after the database gate, which is
+  # the only thing here that can actually answer the question it asks. Refusing
+  # at this point exited before that gate ever ran — so the check asserted "the
+  # map does not name the hostnames the database holds" without ever having
+  # looked at the database, on a deployment where the row said otherwise.
+
   if [ -n "$claimed" ]; then
     echo "hostshift: refusing to call this healthy — $claimed is claimed by" >&2
     echo "  another project too, and the router serves whichever it prefers." >&2
     exit 2
+  fi
+
+  # The map itself, not just the command line that asked for it.
+  #
+  # When the container resolves its own map from a mounted hostshift.yaml, the
+  # command line is `--slug X` and stays `--slug X` however the file changes — so
+  # editing hostshift.yaml and not restarting left `check` printing "hostshift is
+  # serving" while the new alias rewrote nothing. Two attempts at closing this
+  # were worse than the gap (a checksum at init time called a correctly restarted
+  # project stale; a file mtime against the container's was unreliable across
+  # platforms), and both were guessing at something the proxy states outright:
+  # it prints its resolved map to stderr at startup, and `docker logs` still has
+  # it. Comparing that against `hostshift map` here is exact, needs no recorded
+  # state, and both sides render through the same Map.String().
+  #
+  # Best-effort by design. A rotated or truncated log yields no map block and is
+  # not evidence of drift, so it says nothing rather than crying wolf.
+  #
+  # The block is delimited, not pattern-matched out of the whole log, and only
+  # the *last* block counts. Both matter:
+  #
+  #   * Every straggler WARN carries a `context=` attribute whose value is raw
+  #     page bytes. A page that merely mentions `https://old -> https://new`
+  #     within 64 bytes of a straggler injected a phantom pair, `check` exited 2
+  #     on every start, and the advice — `ddev restart` — could not help, because
+  #     the line stays in the log until the container is *recreated*.
+  #   * `docker logs` keeps output across a restart, and a hostshift.yaml edit
+  #     changes the map without changing the compose definition, so the container
+  #     is reused. Unioning the blocks compared the old map against the new one
+  #     and never agreed again. Reading the last block compares what is actually
+  #     running.
+  #
+  # `map from` opens the block and the version banner closes it; both are printed
+  # by the same function, adjacent, before the first request is served.
+  extract_map='
+    /^hostshift: map from /   { inblock = 1; delete m; n = 0; next }
+    inblock && /: listening on / { inblock = 0; next }
+    inblock                   { m[++n] = $0 }
+    END { for (i = 1; i <= n; i++) print m[i] }'
+  # Same normalisation both sides: drop the site-name column and collapse the
+  # alignment padding, which depends on the longest hostname in the map. No line
+  # to skip on the host side — `hostshift map` prints its `map from` header to
+  # stderr, so stdout is pair lines only, and dropping one ate a real pair.
+  norm_map() { awk '{ sub(/^[^ \t]+[ \t]+/, ""); gsub(/[ \t]+/, " "); print }' | LC_ALL=C sort -u; }
+  logs="$(docker logs "ddev-$name-hostshift" 2>&1 || true)"
+  running_map="$(printf '%s\n' "$logs" | awk "$extract_map" | norm_map || true)"
+
+  # A body over the size cap goes to the browser untouched.
+  #
+  # HTML is streamed and uncapped; JSON and text/* are read whole, and over
+  # `--max-body` the proxy passes them through unrewritten and logs a WARN. That
+  # is by design (§5.8) and `--max-body` is the documented answer — what was
+  # missing is that nothing ever said it had happened. Measured on one ordinary
+  # page-builder post: `/wp-json/wp/v2/posts/8` came back 9.4 MB carrying 19,390
+  # live canonical origins and zero rewrites, the proxy logged the skip, and
+  # `check` said "hostshift is serving" and exited 0. That is test 28, at a scale
+  # nothing else in this file can reach — and the block editor and every REST
+  # collection are exactly the surfaces that get large.
+  #
+  # A refusal. Round 56 made it a warning, reasoning that the evidence is a log
+  # line from some earlier request and that refusing would block `ddev start`
+  # until the logs rotated — which is wrong about this container: raising
+  # `--max-body` requires a `ddev restart`, and DDEV recreates the container, so
+  # `docker logs` is empty again the moment the fix is applied. The refusal
+  # clears on the fix, which is the property that makes refusing safe.
+  #
+  # And exiting 0 here was not defensible. Measured: a 9.96 MB `/api.php`
+  # response put 120,001 live production origins in the browser with zero
+  # rewrites, and `check` printed the warning and then "hostshift is serving"
+  # with exit 0. PLAN §3's unattended agent tests `$?`, so it was told everything
+  # was fine on the largest test 28 breach this tool can produce.
+  # The two directions counted apart, because they are different failures.
+  #
+  # Three WARNs carry this phrase and one of them is the *request* body. Counted
+  # together, a 10 MB block-editor autosave was reported as "responses went to
+  # the browser unrewritten … live production links" — every sentence about the
+  # wrong direction. Measured on the same deployment: under the cap the variant
+  # hostname is rewritten to the canonical before the app sees it; over the cap
+  # it arrives verbatim and is written into the shared production database.
+  # That is §4.3, which this file elsewhere calls as bad as a leak, described to
+  # the developer as its opposite.
+  #
+  # Anchored on the log's own field, for the reason the map extractor forty
+  # lines above gives at length: a straggler WARN carries raw page bytes as
+  # context, so an unanchored grep counts a page that merely quotes the phrase.
+  cap_msg='msg="[A-Za-z ]*body exceeds the size cap, passing through untouched"'
+  capped_req="$(printf '%s\n' "$logs" \
+    | grep -c "msg=\"request body exceeds the size cap, passing through untouched\"" \
+    2>/dev/null || true)"
+  capped_all="$(printf '%s\n' "$logs" | grep -cE "$cap_msg" 2>/dev/null || true)"
+  # And the base64 WARN, which nothing escalated. A widget instance carrying the
+  # worktree's hostname into production's wp_options is §4.3 with no undo, and
+  # its only signal was a container log that the next `ddev restart` clears while
+  # the rows stay. Anchored on the log's own field for the same reason the cap
+  # counters are.
+  hidden_b64="$(printf '%s\n' "$logs" \
+    | grep -c 'msg="a variant hostname is inside base64 in this request body' \
+    2>/dev/null || true)"
+  [ -n "$capped_req" ] || capped_req=0
+  [ -n "$capped_all" ] || capped_all=0
+  [ -n "$hidden_b64" ] || hidden_b64=0
+  capped=$((capped_all - capped_req))
+  [ "$capped" -ge 0 ] 2>/dev/null || capped=0
+  if [ "$capped" -gt 0 ] 2>/dev/null || [ "$capped_req" -gt 0 ] 2>/dev/null; then
+    cap_now="$(printf '%s\n' "$logs" \
+      | grep -E "$cap_msg" | sed -n 's/.*cap=\([0-9][0-9]*\).*/\1/p' | tail -1 || true)"
+  fi
+  if [ "$capped_req" -gt 0 ] 2>/dev/null; then
+    echo "hostshift: refusing to call this healthy — $capped_req request(s) reached" >&2
+    echo "  the application unrewritten because they were larger than the body" >&2
+    echo "  cap${cap_now:+ ($cap_now bytes)}. A request that big is a media upload or a" >&2
+    echo "  block-editor save, and what it carries is *variant* hostnames: under" >&2
+    echo "  the cap they are turned back into canonical ones before the app sees" >&2
+    echo "  them, and over it they are written into the shared database as they" >&2
+    echo "  stand. That database is production's, and there is no undo — §4.3." >&2
+    echo "  Raise it in HOSTSHIFT_ARGS in .ddev/.env, e.g. --max-body 33554432," >&2
+    echo "  and \`ddev restart\`. Then find what was already written. A save" >&2
+    echo "  lands in post content, an upload in post meta, and a subsite keeps" >&2
+    echo "  its own tables, so wp_options alone answers no:" >&2
+    echo "    $(hs_db_command) db -e \"" >&2
+    echo "      select 'post_content', count(*) from wp_posts" >&2
+    echo "        where post_content like '%${variants%%,*}%'" >&2
+    echo "      union select 'guid', count(*) from wp_posts" >&2
+    echo "        where guid like '%${variants%%,*}%'" >&2
+    echo "      union select 'postmeta', count(*) from wp_postmeta" >&2
+    echo "        where meta_value like '%${variants%%,*}%'" >&2
+    echo "      union select 'options', count(*) from wp_options" >&2
+    echo "        where option_value like '%${variants%%,*}%'\"" >&2
+    echo "  On a multisite repeat it per subsite — wp_2_posts, wp_2_postmeta," >&2
+    echo "  wp_2_options — for every blog_id in wp_blogs." >&2
+    echo "  The restart clears this log; the rows it wrote are still there." >&2
+  fi
+  if [ "$capped" -gt 0 ] 2>/dev/null; then
+    echo "hostshift: refusing to call this healthy — $capped response(s) went to" >&2
+    echo "  the browser unrewritten" >&2
+    echo "  because they were larger than the body cap${cap_now:+ ($cap_now bytes)}." >&2
+    echo "  Those carry whatever origins the database holds — on a" >&2
+    echo "  production-canonical map that is live production links, and one" >&2
+    echo "  large REST response can carry thousands." >&2
+    echo "  HTML is streamed and never capped; this is JSON and text/*, which is" >&2
+    echo "  the block editor and every REST collection." >&2
+    echo "  Raise it in HOSTSHIFT_ARGS in .ddev/.env, e.g. --max-body 33554432," >&2
+    echo "  and \`ddev restart\`. Which paths:" >&2
+    echo "    docker logs ddev-$name-hostshift 2>&1 | grep 'size cap'" >&2
+    echo "  The restart that applies the new cap also clears this: DDEV recreates" >&2
+    echo "  the container, so the log starts empty." >&2
+  fi
+  if [ "$hidden_b64" -gt 0 ] 2>/dev/null; then
+    echo "hostshift: refusing to call this healthy — $hidden_b64 request(s) carried a" >&2
+    echo "  variant hostname inside base64, which reached the database as it stood." >&2
+    echo "  It cannot be mapped back: the Customizer validates a widget instance" >&2
+    echo "  with wp_hash() over exactly those bytes, so rewriting it makes" >&2
+    echo "  WordPress discard the save. Reporting is the whole remedy." >&2
+    echo "  This is §4.3 and there is no undo. What was written:" >&2
+    echo "    docker logs ddev-$name-hostshift 2>&1 | grep 'inside base64'" >&2
+    echo "  Then repair the rows by hand from the canonical side, or restore." >&2
+    echo "  Widget instances live in wp_options under widget_*; the block editor" >&2
+    echo "  stores them in wp_posts.post_content." >&2
+    echo "  The restart clears this log; the rows it wrote are still there." >&2
+  fi
+  # After all three, so a deployment failing several ways is told about each.
+  if [ "$capped" -gt 0 ] 2>/dev/null || [ "$capped_req" -gt 0 ] 2>/dev/null ||
+    [ "$hidden_b64" -gt 0 ] 2>/dev/null; then
+    exit 2
+  fi
+
+  # The image's version against this command's.
+  #
+  # `ddev add-on get` installs the command and the compose file from the repo,
+  # but the *engine* comes from a published image — so a developer can run
+  # today's command in front of last week's proxy, and every behaviour added in
+  # between is silently absent. Measured: on the published v0.1.0 image a feed
+  # came back with eighteen canonical URLs unrewritten and `check` still said
+  # "hostshift is serving", because it compares the map the container logged and
+  # never its version. The proxy prints its version on the line every
+  # `ddev logs -s hostshift` starts with, precisely so this is answerable.
+  #
+  # A warning, not a refusal: a lagging image is a reason to pull, not a reason
+  # to fail every start. Nothing is said when either version is unknown.
+  # A banner with no version is evidence, not the absence of it.
+  #
+  # v0.1.0 prints `hostshift: listening on …` — the version was added to that
+  # line *after* it — so requiring a space after the name made running_ver empty
+  # on the only skew that actually exists today, and the warning was silent on
+  # exactly the case its comment cites as measured. A bannerless proxy is older
+  # than the change that added the banner.
+  running_ver="$(printf '%s\n' "$logs" | sed -n 's/^hostshift \([^:]*\): listening on.*/\1/p' | tail -1)"
+  # `case` for the same reason as the probe body above: `docker logs` output
+  # passes 64 KiB once straggler WARNs accumulate, and the pipeline would then
+  # return 141 and silence the version-skew warning on the one image skew that
+  # actually exists.
+  logs_has_banner=""
+  case "$logs" in
+    "hostshift: listening on"*|*"
+hostshift: listening on"*) logs_has_banner=1 ;;
+  esac
+  if [ -z "$running_ver" ] && [ -n "$logs_has_banner" ]; then
+    running_ver="(older than v0.2.0)"
+  fi
+  host_ver="$(hostshift --version 2>/dev/null | tail -1 | tr -d '\r' || true)"
+  # A bannerless proxy warns on its own evidence, whatever this command reports.
+  #
+  # The comparison below is suppressed when either side says `dev`, so that a
+  # source build does not warn against every released image — and that
+  # suppression silenced the one skew that exists today, because a developer
+  # running a source build in front of the published image has `host_ver=dev`.
+  # Measured: options.php through that pair wrote `s:54:` over a 44-byte string
+  # and PHP refused the row, while `check` exited 0.
+  #
+  # The sentinel needs no comparison. A proxy whose banner predates the version
+  # being on it is older than every serialized-repair change there has been, and
+  # that is true however this command was built.
+  if [ "$running_ver" = "(older than v0.2.0)" ]; then
+    echo "hostshift: warning: the proxy image predates v0.2.0 — its banner carries" >&2
+    echo "  no version at all. Everything the engine learned since then is absent" >&2
+    echo "  here, silently, because the map and the hostnames still check out." >&2
+    echo "  That includes re-emitting serialized length prefixes: this proxy" >&2
+    echo "  rewrites hosts inside serialized values and leaves the old lengths," >&2
+    echo "  which PHP refuses or truncates — in the request direction that is a" >&2
+    echo "  write to the shared database with no undo." >&2
+    echo "  Pull it: \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
+    echo "  If the banner still carries no version afterwards, the published tag is" >&2
+    echo "  itself that old image — \`:latest\` moves only when a release is tagged —" >&2
+    echo "  and the engine has to be built from the repository to get past it." >&2
+  elif [ -n "$running_ver" ] && [ -n "$host_ver" ] && [ "$running_ver" != "$host_ver" ] &&
+     [ "$running_ver" != "dev" ] && [ "$host_ver" != "dev" ]; then
+    echo "hostshift: warning: the proxy image is $running_ver and this command is" >&2
+    echo "  $host_ver. The add-on installs the command from the repository and the" >&2
+    echo "  engine from a published image, so anything added between those two" >&2
+    echo "  versions is not running here — silently, since the map and the" >&2
+    echo "  hostnames still check out." >&2
+    echo "  Pull it: \`docker pull ghcr.io/generoi/hostshift:latest && ddev restart\`." >&2
+  fi
+  if [ -n "$running_map" ]; then
+    want_map="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" 2>/dev/null \
+      | norm_map || true)"
+    if [ -n "$want_map" ] && [ "$running_map" != "$want_map" ]; then
+      echo "hostshift: the proxy is running a different map than this checkout" >&2
+      echo "  now resolves to. It started with:" >&2
+      printf '%s\n' "$running_map" | sed 's/^/    /' >&2
+      echo "  and hostshift.yaml/DDEV config now give:" >&2
+      printf '%s\n' "$want_map" | sed 's/^/    /' >&2
+      echo "  Run \`ddev restart\`." >&2
+      exit 2
+    fi
+  fi
+
+  # One request, because everything above this line is inference.
+  #
+  # `check` inspects the container five ways — it exists, it is running, its
+  # VIRTUAL_HOST, its command line, the map it logged — and web's VIRTUAL_HOST
+  # besides, and then reports what is *configured* as though it were what is
+  # served. Two states measured green with the URL returning 502: a directory
+  # rename that left DDEV's old traefik routers behind pointing at a dead
+  # container, and two live projects claiming one hostname. A single request
+  # closes both.
+  #
+  # Only a hard routing failure is fatal. A 404, a 302 to wp-signup, a 401 — all
+  # mean the request reached an application, which is what this is asking. curl
+  # is not guaranteed present, so its absence is not an error either.
+  if command -v curl >/dev/null; then
+    probe="$(printf '%s' "$variants" | cut -d, -f1)"
+    # Retried, because this runs in the post-start hook — the instant after
+    # `ddev start` returns, when traefik may not have picked up the new router
+    # yet. A single request would turn that ordinary race into a refusal on a
+    # perfectly good project, and a check that cries wolf on every cold start is
+    # worse than the gap it closes.
+    # The router's port, and no proxy. DDEV supports a non-443 router port — the
+    # standard remedy when something else owns 443 — and exports it to host
+    # commands; without it the probe asked the wrong port and got nothing. An
+    # https_proxy in the shell had the same effect.
+    port=""
+    case "${DDEV_ROUTER_HTTPS_PORT:-443}" in 443|"") ;; *) port=":$DDEV_ROUTER_HTTPS_PORT" ;; esac
+    code=""
+    rc=0
+    for attempt in 1 2 3; do
+      # Reset per attempt. Set once outside the loop, a first-attempt timeout —
+      # the cold-start race the retries exist for — left rc=28 sticky, so two
+      # subsequent 502s were relabelled "slow" and the refusal never ran. That is
+      # exactly the failure this probe exists to catch, certified healthy on an
+      # ordering that is ordinary on a busy machine.
+      rc=0
+      # The body as well as the code, so the one check that actually fetches a
+      # page can say something about what came back. See probe_body below.
+      probe_body="$(curl -sk --noproxy '*' -w '\n%{http_code}' \
+        --connect-timeout 3 --max-time 10 "https://$probe$port/" 2>/dev/null)" || rc=$?
+      code="$(printf '%s' "$probe_body" | sed -n '$p')"
+      case "$code" in
+        000|502) [ "$attempt" = 3 ] || sleep 2 ;;
+        *) break ;;
+      esac
+    done
+    # 28 is curl's timeout. A slow homepage — a cold opcache on a bind mount,
+    # xdebug on, a heavy plugin set — is a site that answers, not a routing
+    # failure, and refusing there cost 35 seconds on every boot and then blamed
+    # the router. 503 and 504 are dropped for the same reason: maintenance-mode
+    # plugins and WordPress core itself send 503 while `.maintenance` exists, and
+    # an application that answers has answered.
+    if [ "$rc" = 28 ]; then
+      code="slow"
+    fi
+    case "$code" in
+      000|502)
+        # The body says who failed, and it was already in hand.
+        #
+        # The proxy answers a failed upstream dial with `hostshift: upstream
+        # request failed: …` in the body, and this command captures that body
+        # above precisely so "the one check that actually fetches a page can say
+        # something about what came back". This branch never read it, so a
+        # stopped `web` — the commonest failure the compose file itself names —
+        # was reported as a router fault, with an escalation path ending at
+        # `ddev poweroff`, a fleet-wide action, for something `ddev start` fixes.
+        case "${probe_body:-}" in
+          *"upstream request failed"*)
+            echo "hostshift: the proxy is running and routed, but it cannot reach" >&2
+            echo "  this project's web container. That is the upstream being down," >&2
+            echo "  not the router and not the configuration:" >&2
+            printf '%s\n' "$probe_body" | sed -n '1,2p' | sed 's/^/    /' >&2
+            echo "  \`ddev start\` here. Nothing about the map needs changing." >&2
+            exit 2 ;;
+        esac
+        echo "hostshift: everything is configured correctly, but https://$probe/" >&2
+        echo "  answers ${code:-nothing} — so something between the router and the" >&2
+        echo "  proxy is broken, not the configuration." >&2
+        echo "  A stale router from a renamed project does this, and so does" >&2
+        echo "  another project claiming the same hostname." >&2
+        # Name the file, because none of the three remedies previously printed
+        # clears it. DDEV keeps per-project router config in
+        # .ddev/traefik/config/<name>.yaml *inside the project*, so renaming a
+        # directory leaves the old name's file there permanently: two routers
+        # register the same rule and traefik picks the one pointing at a
+        # container that no longer exists. Measured, `ddev restart`,
+        # `ddev stop && ddev start` and `ddev poweroff` all leave it — the file
+        # is on disk and comes back on the next start. Deleting it fixes it
+        # immediately, and the previous advice claimed the opposite in the very
+        # case it named.
+        stale=""
+        for f in .ddev/traefik/config/*.yaml; do
+          [ -f "$f" ] || continue
+          case "$(basename "$f" .yaml)" in "$name") ;; *) stale="${stale:+$stale }$f" ;; esac
+        done
+        if [ -n "$stale" ]; then
+          echo "  This project carries router config for a name it no longer has:" >&2
+          printf '    %s\n' $stale >&2
+          echo "  That is what a renamed directory leaves behind, and no restart" >&2
+          echo "  clears it. Delete those files and \`ddev restart\`." >&2
+        else
+          echo "  Try \`ddev restart\`, then \`ddev stop && ddev start\`, and only" >&2
+          echo "  then \`ddev poweroff\`, which retires every project's routers." >&2
+        fi
+        exit 2 ;;
+    esac
+  fi
+
+  # A warning, never a refusal, and it clears nothing.
+  #
+  # This has been wrong in three consecutive audit rounds — it read the wrong
+  # database, then read a value WordPress filters through WP_HOME, then read a
+  # blank line and stopped running at all — and each fix was correct about the
+  # previous failure and introduced the next. PLAN §4.1 says why the ground keeps
+  # moving: "the application self-reports and cannot be interrogated … the map
+  # must be declared, never discovered". Every version of this has been a
+  # discovery mechanism wearing a different hat.
+  #
+  # So it keeps the signal and gives up the authority. It cannot fail a start,
+  # and it can no longer clear the parent-declares warning — the two things that
+  # made a wrong answer expensive. A wrong answer is now a line of noise, which
+  # is the worst a heuristic reading someone else's database should ever cost.
+  #
+  # After the probe, too: the probe is the one hard measurement here, and running
+  # the heuristic first meant a wrong guess from it hid a real 502 behind advice
+  # to run a search-replace.
+  # Ask the database which hostnames it actually holds.
+  #
+  # Everything above compares configuration against configuration, and adopting
+  # production-canonical is a pincer between two states configuration cannot
+  # tell apart. A worktree whose branch predates the parent's hostshift.yaml has
+  # a map built from DDEV hostnames — which is *correct* while the database still
+  # holds them, and both variants return 200 — and check refused it on every
+  # start, every statement in the warning false. Merge the file, as that warning
+  # says, and check reports "hostshift is serving" and exits 0 while both URLs
+  # 302 to wp-signup, because the database has not moved yet. The developer's
+  # only escape from a permanent red is the action that silently breaks the site.
+  #
+  # One query separates them, and the add-on already talks to this database in
+  # copy-db. Best-effort throughout: no container, no WordPress, an unusual table
+  # prefix or a stopped db all yield nothing, and nothing is not evidence.
+  # ${DB_HOST:-db} — the database the *application* reads, not the one beside it.
+  #
+  # `-h db` is the worktree's own container, and the README's headline answer to
+  # "the worktree has an empty database" is to share the parent's. On exactly
+  # that configuration the query hit an idle container holding a leftover
+  # install, so a site serving 200s with every link correctly rewritten was told
+  # its database names a hostname the map does not cover — refused on every
+  # start, every clause false. Worse, the remedy it printed is destructive there:
+  # `ddev wp` targets the parent, so the search-replace it recommends would
+  # rewrite the parent's real content to a throwaway worktree hostname.
+  #
+  # copy-db thirty lines up already asks the web container for DB_HOST for this
+  # exact reason. Running the query inside the container with its own environment
+  # inherits that knowledge instead of duplicating it.
+  # `wp db query`, which reads the *row*, not the application's opinion of it.
+  #
+  # Reading DB_HOST from the container's shell environment was not the same
+  # question. The README's "Share the parent's" section sets DATABASE_URL, not
+  # DB_HOST, and Bedrock keeps credentials in a dotenv file that no `printenv`
+  # can see — so on the README's headline configuration the query hit the
+  # worktree's own idle container instead of the database the application reads.
+  #
+  # That was wrong in both directions, and the silent one is worse: a stale
+  # answer from the idle container *cleared* the parent-declares warning, so a
+  # preview serving live production origins was certified healthy. Reading a
+  # different database and calling it proof is the failure; asking the
+  # application removes the question.
+  #
+  # `wp option get home` was the wrong question, and PLAN §4.1 says why:
+  # "the application self-reports and cannot be interrogated — the map must be
+  # declared, never discovered". get_option('home') runs through
+  # `add_filter('option_home', '_config_wp_home')`, which WordPress registers
+  # unconditionally and which returns WP_HOME whenever it is defined — and
+  # Bedrock always defines it, from HTTP_HOST or DDEV_PRIMARY_URL. So under
+  # `ddev exec`, with no HTTP_HOST, the answer was the worktree's own project
+  # hostname, which is by construction neither canonical nor variant: a refusal
+  # on every start of a healthy site. And where a repo has wp-cli.local.yml, its
+  # `url:` sets HTTP_HOST, so the answer always equalled a canonical host and the
+  # check cleared the parent-declares warning by echoing generated config back at
+  # itself.
+  #
+  # The row is not an opinion. wp-cli resolves the connection from wp-config.php,
+  # so Bedrock's dotenv and the README's DATABASE_URL are both handled — the
+  # thing the shell-environment version got wrong — while `db query` bypasses
+  # every filter.
+  #
+  # Best-effort, and silence is the only safe failure. No wp-cli, no WordPress,
+  # a stopped container or an unusual layout all yield nothing — and nothing
+  # neither clears a warning nor raises one, because an answer we cannot trust
+  # must not be treated as evidence in either direction.
+  # The first line that looks like a URL, not `tail -1`.
+  #
+  # `wp db query` ends its output with a blank line, so `tail -1` assigned an
+  # empty string and the whole gate below — refusal *and* the parent-declares
+  # clearing — silently never ran. `option get home`, which this replaced,
+  # emitted exactly one line, which is why the idiom survived the change. Third
+  # time this gate has been wrong, and the first time it was wrong in the
+  # direction that says nothing at all.
+  #
+  # Matching the shape rather than a position also skips a column header or a
+  # warning line, and `sed -n '…{p;q;}'` is the file's existing way of taking a
+  # first match without `head -1` SIGPIPEing the writer under pipefail.
+  # -d, because `ddev exec -s web` runs in /var/www/html and WordPress is under
+  # the docroot. Without it wp-cli errored, the error was swallowed, and the
+  # gate reported nothing on every project whose root has no wp-cli.yml `path:`.
+  # An `if`, not `[ -n "$dr" ] && …`: under `set -e` a false `&&` chain is the
+  # command's own exit status, so an empty docroot ended the script right here.
+  wproot="/var/www/html"
+  dr="$(ddev_docroot .ddev)"
+  if [ -n "$dr" ]; then
+    wproot="/var/www/html/$dr"
+  fi
+  dbhome="$(ddev exec -s web -d "$wproot" wp --skip-plugins --skip-themes --quiet db query \
+    "select option_value from wp_options where option_name='home' limit 1" --skip-column-names \
+    2>/dev/null | tr -d '\r' | sed -n '/^https\{0,1\}:\/\//{p;q;}' || true)"
+  dbhost=""
+  case "$dbhome" in
+    http://*|https://*) dbhost="$(printf '%s' "$dbhome" | sed -e 's|^https\{0,1\}://||' -e 's|[/:].*$||')" ;;
+  esac
+
+  if [ -n "$dbhost" ]; then
+    canon_hosts="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+      --canonical-hosts 2>/dev/null | sort -u || true)"
+    known=""
+    while IFS= read -r h; do
+      [ "$h" = "$dbhost" ] && { known=1; break; }
+    done <<<"$canon_hosts"
+    # A positive answer here settles the parent-declares question below: the
+    # database's own home is in the map, so the map is not on the wrong side,
+    # whatever the parent's hostshift.yaml declares. A measured row beats an
+    # inference drawn from two config files.
+    if [ -n "$known" ]; then
+      db_confirms_map=1
+    fi
+    if [ -z "$known" ]; then
+      dbh="${dbhome#*://}"; dbh="${dbh%%/*}"
+      hits=0
+      if [ -n "${probe_body:-}" ] && [ -n "$dbh" ]; then
+        hits="$(printf '%s' "$probe_body" \
+          | grep -oE "//${dbh//./\\.}[/\"'\''<> ?#:]" 2>/dev/null | wc -l | tr -d ' ' || true)"
+        [ -n "$hits" ] || hits=0
+      fi
+      if [ "$hits" -ge 5 ]; then
+        echo "hostshift: refusing to call this healthy — the database's home is" >&2
+        echo "  $dbhome, which this map does not name, and the page served at" >&2
+        echo "  https://${probe:-$(printf '%s' "$variants" | cut -d, -f1)} carries" >&2
+        echo "  $hits links to $dbh. Nothing on the page is being rewritten." >&2
+      else
+        echo "hostshift: warning: the database says its home is $dbhome, which this" >&2
+        echo "  map does not name. If that is right, nothing on the page is being" >&2
+        echo "  rewritten and every link points at it." >&2
+      fi
+      echo "  The map covers:" >&2
+      printf '    %s\n' $canon_hosts >&2
+      echo "  Name $dbh in hostshift.yaml — as the canonical, or as an alias of" >&2
+      echo "  it — and \`ddev hostshift init && ddev restart\`." >&2
+      echo "  Do *not* search-replace the database to match the map: under the" >&2
+      echo "  arrangement this tool is for, that database is the parent's, and" >&2
+      echo "  moving it off those hostnames moves production." >&2
+      if [ "$hits" -ge 5 ]; then
+        exit 2
+      fi
+    fi
+  fi
+
+  # What the page actually says it is.
+  #
+  # A stock DDEV WordPress pins WP_HOME to DDEV_PRIMARY_URL — this project's own
+  # hostname, which is neither the canonical nor the variant. The preview then
+  # serves seventeen links to `<project>.ddev.site`, nothing is rewritten
+  # because nothing on the page names an origin the map knows, and every gate
+  # here passed: the map is injective and anchored, the containers are up, the
+  # probe answers 200, and the database's `home` row is whatever it is. Only
+  # `hostshift diff` caught it, and the README points worktree users here.
+  #
+  # This is not discovery of the map — it is reading the one page this command
+  # already fetched and noticing it is full of a hostname the map does not name.
+  if [ -n "${probe_body:-}" ] && [ -n "${DDEV_HOSTNAME:-}" ]; then
+    canon_list="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+      --canonical-hosts 2>/dev/null | paste -sd, - || true)"
+    # Every hostname DDEV registers, not just the first. DDEV joins the project
+    # hostname with each additional_hostnames entry, so reading one name looked
+    # at a fraction of what the project answers to.
+    owns="$(printf '%s' "${DDEV_HOSTNAME}" | tr ',' '\n')"
+    while IFS= read -r own; do
+      [ -n "$own" ] || continue
+      # A hostname the map already covers is not a stranger.
+      case ",$variants," in *",$own,"*) continue ;; esac
+      case ",$canon_list," in *",$own,"*) continue ;; esac
+      # `case`, not `printf | grep -q`. Under `set -o pipefail` a `grep -q` that
+      # matches early exits while printf is still writing, printf takes SIGPIPE,
+      # and the pipeline returns 141 — so the `if` was false on every body past
+      # the 64 KiB pipe buffer, which is every WordPress page. The warning could
+      # not fire on any deployment that had the problem, and the shipped test
+      # passed because its fixture body is 41 bytes. This file documents the
+      # same hazard in three other places and this walked into it anyway.
+      # A count, not a substring, and a boundary after the host.
+      #
+      # One occurrence is an ordinary content link — a developer's note pointing
+      # at the worktree's own mailpit is exactly that, and mailpit is
+      # deliberately not proxied. The defect this exists for produces thirty-odd
+      # in <head> alone: canonical, feed, REST, oEmbed, shortlink. Warning on one
+      # meant warning on every `ddev start` of a healthy site, which is the
+      # warning a developer learns to ignore.
+      #
+      # The boundary stops `//own.ddev.site` matching inside
+      # `//own.ddev.site.cdn.example.net`, which is a different host.
+      hits="$(printf '%s' "$probe_body" \
+        | grep -oE "//${own//./\\.}[/\"'\''<> ?#:]" 2>/dev/null | wc -l | tr -d ' ' || true)"
+      [ -n "$hits" ] || hits=0
+      if [ "$hits" -ge 5 ]; then
+          echo "hostshift: warning: the page served at https://$probe answers with" >&2
+          echo "  links to $own, which is neither a canonical hostname nor a" >&2
+          echo "  variant — so those links are not being rewritten and do not" >&2
+          echo "  reach this preview. DDEV pins WP_HOME, and where it does that" >&2
+          echo "  depends on the project type:" >&2
+          if [ -f .env ] && grep -q "^WP_HOME=" .env 2>/dev/null; then
+            echo "    Bedrock (wp-bedrock): the project-root .env, rewritten on" >&2
+            echo "    every \`ddev start\` — so editing it is undone by the next" >&2
+            echo "    restart. Stop DDEV managing it:" >&2
+            echo "      echo \"disable_settings_management: true\" >> .ddev/config.hostshift.local.yaml" >&2
+            echo "    then set WP_HOME and WP_SITEURL in .env to a canonical" >&2
+            echo "    hostname and \`ddev restart\`." >&2
+          else
+            echo "    stock WordPress: wp-config-ddev.php pins WP_HOME to" >&2
+            echo "    DDEV_PRIMARY_URL. Remove that pin, or set WP_HOME to a" >&2
+            echo "    canonical hostname. If the marker \`#ddev-generated\` is" >&2
+            echo "    still on wp-config.php, remove that first or DDEV will" >&2
+            echo "    restore the pin on the next start." >&2
+          fi
+      fi
+    done <<EOF
+$owns
+EOF
+
+  fi
+  # Every variant's homepage, not only the first one's.
+  #
+  # `probe` is `cut -d, -f1`, and `probe_body` is the sole evidence for all four
+  # scans below — the map-scoped leak count, the database's home, the parent's
+  # unmapped hostnames, and the off-map hosts. So on a multisite no state of any
+  # site but the first could fail `check`: site 1's homepage clean and site 2's
+  # carrying seventeen live production origins exited 0. A multisite is the
+  # configuration hostshift.yaml exists for.
+  #
+  # Appended here, after the routing diagnosis above has had its say on the
+  # first variant alone — a sibling's failure must not be read as this one's.
+  # Best-effort and capped: this runs on every `ddev start`, so a short timeout,
+  # no retries, and a bound on how many pages a large multisite fetches.
+  # The hostnames a redirect may be followed to: the variants and DDEV's own.
+  #
+  # A canonical is deliberately not among them. Under production-canonical the
+  # canonical *is* production, so following a redirect there fetches the
+  # client's live site.
+  local_hosts=",$(printf '%s,%s,' "$variants" "${DDEV_HOSTNAME:-}" \
+    | tr -s ',' ','),"
+
+  # hs_fetch_local fetches a URL, following redirects only while they stay on a
+  # hostname this deployment serves. It prints the final body, or nothing.
+  #
+  # `curl -L` has no same-origin restriction: a `Location:` pointing anywhere is
+  # followed, with `-k` and `--noproxy '*'`. Round 54 added `-L` so a `/` that
+  # 302s to `/fi/` is still scanned, and bought an outbound fetch of whatever
+  # the site redirects to — on every `ddev start`, from the developer's laptop.
+  # WordPress's own canonical redirect is enough to trigger it, and loopback
+  # containment cannot stop it, because this curl runs on the host and not in
+  # `web`. The body then came back attributed to the variant, so `check` refused
+  # a preview by name over links that were on somebody else's page.
+  hs_fetch_local() {
+    _url="$1"; _entry="$1"; _max="${2:-8}"; _hop=0
+    # An explicit template: GNU mktemp rejects `-t hostshift-hdr` for having too
+    # few X's, and the `|| return 0` beside it turned that into a silent
+    # fail-open — every sibling variant went unprobed and `check` passed on a
+    # multisite by never looking at it.
+    _hf="$(mktemp "${TMPDIR:-/tmp}/hostshift-hdr.XXXXXX" 2>/dev/null)" || _hf=""
+    if [ -z "$_hf" ]; then
+      curl -sk --noproxy '*' --connect-timeout 2 --max-time "$_max" \
+        "$_url" 2>/dev/null || true
+      return 0
+    fi
+    while :; do
+      _body="$(curl -sk -D "$_hf" --noproxy '*' --connect-timeout 2 \
+        --max-time "$_max" "$_url" 2>/dev/null || true)"
+      case "$(awk 'NR == 1 { print $2; exit }' "$_hf" 2>/dev/null)" in
+        30*) ;;
+        *) break ;;
+      esac
+      [ "$_hop" -ge 3 ] && break
+      _hop=$((_hop + 1))
+      _loc="$(tr -d '\r' < "$_hf" \
+        | awk 'tolower($1) == "location:" { print $2; exit }')"
+      [ -n "$_loc" ] || break
+      case "$_loc" in
+        //*) _loc="https:$_loc" ;;
+        /*) _loc="$(printf '%s' "$_url" | sed 's|\(https*://[^/]*\).*|\1|')$_loc" ;;
+        http://*|https://*) ;;
+        # A relative path. Resolving it means reimplementing the URL parser in
+        # shell, which is the mistake round 54 took out of the off-map scan.
+        *) break ;;
+      esac
+      # A redirect to wp-signup.php is WordPress saying it does not recognise
+      # this hostname, which on a multisite means `wp_blogs.domain` does not
+      # hold it. That is the state this file's own comments call the
+      # catastrophe — "the action that silently breaks the site" — and it is
+      # what a `db:pull` landing with mismatched `wp_blogs` produces. Every page
+      # 302s, so nothing is previewable, and it was invisible: the status was
+      # discarded here and the signup page carries only variant origins, so the
+      # leak scans found nothing and `check` exited 0 saying "hostshift is
+      # serving". Evidence rather than inference, which is what this file
+      # prefers — the redirect target says it outright.
+      # Through a file, because every caller invokes this inside `$(...)` — a
+      # subshell, where a variable set here is discarded when it closes.
+      case "$_loc" in
+        *wp-signup.php*)
+          if [ -n "${hs_signup_file:-}" ]; then
+            printf '%s\n' "$_entry" >> "$hs_signup_file"
+          fi ;;
+      esac
+      _lh="${_loc#*://}"; _lh="${_lh%%/*}"; _lh="${_lh%%:*}"
+      case "$local_hosts" in
+        *",$_lh,"*) ;;
+        *) break ;;
+      esac
+      _url="$_loc"
+    done
+    rm -f "$_hf"
+    printf '%s' "$_body"
+  }
+
+  # Every probed page kept separately, as well as concatenated.
+  #
+  # `probe_body` is up to nine documents run together — the first variant, the
+  # page its redirect leads to, and up to eight sibling variants — and every
+  # scan below reported its finding as "the page served at https://$probe". On a
+  # multisite the leak is usually on a *sibling*, so the developer opened the URL
+  # the tool named, viewed source, found nothing, and had no way from the message
+  # to the page that is actually leaking.
+  #
+  # A record marker rather than temp files, because the scans below `exit 2` from
+  # inside loops and the one EXIT trap in this file belongs to `init`. A body
+  # containing a line that starts with the marker would split a record early,
+  # which mis-attributes one message; it cannot crash the scan.
+  probe_pages=""
+  # A record marker a served page cannot contain. `=== ` alone splits a record
+  # on any page carrying a line that starts with it — a changelog, a diff, a
+  # code sample — and because `url` then stays set, it mis-attributes every
+  # later message for that page and not just one. SOH is not valid in HTML text
+  # and survives a shell variable.
+  hs_mark="$(printf '\001')=== "
+  hs_add_page() {
+    [ -n "$2" ] || return 0
+    # The bare URL for the list, which is word-split when it is printed — the
+    # label carries "(after its redirect)" and would have arrived as three more
+    # lines that look like hostnames. The label stays on the record below, where
+    # hs_page_carrying reads it whole.
+    case " $probe_urls " in
+      *" ${1%% *} "*) ;;
+      *) probe_urls="$probe_urls ${1%% *}" ;;
+    esac
+    probe_pages="$probe_pages
+$hs_mark$1
+$2"
+  }
+
+  # The probed page that carries a host, for the messages. Falls back to the
+  # first variant, which is what every message used to say unconditionally.
+  hs_page_carrying() {
+    _u="$(printf '%s\n' "$probe_pages" | awk -v needle="$1" -v m="$hs_mark" '
+      index($0, m) == 1 { url = substr($0, length(m) + 1); next }
+      url != "" && index($0, needle) { print url; exit }')"
+    [ -n "$_u" ] || _u="https://${probe:-}${port:-}/"
+    printf '%s' "$_u"
+  }
+
+  probe_urls=""
+  hs_signup_at=""
+  # Pages *attempted*, which is not the same as pages that came back with one.
+  #
+  # hs_add_page returns early on an empty body, and a `wp_redirect()` to a
+  # hostname this map does not name is exactly that: the proxy leaves the
+  # Location alone, hs_fetch_local declines to follow off the deployment, and
+  # the body is empty. So the page that signed up was removed from the
+  # denominator at the same moment it was added to the numerator, "fewer than
+  # all" came out false, and round 57's refusal fired on the one state its own
+  # comment says it was written to stop refusing. The off-map target is the
+  # ordinary case on the production-canonical multisite this tool exists for.
+  hs_attempted_n=0
+  hs_signup_file="$(mktemp "${TMPDIR:-/tmp}/hostshift-signup.XXXXXX" 2>/dev/null)" || hs_signup_file=""
+  # An `if`, not `[ ] && cmd`: this file runs under `set -e`, where a bare test
+  # that comes out false is the script's exit status. Written the short way it
+  # ended `check` silently on any deployment with no probe host, and the suite
+  # saw it as "probed 1 host(s)".
+  if [ -n "${probe:-}" ]; then
+    hs_attempted_n=$((hs_attempted_n + 1))
+    hs_add_page "https://$probe${port:-}/" "${probe_body:-}"
+  fi
+
+  # The page a redirect leads to, which is where the content is.
+  #
+  # The probe above deliberately does not follow redirects: a 302 answers its
+  # question, which is whether the request reached an application. But round 53
+  # made that body the evidence for four page scans, and a site whose `/`
+  # redirects to `/fi/` then had its homepage read as an empty 302 body — every
+  # scan passing on nothing. A redirecting root is the norm on the multilingual
+  # and subdirectory-multisite setups hostshift.yaml exists for. Bounded, and
+  # appended rather than replacing, so the reachability verdict above is
+  # untouched.
+  if [ -n "${probe:-}" ] && command -v curl >/dev/null; then
+    case "${code:-}" in
+      30*)
+        red_body="$(hs_fetch_local "https://$probe$port/" 8)"
+        hs_add_page "https://$probe$port/ (after its redirect)" "$red_body"
+        probe_body="$probe_body
+$red_body" ;;
+    esac
+  fi
+
+  if [ -n "${probe_body:-}" ] && command -v curl >/dev/null; then
+    n_extra=0
+    for extra in $(printf '%s' "$variants" | tr ',' ' '); do
+      [ "$extra" = "${probe:-}" ] && continue
+      [ "$n_extra" -ge 8 ] && break
+      n_extra=$((n_extra + 1))
+      hs_attempted_n=$((hs_attempted_n + 1))
+      extra_body="$(hs_fetch_local "https://$extra$port/" 5)"
+      hs_add_page "https://$extra$port/" "$extra_body"
+      probe_body="$probe_body
+$extra_body"
+    done
+  fi
+
+  hs_signup_n=0
+  if [ -n "${hs_signup_file:-}" ]; then
+    hs_signup_at="$(sort -u "$hs_signup_file" 2>/dev/null | tr '\n' ' ' || true)"
+    hs_signup_n="$(sort -u "$hs_signup_file" 2>/dev/null | grep -c . || true)"
+    [ -n "$hs_signup_n" ] || hs_signup_n=0
+    rm -f "$hs_signup_file"
+  fi
+  hs_probed_n="$hs_attempted_n"
+
+  # Nothing is previewable if WordPress does not know the hostname.
+  #
+  # This is the one state `check` could not see at all: the reachability verdict
+  # above is single-site — `probe` is `cut -d, -f1` — and the sibling fetches
+  # discarded their status entirely, so a multisite where every page 302s to
+  # wp-signup.php reported "hostshift is serving" and exit 0 on every
+  # `ddev start`. `hostshift diff` went RED on the same deployment in one page.
+  #
+  # A refusal rather than a warning, because there is nothing to preview and the
+  # remedy is not obvious: the instinct is to search-replace the database, which
+  # is the parent's and shared, so doing that moves production.
+  #
+  # Refusing only when *every* probed page signs up, which is the state round
+  # 56's own comment described and not the one it coded: firing on any page made
+  # one absent subsite — a partial `db:pull`, a blog created after the dump, an
+  # archived site — declare a healthy preview unpreviewable, fail every
+  # `ddev start`, and print a remedy for a database that had not moved.
+  #
+  # Worse than the false refusal: this sits before the unmapped-host scan, the
+  # canonical-origin scan and the census, so `exit 2` here threw all three away.
+  # Measured: a deployment serving four live production origins reported them,
+  # and with one subsite's row removed reported the signup redirect *instead* —
+  # the leak went unmentioned, and a developer who knows that subsite is missing
+  # reads the whole message as expected noise.
+  if [ "${hs_signup_n:-0}" -gt 0 ] 2>/dev/null &&
+     [ "${hs_signup_n:-0}" -lt "${hs_probed_n:-0}" ] 2>/dev/null; then
+    echo "hostshift: warning: these variant hostname(s) redirect to" >&2
+    echo "  wp-signup.php, so WordPress does not recognise them:" >&2
+    printf '    %s\n' $hs_signup_at >&2
+    echo "  The others serve, so this is not the whole deployment — most likely" >&2
+    echo "  one subsite is absent from the shared database (a partial pull, or a" >&2
+    echo "  blog created after it). Compare what the database holds with what" >&2
+    echo "  this map names:" >&2
+    echo "    $(hs_db_command) -e \\" >&2
+    echo "      \"select blog_id, domain, path from wp_blogs\" db" >&2
+    echo "  The scans below still apply to the pages that do serve." >&2
+  elif [ -n "${hs_signup_at:-}" ]; then
+    echo "hostshift: refusing to call this healthy — $hs_signup_at" >&2
+    echo "  redirects to wp-signup.php, which is WordPress saying it does not" >&2
+    echo "  recognise that hostname. On a multisite the hostnames live in" >&2
+    echo "  \`wp_blogs.domain\` and \`wp_site.domain\`, not in \`wp_options.home\`," >&2
+    echo "  so the map can check out against the database and every page still" >&2
+    echo "  302 — nothing here is previewable." >&2
+    echo "  Compare what the database holds with what this map names:" >&2
+    echo "    $(hs_db_command) -e \\" >&2
+    echo "      \"select blog_id, domain, path from wp_blogs\" db" >&2
+    echo "  If those hostnames are not the ones hostshift maps, the database" >&2
+    echo "  moved and the map did not — fix hostshift.yaml to name what the" >&2
+    echo "  database holds." >&2
+    if hs_db_shared; then
+      echo "  Do *not* search-replace the database: it is the parent's, shared" >&2
+      echo "  with production, and moving it moves production." >&2
+    else
+      echo "  This worktree has its own database, so you may also re-copy it" >&2
+      echo "  (\`ddev hostshift copy-db\`) or search-replace it — nothing outside" >&2
+      echo "  this project reads it." >&2
+    fi
+    exit 2
+  fi
+
+  # The hostnames the parent declares that this map does not name, counted on
+  # the page rather than reasoned about.
+  #
+  # This is the one state both leak scans are blind to: they look for origins
+  # *the map names*, and the defect here is that the map names the wrong ones. A
+  # worktree whose branch predates the commit that added hostshift.yaml, against
+  # a database already moved to production hostnames, served 31 live production
+  # origins in `<head>` alone while `check` printed two accurate warnings and
+  # exited 0, `ddev restart` reported success, and `diff` printed GREEN.
+  #
+  # The instrument is the stranger-hostname count above, at the same threshold,
+  # pointed at `$unmapped`. Evidence, not inference — this file records seven
+  # rounds of inference-based refusals that had to be taken back out.
+  if [ -n "${probe_body:-}" ] && [ -n "${unmapped:-}" ]; then
+    for u in $unmapped; do
+      uh="${u#*://}"; uh="${uh%%/*}"
+      [ -n "$uh" ] || continue
+      uhits="$(printf '%s' "$probe_body" \
+        | grep -oE "//${uh//./\\.}[/\"'\''<> ?#:]" 2>/dev/null | wc -l | tr -d ' ' || true)"
+      [ -n "$uhits" ] || uhits=0
+      if [ "$uhits" -ge 5 ]; then
+        echo "hostshift: refusing to call this healthy — the page served at" >&2
+        echo "  $(hs_page_carrying "$uh") carries" >&2
+        echo "  $uhits links to $uh, which the parent" >&2
+        echo "  declares and this map does not name. They are not rewritten, so" >&2
+        echo "  they are live production links in a preview." >&2
+        echo "  This worktree's branch predates the hostshift.yaml that declares" >&2
+        echo "  them: merge or rebase onto it. Do *not* run a search-replace —" >&2
+        echo "  the database is the parent's, and moving it off those hostnames" >&2
+        echo "  moves production." >&2
+        exit 2
+      fi
+    done
+  fi
+  if [ -n "${probe_body:-}" ]; then
+    canon_list="${canon_list:-$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+      --canonical-hosts 2>/dev/null | paste -sd, - || true)}"
+    # And the other direction, which is the one test 28 is about: a *canonical*
+    # origin in the page the variant serves is a live production link in a
+    # preview, and check called that healthy.
+    #
+    # Asked of the engine, not of grep. The first version matched `//host` with
+    # a boundary, which is one spelling of an origin out of the dozen this
+    # project knows a browser resolves: a JSON `https:\/\/host`, a
+    # percent-encoded `redirect_to`, a character reference, a comma after the
+    # host — all missed, and the first two are what a stock WordPress page
+    # carries by default. Writing the decoder views a second time in shell was
+    # never going to work; the binary already has them.
+    #
+    # `done`, because awk's `exit` runs the END block on its way out. Without
+    # it every path printed twice, `leaked` held "2\n2", and `[ "$leaked" -gt 0 ]`
+    # failed on the two-line value with its error swallowed by `2>/dev/null` —
+    # so the leak check quietly did nothing at all. The version this replaced
+    # avoided it by having no print but the one in END.
+    #
+    # The empty object is on one line. `"rewrites": {}` is what encoding/json
+    # emits for the healthy case — a variant page has nothing to rewrite — and
+    # the first version skipped that line wholesale looking for a closing brace
+    # on its own, so it fell through into "candidates" and summed *those*
+    # instead. Every declined candidate is counted there, deliberately, so a
+    # page linking the project's own mailpit or carrying a near-miss hostname
+    # reported a leak and failed the post-start hook on every `ddev start`.
+    #
+    # `--dry-run` so nothing is emitted, and the *forward* map: a canonical
+    # origin still present in what the variant served is exactly an origin the
+    # forward pass would have rewritten. Prose naming the hostname is not one,
+    # because the engine does not rewrite prose — which is the false positive a
+    # hand-written pattern kept having.
+    leaked=0
+    if command -v hostshift >/dev/null 2>&1; then
+      leaked="$(printf '%s' "$probe_body" \
+        | hostshift rewrite --type text/html --slug "$slug" \
+            "${map_args[@]+"${map_args[@]}"}" --dry-run --json 2>&1 >/dev/null \
+        | awk '/"rewrites"/{if ($0 ~ /\{\}/) {print 0; done=1; exit} f=1; next}
+               f && /^[[:space:]]*\}/ {print s+0; done=1; exit}
+               f {gsub(/[^0-9]/,""); if ($0 != "") s += $0}
+               END {if (!done) print s+0}' \
+        || true)"
+      [ -n "$leaked" ] || leaked=0
+    fi
+    if [ "$leaked" -gt 0 ] 2>/dev/null; then
+      echo "hostshift: the pages probed for this deployment still carry $leaked" >&2
+      echo "  canonical origin(s) — live production links in a preview, which is" >&2
+      echo "  the one thing this tool exists to prevent." >&2
+      # Every probed page, because the count is a sum over all of them and on a
+      # multisite the leak is usually on a sibling. Naming only the first sent
+      # the developer to a page whose source was clean.
+      for pu in ${probe_urls:-}; do echo "    $pu" >&2; done
+      case "$cmd_running" in
+        *--dry-run*)
+          echo "  The proxy is running with --dry-run, which serves every response" >&2
+          echo "  unmodified. Remove it from HOSTSHIFT_ARGS in .ddev/.env." >&2 ;;
+        *--no-sweep*)
+          echo "  The proxy is running with --no-sweep, which disables the" >&2
+          echo "  straggler backstop. Remove it from HOSTSHIFT_ARGS in .ddev/.env." >&2 ;;
+        *)
+          echo "  To see which surface they are on, turn the census on and" >&2
+          echo "  reload the page:" >&2
+          echo "    add --explain to HOSTSHIFT_ARGS in .ddev/.env, \`ddev restart\`," >&2
+          echo "    then: docker logs ddev-$name-hostshift 2>&1 | grep census" >&2
+          echo "  \`hostshift diff\` shows it too, but it needs *both* sides" >&2
+          echo "  fetchable, and this map is canonical-on-production: DDEV does" >&2
+          echo "  not register ${canon_list%%,*} here, so pointing --resolve at" >&2
+          echo "  the router returns 404 and nothing is compared. Point it at" >&2
+          echo "  web's own published port instead:" >&2
+          echo "    port=\$(docker port ddev-$name-web 443/tcp | head -1 | sed 's/.*://')" >&2
+          echo "    hostshift diff --slug ${slug:-<slug>} \\" >&2
+          echo "      --resolve ${canon_list%%,*}:443:127.0.0.1:\$port \\" >&2
+          echo "      --canonical-header 'X-Forwarded-Proto: https'" >&2
+          echo "  Not \`additional_fqdns\`: that writes the client's production" >&2
+          echo "  hostname into /etc/hosts machine-wide, needs elevated" >&2
+          echo "  privileges, and outlives \`ddev stop\` — your whole laptop then" >&2
+          echo "  cannot reach the real site. Diff would otherwise fetch it." >&2 ;;
+      esac
+      # exit 2, the refusal this script uses everywhere else. The first version
+      # incremented a `fails` counter declared nowhere and read nowhere — so
+      # under `set -u` it aborted bash before the rest of check ran, and where
+      # the variable happened to exist it fell through to the unconditional
+      # `exit 0` below and reported the leak as healthy. The test asserting
+      # "check fails" passed on the crash.
+      exit 2
+    fi
+
+    # And the other direction: origins on the page that the map names *nowhere*.
+    #
+    # Every leak instrument in this product is map-scoped. The scan above sums
+    # `rewrites` from `hostshift rewrite --dry-run`, which by construction counts
+    # only origins the forward map matches; `hostshift diff`'s LEAKS column is
+    # the same question asked of the same map. The three gates that can speak
+    # about an unknown hostname each read one named list — `wp_options.home`,
+    # the parent's hostshift.yaml, `$DDEV_HOSTNAME` — so a hostname on none of
+    # those lists is on no list at all.
+    #
+    # That is one defect, and rounds 50, 51 and 52 each found a different
+    # symptom of it. Enumerating the deployment states showed the shape: a
+    # worktree owning its own map whose hostshift.yaml simply omits an alias —
+    # the apex sibling of the canonical, which is the commonest hostname pair
+    # WordPress has — served seventeen live production origins with every gate
+    # correct on its own terms and `check` exiting 0, and `diff` printing "no
+    # canonical origin reached the browser" over it.
+    #
+    # So ask the page instead of asking the map: every absolute-URL host in the
+    # body, minus everything this deployment legitimately names.
+    others="$(printf '%s' "$probe_body" | hostshift origins 2>/dev/null || true)"
+    known_hosts=",$(printf '%s,%s,%s,' "$canon_list" "$variants" "${DDEV_HOSTNAME:-}" \
+      | tr -s ',' ','),"
+    while read -r cnt host; do
+      [ -n "${host:-}" ] || continue
+      [ "${cnt:-0}" -ge 5 ] 2>/dev/null || continue
+      case "$known_hosts" in *",$host,"*) continue ;; esac
+      case "$host" in
+        localhost|*.localhost|*.test|127.*|*.ddev.site) continue ;;
+      esac
+      # At or under the canonical's apex — the apex sibling of a `www.`
+      # canonical, a `shop.`, a `media.`. Third-party hosts on a real WordPress
+      # page (w3.org, gravatar, googleapis) are not, so they stay a note.
+      #
+      # The apex is the canonical with a leading `www.` removed, and *only*
+      # that. Two wider rules have been tried and both refused `ddev start` on a
+      # correct configuration: a two-label registrable domain called
+      # `www.example.co.uk` and `www.bbc.co.uk` relatives, and round 54's
+      # unconditional parent made the apex of `example.co.uk` be `co.uk`, which
+      # is the same bug one shape over — and the same for `acme.com.au` and for
+      # `client.kinsta.cloud`, the shape a Kinsta staging alias has.
+      #
+      # Stripping one `www.` is a rule rather than a guess: `www` is not a
+      # public suffix in any registry, so `www.x` and `x` are always the same
+      # site, while `x.co.uk` and `y.co.uk` never have to be. It keeps every
+      # catch the wider rules had — `acme.example` under `www.acme.example`,
+      # `media.acme.fi` under `www.acme.fi`, `shop.example.co.uk` under
+      # `example.co.uk` — and drops exactly the false ones.
+      #
+      # Getting this right matters more than the refusal does, because of the
+      # remedy: "add $host as an alias of the canonical" is correct advice for a
+      # real sibling and, followed on a false positive, makes the preview proxy
+      # the BBC. A message that is wrong is noise; a message whose remedy is
+      # wrong costs a working deployment.
+      related=""
+      for c in $(printf '%s' "$canon_list" | tr ',' ' '); do
+        apex="${c#www.}"
+        [ "$host" = "$apex" ] && related=1 && break
+        case "$host" in *".$apex") related=1; break ;; esac
+      done
+      if [ -n "$related" ]; then
+        echo "hostshift: refusing to call this healthy — $cnt reference(s) to" >&2
+        echo "  $host across the pages probed, first seen on" >&2
+        echo "  $(hs_page_carrying "$host")," >&2
+        echo "  which this map does not name and which is at or under the same" >&2
+        echo "  site as a hostname it does ($apex). They are not rewritten, so" >&2
+        echo "  they are live production links in a preview." >&2
+        echo "  Counted across:" >&2
+        for pu in ${probe_urls:-}; do echo "    $pu" >&2; done
+        echo "  Add $host to hostshift.yaml — as an alias of the canonical it" >&2
+        echo "  belongs to — and \`ddev hostshift init && ddev restart\`." >&2
+        exit 2
+      fi
+      echo "hostshift: note: $(hs_page_carrying "$host")" >&2
+      echo "  carries $cnt reference(s) to $host, which this map does not name" >&2
+      echo "  — so they are not rewritten. If that is a third party or a" >&2
+      echo "  namespace URI it is nothing. If it is this site under another" >&2
+      echo "  name, add it to hostshift.yaml as an alias of the canonical it" >&2
+      echo "  belongs to and \`ddev hostshift init && ddev restart\`." >&2
+    done <<EOF
+$others
+EOF
+  fi
+
+  # The parent-declares verdict, now that the database has had its say.
+  #
+  # This was a refusal, and it has been wrong in one direction or the other for
+  # seven consecutive rounds — the last time costing a working deployment,
+  # because a developer who follows the printed remedy on a database that holds
+  # DDEV hostnames turns every page into a wp-signup.php redirect. That is the
+  # action this file's own comments elsewhere call "the action that silently
+  # breaks the site".
+  #
+  # So it keeps the signal and gives up the authority, for the same reason the
+  # database gate did in d203760: a wrong answer now costs a line of noise
+  # rather than every boot of a healthy site. The probe above is the hard
+  # measurement and it still refuses.
+  # Two independent facts, both reported, neither silencing the other.
+  #
+  # db_confirms_map was allowed to suppress this entirely, and it cannot: the
+  # row is about *one* origin — whatever `wp_options.home` happens to hold —
+  # while `unmapped` is a set difference over everything the parent declares.
+  # When `copy-db` had left `home` holding a DDEV hostname, the row was
+  # satisfied, the subset test's finding was thrown away, and a declared
+  # production canonical was served to the browser unrewritten with check
+  # exit 0. That re-opened the leak the subset test was added in the same
+  # commit to close.
+  #
+  # So the row now qualifies the warning instead of cancelling it. It is real
+  # evidence and worth printing — a developer whose database has not moved needs
+  # to know the map matches it — but it cannot speak for origins it says nothing
+  # about.
+  if [ -n "$parent_declares" ]; then
+    [ -n "$parent_declares_msg" ] && parent_declares_warn
+    if [ -n "${unmapped:-}" ]; then
+      echo "  Declared there and not in this map:" >&2
+      printf '    %s\n' $unmapped >&2
+    fi
+    if [ -n "$db_confirms_map" ]; then
+      echo "  The database's own home is in the map, so if none of those" >&2
+      echo "  hostnames appear in content this is expected — that is what" >&2
+      echo "  \`copy-db\` plus a search-replace leaves behind." >&2
+    fi
   fi
 
   printf '\n  hostshift is serving:\n' >&2
@@ -557,6 +2722,42 @@ if [ "$cmd" = "init" ] && [ -n "$unreadable_parent" ] && [ ! -f hostshift.yaml ]
   echo "  projects would then claim. Fix that checkout, or declare the hostnames" >&2
   echo "  the database really holds in hostshift.yaml." >&2
   exit 2
+fi
+
+# The production hostnames are already declared, in hostshift.yaml's canonical
+# and aliases. Writing them a second time by hand into a compose file is how the
+# two come to disagree — and the failure of disagreeing is wp-cron POSTing to the
+# client's live site from a box holding a production database. Same shape as
+# wp-cli: it prints, you redirect.
+if [ "$cmd" = "loopback" ]; then
+  # Canonical *and* aliases: an alias is a production hostname the content may
+  # still name, so leaving it out is the same leak with a different spelling.
+  hosts_out="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" \
+    --canonical-hosts | sort -u)"
+  # Off-box means "not one this DDEV project answers to". The project's own TLD
+  # is the tail of its primary hostname, which `hostshift hosts` prints first.
+  # sed, not `| head -1`: this script runs under `set -o pipefail`, and a head
+  # that exits after one line SIGPIPEs whatever is still writing. The same
+  # pattern is called out twice elsewhere in this file; $hosts is short enough
+  # that it has never fired, which is exactly why it would be a surprise.
+  tld="$(printf '%s\n' "$hosts" | sed -n 1p | cut -d. -f2-)"
+  offbox="$(printf '%s\n' "$hosts_out" | grep -v "\.${tld:-ddev.site}\$" || true)"
+  if [ -z "$offbox" ]; then
+    echo "hostshift: every canonical hostname is a local DDEV one, so the" >&2
+    echo "  application's own internal requests already stay on this machine." >&2
+    echo "  Nothing to contain." >&2
+    exit 0
+  fi
+  echo "#ddev-silent-no-warn"
+  echo "# written by \`ddev hostshift loopback\` from hostshift.yaml."
+  echo "# Yours to keep: this file carries no generated-file marker, so edits"
+  echo "# survive \`ddev add-on get\` — but re-running the command over it replaces"
+  echo "# them wholesale."
+  echo "services:"
+  echo "  web:"
+  echo "    extra_hosts:"
+  printf '      - "%s:127.0.0.1"\n' $offbox
+  exit 0
 fi
 
 if [ "$cmd" = "env" ]; then
@@ -585,7 +2786,38 @@ if [ "$cmd" = "wp-cli" ]; then
   canonical="$(hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" --pairs \
     | sed -n '1s/=.*//p')"
   [ -n "$canonical" ] || { echo "no canonical origin in the map" >&2; exit 2; }
+  # Not onto its own input.
+  #
+  # The documented form redirects into `wp-cli.local.yml`. One word away is
+  # `> wp-cli.yml`, and the shell truncates before this runs — so the `sed` below
+  # read an empty file and the committed config came out as a header and a
+  # `url:`, losing `path:` and every alias, with exit 0. That file is committed,
+  # so losing `path:` breaks `ddev wp` for the whole team on the next commit.
+  #
+  # Asked directly: read the file, write the first line, read it again. If the
+  # file changed, stdout is that file. Nothing else can move it in between, and
+  # when stdout is a terminal, a pipe or another file it does not move at all.
+  #
+  # The portable ways to ask this are not portable — `/dev/fd/1 -ef wp-cli.yml`
+  # compares a devfs entry against an apfs one on macOS and says no, and the two
+  # `stat`s in play spell their flags differently. An earlier version asked git
+  # instead, which was wrong in both directions: it refused the *documented*
+  # command in any tree where wp-cli.yml was committed and empty on disk, and it
+  # let the real accident through with exit 0 wherever git was absent, outside a
+  # repository, or in a worktree whose HEAD has no wp-cli.yml. The question is
+  # about this process's stdout, and git cannot see that.
+  before="$(cat wp-cli.yml 2>/dev/null || true)"
   echo "# generated by \`ddev hostshift wp-cli\` — do not commit"
+  if [ "$before" != "$(cat wp-cli.yml 2>/dev/null || true)" ]; then
+    echo "hostshift: this is writing wp-cli.yml from itself, and the shell already" >&2
+    echo "  truncated it — \`path:\` and every alias are gone from disk, before this" >&2
+    echo "  command ran. Nothing here can put them back:" >&2
+    echo "    git checkout -- wp-cli.yml" >&2
+    echo "  The file this belongs in is wp-cli.local.yml, which is gitignored:" >&2
+    echo "    ddev hostshift wp-cli > wp-cli.local.yml" >&2
+    echo "  Stopping rather than finishing the overwrite." >&2
+    exit 2
+  fi
   if [ -f wp-cli.yml ]; then
     sed -e '/^url:[[:space:]]/d' wp-cli.yml
     echo
@@ -621,6 +2853,14 @@ fi
 # additional_hostnames is still what drives /etc/hosts, and a VIRTUAL_HOST-only
 # name would get a certificate but no hosts entry. Every project in the fleet is
 # on ddev.site, whose wildcard resolves at any depth.
+# The static guardrails, before the dry-run exit and before anything is written.
+#
+# They are pure inference over what has already been computed, so there is no
+# reason they could not run here — and every reason they should: `--dry-run` is
+# the step the add-on's post-install text tells a developer to run first, and it
+# was printing a variant hostname that resolves to production without a word.
+refuse_variants_outside_tld "$variants" "$hosts"
+
 if [ -n "$dry_run" ]; then
   echo "# .ddev/.env" ; printf '%s\n' "$env_out"
   hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
@@ -641,7 +2881,8 @@ trap 'rm -f "$tmp"' EXIT
 # putting project env vars, credentials included, so a developer who chmod 600'd
 # it meant it.
 cp -p .ddev/.env "$tmp"
-{ grep -v -e '^HOSTSHIFT_' -e '^#ddev-silent-no-warn' .ddev/.env || true
+{ grep -v -e '^HOSTSHIFT_ARGS=' -e '^HOSTSHIFT_VARIANTS=' -e '^HOSTSHIFT_WEB_HOSTS=' \
+    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^#ddev-silent-no-warn' .ddev/.env || true
   printf '%s\n' "$env_out"; } > "$tmp"
 mv "$tmp" .ddev/.env
 
@@ -657,6 +2898,46 @@ hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
 # hand, init stays what it says on the tin: it writes a file.
 if [ -n "${DDEV_APPROOT:-}" ] && command -v ddev >/dev/null; then
   echo "hostshift: restarting to pick it up" >&2
-  exec ddev restart
+  # Not `exec`: that hands the exit status to `ddev restart`, and DDEV does not
+  # fail a restart on a failing `exec-host` hook — a fact config.hostshift.yaml
+  # documents at length, but only ever reasoned about for the hook itself. So
+  # `ddev hostshift init` printed the warning, printed `refusing to call this
+  # healthy`, printed `Task failed`, and exited **0** on a deployment whose map
+  # named the wrong hostnames entirely. PLAN §3's premise is unattended agents
+  # in worktrees, and an agent that checks $? was told everything was fine.
+  #
+  # So run the check again afterwards and answer with it. The hook has already
+  # printed the diagnosis by then, so this stays quiet and only sets the status.
+  ddev restart && rc=0 || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "hostshift: .ddev/.env is written; the restart is what failed." >&2
+    echo "  DDEV keeps global router state under ~/.ddev, so two projects" >&2
+    echo "  restarting at the same moment can collide there — the error may even" >&2
+    echo "  name another project's file, which is that shared state and not" >&2
+    echo "  damage to it. Nothing here needs redoing:" >&2
+    echo "    ddev restart" >&2
+    exit $rc
+  fi
+  # `.ddev/commands/host/hostshift`, not "$0": we have already cd'd to
+  # $DDEV_APPROOT, so a relative $0 no longer resolves, and DDEV does not promise
+  # an absolute one.
+  self=".ddev/commands/host/hostshift"
+  [ -x "$self" ] || self="$0"
+  # ${slug_explicit:+…}, not ${slug:+…}. Passing --slug makes the sub-invocation
+  # treat the slug as *chosen*, so its expected .ddev/.env carries a
+  # HOSTSHIFT_SLUG_CHOSEN line that the file just written from a branch-derived
+  # slug does not — and it reported the project it had just configured as out of
+  # date. When the slug really was chosen the line is there and they agree; when
+  # it was not, the sub-invocation re-derives the same slug from the same branch.
+  if out="$(HOSTSHIFT_HOOK=1 "$self" check ${slug_explicit:+--slug "$slug"} 2>&1)"; then
+    exit 0
+  fi
+  # The post-start hook has usually printed this already, but not always — a
+  # `check` that fails for a reason the hook could not reach prints nothing
+  # otherwise, and exiting non-zero with no explanation is worse than repeating
+  # a few lines.
+  printf '%s\n' "$out" >&2
+  echo "hostshift: restarted, but the result is not healthy." >&2
+  exit 2
 fi
 echo "hostshift: now run \`ddev restart\`" >&2

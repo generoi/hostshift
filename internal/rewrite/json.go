@@ -134,14 +134,30 @@ func RewriteJSON(b []byte, m *origin.Matcher, st *Stats, log *slog.Logger, expla
 			continue
 		}
 
-		nv, ev := m.Rewrite(v, SurfaceJSONString, explain)
+		// A JSON string value routinely *is* a PHP-serialized blob — a settings
+		// export, an admin-ajax payload — and rewriting the host inside one
+		// without re-emitting `s:NN:` leaves PHP refusing the whole structure.
+		//
+		// It has to be handled here, before the raw pass changes a byte: the
+		// lengths are only trustworthy while they still match the data, and in
+		// the raw span the quotes are `\"`, which the literal parser cannot see.
+		// Unquoting first puts it in the spelling RewriteSerialized reads.
+		serialized := false
+		nv, ev, ok := serializedJSONValue(m, v, explain)
+		if ok {
+			serialized = true
+		} else {
+			nv, ev = m.Rewrite(v, SurfaceJSONString, explain)
+		}
 		for i := range ev {
 			ev[i].Path = ptr
 			ev[i].Offset += start
 		}
 		pending = append(pending, ev...)
 
-		if dv, ok := decodeJSONLeak(m, nv); ok {
+		// The escape pass would decode the value and rewrite it again, which on
+		// a serialized payload re-breaks the lengths just repaired.
+		if dv, ok := decodeJSONLeak(m, nv); ok && !serialized {
 			pendingEsc = append(pendingEsc, origin.Event{
 				Surface: SurfaceJSONEscape, Action: origin.ActionRewrote,
 				Offset: start, Path: ptr, Text: string(v),
@@ -203,7 +219,58 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 	}
 	dec, _ = decodeURLRefs(dec)
 
-	out, _ := m.Rewrite(dec, SurfaceJSONEscape, false)
+	// Through RepairSerialized, because a JSON string value routinely *is* a
+	// PHP-serialized blob — `{"b":"a:1:{s:3:\"url\";s:25:\"http://…\";}"}` is
+	// what a settings export or an admin-ajax payload looks like. Rewriting the
+	// host inside without re-emitting `s:25:` leaves PHP refusing the whole
+	// structure. The JSON arm was the one request path the first repair missed.
+	out := RepairSerialized(dec, func(b []byte) []byte {
+		nv, _ := m.Rewrite(b, SurfaceJSONEscape, false)
+		// Inside the walk, not after it. Spliced afterwards, these replaced a
+		// host of a different length inside an `s:NN:"…"` that nothing then
+		// re-emitted — the corruption this file's header is about, at the one
+		// call site that reached for the views after the walk instead of from
+		// within it. Every other surface wraps them.
+		// SurfaceJSONEscape, not bareSurface(true).
+		//
+		// `bareSurface(true)` is SurfaceHTMLAttr, which answers the
+		// escape-alphabet question identically — both are escPath — and the
+		// *control* question differently: an attribute always joins, while this
+		// buffer is a decoded JSON string that has to be asked about itself. So
+		// the byte matcher one line above asked `joinsControlsIn` and got "this is
+		// a document" while the locator asked the table and got "always a value",
+		// on the one path that exists to catch spellings the matcher cannot see.
+		//
+		// Only `https:\\host` reaches it — an entity origin is decoded by
+		// decodeURLRefs first and `%2F` is in the matcher's prefilter — and Node
+		// resolves that to the bare host. Round 73 measured it both ways on a real
+		// WordPress: served in `content.raw` at the variant, and written into
+		// `wp_posts` on the way back.
+		return hostsFor(m).rewriteAllRefs(nv, true, SurfaceJSONEscape, nil)
+	})
+	// The same two catchers the HTML surfaces get. Without them the REST body
+	// was the one surface with neither: `{"u":"https:\\h/x"}` and an NFD host in
+	// content.rendered both went out untouched while the identical bytes in the
+	// page were rewritten — which is the hazard this function's own header
+	// describes, "the page rewrites; the REST API does not, so Gutenberg and
+	// every JS fetch get production URLs". And because this is also the
+	// request-body path, a Gutenberg save wrote the unfolded host back into the
+	// database.
+	//
+	// value=true: a JSON string holding a URL is a value, so a trailing dot is
+	// the host's root label rather than a sentence's full stop.
+	//
+	// rewriteAllRefs, not rewriteAll: decodeURLRefs above declines an entire
+	// value when any fragment in it would fuse into a new reference, and a
+	// `&#6`+`&#48;`+`;` anywhere in a query string was enough to disable
+	// decoding for an ordinary `https:&#47;&#47;canonical/` in the same string.
+	// The HTML side grew refsOnly for exactly that; the JSON side kept the one
+	// path that declines. `content.rendered` is injected into the page as HTML,
+	// so that href was a live production link — the asymmetry this function's
+	// own header calls out, in the surface it was written to fix.
+	// nil: RewriteJSON records its own events, per span, with an RFC 6901 path
+	// the accumulator cannot produce. This is the one caller for which the old
+	// "the events duplicate what is already recorded" justification was true.
 	if bytes.Equal(out, dec) {
 		return nil, false
 	}
@@ -212,4 +279,67 @@ func decodeJSONLeak(m *origin.Matcher, v []byte) ([]byte, bool) {
 		return nil, false // invalid UTF-8: passing it through beats corrupting it
 	}
 	return q, true
+}
+
+// serializedJSONValue rewrites a JSON string value that carries a PHP-serialized
+// payload, keeping its length prefixes correct.
+//
+// ok is false when the value holds nothing serialized, so the caller falls back
+// to the ordinary raw-span rewrite.
+func serializedJSONValue(m *origin.Matcher, v []byte, explain bool) ([]byte, []origin.Event, bool) {
+	dec, err := jsontext.AppendUnquote(nil, v)
+	if err != nil {
+		return nil, nil, false
+	}
+	var ev []origin.Event
+	out, found := RepairSerializedFound(dec, func(b []byte) []byte {
+		nv, nev := m.Rewrite(b, SurfaceJSONString, explain)
+		ev = append(ev, nev...)
+		// The same decoder views every other surface gets, from inside the walk
+		// so a length is re-emitted over whatever they change.
+		//
+		// This path used to run the byte matcher alone, and the caller routes
+		// here as soon as a value carries anything serialized — so one origin
+		// the matcher could see disarmed the views for every origin in the same
+		// payload that it could not. `https:\\host` next to an ordinary URL in
+		// one blob went out live, and the detector said nothing, because a value
+		// nobody rewrote still parses.
+		// SurfaceJSONEscape, not bareSurface(true).
+		//
+		// `bareSurface(true)` is SurfaceHTMLAttr, which answers the
+		// escape-alphabet question identically — both are escPath — and the
+		// *control* question differently: an attribute always joins, while this
+		// buffer is a decoded JSON string that has to be asked about itself. So
+		// the byte matcher one line above asked `joinsControlsIn` and got "this is
+		// a document" while the locator asked the table and got "always a value",
+		// on the one path that exists to catch spellings the matcher cannot see.
+		//
+		// Only `https:\\host` reaches it — an entity origin is decoded by
+		// decodeURLRefs first and `%2F` is in the matcher's prefilter — and Node
+		// resolves that to the bare host. Round 73 measured it both ways on a real
+		// WordPress: served in `content.raw` at the variant, and written into
+		// `wp_posts` on the way back.
+		return hostsFor(m).rewriteAllRefs(nv, true, SurfaceJSONEscape, nil)
+	})
+	// Only a value that actually carries a span belongs on this path. Routing
+	// on "did anything change" instead sent every rewritten value here and
+	// skipped the escape pass below, which is the one that catches `\uXXXX`.
+	if !found {
+		return nil, nil, false
+	}
+	// Nothing changed: hand the value back untouched rather than re-quoting it.
+	//
+	// AppendQuote does not escape `/` and wp_json_encode always does, so
+	// re-quoting unconditionally turned `\/\/` into `//` on every REST body
+	// carrying a serialized option — six bytes changed under an identity map,
+	// which test 24 forbids, and enough to defeat the equality check that
+	// decides whether the upstream's ETag still describes the body.
+	if bytes.Equal(out, dec) {
+		return nil, nil, false
+	}
+	q, err := jsontext.AppendQuote(nil, out)
+	if err != nil {
+		return nil, nil, false // invalid UTF-8: passing through beats corrupting
+	}
+	return q, ev, true
 }

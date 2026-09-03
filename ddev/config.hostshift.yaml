@@ -21,10 +21,57 @@
 # success — so all the guard did was suppress the one line that made a stale
 # configuration visible above the rest of the start output.
 #
-# --quiet so that a project which has the add-on installed but has never been
-# configured says nothing at all. It has nothing to check, and nine lines of
-# advice plus a `Task failed` on a project with nothing wrong with it is how an
-# add-on stops being inert until it is configured.
+# An environment variable rather than a flag, and that is the whole point.
+#
+# This file carries #ddev-generated, so `ddev add-on get` replaces it on upgrade.
+# The command it calls only gained that marker *after* v0.1.0, so DDEV refuses to
+# replace that one — an upgraded project runs this new hook against the old
+# command, whose parser exits 2 on any flag it does not know. Measured on a real
+# upgrade: `unknown argument: --quiet`, `Task failed`, `Successfully started`.
+# The proxy kept serving, so nothing looked wrong, and the post-start check was
+# dead from then on. Every later drift went unreported on exactly the projects
+# that had been running longest.
+#
+# DDEV runs this line through `bash -c` (pkg/ddevapp/task.go, ExecHostTask), so
+# the prefix is an ordinary assignment, and a command that only reads "$@" cannot
+# trip over it. The rule stated in the compose file — anything added here must
+# work against what is already deployed — applies to the hook line too.
+#
+# What it buys: a project that has the add-on installed but has never been
+# configured says nothing at all on start. It has nothing to check, and nine
+# lines of advice plus a `Task failed` on a project with nothing wrong with it is
+# how an add-on stops being inert until it is configured.
+# The version guard is not decoration.
+#
+# DDEV replaces *this* file on `ddev add-on get` because it carries
+# #ddev-generated, and refuses to replace the command because v0.1.0's copy does
+# not. So an upgraded project runs the new hook against the old logic — and the
+# old logic is missing every refusal added since: the parent-declares check, the
+# variant-resolvability check, the collision liveness gate, and the running-map
+# comparison. Measured on a real upgrade, a worktree whose map named the wrong
+# hostnames entirely printed "hostshift is configured to serve" and exited 0,
+# while both variants 302'd to wp-signup.php.
+#
+# install.yaml warns about this once, in the middle of a long `add-on get`
+# output, at a moment when nothing is yet broken. That is not enough, and DDEV
+# `head -5`, the way install.yaml does it, and not a search of the whole file.
+# The command is 2,700 lines and its own prose mentions #ddev-generated three
+# times, so an unanchored grep matched the explanation instead of the marker: a
+# developer who removed line 2 — which is exactly what DDEV's own "Remove
+# unexpected '#ddev-generated' comments" advice tells them to do, and what the
+# comment below calls arming the trap — silenced the warning about it. The nag
+# and the trap were disarmed by the same keystroke.
+#
+# itself makes it worse: it prints "unexpected #ddev-generated … Remove
+# unexpected '#ddev-generated' comments" on every restart, so a developer
+# following DDEV's own advice arms the trap on a project that was fine. Nagging
+# on every start until the command is replaced is the proportionate answer.
 hooks:
   post-start:
-    - exec-host: .ddev/commands/host/hostshift check --quiet
+    - exec-host: |
+        head -5 .ddev/commands/host/hostshift 2>/dev/null | grep -q '#ddev-generated' || {
+          echo "hostshift: .ddev/commands/host/hostshift predates this add-on and was" >&2
+          echo "  NOT replaced on upgrade, so the checks added since are not running." >&2
+          echo "  rm .ddev/commands/host/hostshift && ddev add-on get <path-to>/hostshift/ddev" >&2
+        }
+        HOSTSHIFT_HOOK=1 .ddev/commands/host/hostshift check

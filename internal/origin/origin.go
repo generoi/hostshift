@@ -28,6 +28,22 @@ type Origin struct {
 	Scheme string // "http" or "https"
 	Host   string // lowercase, punycode, no trailing dot
 	Port   string // "" when it is the scheme's default port
+	// Display is the host as it was declared, folded and lowercased but not
+	// punycoded — empty when that is the same string as Host.
+	//
+	// §5.5 asks for both halves: "compare on normalised punycode, preserve the
+	// original form on output". Only the first half existed. Every replacement
+	// the engine spliced was the ACE form, which is invisible in the forward
+	// direction (a variant is ASCII by construction) and is not in the reverse
+	// one — so a block-editor save on a `hämeenlinna.fi` site wrote
+	// `xn--hmeenlinna-q5a.fi` into the shared production database. The links
+	// still resolve, but the bytes are not the bytes, which is test 24 under an
+	// identity map, and a later `wp search-replace` on the name the client uses
+	// will not find those rows.
+	//
+	// Output only. The upstream `Host` header is built from Host and stays
+	// punycode, because a Host header must be ASCII.
+	Display string
 }
 
 // Parse normalises a declared origin. A trailing "/" is accepted and ignored —
@@ -67,7 +83,24 @@ func Parse(s string) (Origin, error) {
 	if err != nil {
 		return Origin{}, fmt.Errorf("parse origin %q: %w", s, err)
 	}
-	return Origin{Scheme: scheme, Host: host, Port: NormalisePort(scheme, u.Port())}, nil
+	// The declared spelling, folded the same way but left in Unicode — and only
+	// when the declaration was non-ASCII to begin with. `ToUnicode` decodes an
+	// A-label, so without this test a punycode declaration came back as the
+	// U-label: the same defect with the spellings swapped, writing a Unicode
+	// host into a database that holds the ACE. What is preserved is what was
+	// written down, whichever of the two that was.
+	display := ""
+	if !isASCII(u.Hostname()) {
+		if f, ferr := foldHost(u.Hostname()); ferr == nil && f != host {
+			if back, berr := normaliseHost(f); berr == nil && back == host {
+				display = f
+			}
+		}
+	}
+	return Origin{
+		Scheme: scheme, Host: host, Port: NormalisePort(scheme, u.Port()),
+		Display: display,
+	}, nil
 }
 
 // MustParse is Parse for tests and literals.
@@ -79,20 +112,115 @@ func MustParse(s string) Origin {
 	return o
 }
 
-func normaliseHost(h string) (string, error) {
-	h = strings.ToLower(strings.TrimSuffix(h, "."))
-	// idna.Lookup rejects hosts that are invalid for resolution; ToASCII on the
-	// Punycode profile is the comparison form we want and leaves ASCII untouched.
-	a, err := idna.Punycode.ToASCII(h)
+// hostFold is the browser's domain-to-ASCII: UTS46 mapping, then punycode.
+//
+// idna.Punycode punycodes and nothing else — no UTS46 mapping, no NFC, no
+// removal of ignorable code points — while the WHATWG parser runs domain-to-ASCII
+// with beStrict=false, which maps or deletes a large class of code points first.
+// Every spelling UTS46 folds onto a canonical host was therefore invisible: a
+// soft hyphen inside the host, fullwidth letters, U+3002/U+FF0E/U+FF61 as label
+// separators, a zero-width space, and — the one that turns up without an
+// attacker — NFD, which macOS filesystems and pasted content produce. All six
+// resolve to the canonical origin in a browser.
+//
+// idna.Lookup is not the answer either: it rejects hosts that are invalid for
+// resolution, and this is a comparison form, so it must fold rather than judge.
+// MapForLookup with StrictDomainName off maps without rejecting, and
+// Transitional(false) is what browsers do.
+//
+// CheckHyphens(false) because WHATWG's domain-to-ASCII sets it false explicitly,
+// and MapForLookup turns it on. With it on, x/net *errors* where the browser
+// succeeds — on any label with `--` in positions 3-4, or a leading or trailing
+// hyphen — and the fallback then compares the raw string, which shares no bytes
+// with anything. One such host in the map silently switched the whole fold off
+// for that host on every surface. `--` at 3-4 is not exotic: it is the shape the
+// add-on's own default slug produces, `wt--acme.ddev.site`, and a variant is the
+// canonical side of the request-direction matcher.
+var hostFold = idna.New(
+	idna.MapForLookup(),
+	idna.StrictDomainName(false),
+	idna.CheckHyphens(false),
+	idna.Transitional(false),
+)
+
+// NormaliseHost is normaliseHost, for callers outside this package that must
+// key on a hostname the same way the matcher does.
+//
+// `--resolve` is the one that needs it: the crawl's dialer is handed the
+// punycode host with its case preserved, so a map keyed on what the developer
+// typed misses `www.hämeenlinna.fi` and `WWW.EXAMPLE.COM` alike — silently,
+// because a miss falls through to real DNS. Two places asking "is this the same
+// host" with different answers is the shape of half this project's bugs.
+func NormaliseHost(h string) (string, error) { return normaliseHost(h) }
+
+// isASCII reports whether s is all ASCII, which is what decides whether an
+// origin has a second spelling worth carrying at all.
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// foldHost is normaliseHost stopping one step short: the same UTS46 mapping and
+// the same root-dot trim, but left in Unicode instead of encoded to ACE.
+//
+// The two have to fold identically or the display form would be a *different*
+// host from the one that was matched — the pair is "same host, two spellings",
+// not "two hosts".
+func foldHost(h string) (string, error) {
+	h = strings.ToLower(h)
+	u, err := hostFold.ToUnicode(h)
 	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(u, "."), nil
+}
+
+func normaliseHost(h string) (string, error) {
+	// Lowercased here, root dot trimmed *after* the fold: UTS46 produces an
+	// ASCII root dot from U+3002, U+FF0E and U+FF61, so trimming first left one
+	// behind on exactly the spellings the fold exists to catch.
+	h = strings.ToLower(h)
+	a, err := hostFold.ToASCII(h)
+	if err != nil {
+		// A host this cannot map is still a host someone declared. Fall back to
+		// the punycode-only form rather than refusing the configuration: being
+		// unable to fold an exotic spelling is a reason to compare it literally,
+		// not a reason to fail at startup.
+		if p, perr := idna.Punycode.ToASCII(h); perr == nil {
+			return strings.TrimSuffix(p, "."), nil
+		}
 		return "", fmt.Errorf("punycode %q: %w", h, err)
 	}
-	return a, nil
+	return strings.TrimSuffix(a, "."), nil
 }
+
+// HostFold exposes the browser's domain-to-ASCII for callers that parse a host
+// out of content rather than out of a configuration.
+func HostFold(h string) (string, error) { return hostFold.ToASCII(h) }
 
 // NormalisePort returns "" for a scheme's default port, so that
 // https://h and https://h:443 compare equal (PLAN §5.5).
+//
+// Leading zeros are stripped first, because a URL parser reads the port as a
+// *number*: ada resolves `https://h:0443/x` and `https://h:0000000443/x` to
+// `https://h/x`, and there is no bound on the zeros. Comparing the digits as a
+// string matched `:443` and missed every padded spelling of it, so a
+// dereferenceable production origin went to the browser unrewritten while the
+// map named exactly that origin — test 28. All zeros is the port 0, which is a
+// real and distinct port, not the default.
 func NormalisePort(scheme, port string) string {
+	if port != "" {
+		if trimmed := strings.TrimLeft(port, "0"); trimmed != port {
+			port = trimmed
+			if port == "" {
+				port = "0"
+			}
+		}
+	}
 	switch {
 	case port == "":
 		return ""
@@ -105,11 +233,34 @@ func NormalisePort(scheme, port string) string {
 }
 
 // HostPort renders host[:port], omitting a default port.
-func (o Origin) HostPort() string {
-	if o.Port == "" {
-		return o.Host
+//
+// An IPv6 literal gets its brackets back. url.Hostname() strips them, so an
+// origin parsed from `http://[::1]:8080` stored the host as `::1` and rendered
+// `http://::1:8080` — which ada rejects outright, so every rewritten link on the
+// page became unparseable while `check` called the map injective and anchored.
+// DisplayHostPort is HostPort in the spelling the origin was declared with. It
+// is what gets spliced into content; HostPort is what gets compared and what
+// goes in a Host header.
+func (o Origin) DisplayHostPort() string {
+	if o.Display == "" {
+		return o.HostPort()
 	}
-	return o.Host + ":" + o.Port
+	h := o.Display
+	if o.Port == "" {
+		return h
+	}
+	return h + ":" + o.Port
+}
+
+func (o Origin) HostPort() string {
+	h := o.Host
+	if strings.ContainsRune(h, ':') {
+		h = "[" + h + "]"
+	}
+	if o.Port == "" {
+		return h
+	}
+	return h + ":" + o.Port
 }
 
 // String renders scheme://host[:port].

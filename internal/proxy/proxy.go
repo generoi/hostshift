@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -86,6 +87,12 @@ var originHeaders = []string{
 	// a feature off on the variant, which is worse to diagnose than a leak.
 	"Timing-Allow-Origin",
 	"Permissions-Policy",
+	// And its predecessor, which carries origins in the same grammar and is
+	// still what several WordPress security-header plugins emit. PLAN §5.2 says
+	// this list is the whole guarantee for the header surface — there is no
+	// straggler sweep behind it — so a spelling a plugin still writes is a
+	// spelling that has to be on it.
+	"Feature-Policy",
 
 	// Source maps: a dereferenceable production URL the browser fetches on its
 	// own as soon as devtools is open.
@@ -223,7 +230,20 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// returns to the wrong place. The percent-encoded form is in the token set,
 	// which is what makes redirect_to=https%3A%2F%2F… work.
 	if q := r.Out.URL.RawQuery; q != "" {
-		out, ev := rev.Rewrite([]byte(q), rewrite.SurfaceRequestLine, explain)
+		// Through RepairSerializedFields, because a query string is `&`-delimited
+		// fields and a serialized blob is a routine thing to carry in one — an
+		// ACF value round-tripped through a link, a `state=` parameter, the
+		// `blob=` in a link hostshift itself served with its lengths repaired.
+		// Without this the user clicks that link and the application is handed a
+		// value PHP refuses. Nothing scores it: `hostshift diff` never looks at a
+		// request, and the integration suite's redirect_to assertion carries a
+		// bare URL, which has no length prefix to get wrong.
+		var ev []origin.Event
+		out := rewrite.RepairSerializedFields([]byte(q), func(b []byte) []byte {
+			nv, nev := rev.Rewrite(b, rewrite.SurfaceRequestLine, explain)
+			ev = append(ev, nev...)
+			return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceRequestLine, 0)
+		})
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun {
 			r.Out.URL.RawQuery = string(out)
@@ -234,7 +254,14 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	// so that EscapedPath() returns exactly these bytes rather than re-encoding
 	// — URL.String() percent-encodes, which would break test 24's spirit.
 	if esc := r.Out.URL.EscapedPath(); esc != "" {
-		out, ev := rev.Rewrite([]byte(esc), rewrite.SurfaceRequestLine, explain)
+		// Not the field-splitting form: a path has no `&` separators, and a `&`
+		// in one is data.
+		var ev []origin.Event
+		out := rewrite.RepairSerialized([]byte(esc), func(b []byte) []byte {
+			nv, nev := rev.Rewrite(b, rewrite.SurfaceRequestLine, explain)
+			ev = append(ev, nev...)
+			return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceRequestLine, 0)
+		})
 		p.Stats.Record(rewrite.SurfaceRequestLine, 0, ev)
 		if !p.DryRun && string(out) != esc {
 			if dec, err := url.PathUnescape(string(out)); err == nil {
@@ -247,7 +274,12 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	for _, h := range requestOriginHeaders {
 		vs := r.Out.Header.Values(h)
 		for i, v := range vs {
-			out, ev := rev.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
+			var ev []origin.Event
+			out := rewrite.RepairSerialized([]byte(v), func(b []byte) []byte {
+				nv, nev := rev.Rewrite(b, rewrite.SurfaceHeader, explain)
+				ev = append(ev, nev...)
+				return rewrite.HostLeaksBackCounted(rev, nv, p.Stats, rewrite.SurfaceHeader, 0)
+			})
 			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
 			if !p.DryRun {
 				vs[i] = string(out)
@@ -270,10 +302,83 @@ func (p *Proxy) rewriteRequest(r *httputil.ProxyRequest) {
 	}
 }
 
+// reqPath and reqMethod name the request a response belongs to.
+//
+// `check`'s size-cap refusal promises "Which paths:" and points at these lines,
+// and they carried `cap` and `content-type` only — so a developer asking which
+// large responses put production origins in the browser got a content-type
+// histogram. http.Response keeps its Request, and a nil one is only possible in
+// a hand-built response.
+// firstBytes is a log-safe prefix: enough of a decoded blob to recognise which
+// setting it is, never the whole thing.
+func firstBytes(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "…"
+}
+
+func reqPath(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	return resp.Request.URL.Path
+}
+
+func reqMethod(resp *http.Response) string {
+	if resp == nil || resp.Request == nil {
+		return ""
+	}
+	return resp.Request.Method
+}
+
+// rewriteOriginHeaders applies the Tier 1 header list to a header set, and
+// reports whether anything changed.
+//
+// Extracted so the 1xx hook can run it too. `httputil.ReverseProxy` forwards an
+// informational response through `httptrace.Got1xxResponse`, copying the header
+// verbatim — `ModifyResponse` is never consulted — so a `103 Early Hints`
+// carrying `Link: <https://canonical/…>; rel=preload` went to the browser as
+// production while the *same* header on the final 200 was rewritten. PLAN §5.2
+// calls this list "the whole guarantee for the header surface"; a preload went
+// through the hole.
+func (p *Proxy) rewriteOriginHeaders(hdr http.Header, skipLocation bool) bool {
+	fwd := p.Map.Forward()
+	explain := p.Stats.Explain()
+	changed := false
+	for _, h := range originHeaders {
+		if skipLocation && h == "Location" {
+			continue
+		}
+		vs := hdr.Values(h)
+		for i, v := range vs {
+			// Through RepairSerialized for the same reason the bodies are: a
+			// `Location: /landing.php?state=<blob>` is built by the application
+			// out of a serialized value, and rewriting the host inside it
+			// changes a byte count the length still describes.
+			var ev []origin.Event
+			out := rewrite.RepairSerialized([]byte(v), func(b []byte) []byte {
+				nv, nev := fwd.Rewrite(b, rewrite.SurfaceResponseHeader, explain)
+				ev = append(ev, nev...)
+				// Location, Link, Refresh and CSP had the byte matcher alone, so
+				// every obfuscated and folded spelling passed straight through —
+				// and a Location is followed by the browser through the parser.
+				return rewrite.HostLeaksCounted(fwd, nv, true, p.Stats,
+					rewrite.SurfaceResponseHeader, 0)
+			})
+			p.Stats.Record(rewrite.SurfaceResponseHeader, 0, ev)
+			if !p.DryRun && string(out) != v {
+				vs[i] = string(out)
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
 func (p *Proxy) modifyResponse(resp *http.Response) error {
 	st, _ := resp.Request.Context().Value(stateKey).(*state)
 	fwd := p.Map.Forward()
-	explain := p.Stats.Explain()
 	changed := false
 
 	// The self-redirect guard (PLAN §4.4, test 32). 55 of the fleet's 63 DDEV
@@ -298,7 +403,17 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	skipLocation := false
 	if st != nil && isRedirect(resp.StatusCode) && safeMethod(resp.Request) {
 		if loc := resp.Header.Get("Location"); loc != "" {
-			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceHeader, false)
+			// The surface the emission pass below answers on, not a different
+			// one. They differ in exactly one thing — whether a CSS tokenizer
+			// runs — so a guard reading CSS escapes decides "this Location is
+			// the URL the browser just asked for" about values that go
+			// somewhere else entirely: ada resolves `https://www.exampl\65.fi/x`
+			// to `www.exampl`, and 52 of the 56 one-character CSS escapes of a
+			// canonical host tripped it. Under --strict-origins that blanks a
+			// working off-site redirect to 404 while claiming test 28.
+			rewritten, _ := fwd.Rewrite([]byte(loc), rewrite.SurfaceResponseHeader, false)
+			rewritten = rewrite.HostLeaksCounted(fwd, rewritten, true, p.Stats,
+				rewrite.SurfaceResponseHeader, 0)
 			if sameURL(string(rewritten), st.url) {
 				if p.StrictOrigins {
 					p.log().Warn("self-redirect suppressed by --strict-origins", "url", st.url)
@@ -307,8 +422,14 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 							"redirecting the browser to the canonical origin\n")
 					return nil
 				}
-				p.Stats.Record(rewrite.SurfaceHeader, 0, []origin.Event{{
-					Surface: rewrite.SurfaceHeader, Text: loc,
+				// The response surface, like the guard above it. Round 59 moved
+				// the guard and left this, so the one enumerated test-28
+				// carve-out — a canonical origin going *to the browser* — was
+				// filed under the name that means §4.3, a variant hostname
+				// going *into the database*. `check` sends a developer to this
+				// exact field at the moment of a test-28 refusal.
+				p.Stats.Record(rewrite.SurfaceResponseHeader, 0, []origin.Event{{
+					Surface: rewrite.SurfaceResponseHeader, Text: loc,
 					Action: origin.ActionSkipped, Reason: origin.ReasonSelfRedirect,
 				}})
 				p.log().Info("self-redirect passed through", "location", loc)
@@ -317,19 +438,8 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		}
 	}
 
-	for _, h := range originHeaders {
-		if skipLocation && h == "Location" {
-			continue
-		}
-		vs := resp.Header.Values(h)
-		for i, v := range vs {
-			out, ev := fwd.Rewrite([]byte(v), rewrite.SurfaceHeader, explain)
-			p.Stats.Record(rewrite.SurfaceHeader, 0, ev)
-			if !p.DryRun && string(out) != v {
-				vs[i] = string(out)
-				changed = true
-			}
-		}
+	if p.rewriteOriginHeaders(resp.Header, skipLocation) {
+		changed = true
 	}
 
 	// Set-Cookie Domain= is Tier 1 and load-bearing. ms_cookie_constants()
@@ -338,7 +448,14 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	// while the browser is on a variant host — the cookie is discarded and login
 	// fails outright. Dropping the attribute is always safe; host-scoped is
 	// exactly what a variant host wants.
-	if !p.DryRun {
+	// Not under an identity map. Dropping Domain= makes a cookie host-only,
+	// which is right on a variant host and wrong when the proxy was asked to be
+	// a mirror — under an identity map every variant *is* its own canonical, so
+	// isCanonicalDomain matches every cookie and every one of them changes.
+	// compressBody and finishBody already guard on this; these two reached the
+	// response in front of that guard with none of their own, so test 24 held
+	// for the body and not for the headers beside it.
+	if !p.DryRun && !p.Map.Identity() {
 		if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
 			for i, c := range cookies {
 				if nc := p.dropCookieDomain(c); nc != c {
@@ -352,6 +469,35 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	return p.finishBody(resp, st, changed)
 }
 
+// reportHiddenBase64 is the response-direction mirror of the request arm's
+// report, which round 67 wrote pointing one way only.
+//
+// `WP_REST_Widgets_Controller` returns a legacy widget's settings as
+// `instance.encoded` = base64(serialize(…)), and the widgets screen and the
+// Customizer decode it in JavaScript and render the widget — so a canonical
+// origin in there becomes a live production URL in the developer's
+// authenticated browser. It cannot be rewritten for the reason the other
+// direction cannot: `wp_hash()` covers exactly those bytes. Saying so is the
+// whole remedy.
+//
+// Called from both buffered arms. The HTML arm streams and is never buffered,
+// so a blob spliced into an attribute there is not scanned — the shapes this
+// exists for arrive as REST JSON.
+func (p *Proxy) reportHiddenBase64(resp *http.Response, body []byte) {
+	n, sample := rewrite.HiddenInBase64(body, func(b []byte) []byte {
+		nv, _ := p.Map.Forward().Rewrite(b, rewrite.SurfaceText, false)
+		return nv
+	})
+	if n == 0 {
+		return
+	}
+	p.log().Warn("a canonical origin is inside base64 in this response "+
+		"— it cannot be rewritten without breaking the signature the app checks, "+
+		"so the browser will resolve it against live production",
+		"blobs", n, "method", reqMethod(resp), "path", reqPath(resp),
+		"decoded", firstBytes(sample, 120))
+}
+
 func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	// Vary first, before anything can return early.
 	//
@@ -362,8 +508,10 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	// proxy_cache_key $uri, a Varnish default with no host in the key — the
 	// deployment §5.5 is written for) then hands variant A's redirect to a
 	// browser sitting on variant B, which is bounced out of its own worktree.
-	// Headers are rewritten for every response, so every response varies.
-	if !p.DryRun {
+	// Headers are rewritten for every response, so every response varies — but
+	// an identity map rewrites nothing, and a header it adds is a header the
+	// upstream did not send.
+	if !p.DryRun && !p.Map.Identity() {
 		addVary(resp.Header, "Host")
 	}
 
@@ -379,10 +527,24 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 	//
 	// A compressed body therefore cannot be measured in that mode. Saying so is
 	// the point: a silent zero reads as "nothing to rewrite here".
-	if p.DryRun {
+	if p.DryRun || p.Map.Identity() {
+		// An identity map is the same promise as --dry-run about the *bytes*:
+		// nothing to rewrite, so nothing to change. Decoding a gzip body and
+		// re-serving it as identity is a change — the response goes out with a
+		// different encoding and a different length than the upstream sent —
+		// and that is test 24 failing on the one configuration whose whole
+		// purpose is to prove it holds. compressBody already returns early
+		// under Identity(); this is the other half, and it is the same shape as
+		// the Vary and Set-Cookie holes above.
+		//
+		// Only reachable when an upstream compresses despite
+		// `Accept-Encoding: identity`, which stock nginx does not and
+		// `ob_gzhandler` does.
 		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(strings.TrimSpace(enc), "identity") {
-			p.log().Info("--dry-run leaves a compressed body untouched, so it is not measured", "encoding", enc)
-			p.skipEncoding(enc)
+			if p.DryRun {
+				p.log().Info("--dry-run leaves a compressed body untouched, so it is not measured", "encoding", enc)
+				p.skipEncoding(enc)
+			}
 			return nil
 		}
 	} else if !p.decodeBody(resp) {
@@ -391,12 +553,33 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 
 	ct := resp.Header.Get("Content-Type")
 	switch {
+	// First, and before anything content-type-shaped.
+	//
+	// A download is a file the developer saves, not a page the browser renders,
+	// so the hostnames in it outlive this machine. Placed third it could only
+	// ever fire for text/plain and XML — so ACF's "Export Field Groups" and
+	// Elementor's template export, both application/json with
+	// Content-Disposition: attachment, still came out full of worktree
+	// hostnames, which is the same harm the WXR carve-out exists to prevent.
+	//
+	// Recorded rather than silent: the arms beside it log a skip, and a body that
+	// was deliberately not rewritten should say so in --explain too.
+	case isAttachment(resp.Header):
+		p.Stats.Record(rewrite.SurfaceText, 0, []origin.Event{{
+			Surface: rewrite.SurfaceText, Action: origin.ActionSkipped,
+			Reason: origin.ReasonAttachment,
+		}})
+		return nil
+
 	case rewritableHTML(ct):
 		resp.Body = rewrite.NewResponseBody(resp.Body, p.Map.Forward(), resp.Body, rewrite.Options{
 			DryRun:  p.DryRun,
 			NoSweep: p.NoSweep,
 			Stats:   p.Stats,
 			Log:     p.log(),
+			// XHTML is parsed by an XML parser, which decodes references inside
+			// script and style.
+			XMLEntities: strings.EqualFold(mediaType(ct), "application/xhtml+xml"),
 		})
 
 	case rewritableJSON(ct):
@@ -406,9 +589,11 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 		if err != nil {
 			return err
 		}
+		p.reportHiddenBase64(resp, body)
 		if over != nil {
 			p.log().Warn("JSON body exceeds the size cap, passing through untouched",
-				"cap", p.maxBody(), "content-type", ct)
+				"cap", p.maxBody(), "content-type", ct,
+				"method", reqMethod(resp), "path", reqPath(resp))
 			p.Stats.Record(rewrite.SurfaceJSONString, 0, []origin.Event{{
 				Surface: rewrite.SurfaceJSONString, Action: origin.ActionSkipped,
 				Reason: origin.ReasonSizeCap,
@@ -422,7 +607,14 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			// what turns a malformed-document pass-through — a duplicate object
 			// member is legal JSON and jsontext rejects it — from a silent leak
 			// into a rewrite plus a WARN.
-			out = rewrite.SweepBytes(out, p.Map.Forward(), p.Stats, p.log())
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, p.Map.Forward(), p.Stats, p.log())
+			})
 		}
 		if p.DryRun {
 			out = body
@@ -443,7 +635,127 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 			return nil
 		}
 
+	case rewritableText(ct):
+		// Buffered and swept like JSON, without a grammar.
+		//
+		// These were streaming through untouched, and one of them is the single
+		// most common admin action there is: wp-admin/async-upload.php sets
+		// `text/plain` before wp_send_json can set application/json, so every
+		// media upload handed the browser a canonical `url` and `link` while the
+		// listing endpoint beside it — application/json — was rewritten
+		// correctly. Feeds and sitemaps are the same shape. Under
+		// production-canonical that URL is the client's live site, and the
+		// developer's admin session fetches from it.
+		//
+		// Silent, too: --explain printed nothing at all for those responses, not
+		// even a skip.
+		body, over, err := readCapped(resp.Body, p.maxBody())
+		if err != nil {
+			return err
+		}
+		p.reportHiddenBase64(resp, body)
+		if over != nil {
+			p.log().Warn("body exceeds the size cap, passing through untouched",
+				"cap", p.maxBody(), "content-type", ct,
+				"method", reqMethod(resp), "path", reqPath(resp))
+			p.Stats.Record(rewrite.SurfaceText, 0, []origin.Event{{
+				Surface: rewrite.SurfaceText, Action: origin.ActionSkipped,
+				Reason: origin.ReasonSizeCap,
+			}})
+			resp.Body = readCloser{io.MultiReader(bytes.NewReader(body), over), resp.Body}
+			return nil
+		}
+		// JSON under a text label is still JSON, and the arm exists because of
+		// one such endpoint. wp-admin/async-upload.php sets `text/plain` before
+		// wp_send_json can set application/json — so the body is exactly what
+		// wp_json_encode produced, `\uXXXX` escapes and all, and PLAN M4 lists
+		// that spelling as a test-28 leak because wp_json_encode does not pass
+		// JSON_UNESCAPED_UNICODE. The raw-UTF-8 IDN host was caught here; the
+		// escaped form PHP actually emits was not.
+		if t := bytes.TrimLeft(body, " \t\r\n"); len(t) > 0 && (t[0] == '{' || t[0] == '[') {
+			out := rewrite.RewriteJSON(body, p.Map.Forward(), p.Stats, p.log(), p.Stats.Explain())
+			if !p.NoSweep {
+				// Inside the repair: the sweep is a raw byte matcher, so a host it
+				// rewrites inside a serialized string leaves the length stale. On
+				// RewriteJSON's decline path — a duplicate member is legal JSON and
+				// is rejected — the sweep is the only pass that touches the body, so
+				// it corrupted the blob while logging a line that reads like a save.
+				out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+					return rewrite.SweepBytes(b, p.Map.Forward(), p.Stats, p.log())
+				})
+			}
+			if p.DryRun {
+				out = body
+			}
+			resp.Body = readCloser{bytes.NewReader(out), resp.Body}
+			if bytes.Equal(out, body) && !changed {
+				return nil
+			}
+			break
+		}
+		// Wrapped in RepairSerialized, which has to *contain* the rewrite rather
+		// than follow it: by the time the host has changed, the declared length
+		// no longer matches the data and the span can no longer be found. The
+		// response direction needs this as much as the request direction — serve
+		// a blob whose prefix counts the canonical host over variant data and
+		// the way back cannot parse it, so the round trip never comes home.
+		var ev []origin.Event
+		isXML := strings.HasSuffix(strings.ToLower(mediaType(ct)), "xml")
+		// One name for the whole arm, chosen by what will decode the body. The
+		// reference split below was already made on this question; the CSS view
+		// keys on the surface, so it has to be made here too or a text/plain
+		// body is read as a stylesheet.
+		textSurface := rewrite.SurfaceText
+		if isXML {
+			textSurface = rewrite.SurfaceXMLText
+		}
+		out := rewrite.RepairSerialized(body, func(b []byte) []byte {
+			nv, nev := p.Map.Forward().RewriteText(b, textSurface, p.Stats.Explain())
+			ev = append(ev, nev...)
+			// References too, when the consumer decodes them. An SVG's `href`
+			// and a feed's `<link>` are read by an XML parser, which decodes
+			// `&#47;` exactly as HTML does in an attribute. text/plain keeps
+			// HostLeaks: nothing parses references in plain text, so leaving
+			// them is correct there.
+			if isXML {
+				return rewrite.HostLeaksXMLCounted(p.Map.Forward(), nv, false, p.Stats,
+					textSurface, 0)
+			}
+			return rewrite.HostLeaksCounted(p.Map.Forward(), nv, false, p.Stats,
+				textSurface, 0)
+		})
+		p.Stats.Record(textSurface, 0, ev)
+		if !p.NoSweep {
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, p.Map.Forward(), p.Stats, p.log())
+			})
+		}
+		if p.DryRun {
+			out = body
+		}
+		resp.Body = readCloser{bytes.NewReader(out), resp.Body}
+		if bytes.Equal(out, body) && !changed {
+			return nil
+		}
+
 	default:
+		if strings.EqualFold(mediaType(ct), "text/event-stream") {
+			// PLAN §5.8 accepts this one: an event stream is unbounded and
+			// must not be buffered, so its origins go out as written. Recorded
+			// rather than returned silently — every other exclusion here
+			// (attachment, size cap, undecodable encoding, range) records a
+			// skip, and `--explain` printed nothing whatever for this one, so
+			// the accepted gap was also an invisible one.
+			p.Stats.Record(rewrite.SurfaceText, 0, []origin.Event{{
+				Surface: rewrite.SurfaceText, Action: origin.ActionSkipped,
+				Reason: origin.ReasonEventStream,
+			}})
+		}
 		return nil
 	}
 	// An identity map cannot change a byte, so the upstream's length and
@@ -481,7 +793,11 @@ func (p *Proxy) finishBody(resp *http.Response, st *state, changed bool) error {
 // receives variant URLs and sends them straight back (tests 30 and 31).
 func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch:
+	// DELETE too: `WP_REST_Request::parse_body_params()` reads a form or JSON
+	// body whatever the method, and the query string and path beside this are
+	// already mapped back for every method. The gate was an asymmetry, not a
+	// decision — a DELETE with a body put a variant hostname upstream untouched.
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
 	default:
 		return
 	}
@@ -503,7 +819,8 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// Over the cap: stream through untouched and log the skip. The bytes
 		// already read are put back in front of the rest.
 		p.log().Warn("request body exceeds the size cap, passing through untouched",
-			"cap", max, "content-type", ct)
+			"cap", max, "content-type", ct,
+			"method", r.Method, "path", r.URL.Path)
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, []origin.Event{{
 			Surface: rewrite.SurfaceRequestBody, Action: origin.ActionSkipped,
 			Reason: origin.ReasonSizeCap,
@@ -527,10 +844,81 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 		// JSON rather than leaving it alone — three ways for a write to differ
 		// from the read that produced it.
 		out = rewrite.RewriteJSON(buf, rev, p.Stats, p.log(), explain)
+		// And the straggler sweep the response side has had all along.
+		//
+		// RewriteJSON returns the document untouched whenever jsontext rejects
+		// it — invalid UTF-8 from a Windows-1252 paste, a duplicate member, a
+		// body truncated by a dropped connection — and logs a WARN. On the
+		// response side SweepBytes catches what the structured pass could not
+		// reach; on the request side the WARN was the only thing that happened,
+		// so the variant hostname went upstream into the shared database. The
+		// asymmetry is backwards: a leak into a response is one page view, a
+		// leak into a request is written down.
+		if !p.NoSweep {
+			// Inside the repair: the sweep is a raw byte matcher, so a host it
+			// rewrites inside a serialized string leaves the length stale. On
+			// RewriteJSON's decline path — a duplicate member is legal JSON and
+			// is rejected — the sweep is the only pass that touches the body, so
+			// it corrupted the blob while logging a line that reads like a save.
+			out = rewrite.RepairSerialized(out, func(b []byte) []byte {
+				return rewrite.SweepBytes(b, rev, p.Stats, p.log())
+			})
+		}
 	default:
+		// Through RepairSerialized, which keeps any PHP-serialized length
+		// prefix correct. `s:51:"…"` rewritten to a shorter canonical leaves the
+		// prefix over the wrong byte count and PHP refuses the whole structure.
+		// Both spellings matter: a form percent-encodes, so `options.php` sends
+		// `s%3A51%3A%22` and a literal scanner never sees it.
 		var ev []origin.Event
-		out, ev = rev.Rewrite(buf, rewrite.SurfaceRequestBody, explain)
+		// The field-splitting form only for a real urlencoded body, where `&` is
+		// unambiguously a separator because a `&` inside a value is `%26`.
+		// Guessing that from the bytes cut serialized values apart at the
+		// `&utm_medium=` inside ordinary tracking URLs.
+		repair := rewrite.RepairSerialized
+		// Lowercased, because media types are case-insensitive (RFC 9110 §8.3.1)
+		// and `bodyKind` 165 lines below already lowercases. So
+		// `Application/X-WWW-Form-Urlencoded` was classified as a flat body and
+		// rewritten, but took the non-splitting repair — losing the field split
+		// *and* the form-layer peel, which re-opened round 63's leak verbatim:
+		// a double-encoded variant hostname went upstream into the shared
+		// database. One media type read two ways in one file.
+		if strings.ToLower(mediaType(r.Header.Get("Content-Type"))) ==
+			"application/x-www-form-urlencoded" {
+			repair = rewrite.RepairSerializedFields
+		}
+		out = repair(buf, func(b []byte) []byte {
+			nv, nev := rev.Rewrite(b, rewrite.SurfaceRequestBody, explain)
+			ev = append(ev, nev...)
+			return rewrite.HostLeaksBackCounted(rev, nv, p.Stats,
+				rewrite.SurfaceRequestBody, 0)
+		})
 		p.Stats.Record(rewrite.SurfaceRequestBody, 0, ev)
+	}
+	// A variant hostname inside a base64 blob is one no spelling reaches and none
+	// should: the Customizer validates a widget instance with `wp_hash()` over
+	// exactly those bytes, so rewriting it makes WordPress discard the save. What
+	// was wrong was the silence — the save went through, production's database
+	// took the worktree's hostname, the canonical site served it to the public,
+	// and nothing logged a line.
+	//
+	// Outside the switch, because round 66 put it inside the flat arm and a
+	// widget saved through `POST /wp-json/wp/v2/widgets`, or any form with a file
+	// field beside the settings, was silent by construction. Both auditors found
+	// that independently, which is what a body arm nobody enumerated looks like.
+	if n, sample := rewrite.HiddenInBase64(buf, func(b []byte) []byte {
+		nv, _ := rev.Rewrite(b, rewrite.SurfaceRequestBody, false)
+		return nv
+	}); n > 0 {
+		p.log().Warn("a variant hostname is inside base64 in this request body "+
+			"— it cannot be mapped back without breaking the signature the app "+
+			"checks, so it will reach the shared database as it stands",
+			// RequestURI, not Path: the refusal tells a developer to grep this
+			// log to find what was written, and on a plain-permalink site the
+			// REST endpoint is entirely in the query — `path=/index.php` names
+			// nothing.
+			"blobs", n, "method", r.Method, "path", r.URL.RequestURI(),
+			"decoded", firstBytes(sample, 120))
 	}
 	if p.DryRun {
 		out = buf
@@ -547,7 +935,17 @@ func (p *Proxy) rewriteRequestBody(r *http.Request, st *state) {
 func (p *Proxy) dropCookieDomain(c string) string {
 	parts := strings.Split(c, ";")
 	out := parts[:0]
-	for _, part := range parts {
+	for i, part := range parts {
+		// The first `;`-part is the cookie's own name=value, never an
+		// attribute — RFC 6265 §4.1.1 — so a cookie *named* `domain` was read
+		// as one and dropped, taking the cookie with it and leaving the browser
+		// a new cookie named after whatever attribute followed:
+		// `Set-Cookie: domain=www.example.fi; Path=/; HttpOnly` came out as
+		// ` Path=/; HttpOnly`.
+		if i == 0 {
+			out = append(out, part)
+			continue
+		}
 		k, v, ok := strings.Cut(part, "=")
 		if ok && strings.EqualFold(strings.TrimSpace(k), "domain") {
 			d := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(v)), ".")
@@ -565,6 +963,14 @@ func (p *Proxy) dropCookieDomain(c string) string {
 func (p *Proxy) isCanonicalDomain(d string) bool {
 	if d == "" {
 		return false
+	}
+	// Through the same fold the map was built with. This was the one host
+	// comparison in the codebase done on raw bytes: `c.Host` is punycode and `d`
+	// is whatever the attribute said, so an IDN cookie matched in exactly one of
+	// its two spellings — and the U-label, the one a developer declares and the
+	// one WordPress derives when COOKIE_DOMAIN is unset, was the one that failed.
+	if f, err := origin.NormaliseHost(strings.TrimPrefix(d, ".")); err == nil {
+		d = f
 	}
 	for _, s := range p.Map.Sites {
 		for _, c := range s.CanonicalSet() {
@@ -584,7 +990,45 @@ func (p *Proxy) isCanonicalDomain(d string) bool {
 // it for free. text/css and application/javascript are deliberately excluded per
 // Tier 2: 88 CSS and 185 JS files in the fleet's themes, zero absolute URLs.
 func rewritableHTML(ct string) bool {
-	return strings.EqualFold(mediaType(ct), "text/html")
+	mt := strings.ToLower(mediaType(ct))
+	// application/xhtml+xml is HTML. rewritableText's `+xml` suffix swallowed it
+	// into the flat arm, which has no attribute-value decode at all — so
+	// `href="https:&#47;&#47;host"` went out untouched while the byte-identical
+	// body under text/html was rewritten. XML parses numeric character
+	// references in attribute values exactly as HTML does, and §4.4 calls that
+	// surface safety-critical.
+	return mt == "text/html" || mt == "application/xhtml+xml"
+}
+
+// isAttachment reports whether the response is offered as a download.
+func isAttachment(h http.Header) bool {
+	d := h.Get("Content-Disposition")
+	if d == "" {
+		return false
+	}
+	if t, _, err := mime.ParseMediaType(d); err == nil {
+		return strings.EqualFold(t, "attachment")
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(d)), "attachment")
+}
+
+// rewritableText is the set that carries origins in no grammar the rewriter
+// models: plain text, and the XML family.
+//
+// text/plain because wp-admin/async-upload.php sends JSON under it — the one
+// endpoint every media upload goes through. The XML family because a feed and a
+// sitemap are full of absolute URLs, a browser renders both, and a reader
+// dereferences them. Excluded, deliberately and as §5.2 already decides: CSS and
+// JavaScript, where the fleet's themes have zero absolute URLs, and every binary
+// type, where the Content-Type answers the question for free.
+func rewritableText(ct string) bool {
+	mt := strings.ToLower(mediaType(ct))
+	switch mt {
+	case "text/plain", "text/xml", "application/xml",
+		"application/rss+xml", "application/atom+xml", "image/svg+xml":
+		return true
+	}
+	return strings.HasSuffix(mt, "+xml")
 }
 
 // rewritableJSON covers the REST API and everything modelled on it. JSON-LD
@@ -640,7 +1084,17 @@ func bodyKind(ct string) bodyClass {
 	// flat path is not used for JSON in the first place.
 	case mt == "application/json", mt == "text/json", strings.HasSuffix(mt, "+json"):
 		return bodyJSON
+	// The XML family, for the same reason text/json is above: the two directions
+	// must not disagree about the same body. rewritableText rewrites every
+	// `+xml` type on the way out and rewritableHTML claims
+	// application/xhtml+xml, while this arm listed only the `text/` prefix — so
+	// text/xml was mapped back and application/xml, image/svg+xml,
+	// application/rss+xml, application/atom+xml and application/xhtml+xml were
+	// not mapped back at all, not even a plain variant origin. Same shape as the
+	// multipart finding a round earlier: an arm nobody enumerated.
 	case mt == "application/x-www-form-urlencoded",
+		mt == "application/xml", mt == "application/xhtml+xml",
+		strings.HasSuffix(mt, "+xml"),
 		strings.HasPrefix(mt, "text/"):
 		return bodyFlat
 	case mt == "multipart/form-data":

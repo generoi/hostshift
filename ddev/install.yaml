@@ -7,7 +7,8 @@ name: hostshift
 # The command is where the DDEV- and stack-shaped opinions live — deriving a slug
 # from a branch, deciding which hostnames web keeps, writing .ddev/ files — so
 # that the binary can stay a general origin mapper that scaffolds nothing.
-# PLAN §5.7. There are still no hooks and no guard.
+# PLAN §5.7. There is a post-start hook — config.hostshift.yaml installs one,
+# and it runs `check` on every start — but still no guard.
 
 pre_install_actions:
   - |
@@ -17,6 +18,93 @@ pre_install_actions:
       echo "The proxy itself runs from the container image, so the add-on works" >&2
       echo "without it, but 'ddev hostshift' and 'hostshift map|check|diff' need it." >&2
     fi
+
+# Ignore what this add-on installs, in the checkout rather than in a commit.
+#
+# A .gitignore block is *branch*-scoped: adopt hostshift on one branch and every
+# pre-existing branch still shows the add-on's files as untracked, which is where
+# `git add -A` commits them. $GIT_COMMON_DIR/info/exclude is checkout-scoped,
+# which is the right scope for machine-local tool files, and it is shared by a
+# repository and all its linked worktrees — so one write covers them all, on
+# every branch, and the repo commits nothing.
+#
+# Deliberately not the root hostshift.yaml, which is a project's own committed
+# statement about its hostnames.
+  - |
+    #ddev-nodisplay
+    # `|| true` inside the substitution: DDEV runs actions under `set -eu -o
+    # pipefail`, git rev-parse exits 128 outside a repository, and the assignment
+    # inherits that — which aborted the whole install and left the project with
+    # nothing, in any .ddev project that is not a git checkout.
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    [ -n "$common" ] || exit 0
+    ex="$common/info/exclude"
+    [ -d "$(dirname "$ex")" ] || exit 0
+    # A delimited block, so removal can take back exactly what install put in.
+    #
+    # Removal used to `grep -vxF` each pattern, which deletes *every* matching
+    # line — including one the developer had written themselves. Both pilot
+    # repos had added `.ddev/.env` by hand before the add-on existed, so
+    # uninstalling took away their own rule and left the credentials file
+    # untracked and un-ignored: the exact exposure the block exists to prevent,
+    # in a single-checkout project with no worktrees in sight.
+    #
+    # The end marker also means a later version can add a pattern to the block
+    # rather than being frozen by the idempotency guard below.
+    # A complete block is left alone; a half-written one is repaired rather than
+    # frozen, since the idempotency guard would otherwise arm that trap forever.
+    if grep -qxF '# hostshift (ddev add-on) — begin' "$ex" 2>/dev/null; then
+      if grep -qxF '# hostshift (ddev add-on) — end' "$ex"; then
+        exit 0
+      fi
+      tmp="$(mktemp)"
+      awk '
+        $0 == "# hostshift (ddev add-on) — begin" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && cat "$tmp" > "$ex"
+      rm -f "$tmp"
+    fi
+    # An older, undelimited block from a previous version: take it out first, so
+    # this does not append a second copy beside it.
+    #
+    # Only the *contiguous* run that follows the marker. `grep -vxF` removed
+    # every matching line anywhere in the file, so a developer's own
+    # `.ddev/.env` rule written above the block — the shape this file's comments
+    # say both pilot repos have — was deleted from their own section and
+    # absorbed into ours, and the next removal then took it away for good. That
+    # is the exposure the markers were introduced to prevent, reintroduced one
+    # release later through the migration.
+    if grep -qxF '# hostshift (ddev add-on)' "$ex" 2>/dev/null; then
+      tmp="$(mktemp)"
+      awk '
+        $0 == "# hostshift (ddev add-on)" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && cat "$tmp" > "$ex"
+      rm -f "$tmp"
+    fi
+    # A file that does not end in a newline gets one first. Appending to
+    # `…node_modules/` with no trailing newline welded the marker onto the
+    # developer's last rule — `node_modules/# hostshift (ddev add-on) — begin` —
+    # which stopped ignoring node_modules, defeated the idempotency guard (the
+    # welded line is not an exact match, so every later install appended another
+    # whole block), and made removal impossible, since none of its three paths
+    # can find a marker that is not on a line of its own.
+    if [ -s "$ex" ] && [ -n "$(tail -c 1 "$ex")" ]; then
+      echo "" >> "$ex"
+    fi
+    {
+      echo '# hostshift (ddev add-on) — begin'
+      echo '.ddev/**/*hostshift*'
+      echo '.ddev/.env'
+      # `ddev hostshift wp-cli` writes this, its own header says not to commit
+      # it, and the README calls it gitignored — and nothing ignored it. Under
+      # production-canonical it carries the *production* URL, so committing it
+      # points every teammate's `ddev wp` at the live site.
+      echo 'wp-cli.local.yml'
+      echo '# hostshift (ddev add-on) — end'
+    } >> "$ex"
 
 project_files:
   - config.hostshift.yaml
@@ -48,7 +136,7 @@ post_install_actions:
       echo "  working when that goes."
       echo
       echo "  Delete it and install again:"
-      echo "      rm .ddev/commands/host/hostshift && ddev add-on get generoi/hostshift"
+      echo "      rm .ddev/commands/host/hostshift && ddev add-on get <path-to>/hostshift/ddev"
       echo
     fi
   - |
@@ -89,4 +177,195 @@ post_install_actions:
 removal_actions:
   - |
     #ddev-nodisplay
-    echo "hostshift removed. wp-cli.local.yml, if you generated one, is yours to delete."
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    [ -n "$common" ] || exit 0
+    ex="$common/info/exclude"
+    [ -f "$ex" ] || exit 0
+    # Only when no other checkout of this repository still has the add-on.
+    #
+    # info/exclude is shared by the repository and all its linked worktrees —
+    # which is the property that makes one write cover them all on install, and
+    # exactly what made removal reach too far. Removing the add-on from one
+    # worktree un-ignored .ddev/config.hostshift.yaml, the host command and
+    # .ddev/.env in the *parent and every other worktree*, where it is still
+    # installed and running, with nothing printed. The next `git add -A` over
+    # there commits the add-on's files and .ddev/.env, which is where DDEV
+    # documents putting project env vars, credentials included. The install is
+    # idempotent-guarded, so it does not come back on its own either.
+    #
+    # `git worktree list --porcelain` names every checkout, this one included;
+    # the block stays while any *other* one still has the command installed.
+    # A path that is not there any more counts as still installed.
+    #
+    # `git worktree list` reports the *recorded* path, and a plain `mv` of a
+    # worktree directory leaves that stale — git marks the entry prunable and
+    # says nothing, while ddev and hostshift both go on working from the new
+    # location. Probing the stale path found no command, counted the worktree as
+    # gone, and stripped the block while it was still installed and running:
+    # .ddev/.env — DDEV's documented home for credentials — became committable
+    # by the next `git add -A`, which is the exact harm this guard exists to
+    # prevent. The same for a worktree on an unmounted volume, or one restored
+    # to a different path.
+    #
+    # So the asymmetry decides it: a stale ignore entry is harmless, and an
+    # un-ignored .ddev/.env is not. When the answer is unknowable, keep it.
+    others=0
+    here="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    while read -r k v; do
+      [ "$k" = "worktree" ] || continue
+      [ "$v" = "$here" ] && continue
+      if [ ! -d "$v" ] || [ -f "$v/.ddev/commands/host/hostshift" ]; then
+        others=$((others + 1))
+      fi
+    done <<EOT
+    $(git worktree list --porcelain 2>/dev/null || true)
+    EOT
+    if [ "$others" -gt 0 ]; then
+      echo "note: $others other checkout(s) of this repository still have hostshift" >&2
+      echo "installed, so .git/info/exclude keeps ignoring its files for them." >&2
+      exit 0
+    fi
+    # Delete the delimited range, not every line that looks like ours.
+    #
+    # `grep -vxF '.ddev/.env'` removed the developer's own rule too, and both
+    # pilot repos had written that line by hand before this add-on existed. sed
+    # between the markers takes back exactly what install appended.
+    #
+    # The awk fallback handles a block written by a version that had no end
+    # marker; there, matching the patterns is all there is to go on.
+    tmp="$(mktemp)"
+    ok=""
+    # Both markers, or neither. `sed` with an unmatched end address deletes from
+    # the begin marker to end of file, so a block whose end marker had been
+    # hand-deleted emptied the developer's whole exclude file — silently, exit 0.
+    if grep -qxF '# hostshift (ddev add-on) — begin' "$ex" &&
+       grep -qxF '# hostshift (ddev add-on) — end' "$ex"; then
+      sed '/^# hostshift (ddev add-on) — begin$/,/^# hostshift (ddev add-on) — end$/d' \
+        "$ex" > "$tmp" && ok=1
+    elif grep -qxF '# hostshift (ddev add-on) — begin' "$ex"; then
+      # A begin marker with no end: take the marker and the contiguous run of
+      # our own patterns, and leave everything else alone. Deleting to end of
+      # file, which is what sed does with an unmatched end address, emptied the
+      # developer's whole exclude file.
+      awk '
+        $0 == "# hostshift (ddev add-on) — begin" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && ok=1
+    else
+      # The same contiguous-run rule as the migration, for a block written by a
+      # version that had no markers at all. Not `grep -vxF`: that removes every
+      # matching line anywhere in the file, which takes the developer's own
+      # `.ddev/.env` rule with it — and, as a bare statement returning 1 when it
+      # selects nothing, it aborted this whole action under `set -eu -o
+      # pipefail`, so the block survived, the temp file leaked, and the farewell
+      # action never ran. awk always exits 0 here.
+      awk '
+        $0 == "# hostshift (ddev add-on)" { drop = 1; next }
+        drop && ($0 == ".ddev/**/*hostshift*" || $0 == ".ddev/.env" || $0 == "wp-cli.local.yml") { next }
+        { drop = 0; print }
+      ' "$ex" > "$tmp" && ok=1
+    fi
+    # The *status*, not the size. An empty result is correct when the block was
+    # the whole file, so testing `-s "$tmp"` left the block behind in exactly
+    # that case — while a genuinely failed filter must not be allowed to blank
+    # the developer's other rules.
+    if [ -n "$ok" ]; then
+      cat "$tmp" > "$ex"
+    fi
+    rm -f "$tmp"
+  - |
+    #ddev-nodisplay
+    # Everything DDEV does not take away itself. docker-compose.hostshift-loopback.yaml
+    # carries no #ddev-generated marker — deliberately, since `ddev hostshift
+    # loopback` writes it per project — so `add-on remove` leaves it, and a
+    # loopback file left behind goes on pinning production hostnames to 127.0.0.1
+    # inside web after the thing that needed it is gone. The HOSTSHIFT_ block in
+    # .ddev/.env is inert once the compose service is gone, but it is still this
+    # add-on's litter in the developer's project file.
+    # Paths relative to .ddev/, which is the cwd DDEV runs these actions in —
+    # documented at post_install_actions above, and got wrong here, which made
+    # this whole list dead on every removal. `..` is the project root.
+    left=""
+    [ -f docker-compose.hostshift-loopback.yaml ] && left="$left
+      .ddev/docker-compose.hostshift-loopback.yaml — pins production hostnames to 127.0.0.1 in web"
+    grep -qs '^HOSTSHIFT_' .env && left="$left
+      the HOSTSHIFT_ lines in .ddev/.env"
+    [ -f ../wp-cli.local.yml ] && left="$left
+      wp-cli.local.yml — it carries the canonical URL \`ddev wp\` defaults to"
+    true
+    # The hostnames go back to web, and that is not always harmless.
+    #
+    # docker-compose.hostshift.yaml is what narrowed web's VIRTUAL_HOST to this
+    # project's own hostnames. With it gone, a worktree's web re-registers every
+    # hostname it inherited verbatim from the tracked config.yaml — a multisite's
+    # blog hostnames included — and wins the router's tie against the parent, so
+    # the parent's second blog is served by the worktree's code and database.
+    # `init` prints a note about this hazard at the moment it *creates* it;
+    # removal is the moment that re-creates it and said nothing. The parent's own
+    # `check` cannot notice by construction: it scans siblings for variant
+    # collisions, never for web hostnames.
+    # `..` is the project root: these actions run with cwd <project>/.ddev, and
+    # a linked worktree's `.git` is a *file* there rather than a directory.
+    #
+    # And only when there is something to inherit. `HOSTSHIFT_WEB_HOSTS` is set
+    # on every configured worktree — on the README's headline single-hostname
+    # case it equals `$DDEV_HOSTNAME`, so removal changes nothing and the
+    # warning described a hazard that could not occur. The short-circuit at the
+    # top of this same file already asks the right question.
+    inherited=""
+    if [ -f ../.git ] && grep -qs '^HOSTSHIFT_WEB_HOSTS=.' .env; then
+      pdir=""
+      p="$(sed -n 's/^gitdir:[[:space:]]*//p' ../.git | head -1)"
+      case "$p" in
+        */.git/worktrees/*) pdir="${p%%/.git/worktrees/*}" ;;
+      esac
+      # A *non-empty* list. `additional_hostnames: []` is what `ddev config`
+      # writes into every project by default, so matching the key alone brought
+      # the note back on every ordinary parent — telling a developer their
+      # worktree may hijack the parent's hostnames at the moment they are
+      # tearing it down, when HOSTSHIFT_WEB_HOSTS equals $DDEV_HOSTNAME and
+      # removal restores nothing.
+      # An empty list is empty however it is spelled: `[]`, `[]` with a trailing
+      # comment, or a flow list opened on one line and closed on the next. The
+      # first version anchored the empty-flow rule at end-of-line, so
+      # `additional_hostnames: [] # none` read as inherited.
+      if [ -n "$pdir" ] && awk '
+        /^additional_hostnames:[[:space:]]*\[/ {
+          rest = $0
+          sub(/^additional_hostnames:[[:space:]]*\[/, "", rest)
+          sub(/#.*$/, "", rest)
+          gsub(/[][[:space:],]/, "", rest)
+          if (rest != "") { found = 1; exit }
+          if ($0 ~ /\]/) { next }
+          inflow = 1
+          next
+        }
+        inflow {
+          rest = $0
+          sub(/#.*$/, "", rest)
+          gsub(/[][[:space:],]/, "", rest)
+          if (rest != "") { found = 1; exit }
+          if ($0 ~ /\]/) { inflow = 0 }
+          next
+        }
+        /^additional_hostnames:/ { inlist = 1; next }
+        inlist && /^[[:space:]]*-[[:space:]]*[^[:space:]]/ { found = 1; exit }
+        inlist && /^[^[:space:]#-]/ { inlist = 0 }
+        END { exit !found }
+      ' "$pdir/.ddev/config.yaml" 2>/dev/null; then
+        inherited=1
+      fi
+    fi
+
+    echo "hostshift removed."
+    if [ -n "$inherited" ]; then
+      echo "Note: this is a linked worktree, and the add-on was what kept the"
+      echo "hostnames it inherits from the parent's config.yaml off its web"
+      echo "container. They go back now, and the router prefers this project for"
+      echo "any it shares with the parent — so a hostname you expect to reach the"
+      echo "parent may reach this worktree instead. \`ddev stop\` here, or drop the"
+      echo "inherited hostnames from this worktree's DDEV config."
+    fi
+    [ -n "$left" ] && echo "These are yours to delete:$left"
+    true

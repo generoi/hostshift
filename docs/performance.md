@@ -239,6 +239,19 @@ table byte by byte through a document that is 99.8% uninteresting.
 | One value, miss | 242 ns | **117 ns** |
 | Building the map | 2.98 ms, 257,385 allocs | **14 µs, 361 allocs** |
 
+Those figures predate the serialized-length repair. Repairing a PHP `s:NN:`
+prefix means every attribute value and text node is offered to a grammar walk,
+and measuring that honestly: the identity map went 246 MB/s → 133 MB/s when the
+wrapper was added, and back to **194 MB/s** once a gate ran first — a colon
+found with `IndexByte`, a type letter before it, a digit after. About 22% of the
+identity map's throughput is what the repair costs, and the remaining gap is the
+gate's own scan.
+
+The gate has to be exact in one direction only: it may admit a value the walk
+then declines, but it must never refuse one the walk would repair. Requiring the
+digit is what makes it worth having — without it every `https://` matched on its
+own `s:`, so the gate admitted every page carrying a link and saved nothing.
+
 The pattern set is what makes something simpler possible. Every pattern contains
 a separator, and every explicit-scheme pattern *ends with* its relative form —
 `https://H` is `https:` followed by `//H`. So finding the separator finds every

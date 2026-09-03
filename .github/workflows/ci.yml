@@ -37,8 +37,16 @@ jobs:
 
       # The add-on command is shell and holds the opinions the binary refuses
       # to: the slug, which checkout the map comes from, which hostnames web
-      # keeps. It needs no Docker and no DDEV, so it belongs here rather than in
-      # the e2e job that takes twenty minutes.
+      # keeps. It needs no Docker, no DDEV and no network, so it belongs here
+      # rather than in the e2e job that takes twenty minutes.
+      #
+      # The no-network half of that was untrue until it first ran here: seventy-
+      # four `check` cells left the real curl on PATH and asked the machine
+      # whether the variant answered, so eleven of them passed on a developer's
+      # laptop — where a local DDEV router answers on 443 — and failed on a
+      # runner where nothing does. The suite now poisons curl behind the fake one
+      # and asserts nothing fell through, so the property this comment claims is
+      # checked rather than assumed.
       - name: the add-on command
         run: make test-addon
 

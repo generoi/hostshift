@@ -50,10 +50,49 @@ cleanup() {
   done
   rm -rf "$work"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM HUP
 
 command -v ddev >/dev/null || { echo "ddev is not installed; skipping"; exit 0; }
 docker info >/dev/null 2>&1 || { echo "docker is not running; skipping"; exit 0; }
+
+# Leftovers from an interrupted run.
+#
+# `trap cleanup EXIT` does not survive a process-group kill, and three
+# interrupted runs in one session left seven registered projects behind — each
+# holding a docker network and an address from a pool that is not large, and
+# each one a project a later reader has to decide whether it is safe to delete.
+#
+# They are recognisable without ambiguity: this suite names every project
+# `it<pid>` and creates it under a temp root, so a registered project matching
+# that shape, under a temp root, whose pid is no longer running is this suite's
+# and is dead. All three are required: the name alone would match a live run's
+# projects, the temp root keeps a developer's own project out of scope, and the
+# dead pid is what says the run is over. The approot is not the signal — an
+# interrupted run never reaches the `rm -rf` either, so the directory is still
+# there.
+sweep_stale() {
+  command -v jq >/dev/null || return 0
+  ddev list -j 2>/dev/null \
+    | jq -r '.raw[]? | select(.name | test("^it[0-9]+(-.*)?$")) | "\(.name)\t\(.approot)"' \
+      2>/dev/null \
+    | while IFS=$'\t' read -r name approot; do
+        [ -n "$name" ] || continue
+        # Under a temp root, so a project of the developer's that happens to be
+        # named this way is never in scope.
+        case "$approot" in
+          /tmp/*|/var/folders/*|"${TMPDIR:-/nonexistent}"*) ;;
+          *) continue ;;
+        esac
+        # And the run that made it is gone. The pid is in the name, and the
+        # current run's own pid is alive, so this cannot reach its own projects.
+        pid="${name#it}"; pid="${pid%%-*}"
+        [ -n "$pid" ] || continue
+        kill -0 "$pid" 2>/dev/null && continue
+        echo "  (removing $name, left by an interrupted run)" >&2
+        ddev delete --omit-snapshot -y "$name" >/dev/null 2>&1 || true
+      done
+}
+sweep_stale
 
 mkdir -p "$work/bin"
 "$GO" build -o "$work/bin/hostshift" "$repo/cmd/hostshift"
@@ -66,6 +105,13 @@ newsite() {
   {
     echo "type: php"
     echo "docroot: web"
+    # DDEV waits 120s for a container to become healthy and then fails the
+    # start. On a machine already running the fleet, a *bare* project — no
+    # add-on, no hostshift — measured 2m34s to come up, so the suite failed on
+    # `ddev start` with a health-check timeout and every assertion after it,
+    # while nothing in this repository was wrong. The failure text names this
+    # setting; a suite that a busy machine turns red is a suite nobody can read.
+    echo "default_container_timeout: \"600\""
     [ -n "${3:-}" ] && printf 'additional_hostnames:\n  - %s\n' "$3"
   } > "$1/.ddev/config.yaml"
   printf '<?php echo "PROJECT=%s HOST=", $_SERVER["HTTP_HOST"], "\\n";' "$2" > "$1/web/index.php"
@@ -90,6 +136,25 @@ installaddon() {
 
 get() { curl -sk --max-time 20 "$1" 2>&1; }
 
+# ready waits for a URL to answer at all, before the assertions that care what it
+# answers.
+#
+# `ddev start` returns before traefik has finished reconfiguring, and a teardown
+# running beside it — another suite's, or an agent's — churns the router further.
+# The symptom is an empty body from one hostname while its neighbours are fine,
+# which reads exactly like a routing bug and cost two investigations to identify.
+#
+# This is a readiness wait, not a retry-until-green: it gives up after 30 seconds
+# and the assertions then run and fail as they would have, so a hostname that
+# genuinely never serves is still a failure with the same message.
+ready() {
+  for _ in $(seq 1 15); do
+    [ -n "$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null | grep -v '^000$')" ] && return 0
+    sleep 2
+  done
+  return 0
+}
+
 echo "== a single-site worktree, zero committed config  (image: $IMAGE)"
 
 main="$work/${tag}"
@@ -100,8 +165,8 @@ printf '<?php echo "PROJECT=worktree HOST=", $_SERVER["HTTP_HOST"], "\\n";' > "$
 installaddon "$wt"
 
 projects+=("$main" "$wt")
-(cd "$main" && ddev start -y >/dev/null 2>&1) || fail "the parent starts" ""
-(cd "$wt" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds in the worktree" ""
+out="$(cd "$main" && ddev start -y 2>&1)" || fail "the parent starts" "$out"
+out="$(cd "$wt" && ddev hostshift init 2>&1)" || fail "init succeeds in the worktree" "$out"
 
 start_out="$(cd "$wt" && ddev start -y 2>&1)" || fail "the worktree starts" "$start_out"
 
@@ -136,6 +201,39 @@ code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 20 https://${tag}-wt-
 out="$(cd "$wt" && ddev hostshift check 2>&1)" && pass "check passes a live worktree" \
   || fail "check passes a live worktree" "$out"
 
+# ...and stops passing it the moment a *running* sibling claims the same
+# hostname. Two projects on one hostname is an error nowhere in DDEV — traefik
+# breaks the tie by rule length and the loser is silently unreachable — so this
+# refusal is what stands between a developer and reviewing the wrong branch's
+# code at the right URL.
+#
+variant="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env" | cut -d, -f1)"
+
+# A directory left behind by a deleted worktree is not a claim. `git worktree
+# remove` refuses while untracked files are present, so the directory outliving
+# the project is the common case — and refusing there failed the post-start hook
+# on every start while routing was entirely correct.
+dead="$work/${tag}-dead"
+mkdir -p "$dead/.ddev"
+printf 'HOSTSHIFT_VARIANTS=%s\n' "$variant" > "$dead/.ddev/.env"
+# The parent is up but runs no proxy, so it is the same case: a .ddev/.env that
+# claims a variant nothing is serving. The variants live on the *hostshift*
+# container, so asking about web read every add-on-removed, crashed or
+# never-restarted sibling as a live claimant, and failed the post-start hook on
+# every start of a correct deployment.
+cp "$main/.ddev/.env" "$work/main-env.bak" 2>/dev/null || : > "$work/main-env.bak"
+printf 'HOSTSHIFT_VARIANTS=%s\n' "$variant" >> "$main/.ddev/.env"
+out="$(cd "$wt" && ddev hostshift check 2>&1)" \
+  && pass "a running project with no proxy of its own claims nothing" \
+  || fail "a running project with no proxy of its own claims nothing" "$out"
+cp "$work/main-env.bak" "$main/.ddev/.env"
+
+out="$(cd "$wt" && ddev hostshift check 2>&1)" \
+  && pass "and a stopped project's leftover directory is a warning, not a failure" \
+  || fail "and a stopped project's leftover directory is a warning, not a failure" "$out"
+contains "which still says what it found" "already claims" "$out"
+rm -rf "$dead"
+
 echo "== copy-db"
 
 # The only subcommand that destroys something. It streams the parent's database
@@ -144,12 +242,26 @@ echo "== copy-db"
 # would overwrite. Both halves are new and neither had any coverage.
 sql() { (cd "$1" && ddev exec -s web bash -c "mysql -h db -udb -pdb -N -B -e \"$2\" db" 2>/dev/null) || true; }
 sql "$main" "create table hs_probe (id int); insert into hs_probe values (42);" >/dev/null
-
 out="$(cd "$wt" && ddev hostshift copy-db 2>&1)" || fail "copy-db copies the parent's database" "$out"
 contains "copy-db copies the parent's database" "42" "$(sql "$wt" "select id from hs_probe")"
 
-# Running it twice is the accident: the second run silently replaced whatever
-# the first one's work had put there.
+# Replace, not merge — and this is the assertion that distinguishes them. The one
+# above passed before the fix too. `mysqldump db | mysql` drops only the tables
+# the dump contains, so a worktree whose database came from an older pull kept
+# everything the parent no longer has, while the refusal message promised a
+# replace. Needs a table the *worktree* has and the parent does not; it goes in
+# after the first copy, so the copy above still runs against an empty database.
+sql "$wt" "create table hs_only_here (id int); insert into hs_only_here values (7);" >/dev/null
+out="$(cd "$wt" && ddev hostshift copy-db --force 2>&1)" \
+  || fail "and drops what only the worktree had" "$out"
+if [ -n "$(sql "$wt" "select id from hs_only_here" 2>&1 | grep -x 7 || true)" ]; then
+  fail "and drops what only the worktree had" "hs_only_here survived, so it merged"
+else
+  pass "and drops what only the worktree had"
+fi
+
+# Running it twice is the accident this refusal is for: the second run silently
+# replaced whatever the first one's work had put there.
 if (cd "$wt" && ddev hostshift copy-db >/dev/null 2>&1); then
   fail "copy-db refuses a database that already has tables" "exited 0"
 else
@@ -179,9 +291,14 @@ printf '<?php echo "PROJECT=worktree2 HOST=", $_SERVER["HTTP_HOST"], "\\n";' > "
 installaddon "$wt2"
 projects+=("$m2" "$wt2")
 
-(cd "$m2" && ddev start -y >/dev/null 2>&1) || fail "the multisite parent starts" ""
-(cd "$wt2" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds on a multisite" ""
-(cd "$wt2" && ddev start -y >/dev/null 2>&1) || fail "the multisite worktree starts" ""
+out="$(cd "$m2" && ddev start -y 2>&1)" || fail "the multisite parent starts" "$out"
+out="$(cd "$wt2" && ddev hostshift init 2>&1)" || fail "init succeeds on a multisite" "$out"
+out="$(cd "$wt2" && ddev start -y 2>&1)" || fail "the multisite worktree starts" "$out"
+# Both blogs, because the second one is the one that has been seen empty while
+# the first was already answering.
+ready "https://wt-b--${tag}2.ddev.site/"
+ready "https://wt-b--shop.${tag}2.ddev.site/"
+ready "https://shop.${tag}2.ddev.site/"
 
 # The case a comma-separated --map broke against the published image: both
 # variants 421'd while everything reported success.
@@ -223,8 +340,8 @@ YAML
 installaddon "$wt3"
 projects+=("$m3" "$wt3")
 
-(cd "$m3" && ddev start -y >/dev/null 2>&1) || fail "the hostshift.yaml parent starts" ""
-(cd "$wt3" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds with a hostshift.yaml" ""
+out="$(cd "$m3" && ddev start -y 2>&1)" || fail "the hostshift.yaml parent starts" "$out"
+out="$(cd "$wt3" && ddev hostshift init 2>&1)" || fail "init succeeds with a hostshift.yaml" "$out"
 out3="$(cd "$wt3" && ddev start -y 2>&1)" || fail "the hostshift.yaml worktree starts" "$out3"
 
 # The whole line, compared for equality. `contains "HOSTSHIFT_MAP_ARGS="` was
@@ -234,6 +351,31 @@ out3="$(cd "$wt3" && ddev start -y 2>&1)" || fail "the hostshift.yaml worktree s
 # variable was renamed out of existence. What must be true is that the proxy
 # gets a slug and nothing else: a `--from/--to` pair here beats the mounted
 # file, and the file's aliases then silently never rewrite.
+# This map has an alias on a domain that is not a DDEV hostname, and nothing
+# has generated a loopback file — so web can reach it for real. That is what
+# wp-cron and Site Health do under production-canonical, with sslverify off,
+# against a database that believes it is production. The shipped
+# docker-compose.hostshift-loopback.yaml carries `www.example.com` as a
+# placeholder, so a project that never edited it passed every guardrail here
+# and reported "hostshift is serving".
+out="$(cd "$wt3" && ddev hostshift check 2>&1 || true)"
+contains "check notices that loopback containment is not in place" \
+  "not pinned to the" "$out"
+contains "and names the hostname that is not contained" "${tag}3.staging.example" "$out"
+
+# And it stops once containment is real. Without this the check could warn
+# unconditionally and the assertion above would still pass — which is the shape
+# of every guardrail in this file that turned out not to guard.
+(cd "$wt3" && ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml) \
+  || fail "loopback emits a compose file" ""
+out="$(cd "$wt3" && ddev restart -y 2>&1)" || fail "restart with containment" "$out"
+out="$(cd "$wt3" && ddev hostshift check 2>&1 || true)"
+case "$out" in
+  *"not pinned to the"*)
+    fail "and goes quiet once containment is in place" "$out" ;;
+  *) pass "and goes quiet once containment is in place" ;;
+esac
+
 args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wt3/.ddev/.env")"
 [ "$args" = "--slug wt-c" ] \
   && pass "no flat map is handed over, so the container reads the mounted file" \
@@ -262,6 +404,74 @@ install_out="$(cd "$m4" && ddev add-on get "$repo/ddev" 2>&1)" \
 projects+=("$m4")
 
 contains "the add-on installs the host command" "commands/host/hostshift" "$install_out"
+
+# A .ddev project that is not a git checkout. DDEV runs install actions under
+# `set -eu -o pipefail`, and `git rev-parse` exits 128 outside a repository — so
+# an unguarded call aborted the install and left the project with nothing.
+nogit="$work/${tag}-nogit"
+mkdir -p "$nogit/.ddev"
+printf 'name: %s-nogit\ntype: php\n' "$tag" > "$nogit/.ddev/config.yaml"
+ng_out="$(cd "$nogit" && ddev add-on get "$repo/ddev" 2>&1)" || true
+projects+=("$nogit")
+if [ -f "$nogit/.ddev/commands/host/hostshift" ]; then
+  pass "and installs into a project that is not a git checkout"
+else
+  fail "and installs into a project that is not a git checkout" "$ng_out"
+fi
+
+# The files it installs are ignored in the *checkout*, not in a commit. A
+# .gitignore block is branch-scoped, so adopting hostshift leaves them untracked
+# on every branch that predates the adoption — which is where `git add -A`
+# commits them.
+if [ -z "$(git -C "$m4" status --porcelain -- .ddev)" ]; then
+  pass "and nothing it installs shows up as untracked"
+else
+  fail "and nothing it installs shows up as untracked" "$(git -C "$m4" status --porcelain -- .ddev)"
+fi
+# The project's own committed statement about its hostnames is not ignored.
+printf 'sites:\n  - canonical: https://x.example\n' > "$m4/hostshift.yaml"
+if git -C "$m4" check-ignore -q hostshift.yaml; then
+  fail "but the repo's own hostshift.yaml still is not" "it is ignored"
+else
+  pass "but the repo's own hostshift.yaml still is not"
+fi
+rm -f "$m4/hostshift.yaml"
+
+# Removing the add-on from one worktree must not un-ignore it in the others.
+#
+# info/exclude is shared by the repository and all its linked worktrees, which
+# is the property that makes one write cover them all on install — and is
+# exactly what made removal reach too far. `ddev add-on remove` in a worktree
+# un-ignored the add-on's files and .ddev/.env in the parent and in every other
+# worktree, where it is still installed and running, and said nothing. The next
+# `git add -A` over there commits them, .ddev/.env included.
+rmwt="$work/${tag}-rmwt"
+git -C "$m4" worktree add -q -b "${tag}-rm" "$rmwt" >/dev/null 2>&1
+mkdir -p "$rmwt/.ddev"
+printf 'name: %s-rm\ntype: php\n' "$tag" > "$rmwt/.ddev/config.yaml"
+(cd "$rmwt" && ddev add-on get "$repo/ddev" >/dev/null 2>&1) || true
+projects+=("$rmwt")
+# `additional_hostnames: []` is what `ddev config` writes into every project by
+# default, and the removal note matched the key alone — so it told a developer
+# their worktree may hijack the parent's hostnames at the moment they were
+# tearing it down, on every ordinary parent, when nothing is inherited at all.
+cp "$m4/.ddev/config.yaml" "$work/m4cfg.hold"
+printf 'additional_hostnames: []\n' >> "$m4/.ddev/config.yaml"
+rm_out="$(cd "$rmwt" && ddev add-on remove hostshift 2>&1)" || true
+cp "$work/m4cfg.hold" "$m4/.ddev/config.yaml"
+case "$rm_out" in
+  *"may reach this worktree instead"*)
+    fail "an empty additional_hostnames is not an inherited hostname" "$rm_out" ;;
+  *) pass "an empty additional_hostnames is not an inherited hostname" ;;
+esac
+if git -C "$m4" check-ignore -q .ddev/.env; then
+  pass "removing it from one worktree leaves the others ignored"
+else
+  fail "removing it from one worktree leaves the others ignored" "$rm_out"
+fi
+git -C "$m4" worktree remove --force "$rmwt" >/dev/null 2>&1 || true
+git -C "$m4" branch -D "${tag}-rm" >/dev/null 2>&1 || true
+
 case "$install_out" in
   *"predates this add-on"*)
     fail "a fresh install is not told its command is stale" "$install_out" ;;

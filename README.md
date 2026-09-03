@@ -5,7 +5,21 @@ Rewrite origins in HTTP traffic, in both directions.
 A site's content refers to one hostname; you want to reach it at another.
 hostshift maps between them: responses get the hostname the browser is on,
 requests get the hostname the content was written for. Nothing is rewritten at
-rest — the database is never touched.
+rest — hostshift never writes to the database itself.
+
+What the *application* writes does pass through it, though, and one thing
+changes there: **the scheme**. A canonical is declared with a scheme, and the
+matcher accepts either — so `http://www.acme.fi/legacy/` in a post becomes the
+variant on the way out, and comes back as `https://www.acme.fi/legacy/`, because
+nothing in the variant spelling records which scheme was written originally.
+Save a post you did not otherwise edit and every plain URL in it takes the
+canonical's declared scheme. That is an upgrade when the canonical is `https`
+and a downgrade when it is `http`, which some staging environments are; PLAN §M0
+measured one fleet host appearing 165 times over `http` and never over `https`.
+The data stays valid and serialized lengths are recomputed correctly — this is
+the scheme and nothing else — but it is a real change to rows you did not
+intend to touch, and `hostshift diff` cannot see it, because it only exercises
+the response direction.
 
 It is a filter and a reverse proxy, it knows nothing about any CMS, and it
 scaffolds nothing: no config files written, no slugs guessed, no directories
@@ -14,9 +28,18 @@ created. An optional DDEV add-on sits on top and does the opinionated part.
 **You have this problem if** one database has to be browsed at more than one
 hostname — a git worktree previewing a branch beside the main checkout, or a
 production dump you want to open locally without search-replacing it first.
-**The one precondition hostshift cannot supply** is that the application derive
-its host from the request. Bedrock does; a site that pins `WP_HOME` to a
-constant cannot be proxied by hostshift or by anything else.
+**The one precondition hostshift cannot supply** is that the application answer
+to a hostname the map names. Deriving `WP_HOME` from the request satisfies that
+for free; so does pinning it, as long as it is pinned to the canonical or the
+variant. What cannot work is a site pinned to a *third* hostname — stock DDEV
+WordPress does this, setting `WP_HOME` to `DDEV_PRIMARY_URL`, which is the
+project's own name and neither side of the map. `ddev hostshift check` says so
+when it sees it.
+
+(Stock Bedrock does not derive its host from the request either: its
+`config/application.php` *requires* `WP_HOME` and defines it as a constant. The
+`env('WP_HOME') ?: 'https://'.$host` form PLAN §4.1 quotes is a local edit, not
+upstream. It works fine either way.)
 
 ## Install
 
@@ -70,11 +93,19 @@ hostname, so a branch can be previewed without a database of its own.
 checkout goes on serving `acme.ddev.site` untouched. Whatever pulls the
 database keeps its search-replace; nothing about a normal pull changes.
 
-Install the add-on once per project:
+Install the add-on once per project, from a clone of this repository:
 
 ```
-ddev add-on get generoi/hostshift
+git clone git@github.com:generoi/hostshift.git ~/src/hostshift   # once, anywhere
+ddev add-on get ~/src/hostshift/ddev                             # per project
 ```
+
+`ddev add-on get generoi/hostshift` does **not** work, for two reasons worth
+stating rather than leaving you to discover: the repository is private, so
+DDEV's registry lookup 404s; and DDEV expects `install.yaml` at the repository
+root while hostshift keeps its add-on under `ddev/`, so even with
+`DDEV_GITHUB_TOKEN` set the download fails with `Unable to read … install.yaml`.
+The path form above is the supported one today.
 
 Then, in the worktree, one command:
 
@@ -95,10 +126,10 @@ DDEV project of its own with nothing configured.
 ```console
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
-$ ddev add-on get generoi/hostshift
+$ ddev add-on get ~/src/hostshift/ddev
 $ ddev hostshift init
 hostshift: slug "wt-a", from the git branch wt-a
-hostshift: canonical hostnames from /Users/you/Projects/acme, whose database this shares
+hostshift: canonical hostnames from /Users/you/Projects/acme, the checkout this was made from
 hostshift: wrote .ddev/.env
 map from --from/--to
 site1  https://acme.ddev.site  ->  https://wt-a--acme.ddev.site
@@ -117,14 +148,20 @@ The one file that comes out of it:
 
 ```sh
 # .ddev/.env
+#ddev-silent-no-warn
 HOSTSHIFT_ARGS=--from https://acme.ddev.site --to https://wt-a--acme.ddev.site
 HOSTSHIFT_VARIANTS=wt-a--acme.ddev.site
 HOSTSHIFT_WEB_HOSTS=acme-wt-a.ddev.site
 ```
 
-Ignore it in the project's own `.gitignore` — DDEV's generated
-`.ddev/.gitignore` does not cover `.env`. `init` merges into the file rather
-than truncating it, so anything else already in there survives.
+The first line is not a comment DDEV ignores: without it every `ddev start`
+prints a four-line "Custom configuration detected" block. `init` merges into
+the file rather than truncating it, so anything else already in there survives.
+
+You do not need to gitignore it. Installing the add-on adds its files to
+`.git/info/exclude`, which is per checkout and shared with linked worktrees, so
+the ignore travels with the machine rather than with the branch. Removing the
+add-on takes the entry back out.
 
 After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
 `https://acme.ddev.site` goes on serving the parent.
@@ -153,11 +190,54 @@ After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
   nginx snippet that 302-redirects a missing `/app/uploads/` request to a
   hardcoded production origin. Rewriting that `Location` would send the browser
   back to the request it just made, so hostshift passes it through unmodified
-  and counts it as `self-redirect`. That is the single enumerated exception to
-  "no canonical origin reaches the browser"; `--strict-origins` returns 404
-  instead.
+  and counts it as `self-redirect`. `--strict-origins` returns 404 instead.
+
+  A JSON body over the 8 MB cap is another: it streams through untouched with
+  only a `WARN` in `ddev logs -s hostshift`, and under production-canonical every
+  origin in it reaches the browser. PLAN §5.8 decides the cap deliberately —
+  buffering an arbitrarily large body is the thing it exists to prevent — but
+  `/wp-json/wp/v2/posts?per_page=100` on a content-heavy site gets there.
+
+  It is not the only exception. Tier 2 content types — `text/css` and
+  JavaScript — are excluded by design (PLAN §5.2), so an absolute canonical URL
+  inside a stylesheet reaches the browser unrewritten. That is a deliberate
+  decision on evidence from theme sources, and generated CSS under `uploads/`
+  (Elementor, WPBakery, the Customizer) is the case that evidence did not
+  survey; those files do carry absolute upload URLs. `hostshift diff` reports
+  them on its `Tier 2` line rather than failing the run, which is the trigger
+  PLAN's fast path names for rewriting them.
 
 [ddev/ddev#5486]: https://github.com/ddev/ddev/issues/5486
+
+
+### If your repo pins `name:`
+
+Most do. A worktree inherits the tracked `.ddev/config.yaml`, so it inherits the
+name, and DDEV refuses before hostshift is involved:
+
+```console
+$ ddev add-on get ~/src/hostshift/ddev
+Unable to get project : a project (web container) in running state already
+exists for acme that was created at /Users/you/Projects/acme
+```
+
+Give the worktree a name of its own. Every command here runs **inside the
+worktree** — running the `printf` in the parent renames the parent, and its
+canonical hostname, the one the database holds, stops resolving.
+
+```console
+$ git worktree add ../acme-wt-a -b wt-a
+$ cd ../acme-wt-a
+$ printf '#ddev-silent-no-warn\nname: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
+$ ddev add-on get ~/src/hostshift/ddev
+$ ddev hostshift init
+```
+
+The name only has to be unique; hostshift derives the preview hostnames from the
+parent's config and the slug, not from it. Between the `printf` and the add-on
+install `git status` will list the file — that is expected, because the install
+is what writes the `.git/info/exclude` rule that hides it.
+
 
 ## The map
 
@@ -212,6 +292,15 @@ container resolves by name with nothing else configured. Note that a shared
 database is shared: previewing is safe, but activating a plugin, running a
 migration or uploading media writes to the real thing.
 
+Uploads split in a way worth knowing about. The row goes to the shared database
+and the *file* goes to the worktree's own `uploads/`, so the parent gets a row
+pointing at an image that is not there. On a stock DDEV WordPress it is worse:
+`wp-config-ddev.php` pins `WP_HOME` to this project's own hostname, so the
+attachment's `guid` is computed from a name that is neither canonical nor
+variant, and nothing will ever map it back. `ddev hostshift check` warns when
+the served page carries that hostname; the fix is to remove the pin, not to
+rewrite the row afterwards.
+
 **Or give it one of its own**, which a branch that has to write needs. The
 fastest source is the parent, and it is the state you are already working
 against:
@@ -230,13 +319,10 @@ before.
 
 ### `hostshift.yaml` — only for aliases, or for production-canonical
 
-**`ddev restart` after editing it.** The proxy reads the file once, at startup,
-and nothing detects that you have changed it since — `ddev hostshift check`
-compares `.ddev/.env` and the running container's command line, and neither moves
-when the file's contents do. Two attempts at detecting this were worse than the
-gap: a checksum recorded at `init` time called a correctly-restarted project
-stale, and comparing the file's timestamp against the container's proved
-unreliable across platforms.
+**`ddev restart` after editing it.** The proxy reads the file once, at startup.
+`ddev hostshift check` catches it if you forget: the proxy prints its resolved
+map to stderr when it starts, so `check` compares that against what this
+checkout resolves to now and refuses to call a stale proxy healthy.
 
 Not needed because a site is a multisite. Needed for the two things a DDEV
 config genuinely cannot say: **alias hostnames**, so a residual `@staging` URL
@@ -266,14 +352,25 @@ canonical=variant list cannot carry aliases.
 
 The same engine pointed further: set `canonical` to the live production
 hostname and a database that was never search-replaced at all can be browsed
-locally. Opt-in per repo, and it is where the hazards live — see
-[`PLAN.md`](PLAN.md) §4.4. Two things become required with it:
+locally. Opt-in per repo, and it is where the hazards live — see PLAN §4.4,
+summarised below. Two things become required with it:
 
-- **Loopback containment.** List the site's production hostnames in
-  `.ddev/docker-compose.hostshift-loopback.yaml`, or WordPress's internal
-  requests (wp-cron, Site Health) leave the machine for live production. That
-  file carries no generated-file marker, so your edit survives the next
-  `ddev add-on get`.
+- **Loopback containment.** `ddev hostshift loopback > .ddev/docker-compose.hostshift-loopback.yaml`
+  writes the site's production hostnames into web's `extra_hosts`, pointed at
+  127.0.0.1. Without it WordPress's internal requests (wp-cron, Site Health)
+  leave the machine for live production — with `sslverify => false`, against a
+  database that believes it is production. The file ships with `www.example.com`
+  in it as a placeholder, so generate it rather than assuming its presence means
+  anything; `ddev hostshift check` warns when a canonical hostname is not pinned
+  to the loopback in web's `extra_hosts` — a comparison against the container's
+  configuration, not a reachability probe. It carries no generated-file marker,
+  so a hand edit survives the next `ddev add-on get`.
+
+  Note the redirect **replaces** the file. If you have added hosts of your own —
+  a CDN origin, a legacy domain, an apex sibling that is not in `hostshift.yaml`
+  — regenerating discards them along with the file's own explanatory header.
+  Keep those additions somewhere you can re-apply, or edit the file by hand
+  instead and use the generated output as a reference.
 - **WP-CLI.** `ddev hostshift wp-cli > wp-cli.local.yml`, gitignored. WP-CLI
   resolves a site by URL, so without it every `ddev wp` on a multisite fails
   with "Site not found". It emits the project's existing `wp-cli.yml` back
@@ -325,13 +422,76 @@ Flags worth knowing:
   default; it exists for performance work where transfer size must resemble
   production.
 
-Exit codes: 0 success, 1 runtime error, 2 invalid configuration.
+Exit codes: 0 success, 1 runtime error, 2 invalid configuration. These are the
+binary's. DDEV collapses a host command's status to 1, so a script testing
+`ddev hostshift check` for `-eq 2` will never match — test for non-zero, or call
+`hostshift` directly.
 
 `hostshift diff -n 20` is the check that validates a deployment against
 reality: it crawls N pages canonically, fetches the same N through the proxy,
-runs the canonical bytes through the same engine, and compares. The assertions
-that fail a run are the ones that cannot be innocent — a canonical origin
-reaching the browser, and a page whose line count changed.
+runs the canonical bytes through the same engine, and compares. In a worktree
+it needs `--canonical-base` to say what the canonical side is, since the
+production hostname is not routed locally:
+
+```
+hostshift diff -n 20 --slug <slug> --canonical-base https://<project>.ddev.site
+```
+
+`--slug` is not optional here. Without it the worktree's map has no variant side
+to derive — `hostshift diff` exits 2 with *no variant — pass --slug, or declare
+`variant:` on the site* — and there is no `ddev hostshift diff` wrapper to supply
+it for you.
+
+**On a worktree whose map comes from DDEV config alone**, add `--variant-base`
+too. The variant is derived from the project the command is run in, so in
+`acme-wt-a` it comes out `wt-a--acme-wt-a.ddev.site` — a hostname nothing serves,
+and every row a 404:
+
+```
+hostshift diff -n 20 --slug wt-a \
+  --canonical-base https://acme.ddev.site \
+  --variant-base   https://wt-a--acme.ddev.site
+```
+
+Under production-canonical `--variant-base` is not needed — the map names the
+variant — but `--slug` still is, unless the site declares `variant:` outright
+rather than deriving it from `base:`. The README's own `hostshift.yaml` derives
+it, so `--slug` applies there too.
+
+When you pass one base, `diff` warns if it is not a hostname its map knows and
+says what it fell back to. When you pass **both** and the map knows neither —
+the worktree case above — the two bases *are* the comparison, and `diff` says so
+and uses them as its map. That is what makes the worktree form mean anything:
+the bases used to move only the crawl, while the rewriting map still came from
+`--slug`, so the leak scan looked for an origin that could not occur and printed
+`0 leaks` over pages that were full of them.
+
+The assertions that fail a run are the ones that cannot be innocent — a canonical origin
+reaching the browser, a serialized value served with a length that does not
+describe its data, which PHP will refuse or silently truncate, a page whose byte
+count moved by more than a quarter — which is how an upstream that answers 200
+with an empty body, or dies mid-stream, is caught — and a page whose
+line count moved by more than a Host-dependent line could explain (over eight
+lines, or over a quarter of the page). A one-line difference is reported and
+does not fail the run: the two fetches carry different `Host` headers, so
+WordPress emits one extra `<link rel="dns-prefetch">` on every page of a
+healthy production-canonical site.
+
+That one-line expectation assumes `WP_HOME` is **pinned to the canonical**. If
+you derive it from the request — which this README recommends above, and which
+is right for serving — then under production-canonical the only baseline you can
+fetch locally, `<project>.ddev.site`, emits *that* hostname throughout instead of
+the database's. Every page then differs by a tenth of its lines, reported as
+`N lines differ (dynamic content?)`, and the run is still GREEN. Measured: 20–29
+lines a page against 0–1 with `WP_HOME` pinned. A real re-serialisation sits
+inside that noise indistinguishably, so pin `WP_HOME` for the run you intend to
+read, or compare against a checkout that has it pinned.
+
+That last one is asserted on the served bytes alone, not by comparing the proxy
+against the engine. Every other check here compares the two, so when both are
+wrong in the same way the run is green — which is how five consecutive rounds of
+silent `wp_options` destruction went unreported by the one check that validates
+against reality.
 
 ## Building and testing
 
@@ -353,6 +513,11 @@ not let it go red.
 
 ## Design
 
-[`PLAN.md`](PLAN.md) is the authoritative design and is not re-decided here.
-[`docs/`](docs/) has the pilot notes and the performance numbers;
+`PLAN.md` is the authoritative design and is not re-decided here. It is written
+against named client deployments and so is not published, which is why comments
+throughout the code cite sections of a document this repo does not contain —
+`PLAN §4.3` is the shared-database invariant, `§4.4` the production-canonical
+hazards, `§5.2` the identity map. The citation still names the decision.
+
+[`docs/performance.md`](docs/performance.md) has the numbers;
 [`spike/`](spike/) is the evidence behind the Go decision. MIT licensed.

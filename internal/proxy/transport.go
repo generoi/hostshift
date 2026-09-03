@@ -228,8 +228,10 @@ func isPartial(resp *http.Response) bool {
 // so in the fleet this costs nothing on a page; it costs a media file being
 // re-fetched from zero on a seek, over loopback or the Docker bridge.
 //
-// RFC 9110 lets a server ignore Range, and Accept-Ranges is dropped from every
-// response so a well-behaved client does not ask again.
+// RFC 9110 lets a server ignore Range and answer 200, which is what a client
+// gets here. Accept-Ranges is dropped from *rewritten* responses only, along
+// with the other validators — an untouched body keeps it, so a client may still
+// ask for a range on a media file and be answered in full.
 func stripRange(h http.Header) {
 	h.Del("Range")
 	h.Del("If-Range")

@@ -87,10 +87,49 @@ cleanup() {
   done
   rm -rf "$work"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM HUP
 
 command -v ddev >/dev/null || { echo "ddev is not installed; skipping"; exit 0; }
 docker info >/dev/null 2>&1 || { echo "docker is not running; skipping"; exit 0; }
+
+# Leftovers from an interrupted run.
+#
+# `trap cleanup EXIT` does not survive a process-group kill, and three
+# interrupted runs in one session left seven registered projects behind — each
+# holding a docker network and an address from a pool that is not large, and
+# each one a project a later reader has to decide whether it is safe to delete.
+#
+# They are recognisable without ambiguity: this suite names every project
+# `pit<pid>` and creates it under a temp root, so a registered project matching
+# that shape, under a temp root, whose pid is no longer running is this suite's
+# and is dead. All three are required: the name alone would match a live run's
+# projects, the temp root keeps a developer's own project out of scope, and the
+# dead pid is what says the run is over. The approot is not the signal — an
+# interrupted run never reaches the `rm -rf` either, so the directory is still
+# there.
+sweep_stale() {
+  command -v jq >/dev/null || return 0
+  ddev list -j 2>/dev/null \
+    | jq -r '.raw[]? | select(.name | test("^pit[0-9]+(-.*)?$")) | "\(.name)\t\(.approot)"' \
+      2>/dev/null \
+    | while IFS=$'\t' read -r name approot; do
+        [ -n "$name" ] || continue
+        # Under a temp root, so a project of the developer's that happens to be
+        # named this way is never in scope.
+        case "$approot" in
+          /tmp/*|/var/folders/*|"${TMPDIR:-/nonexistent}"*) ;;
+          *) continue ;;
+        esac
+        # And the run that made it is gone. The pid is in the name, and the
+        # current run's own pid is alive, so this cannot reach its own projects.
+        pid="${name#pit}"; pid="${pid%%-*}"
+        [ -n "$pid" ] || continue
+        kill -0 "$pid" 2>/dev/null && continue
+        echo "  (removing $name, left by an interrupted run)" >&2
+        ddev delete --omit-snapshot -y "$name" >/dev/null 2>&1 || true
+      done
+}
+sweep_stale
 
 mkdir -p "$work/bin"
 "$GO" build -o "$work/bin/hostshift" "$repo/cmd/hostshift"
@@ -99,7 +138,8 @@ export PATH="$work/bin:$PATH"
 # newsite DIR NAME — a git repo with a DDEV project and a one-line web root.
 newsite() {
   mkdir -p "$1/.ddev" "$1/web"
-  printf 'type: php\ndocroot: web\n' > "$1/.ddev/config.yaml"
+  printf 'type: php\ndocroot: web\ndefault_container_timeout: "600"\n' \
+    > "$1/.ddev/config.yaml"
   printf '<?php echo "PROJECT=%s HOST=", $_SERVER["HTTP_HOST"], "\\n";' "$2" > "$1/web/index.php"
   git -C "$1" init -q -b main
   git -C "$1" add .ddev/config.yaml web/index.php
@@ -108,28 +148,36 @@ newsite() {
 
 # fixtures DIR CANONICAL-HOST — the application under test.
 #
-# Every endpoint that reports what it received answers `text/plain`, which is
-# outside the rewritable set. That is the whole trick: an HTML echo would be
-# rewritten canonical->variant on the way out and would report the variant back
-# whatever the request direction did, so it could not fail. text/plain comes
-# back byte for byte, so what it prints is what the application saw.
+# Every endpoint that reports what it received answers base64. That is the whole
+# trick: a plain echo is rewritten canonical->variant on the way out and reports
+# the variant back whatever the request direction did, so it cannot fail. A host
+# does not survive base64, so what these print is what the application saw.
+#
+# This used to rely on `text/plain` being outside the rewritable set instead.
+# cf661ac put it inside — wp-admin/async-upload.php sends JSON under it — and
+# the eight request-direction assertions below have been unpassable ever since,
+# for 43 commits, whatever the proxy did. They are the only cover PLAN tests 30
+# and 31 have, so the class they guard was untested the whole time and a
+# permanently-red suite is what hid it. Encoding does not depend on a set that
+# can grow again.
 fixtures() {
   local d="$1/web" c="$2"
   cat > "$d/req.php" <<'PHP'
 <?php
 header('Content-Type: text/plain');
 $b = file_get_contents('php://input');
-echo "HOST=", $_SERVER['HTTP_HOST'] ?? '-', "\n";
-echo "URI=", $_SERVER['REQUEST_URI'] ?? '-', "\n";
-echo "QUERY=", $_SERVER['QUERY_STRING'] ?? '-', "\n";
-echo "REFERER=", $_SERVER['HTTP_REFERER'] ?? '-', "\n";
-echo "ORIGIN=", $_SERVER['HTTP_ORIGIN'] ?? '-', "\n";
-echo "XFPROTO=", $_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '-', "\n";
-echo "XFHOST=", $_SERVER['HTTP_X_FORWARDED_HOST'] ?? '-', "\n";
-echo "XFPORT=", $_SERVER['HTTP_X_FORWARDED_PORT'] ?? '-', "\n";
-echo "CT=", $_SERVER['CONTENT_TYPE'] ?? '-', "\n";
-echo "BODY=", $b, "\n";
-foreach ($_POST as $k => $v) { echo "POST[$k]=", is_array($v) ? implode(',', $v) : $v, "\n"; }
+$o  = "HOST=" . ($_SERVER['HTTP_HOST'] ?? '-') . "\n";
+$o .= "URI=" . ($_SERVER['REQUEST_URI'] ?? '-') . "\n";
+$o .= "QUERY=" . ($_SERVER['QUERY_STRING'] ?? '-') . "\n";
+$o .= "REFERER=" . ($_SERVER['HTTP_REFERER'] ?? '-') . "\n";
+$o .= "ORIGIN=" . ($_SERVER['HTTP_ORIGIN'] ?? '-') . "\n";
+$o .= "XFPROTO=" . ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '-') . "\n";
+$o .= "XFHOST=" . ($_SERVER['HTTP_X_FORWARDED_HOST'] ?? '-') . "\n";
+$o .= "XFPORT=" . ($_SERVER['HTTP_X_FORWARDED_PORT'] ?? '-') . "\n";
+$o .= "CT=" . ($_SERVER['CONTENT_TYPE'] ?? '-') . "\n";
+$o .= "BODY=" . $b . "\n";
+foreach ($_POST as $k => $v) { $o .= "POST[$k]=" . (is_array($v) ? implode(',', $v) : $v) . "\n"; }
+echo base64_encode($o);
 PHP
   # The database half of PLAN tests 30 and 31 without a database: what the
   # application *persists* is read back through a surface nothing rewrites.
@@ -142,7 +190,7 @@ PHP
   cat > "$d/stored.php" <<'PHP'
 <?php
 header('Content-Type: text/plain');
-echo "STORED=", @file_get_contents(sys_get_temp_dir() . '/hs_stored'), "\n";
+echo base64_encode("STORED=" . @file_get_contents(sys_get_temp_dir() . '/hs_stored') . "\n");
 PHP
   # HTTP_HOST is the canonical host by the time PHP sees it, so `self` builds
   # exactly the URL the browser asked for, in canonical space — which is what
@@ -210,6 +258,17 @@ installaddon() {
 }
 
 get()    { curl -sk --max-time 20 "$@" 2>&1; }
+# report — get from an endpoint that answers base64, decoded. See fixtures.
+#
+# Falls back to the raw body when it does not decode, so a curl error or an
+# nginx error page is shown rather than an empty string — which would fail the
+# assertion with nothing in it to read.
+report() {
+  local raw dec
+  raw="$(get "$@")"
+  dec="$(printf '%s' "$raw" | tr -d '\r\n' | base64 -d 2>/dev/null || true)"
+  if [ -n "$dec" ]; then printf '%s' "$dec"; else printf '%s' "$raw"; fi
+}
 hdrs()   { curl -sk --max-time 20 -o /dev/null -D - "$@" 2>&1; }
 status() { curl -sk --max-time 20 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || true; }
 
@@ -237,7 +296,7 @@ echo "== the request direction: what the application receives"
 
 # One request carries the query, the Referer and the Origin, because they are
 # rewritten by three different code paths and a round trip costs a second.
-r="$(get -H "Referer: https://$V/some/page" -H "Origin: https://$V" \
+r="$(report -H "Referer: https://$V/some/page" -H "Origin: https://$V" \
   "https://$V/req.php?redirect_to=https%3A%2F%2F$V%2Fwp-admin%2F")"
 contains "the application sees the canonical Host" "HOST=$C" "$r"
 # wp_validate_redirect() checks redirect_to against home_url()'s host and
@@ -257,14 +316,14 @@ contains "X-Forwarded-Proto says https" "XFPROTO=https" "$r"
 contains "X-Forwarded-Host is not forwarded" "XFHOST=-" "$r"
 contains "X-Forwarded-Port is not forwarded" "XFPORT=-" "$r"
 
-r="$(get -d "url=https://$V/x&other=keep" "https://$V/req.php")"
+r="$(report -d "url=https://$V/x&other=keep" "https://$V/req.php")"
 contains "a form POST body arrives canonical" "POST[url]=https://$C/x" "$r"
 lacks "and carries no variant origin at all" "$V" "$r"
 
-r="$(get -H 'Content-Type: application/json' -d "{\"u\":\"https://$V/x\"}" "https://$V/req.php")"
+r="$(report -H 'Content-Type: application/json' -d "{\"u\":\"https://$V/x\"}" "https://$V/req.php")"
 contains "a JSON write body arrives canonical" "BODY={\"u\":\"https://$C/x\"}" "$r"
 
-r="$(get -F "url=https://$V/x" "https://$V/req.php")"
+r="$(report -F "url=https://$V/x" "https://$V/req.php")"
 contains "a multipart field arrives canonical" "POST[url]=https://$C/x" "$r"
 
 # What the application *stored*, read back through a surface nothing rewrites.
@@ -272,7 +331,7 @@ contains "a multipart field arrives canonical" "POST[url]=https://$C/x" "$r"
 # can look perfect while the clone fills with worktree hostnames.
 get -d "url=https://$V/stored-target/" "https://$V/store.php" >/dev/null
 contains "and what the application stores is canonical" \
-  "STORED=https://$C/stored-target/" "$(get "https://$V/stored.php")"
+  "STORED=https://$C/stored-target/" "$(report "https://$V/stored.php")"
 
 echo "== the response direction"
 
@@ -374,6 +433,28 @@ projects+=("$wt2")
 (cd "$wt2" && ddev hostshift init >/dev/null 2>&1) || fail "init succeeds in the second worktree" ""
 out="$(cd "$wt2" && ddev start -y 2>&1)" || fail "the second worktree starts" "$out"
 
+# Both proxies are up, so this is a real collision rather than a leftover file:
+# point the second worktree's .ddev/.env at the first one's variant and it is
+# genuinely contending for that hostname. This is the assertion the liveness gate
+# exists for, and it needs two *running proxies* — which is why it lives here and
+# not in the suite where the only other project is a parent with no proxy.
+v1="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$wt/.ddev/.env" | cut -d, -f1)"
+cp "$wt2/.ddev/.env" "$work/wt2-env.bak"
+# Replaced, not appended: the scan reads the *first* HOSTSHIFT_VARIANTS line and
+# quits, so a second one below it is never seen and the rival claims nothing.
+sed -i.bak "s|^HOSTSHIFT_VARIANTS=.*|HOSTSHIFT_VARIANTS=$v1|" "$wt2/.ddev/.env"
+rm -f "$wt2/.ddev/.env.bak"
+if (cd "$wt" && ddev hostshift check >/dev/null 2>&1); then
+  fail "check refuses when a running proxy claims the same hostname" \
+    "exit 0 — a live collision was reported as healthy"
+else
+  pass "check refuses when a running proxy claims the same hostname"
+fi
+cp "$work/wt2-env.bak" "$wt2/.ddev/.env"
+(cd "$wt" && ddev hostshift check >/dev/null 2>&1) \
+  && pass "and passes again once the rival stops claiming it" \
+  || fail "and passes again once the rival stops claiming it" "$(cd "$wt" && ddev hostshift check 2>&1)"
+
 contains "the first worktree's variant still serves the first worktree" \
   "PROJECT=worktree HOST=$C" "$(get "https://$V/")"
 contains "the second worktree's variant serves the second worktree" \
@@ -396,7 +477,11 @@ if (cd "$wt" && ddev hostshift check --slug wt-z >/dev/null 2>&1); then
 else
   pass "check catches a slug the running proxy does not answer on"
 fi
-(cd "$wt" && ddev hostshift init >/dev/null 2>&1) || true
+# --slug-from-branch, because a slug passed to `init` is now recorded and sticks:
+# a bare `init` that silently reverted it was failing the post-start hook forever
+# on every deliberately-slugged project, and telling the developer to run the
+# command that undid their choice.
+(cd "$wt" && ddev hostshift init --slug-from-branch >/dev/null 2>&1) || true
 
 # The compose service is `restart: "no"`, so a proxy that dies stays dead while
 # `ddev start` has already returned success — which is how an image that parses
@@ -448,7 +533,7 @@ fi
 start_out="$(cd "$wt" && ddev start -y 2>&1)" || fail "the worktree starts again" "$start_out"
 contains "the hook names the variant on a cold start too" "https://$V" "$start_out"
 contains "and the variant serves the worktree again" "PROJECT=worktree HOST=$C" "$(get "https://$V/")"
-contains "with the request direction still in place" "HOST=$C" "$(get "https://$V/req.php")"
+contains "with the request direction still in place" "HOST=$C" "$(report "https://$V/req.php")"
 
 echo
 if [ "$fails" -gt 0 ]; then echo "$fails failure(s)"; exit 1; fi
