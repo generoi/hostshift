@@ -58,6 +58,7 @@ usage: ddev hostshift <command> [flags]
   --slug NAME         name this worktree's hostnames; recorded, and it sticks
   --slug-from-branch  forget a recorded slug and follow the branch again
   --dry-run, -n       say what would happen, write nothing
+  --no-restart        init: write the file and stop, for a pre-start hook
   --force             copy-db: overwrite a database that has tables
   --quiet, -q         say nothing when there is nothing to check
 USAGE
@@ -77,6 +78,7 @@ slug_explicit=""
 forget_slug=""
 branch=""
 dry_run=""
+no_restart=""
 force=""
 quiet=""
 claimed=""
@@ -96,6 +98,7 @@ while [ $# -gt 0 ]; do
     # naming is to hand-edit .ddev/.env.
     --slug-from-branch) forget_slug=1; shift ;;
     --dry-run|-n) dry_run=1; shift ;;
+    --no-restart) no_restart=1; shift ;;
     --quiet|-q) quiet=1; shift ;;
     --force) force=1; shift ;;
     # Silently discarding an unknown flag is how `--dry-run` came to write the
@@ -2896,6 +2899,14 @@ hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
 # Only when actually invoked through `ddev hostshift` — DDEV sets DDEV_APPROOT
 # for a host command, and nothing else does. Run directly, from a test or by
 # hand, init stays what it says on the tin: it writes a file.
+# --no-restart is for the pre-start hook, which is already inside the start it
+# would otherwise ask for: restarting there either deadlocks or loops. Everything
+# above this line has run, so the refusals and the warnings are the same ones a
+# hand-run init prints.
+if [ -n "$no_restart" ]; then
+  exit 0
+fi
+
 if [ -n "${DDEV_APPROOT:-}" ] && command -v ddev >/dev/null; then
   echo "hostshift: restarting to pick it up" >&2
   # Not `exec`: that hands the exit status to `ddev restart`, and DDEV does not

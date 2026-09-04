@@ -67,6 +67,39 @@
 # following DDEV's own advice arms the trap on a project that was fine. Nagging
 # on every start until the command is replaced is the proportionate answer.
 hooks:
+  # A worktree configures itself on its first start, so `ddev hostshift init` is
+  # not a step anyone has to know about. It ships here rather than in a file the
+  # project commits, for the reason the rest of this file is about: this one
+  # carries #ddev-generated and travels in the same tarball as the command it
+  # calls, so the two cannot drift. A committed bootstrap would be the one file
+  # `ddev add-on get` can never replace — which is exactly the shape of the two
+  # costliest upgrades this add-on has had.
+  #
+  # `init --no-restart`, never `env`. Every refusal that makes init safe is gated
+  # on the subcommand being init: the one that stops a worktree writing a map
+  # built from its own hostnames when the parent checkout cannot be read, and the
+  # note about hostnames inherited from the parent. `env` prints past all of
+  # them, and `check` would then agree with the result, because it recomputes the
+  # same thing.
+  #
+  # Only in a linked worktree. `.git` is a file there and a directory in the
+  # parent, and that is the distinction the whole design rests on — running this
+  # in the parent would write it a map of its own hostnames and take the
+  # canonical name the database holds.
+  #
+  # The guard is a HOSTSHIFT_ line, not the file existing. init writes through a
+  # temp file and a rename, so a failure leaves no file at all — but an operator
+  # who ran `: > .ddev/.env`, or any future writer that is not init, leaves an
+  # empty one, and `[ -f ]` would then skip the derive on every start while the
+  # post-start check short-circuits silently on the same file.
+  pre-start:
+    - exec-host: |
+        if [ -f .git ] && grep -q '/worktrees/' .git 2>/dev/null; then
+          grep -q '^HOSTSHIFT_' .ddev/.env 2>/dev/null || {
+            .ddev/commands/host/hostshift init --no-restart || true
+          }
+        fi
+
   post-start:
     - exec-host: |
         head -5 .ddev/commands/host/hostshift 2>/dev/null | grep -q '#ddev-generated' || {
