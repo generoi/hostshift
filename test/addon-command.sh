@@ -2899,6 +2899,74 @@ case "$hook" in
   *) fail "the shipped hook guards on a HOSTSHIFT_ line, not the file" "$hook" ;;
 esac
 
+# And run it. Asserting on the hook's *text* is how the post-start extraction
+# came to select the wrong block and still pass: three greps agreed with a string
+# nobody executed. DDEV runs a pre-start hook through `bash -c` from the approot,
+# the same way test 486 runs the post-start one.
+prehook="$(awk '
+  /^ *pre-start:/ { inpre = 1; next }
+  inpre && /^ *[a-z-]+:/ && !/^ *- / { exit }
+  inpre && /^ *- *exec-host: *\|/ { inblock = 1; next }
+  inblock && /^        / { sub(/^        /, ""); print; next }
+  inblock { exit }
+' "$repo/ddev/config.hostshift.yaml")"
+[ -n "$prehook" ] || fail "the pre-start hook body could not be read" ""
+
+# The hook invokes `.ddev/commands/host/hostshift`, which is where `ddev add-on
+# get` puts it. The harness runs the repo copy from elsewhere, so put one there.
+mkdir -p "$exw/.ddev/commands/host" "$ex/.ddev/commands/host"
+cp "$cmd" "$exw/.ddev/commands/host/hostshift"
+cp "$cmd" "$ex/.ddev/commands/host/hostshift"
+chmod +x "$exw/.ddev/commands/host/hostshift" "$ex/.ddev/commands/host/hostshift"
+
+rm -f "$exw/.ddev/.env"
+(cd "$exw" && bash -c "$prehook") >/dev/null 2>&1 || true
+if grep -q '^HOSTSHIFT_VARIANTS=' "$exw/.ddev/.env" 2>/dev/null; then
+  pass "the pre-start hook derives .ddev/.env when there is none"
+else
+  fail "the pre-start hook derives .ddev/.env when there is none" "no HOSTSHIFT_VARIANTS"
+fi
+
+# The empty file is the whole reason the guard is a HOSTSHIFT_ line rather than
+# `[ -f ]`, and nothing exercised it. An operator's `: > .ddev/.env`, or any
+# writer that is not init, must not disable the derive for every later start.
+: > "$exw/.ddev/.env"
+(cd "$exw" && bash -c "$prehook") >/dev/null 2>&1 || true
+if grep -q '^HOSTSHIFT_VARIANTS=' "$exw/.ddev/.env" 2>/dev/null; then
+  pass "an empty .ddev/.env is still derived, not skipped"
+else
+  fail "an empty .ddev/.env is still derived, not skipped" "left empty"
+fi
+
+# Configured already: the hook must be a no-op, or every start re-runs the
+# collision scan and re-derives hostnames after a branch switch.
+before="$(cat "$exw/.ddev/.env")"
+(cd "$exw" && bash -c "$prehook") >/dev/null 2>&1 || true
+if [ "$before" = "$(cat "$exw/.ddev/.env")" ]; then
+  pass "the pre-start hook is a no-op once configured"
+else
+  fail "the pre-start hook is a no-op once configured" "the file changed"
+fi
+
+# In the parent it must do nothing at all. This is the failure the gate exists
+# for: a self-map written to the one checkout whose canonical hostname the
+# database holds.
+rm -f "$ex/.ddev/.env"
+(cd "$ex" && bash -c "$prehook") >/dev/null 2>&1 || true
+if [ -e "$ex/.ddev/.env" ]; then
+  fail "the pre-start hook writes nothing in the parent" "it wrote .ddev/.env"
+else
+  pass "the pre-start hook writes nothing in the parent"
+fi
+
+# The temp file init writes must not be one DDEV will later hand to compose.
+# EnvFiles() globs .ddev/.env.* and passes each as a *later* --env-file, so a
+# leftover would outrank the file it was written to replace.
+case "$(grep -m1 'mktemp .ddev/' "$repo/ddev/commands/host/hostshift")" in
+  *".ddev/.env."*) fail "the env temp file is outside DDEV's .env.* glob" "matches .env.*" ;;
+  *) pass "the env temp file is outside DDEV's .env.* glob" ;;
+esac
+
 echo "== a proxy flag in HOSTSHIFT_ARGS survives check and init"
 
 # --max-body, --strict-origins, --compress and --no-sweep are real proxy flags

@@ -146,9 +146,12 @@ post_install_actions:
     # writes into .ddev/, and an add-on that edits a project's configuration
     # without being asked is how a surprise gets installed.
     echo
-    echo "hostshift installed. One step remains:"
+    echo "hostshift installed. Nothing else to run:"
     echo
-    echo "    ddev hostshift init"
+    echo "    ddev restart"
+    echo
+    echo "A worktree derives .ddev/.env on start. \`ddev hostshift init\` is still"
+    echo "how you change it — --slug, or re-deriving after a branch rename."
     echo
     echo "It works out the slug from the git branch and merges the HOSTSHIFT_*"
     echo "variables into .ddev/.env — the only file it writes. Then"

@@ -71,9 +71,13 @@ hooks:
   # not a step anyone has to know about. It ships here rather than in a file the
   # project commits, for the reason the rest of this file is about: this one
   # carries #ddev-generated and travels in the same tarball as the command it
-  # calls, so the two cannot drift. A committed bootstrap would be the one file
-  # `ddev add-on get` can never replace — which is exactly the shape of the two
-  # costliest upgrades this add-on has had.
+  # calls, so they upgrade together in the ordinary case. Not "cannot drift":
+  # DDEV will not replace the *command* on a project whose copy predates the
+  # marker, so a pre-marker worktree that was never configured runs this hook
+  # against a parser that exits 2 on `--no-restart`. The HOSTSHIFT_ guard covers
+  # every such project that was configured, because v0.1.0 wrote HOSTSHIFT_ lines
+  # too. A committed bootstrap would still be worse: it would be the one file
+  # `ddev add-on get` can never replace, in every client repo at once.
   #
   # `init --no-restart`, never `env`. Every refusal that makes init safe is gated
   # on the subcommand being init: the one that stops a worktree writing a map
@@ -96,7 +100,17 @@ hooks:
     - exec-host: |
         if [ -f .git ] && grep -q '/worktrees/' .git 2>/dev/null; then
           grep -q '^HOSTSHIFT_' .ddev/.env 2>/dev/null || {
-            .ddev/commands/host/hostshift init --no-restart || true
+            .ddev/commands/host/hostshift init --no-restart || {
+              # Not `|| true`. DDEV prints `Task failed:` on a non-zero hook and
+              # only aborts under fail_on_hook_fail, so swallowing the status
+              # swallowed the one marker that said anything went wrong — and
+              # when the derive refuses there is no .ddev/.env, so the
+              # post-start check exits 0 without a word. Exit 0 deliberately: a
+              # project running fail_on_hook_fail must still be able to start
+              # when init legitimately refuses.
+              echo "hostshift: could not configure this worktree." >&2
+              echo "  \`ddev hostshift init\` on its own says why." >&2
+            }
           }
         fi
 
