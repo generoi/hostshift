@@ -67,6 +67,68 @@
 # following DDEV's own advice arms the trap on a project that was fine. Nagging
 # on every start until the command is replaced is the proportionate answer.
 hooks:
+  # A worktree configures itself on its first start, so `ddev hostshift init` is
+  # not a step anyone has to know about. It ships here rather than in a file the
+  # project commits, for the reason the rest of this file is about: this one
+  # carries #ddev-generated and travels in the same tarball as the command it
+  # calls, so they upgrade together in the ordinary case. Not "cannot drift":
+  # DDEV will not replace the *command* on a project whose copy predates the
+  # marker, so a pre-marker worktree that was never configured runs this hook
+  # against a parser that exits 2 on `--no-restart`. The HOSTSHIFT_ guard covers
+  # every such project that was configured, because v0.1.0 wrote HOSTSHIFT_ lines
+  # too. A committed bootstrap would still be worse: it would be the one file
+  # `ddev add-on get` can never replace, in every client repo at once.
+  #
+  # `init --no-restart`, never `env`. Every refusal that makes init safe is gated
+  # on the subcommand being init: the one that stops a worktree writing a map
+  # built from its own hostnames when the parent checkout cannot be read, and the
+  # note about hostnames inherited from the parent. `env` prints past all of
+  # them, and `check` would then agree with the result, because it recomputes the
+  # same thing.
+  #
+  # Only in a linked worktree. `.git` is a file there and a directory in the
+  # parent, and that is the distinction the whole design rests on — running this
+  # in the parent would write it a map of its own hostnames and take the
+  # canonical name the database holds.
+  #
+  # The guard is a HOSTSHIFT_ line, not the file existing. init writes through a
+  # temp file and a rename, so a failure leaves no file at all — but an operator
+  # who ran `: > .ddev/.env`, or any future writer that is not init, leaves an
+  # empty one, and `[ -f ]` would then skip the derive on every start while the
+  # post-start check short-circuits silently on the same file.
+  pre-start:
+    - exec-host: |
+        if [ -f .git ] && grep -q '/worktrees/' .git 2>/dev/null; then
+          # `-r`, not `2>/dev/null` on the grep. Suppressing the error conflates
+          # "no HOSTSHIFT_ line" with "cannot read the file" — the exact
+          # distinction the command rejects `grep -qs` for. Unreadable means
+          # already-configured-but-broken, and `check` says so precisely a moment
+          # later; deriving over the top of it prints a raw `sed: Permission
+          # denied` first and re-derives a project that needs no deriving.
+          if [ -r .ddev/.env ] && grep -q '^HOSTSHIFT_' .ddev/.env; then
+            :
+          elif [ -e .ddev/.env ] && [ ! -r .ddev/.env ]; then
+            :
+          else
+            # The CLI is optional (install.yaml), and without it init cannot
+            # derive anything. Saying so once per start forever is noise on a
+            # project that may never want the CLI, so this is the one failure
+            # that stays quiet — `check` reports it a moment later either way.
+            command -v hostshift >/dev/null 2>&1 || exit 0
+            HOSTSHIFT_HOOK=1 .ddev/commands/host/hostshift init --no-restart || {
+              # Not `|| true`. DDEV prints `Task failed:` on a non-zero hook and
+              # only aborts under fail_on_hook_fail, so swallowing the status
+              # swallowed the one marker that said anything went wrong — and
+              # when the derive refuses there is no .ddev/.env, so the
+              # post-start check exits 0 without a word. Exit 0 deliberately: a
+              # project running fail_on_hook_fail must still be able to start
+              # when init legitimately refuses.
+              echo "hostshift: could not configure this worktree." >&2
+              echo "  \`ddev hostshift init\` on its own says why." >&2
+            }
+          fi
+        fi
+
   post-start:
     - exec-host: |
         head -5 .ddev/commands/host/hostshift 2>/dev/null | grep -q '#ddev-generated' || {

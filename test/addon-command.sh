@@ -460,8 +460,14 @@ check "init is idempotent" "$first" "$(cat "$wt/.ddev/.env")"
 # against every tag there is — a stub only proves what its author remembered.
 # The hook is a YAML block scalar now, so take the whole indented body rather
 # than one line after the key.
+# The post-start block specifically. This used to take the first exec-host in
+# the file, which was the same thing until a pre-start hook was added above it —
+# and then this silently tested the wrong hook, which is a test that asserts
+# nothing rather than one that fails.
 hook="$(awk '
-  /^ *- *exec-host: *\|/ { inblock = 1; next }
+  /^ *post-start:/ { inpost = 1; next }
+  inpost && /^ *[a-z-]+:/ && !/^ *- / { exit }
+  inpost && /^ *- *exec-host: *\|/ { inblock = 1; next }
   inblock && /^        / { sub(/^        /, ""); print; next }
   inblock { exit }
 ' "$repo/ddev/config.hostshift.yaml")"
@@ -488,18 +494,21 @@ for tag in $(cd "$repo" && git tag -l 'v*'); do
   # one line in an `add-on get` output is not enough, and DDEV itself tells
   # developers to strip the marker that keeps the command replaceable.
   #
-  # Only for a tag that is actually older. The loop takes every tag there is,
-  # and the newest one is usually the command in the working tree byte for byte
-  # — cutting a release is what makes that true. Such a copy is not stale and
-  # must not warn, so asserting the warning against it fails the moment a
-  # release is tagged, which is exactly when this suite most needs to be green.
-  # The discriminant is the bytes, not the version: a tag whose command differs
-  # from the current one is an old command, whatever it is called.
-  if cmp -s "$old_cmd" "$repo/ddev/commands/host/hostshift"; then
+  # The warning fires on one thing and one thing only: whether the command on
+  # disk carries #ddev-generated, because that is what DDEV tests before it will
+  # replace a file. So that is what decides which assertion applies.
+  #
+  # An earlier version of this compared the tag's command against the working
+  # tree's and treated "differs" as "old". That held while the only tags were
+  # v0.1.0 and the release the tree was on, and broke the moment a third existed:
+  # v0.2.1 and v0.2.2 differ from HEAD *and* carry the marker, so they neither
+  # warn nor should. Comparing bytes was a proxy for the property; this asks the
+  # property.
+  if head -5 "$old_cmd" | grep -q '#ddev-generated'; then
     case "$out" in
       *"predates this add-on"*)
-        fail "$tag's command is the current one and must not call itself stale" "$out" ;;
-      *) pass "$tag's command is the current one and does not call itself stale" ;;
+        fail "$tag's command carries the marker and must not call itself stale" "$out" ;;
+      *) pass "$tag's command carries the marker and does not call itself stale" ;;
     esac
     continue
   fi
@@ -578,14 +587,16 @@ check ".env keeps the mode it had" "-rw-------" \
 
 # The write goes through a temp file in .ddev/ so the mv is an atomic rename.
 # That temp file is only safe because of the EXIT trap: without it, every failed
-# init leaves a `.ddev/.env.XXXXXX` behind — a file DDEV's own .ddev/.gitignore
-# does not cover, so it shows up as an untracked file in the developer's repo,
-# holding whatever credentials .env held. chmod 000 makes the `cp -p` fail,
-# which is the failure path.
+# init leaves one behind, holding whatever credentials .env held. chmod 000 makes
+# the `cp -p` fail, which is the failure path.
+#
+# The glob has to track the template. It said `.env.??????` after the template
+# became `.hostshift-env.XXXXXX`, so it matched nothing and the assertion was
+# true however the code behaved — the trap could have been deleted outright.
 chmod 000 "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
 chmod 600 "$wt/.ddev/.env"
-leftover="$(ls "$wt"/.ddev/.env.?????? 2>/dev/null || true)"
+leftover="$(ls "$wt"/.ddev/.hostshift-env.?????? "$wt"/.ddev/.env.?????? 2>/dev/null || true)"
 if [ -n "$leftover" ]; then
   fail "a failed init leaves no temp file behind" "$leftover"
 else
@@ -2826,7 +2837,156 @@ out="$(cd "$exw" && DDEV_APPROOT="$exw" PATH="$work/failddev:$PATH" \
   "$cmd" init --slug wt-x 2>&1 || true)"
 contains "and says the env is written and the restart is what failed" \
   "the restart is what failed" "$out"
+echo "== --no-restart, which is what the pre-start hook runs"
+
+# The hook is inside the start it would otherwise ask for, so init must be able
+# to write the file and stop. Everything above the restart still runs, which is
+# the whole reason the hook calls `init --no-restart` rather than `env`: every
+# refusal that makes init safe is gated on the subcommand being init, and `env`
+# prints past all of them.
+rm -f "$exw/.ddev/.env"
+(cd "$exw" && DDEV_APPROOT="$exw" PATH="$work/failddev:$PATH" \
+  "$cmd" init --no-restart --slug wt-x >/dev/null 2>&1) && rc=0 || rc=$?
+[ "$rc" = 0 ] && pass "--no-restart exits 0 without restarting" \
+  || fail "--no-restart exits 0 without restarting" "exit $rc"
+if grep -q '^HOSTSHIFT_VARIANTS=' "$exw/.ddev/.env" 2>/dev/null; then
+  pass "--no-restart still writes the file"
+else
+  fail "--no-restart still writes the file" "no HOSTSHIFT_VARIANTS"
+fi
+
+# The refusal that stops a worktree writing a map of its own hostnames is
+# `[ "$cmd" = "init" ]`-gated. If --no-restart ever became its own subcommand,
+# or the hook were switched back to `env`, this is what would go quiet.
+rm -f "$exw/.ddev/.env"
+mv "$ex" "$ex.moved"
+out="$(cd "$exw" && "$cmd" init --no-restart --slug wt-x 2>&1 || true)"
+mv "$ex.moved" "$ex"
+contains "--no-restart keeps init's refusals" "refusing to write a map" "$out"
+if [ -e "$exw/.ddev/.env" ]; then
+  fail "a refused --no-restart writes nothing" "the file exists"
+else
+  pass "a refused --no-restart writes nothing"
+fi
+
+# Only now. Deleting the stub before the --no-restart block left that block
+# prepending a directory that no longer exists, so `command -v ddev` fell through
+# to the real binary: on a developer machine a regression in --no-restart would
+# have run an actual `ddev restart` from a suite the Makefile calls "no Docker
+# and no DDEV needed", and on CI the assertion passed whether or not the flag
+# did anything.
 rm -rf "$work/failddev"
+
+echo "== the pre-start hook only fires in a linked worktree"
+
+# `.git` is a file in a linked worktree and a directory in the parent. Running
+# the hook in the parent would write it a map of its own hostnames and take the
+# canonical name the database holds, so the gate is load-bearing rather than
+# tidiness.
+gate() {
+  [ -f "$1/.git" ] && grep -q '/worktrees/' "$1/.git" 2>/dev/null
+}
+gate "$exw" && pass "the gate fires in a worktree" \
+  || fail "the gate fires in a worktree" "$exw"
+gate "$ex" && fail "the gate must not fire in the parent" "$ex" \
+  || pass "the gate does not fire in the parent"
+
+# And the hook the add-on actually ships has to be the one just tested.
+hook="$(awk '/pre-start:/{f=1} f&&/exec-host/{g=1} g&&/^$/{exit} g' \
+  "$repo/ddev/config.hostshift.yaml")"
+case "$hook" in
+  *"init --no-restart"*) pass "the shipped hook calls init --no-restart" ;;
+  *) fail "the shipped hook calls init --no-restart" "$hook" ;;
+esac
+case "$hook" in
+  *"/worktrees/"*) pass "the shipped hook gates on a linked worktree" ;;
+  *) fail "the shipped hook gates on a linked worktree" "$hook" ;;
+esac
+case "$hook" in
+  *"grep -q '^HOSTSHIFT_'"*) pass "the shipped hook guards on a HOSTSHIFT_ line, not the file" ;;
+  *) fail "the shipped hook guards on a HOSTSHIFT_ line, not the file" "$hook" ;;
+esac
+
+# And run it. Asserting on the hook's *text* is how the post-start extraction
+# came to select the wrong block and still pass: three greps agreed with a string
+# nobody executed. DDEV runs a pre-start hook through `bash -c` from the approot,
+# the same way test 486 runs the post-start one.
+prehook="$(awk '
+  /^ *pre-start:/ { inpre = 1; next }
+  inpre && /^ *[a-z-]+:/ && !/^ *- / { exit }
+  inpre && /^ *- *exec-host: *\|/ { inblock = 1; next }
+  inblock && /^        / { sub(/^        /, ""); print; next }
+  inblock { exit }
+' "$repo/ddev/config.hostshift.yaml")"
+[ -n "$prehook" ] || fail "the pre-start hook body could not be read" ""
+
+# The hook invokes `.ddev/commands/host/hostshift`, which is where `ddev add-on
+# get` puts it. The harness runs the repo copy from elsewhere, so put one there.
+mkdir -p "$exw/.ddev/commands/host" "$ex/.ddev/commands/host"
+cp "$cmd" "$exw/.ddev/commands/host/hostshift"
+cp "$cmd" "$ex/.ddev/commands/host/hostshift"
+chmod +x "$exw/.ddev/commands/host/hostshift" "$ex/.ddev/commands/host/hostshift"
+
+rm -f "$exw/.ddev/.env"
+(cd "$exw" && bash -c "$prehook") >/dev/null 2>&1 || true
+if grep -q '^HOSTSHIFT_VARIANTS=' "$exw/.ddev/.env" 2>/dev/null; then
+  pass "the pre-start hook derives .ddev/.env when there is none"
+else
+  fail "the pre-start hook derives .ddev/.env when there is none" "no HOSTSHIFT_VARIANTS"
+fi
+
+# The empty file is the whole reason the guard is a HOSTSHIFT_ line rather than
+# `[ -f ]`, and nothing exercised it. An operator's `: > .ddev/.env`, or any
+# writer that is not init, must not disable the derive for every later start.
+: > "$exw/.ddev/.env"
+(cd "$exw" && bash -c "$prehook") >/dev/null 2>&1 || true
+if grep -q '^HOSTSHIFT_VARIANTS=' "$exw/.ddev/.env" 2>/dev/null; then
+  pass "an empty .ddev/.env is still derived, not skipped"
+else
+  fail "an empty .ddev/.env is still derived, not skipped" "left empty"
+fi
+
+# Configured already: the hook must be a no-op, or every start re-runs the
+# collision scan and re-derives hostnames after a branch switch.
+# Byte-equality of .ddev/.env is not the property: init is idempotent, so that
+# assertion passes with the guard deleted. What must be true is that the hook
+# does not *run* — no output, and every start otherwise pays for a collision
+# scan and a docker inspect.
+noop="$(cd "$exw" && bash -c "$prehook" 2>&1)" || true
+if [ -z "$noop" ]; then
+  pass "the pre-start hook is a no-op once configured"
+else
+  fail "the pre-start hook is a no-op once configured" "$noop"
+fi
+
+# In the parent it must do nothing at all. This is the failure the gate exists
+# for: a self-map written to the one checkout whose canonical hostname the
+# database holds.
+rm -f "$ex/.ddev/.env"
+(cd "$ex" && bash -c "$prehook") >/dev/null 2>&1 || true
+if [ -e "$ex/.ddev/.env" ]; then
+  fail "the pre-start hook writes nothing in the parent" "it wrote .ddev/.env"
+else
+  pass "the pre-start hook writes nothing in the parent"
+fi
+
+# The temp file init writes must not be one DDEV will later hand to compose.
+# EnvFiles() globs .ddev/.env.* and passes each as a *later* --env-file, so a
+# leftover would outrank the file it was written to replace.
+# Run it, do not read it. Grepping the source fails open twice over: no match
+# lands in the catch-all arm and passes, and `mktemp -p .ddev .env.XXXXXX`
+# reintroduces the bug while defeating the pattern. Hold the temp file open by
+# making the write fail, then look at what is on disk.
+chmod 000 "$exw/.ddev/.env"
+(cd "$exw" && "$cmd" init --slug wt-x >/dev/null 2>&1) || true
+chmod 644 "$exw/.ddev/.env"
+envglob="$(ls "$exw"/.ddev/.env.* 2>/dev/null || true)"
+if [ -n "$envglob" ]; then
+  fail "no temp file matches DDEV's .env.* glob" \
+    "$envglob would be passed to compose as a later --env-file"
+else
+  pass "no temp file matches DDEV's .env.* glob"
+fi
 
 echo "== a proxy flag in HOSTSHIFT_ARGS survives check and init"
 

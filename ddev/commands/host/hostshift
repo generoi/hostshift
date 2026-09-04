@@ -58,6 +58,7 @@ usage: ddev hostshift <command> [flags]
   --slug NAME         name this worktree's hostnames; recorded, and it sticks
   --slug-from-branch  forget a recorded slug and follow the branch again
   --dry-run, -n       say what would happen, write nothing
+  --no-restart        init: write the file and stop, for a pre-start hook
   --force             copy-db: overwrite a database that has tables
   --quiet, -q         say nothing when there is nothing to check
 USAGE
@@ -77,6 +78,7 @@ slug_explicit=""
 forget_slug=""
 branch=""
 dry_run=""
+no_restart=""
 force=""
 quiet=""
 claimed=""
@@ -96,6 +98,7 @@ while [ $# -gt 0 ]; do
     # naming is to hand-edit .ddev/.env.
     --slug-from-branch) forget_slug=1; shift ;;
     --dry-run|-n) dry_run=1; shift ;;
+    --no-restart) no_restart=1; shift ;;
     --quiet|-q) quiet=1; shift ;;
     --force) force=1; shift ;;
     # Silently discarding an unknown flag is how `--dry-run` came to write the
@@ -1284,7 +1287,17 @@ fi
 # `loopback` printed it on an already-restarted, entirely healthy worktree,
 # telling the developer their worktree was stealing a hostname it was not and
 # pointing them at remedial action they should not take.
-if [ -n "$parent_hosts" ] && [ "$cmd" = "init" ]; then
+# ...and not from the pre-start hook either, for the same reason one step further
+# on: the hook *is* a start. It would print "until `ddev restart`, those serve
+# this worktree" from inside the restart that hands them back, and on a
+# first-ever start nothing was ever serving them.
+#
+# HOSTSHIFT_HOOK, not `-z "$no_restart"`. The property is "I am inside a start",
+# and --no-restart is a public flag: run by hand it restarts nothing, so the
+# hostnames really do keep serving this worktree and the note is true. Keying on
+# the flag suppressed it for the one caller it is correct for. The post-start
+# hook already uses this variable for the same distinction.
+if [ -n "$parent_hosts" ] && [ "$cmd" = "init" ] && [ -z "${HOSTSHIFT_HOOK:-}" ]; then
   shared=""
   while IFS= read -r h; do
     [ -n "$h" ] || continue
@@ -2874,7 +2887,14 @@ touch .ddev/.env
 # In .ddev/ so the mv is a rename on one filesystem rather than a copy+unlink
 # across two, which is not atomic — a concurrent compose read must never catch
 # this half-written and see an empty VIRTUAL_HOST.
-tmp="$(mktemp .ddev/.env.XXXXXX)"
+# Not `.ddev/.env.XXXXXX`: DDEV globs `.ddev/.env.*` in EnvFiles() and passes
+# each one to compose as a *later* `--env-file`, so a leftover temp would
+# override the real file rather than be ignored — and the exclude block names
+# `.ddev/.env` exactly, so it would show up in `git status` too. This spelling
+# dodges the glob and falls inside the `.ddev/**/*hostshift*` rule. The EXIT trap
+# still removes it; the point is that a start killed mid-write leaves nothing
+# that can outrank the file it was writing.
+tmp="$(mktemp .ddev/.hostshift-env.XXXXXX)"
 trap 'rm -f "$tmp"' EXIT
 # cp -p first, then truncate: that gives the temp file the mode the real one
 # already had, and redirection keeps it. .ddev/.env is where DDEV documents
@@ -2896,6 +2916,14 @@ hostshift map --slug "$slug" "${map_args[@]+"${map_args[@]}"}" >&2
 # Only when actually invoked through `ddev hostshift` — DDEV sets DDEV_APPROOT
 # for a host command, and nothing else does. Run directly, from a test or by
 # hand, init stays what it says on the tin: it writes a file.
+# --no-restart is for the pre-start hook, which is already inside the start it
+# would otherwise ask for: restarting there either deadlocks or loops. Everything
+# above this line has run, so the refusals and the warnings are the same ones a
+# hand-run init prints.
+if [ -n "$no_restart" ]; then
+  exit 0
+fi
+
 if [ -n "${DDEV_APPROOT:-}" ] && command -v ddev >/dev/null; then
   echo "hostshift: restarting to pick it up" >&2
   # Not `exec`: that hands the exit status to `ddev restart`, and DDEV does not

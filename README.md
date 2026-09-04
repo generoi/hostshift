@@ -111,15 +111,19 @@ twice.
 A local clone still works if you are developing the add-on itself:
 `ddev add-on get ~/src/hostshift/ddev`.
 
-Then, in the worktree, one command:
+Then `ddev start`. A worktree configures itself: a pre-start hook derives
+`.ddev/.env` before compose reads it, so there is nothing to run and nothing to
+remember. It writes exactly one file and prints the map it resolved.
 
-```
-ddev hostshift init
-```
+`ddev hostshift init` still exists and is still the way to *change* that —
+`--slug`, or re-deriving after a branch rename. It writes the same file and then
+restarts to pick it up. `--no-restart` writes and stops, which is what the hook
+runs.
 
-It writes exactly one file, `.ddev/.env`, and nothing else — then restarts the
-project to pick it up, and prints the URLs it is serving. That is the whole
-required path.
+The hook fires only in a linked worktree, and only when `.ddev/.env` carries no
+`HOSTSHIFT_` line, so it is a no-op on every later start. One thing it cannot do
+that `init` can: set the exit status. `ddev start` exits 0 whatever `check`
+finds, so a script that wants a status must run `ddev hostshift check` itself.
 
 ### Worked example
 
@@ -131,14 +135,17 @@ DDEV project of its own with nothing configured.
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
 $ ddev add-on get https://github.com/generoi/hostshift/releases/latest/download/hostshift-ddev.tar.gz
-$ ddev hostshift init
+$ ddev start
 hostshift: slug "wt-a", from the git branch wt-a
 hostshift: canonical hostnames from /Users/you/Projects/acme, the checkout this was made from
 hostshift: wrote .ddev/.env
 map from --from/--to
 site1  https://acme.ddev.site  ->  https://wt-a--acme.ddev.site
-hostshift: restarting to pick it up
 ```
+
+The hostshift lines come from a pre-start hook, which runs before compose reads
+`.ddev/.env` — so the project comes up already serving the variant. There is no
+second start.
 
 Nothing was committed and no map was declared. The hostnames the database holds
 are the **parent checkout's** — whatever pulled it search-replaced to
@@ -167,8 +174,8 @@ You do not need to gitignore it. Installing the add-on adds its files to
 the ignore travels with the machine rather than with the branch. Removing the
 add-on takes the entry back out.
 
-After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
-`https://acme.ddev.site` goes on serving the parent.
+That first `ddev start` is the only one needed: `https://wt-a--acme.ddev.site`
+serves the worktree and `https://acme.ddev.site` goes on serving the parent.
 
 ### What happens by itself
 
@@ -184,8 +191,10 @@ After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
   to the worktree's own hostnames. DDEV derives `name` from the directory but
   not `additional_hostnames`, so a worktree inherits the parent's extra
   hostnames verbatim and — traefik breaking the tie by rule length — silently
-  wins them from its first `ddev start` until the next restart. `init` says so
-  when it sees the overlap. Upstream: [ddev/ddev#5486][].
+  wins them from its first `ddev start` until the next restart. `check` says so
+  on every start while the overlap lasts — the pre-start hook deliberately does
+  not, because its remedy is "run `ddev restart`" and the hook is inside one.
+  Upstream: [ddev/ddev#5486][].
 - **Staleness.** A `post-start` hook runs `ddev hostshift check` on every
   `ddev start`, prints what is being served, and says so when `.ddev/.env` no
   longer matches what the project resolves to — which happens on its own, since
@@ -261,7 +270,7 @@ $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
 $ printf '#ddev-silent-no-warn\nname: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
 $ ddev add-on get https://github.com/generoi/hostshift/releases/latest/download/hostshift-ddev.tar.gz
-$ ddev hostshift init
+$ ddev start
 ```
 
 The name only has to be unique; hostshift derives the preview hostnames from the
@@ -450,7 +459,10 @@ hostshift diff      crawl a site two ways and compare, to verify a deployment
 ```
 
 ```
-ddev hostshift init      write .ddev/.env         (required, per worktree)
+ddev hostshift init      write .ddev/.env         (automatic on start; run it
+                                                   to change --slug, or after a
+                                                   branch rename)
+  --no-restart           write it and stop          (what the pre-start hook runs)
 ddev hostshift check     is the deployed map still current  (also the post-start hook)
 ddev hostshift copy-db   copy the parent checkout's database into this worktree
                          (refuses to overwrite a non-empty one without --force)

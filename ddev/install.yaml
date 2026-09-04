@@ -146,14 +146,24 @@ post_install_actions:
     # writes into .ddev/, and an add-on that edits a project's configuration
     # without being asked is how a surprise gets installed.
     echo
-    echo "hostshift installed. One step remains:"
+    echo "hostshift installed."
+    echo
+    echo "In a git worktree, run:"
+    echo
+    echo "    ddev restart"
+    echo
+    echo "A pre-start hook works the slug out from the git branch and writes the"
+    echo "HOSTSHIFT_* variables into .ddev/.env — the only file it writes —"
+    echo "before compose reads it, so one start is enough."
+    echo
+    echo "Anywhere else — the parent checkout, or a project mapping production"
+    echo "hostnames — the hook does not fire and there is one step:"
     echo
     echo "    ddev hostshift init"
     echo
-    echo "It works out the slug from the git branch and merges the HOSTSHIFT_*"
-    echo "variables into .ddev/.env — the only file it writes. Then"
-    echo "'ddev restart', which prints the URLs it is serving. Pass --dry-run"
-    echo "first to see what it would write, or --slug to name it yourself."
+    echo "That is also how you change a worktree's map afterwards: --slug to name"
+    echo "it yourself, --slug-from-branch after a rename, --dry-run to see what"
+    echo "it would write."
     echo
     echo "Two things it cannot do for you:"
     echo
