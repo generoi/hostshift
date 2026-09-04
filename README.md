@@ -99,6 +99,28 @@ Install the add-on once per project, from the release:
 ddev add-on get https://github.com/generoi/hostshift/releases/latest/download/hostshift-ddev.tar.gz
 ```
 
+**Per project means per worktree, and a worktree does not inherit the parent's
+add-ons.** There is no way around this and it is not an oversight of ours: DDEV
+assembles a project's services by globbing `docker-compose.*.yaml` in *that
+project's* `.ddev/` (`ComposeFiles()`), and it has no global compose file and no
+global hooks. A `git worktree` is a separate working directory, so it gets its
+own empty `.ddev/`. Only the host command could be shared, via
+`~/.ddev/commands/`, and that is one file of the three.
+
+**The parent checkout usually should not have it.** The service takes its routing
+from `VIRTUAL_HOST: ${HOSTSHIFT_VARIANTS:-}`, which is empty where nothing was
+configured — so an add-on installed in the parent starts a proxy the router sends
+nothing to. It does no harm; it is a container for no reason. The pre-start hook
+does not fire there either, because it gates on a linked worktree.
+
+The exception is a parent that needs a map of its own — a production-canonical
+database, where `wp_blogs` holds the live hostnames and even the main checkout
+has to be mapped to be browsable at `.ddev.site`. Then it is an ordinary
+hostshift project and `ddev hostshift init` configures it like any other.
+
+Installing anywhere in the checkout is enough for the *ignore*: `install.yaml`
+writes to `$GIT_COMMON_DIR/info/exclude`, which linked worktrees share.
+
 `ddev add-on get generoi/hostshift` does **not** work, and the reason is worth
 stating rather than leaving you to discover: DDEV expects `install.yaml` at the
 repository root, and hostshift keeps its add-on under `ddev/` because the root is
