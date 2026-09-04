@@ -166,9 +166,22 @@ installaddon "$wt"
 
 projects+=("$main" "$wt")
 out="$(cd "$main" && ddev start -y 2>&1)" || fail "the parent starts" "$out"
-out="$(cd "$wt" && ddev hostshift init 2>&1)" || fail "init succeeds in the worktree" "$out"
+
+# No `ddev hostshift init` here, deliberately. The pre-start hook derives
+# .ddev/.env, and the claim that it lands before compose reads the file is a
+# claim about DDEV's ordering inside Start() — which only a real `ddev start`
+# can test. Running init first made the hook a no-op in every integration case,
+# so the feature had coverage nowhere: the shell logic is exercised in
+# addon-command.sh through `bash -c`, and that proves nothing about when DDEV
+# runs it. If DDEV ever moves ProcessHooks after WriteDockerComposeYAML, this is
+# the test that goes red.
+[ -e "$wt/.ddev/.env" ] && fail "the worktree starts unconfigured" "already has .ddev/.env"
 
 start_out="$(cd "$wt" && ddev start -y 2>&1)" || fail "the worktree starts" "$start_out"
+
+grep -q '^HOSTSHIFT_VARIANTS=' "$wt/.ddev/.env" 2>/dev/null \
+  && pass "ddev start alone configures the worktree" \
+  || fail "ddev start alone configures the worktree" "no HOSTSHIFT_VARIANTS in .ddev/.env"
 
 # The hook ran, and did not blow up. Exit 127 here was invisible to every other
 # test in the repo.

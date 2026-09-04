@@ -587,14 +587,16 @@ check ".env keeps the mode it had" "-rw-------" \
 
 # The write goes through a temp file in .ddev/ so the mv is an atomic rename.
 # That temp file is only safe because of the EXIT trap: without it, every failed
-# init leaves a `.ddev/.env.XXXXXX` behind — a file DDEV's own .ddev/.gitignore
-# does not cover, so it shows up as an untracked file in the developer's repo,
-# holding whatever credentials .env held. chmod 000 makes the `cp -p` fail,
-# which is the failure path.
+# init leaves one behind, holding whatever credentials .env held. chmod 000 makes
+# the `cp -p` fail, which is the failure path.
+#
+# The glob has to track the template. It said `.env.??????` after the template
+# became `.hostshift-env.XXXXXX`, so it matched nothing and the assertion was
+# true however the code behaved — the trap could have been deleted outright.
 chmod 000 "$wt/.ddev/.env"
 (cd "$wt" && "$cmd" init --slug wt-a >/dev/null 2>&1) || true
 chmod 600 "$wt/.ddev/.env"
-leftover="$(ls "$wt"/.ddev/.env.?????? 2>/dev/null || true)"
+leftover="$(ls "$wt"/.ddev/.hostshift-env.?????? "$wt"/.ddev/.env.?????? 2>/dev/null || true)"
 if [ -n "$leftover" ]; then
   fail "a failed init leaves no temp file behind" "$leftover"
 else
@@ -2835,8 +2837,6 @@ out="$(cd "$exw" && DDEV_APPROOT="$exw" PATH="$work/failddev:$PATH" \
   "$cmd" init --slug wt-x 2>&1 || true)"
 contains "and says the env is written and the restart is what failed" \
   "the restart is what failed" "$out"
-rm -rf "$work/failddev"
-
 echo "== --no-restart, which is what the pre-start hook runs"
 
 # The hook is inside the start it would otherwise ask for, so init must be able
@@ -2868,6 +2868,14 @@ if [ -e "$exw/.ddev/.env" ]; then
 else
   pass "a refused --no-restart writes nothing"
 fi
+
+# Only now. Deleting the stub before the --no-restart block left that block
+# prepending a directory that no longer exists, so `command -v ddev` fell through
+# to the real binary: on a developer machine a regression in --no-restart would
+# have run an actual `ddev restart` from a suite the Makefile calls "no Docker
+# and no DDEV needed", and on CI the assertion passed whether or not the flag
+# did anything.
+rm -rf "$work/failddev"
 
 echo "== the pre-start hook only fires in a linked worktree"
 
@@ -2940,12 +2948,15 @@ fi
 
 # Configured already: the hook must be a no-op, or every start re-runs the
 # collision scan and re-derives hostnames after a branch switch.
-before="$(cat "$exw/.ddev/.env")"
-(cd "$exw" && bash -c "$prehook") >/dev/null 2>&1 || true
-if [ "$before" = "$(cat "$exw/.ddev/.env")" ]; then
+# Byte-equality of .ddev/.env is not the property: init is idempotent, so that
+# assertion passes with the guard deleted. What must be true is that the hook
+# does not *run* — no output, and every start otherwise pays for a collision
+# scan and a docker inspect.
+noop="$(cd "$exw" && bash -c "$prehook" 2>&1)" || true
+if [ -z "$noop" ]; then
   pass "the pre-start hook is a no-op once configured"
 else
-  fail "the pre-start hook is a no-op once configured" "the file changed"
+  fail "the pre-start hook is a no-op once configured" "$noop"
 fi
 
 # In the parent it must do nothing at all. This is the failure the gate exists
@@ -2962,10 +2973,20 @@ fi
 # The temp file init writes must not be one DDEV will later hand to compose.
 # EnvFiles() globs .ddev/.env.* and passes each as a *later* --env-file, so a
 # leftover would outrank the file it was written to replace.
-case "$(grep -m1 'mktemp .ddev/' "$repo/ddev/commands/host/hostshift")" in
-  *".ddev/.env."*) fail "the env temp file is outside DDEV's .env.* glob" "matches .env.*" ;;
-  *) pass "the env temp file is outside DDEV's .env.* glob" ;;
-esac
+# Run it, do not read it. Grepping the source fails open twice over: no match
+# lands in the catch-all arm and passes, and `mktemp -p .ddev .env.XXXXXX`
+# reintroduces the bug while defeating the pattern. Hold the temp file open by
+# making the write fail, then look at what is on disk.
+chmod 000 "$exw/.ddev/.env"
+(cd "$exw" && "$cmd" init --slug wt-x >/dev/null 2>&1) || true
+chmod 644 "$exw/.ddev/.env"
+envglob="$(ls "$exw"/.ddev/.env.* 2>/dev/null || true)"
+if [ -n "$envglob" ]; then
+  fail "no temp file matches DDEV's .env.* glob" \
+    "$envglob would be passed to compose as a later --env-file"
+else
+  pass "no temp file matches DDEV's .env.* glob"
+fi
 
 echo "== a proxy flag in HOSTSHIFT_ARGS survives check and init"
 

@@ -1290,10 +1290,14 @@ fi
 # ...and not from the pre-start hook either, for the same reason one step further
 # on: the hook *is* a start. It would print "until `ddev restart`, those serve
 # this worktree" from inside the restart that hands them back, and on a
-# first-ever start nothing was ever serving them. The refusals below still run
-# under --no-restart; this note is the one thing that does not, because its
-# remedy is the very command that is already happening.
-if [ -n "$parent_hosts" ] && [ "$cmd" = "init" ] && [ -z "$no_restart" ]; then
+# first-ever start nothing was ever serving them.
+#
+# HOSTSHIFT_HOOK, not `-z "$no_restart"`. The property is "I am inside a start",
+# and --no-restart is a public flag: run by hand it restarts nothing, so the
+# hostnames really do keep serving this worktree and the note is true. Keying on
+# the flag suppressed it for the one caller it is correct for. The post-start
+# hook already uses this variable for the same distinction.
+if [ -n "$parent_hosts" ] && [ "$cmd" = "init" ] && [ -z "${HOSTSHIFT_HOOK:-}" ]; then
   shared=""
   while IFS= read -r h; do
     [ -n "$h" ] || continue

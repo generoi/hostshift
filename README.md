@@ -174,8 +174,8 @@ You do not need to gitignore it. Installing the add-on adds its files to
 the ignore travels with the machine rather than with the branch. Removing the
 add-on takes the entry back out.
 
-After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
-`https://acme.ddev.site` goes on serving the parent.
+That first `ddev start` is the only one needed: `https://wt-a--acme.ddev.site`
+serves the worktree and `https://acme.ddev.site` goes on serving the parent.
 
 ### What happens by itself
 
@@ -191,8 +191,10 @@ After `ddev restart`, `https://wt-a--acme.ddev.site` serves the worktree and
   to the worktree's own hostnames. DDEV derives `name` from the directory but
   not `additional_hostnames`, so a worktree inherits the parent's extra
   hostnames verbatim and — traefik breaking the tie by rule length — silently
-  wins them from its first `ddev start` until the next restart. `init` says so
-  when it sees the overlap. Upstream: [ddev/ddev#5486][].
+  wins them from its first `ddev start` until the next restart. `check` says so
+  on every start while the overlap lasts — the pre-start hook deliberately does
+  not, because its remedy is "run `ddev restart`" and the hook is inside one.
+  Upstream: [ddev/ddev#5486][].
 - **Staleness.** A `post-start` hook runs `ddev hostshift check` on every
   `ddev start`, prints what is being served, and says so when `.ddev/.env` no
   longer matches what the project resolves to — which happens on its own, since

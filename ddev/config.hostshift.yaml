@@ -99,8 +99,23 @@ hooks:
   pre-start:
     - exec-host: |
         if [ -f .git ] && grep -q '/worktrees/' .git 2>/dev/null; then
-          grep -q '^HOSTSHIFT_' .ddev/.env 2>/dev/null || {
-            .ddev/commands/host/hostshift init --no-restart || {
+          # `-r`, not `2>/dev/null` on the grep. Suppressing the error conflates
+          # "no HOSTSHIFT_ line" with "cannot read the file" — the exact
+          # distinction the command rejects `grep -qs` for. Unreadable means
+          # already-configured-but-broken, and `check` says so precisely a moment
+          # later; deriving over the top of it prints a raw `sed: Permission
+          # denied` first and re-derives a project that needs no deriving.
+          if [ -r .ddev/.env ] && grep -q '^HOSTSHIFT_' .ddev/.env; then
+            :
+          elif [ -e .ddev/.env ] && [ ! -r .ddev/.env ]; then
+            :
+          else
+            # The CLI is optional (install.yaml), and without it init cannot
+            # derive anything. Saying so once per start forever is noise on a
+            # project that may never want the CLI, so this is the one failure
+            # that stays quiet — `check` reports it a moment later either way.
+            command -v hostshift >/dev/null 2>&1 || exit 0
+            HOSTSHIFT_HOOK=1 .ddev/commands/host/hostshift init --no-restart || {
               # Not `|| true`. DDEV prints `Task failed:` on a non-zero hook and
               # only aborts under fail_on_hook_fail, so swallowing the status
               # swallowed the one marker that said anything went wrong — and
@@ -111,7 +126,7 @@ hooks:
               echo "hostshift: could not configure this worktree." >&2
               echo "  \`ddev hostshift init\` on its own says why." >&2
             }
-          }
+          fi
         fi
 
   post-start:
