@@ -93,19 +93,23 @@ hostname, so a branch can be previewed without a database of its own.
 checkout goes on serving `acme.ddev.site` untouched. Whatever pulls the
 database keeps its search-replace; nothing about a normal pull changes.
 
-Install the add-on once per project, from a clone of this repository:
+Install the add-on once per project, from the release:
 
 ```
-git clone git@github.com:generoi/hostshift.git ~/src/hostshift   # once, anywhere
-ddev add-on get ~/src/hostshift/ddev                             # per project
+ddev add-on get https://github.com/generoi/hostshift/releases/latest/download/hostshift-ddev.tar.gz
 ```
 
-`ddev add-on get generoi/hostshift` does **not** work, for two reasons worth
-stating rather than leaving you to discover: the repository is private, so
-DDEV's registry lookup 404s; and DDEV expects `install.yaml` at the repository
-root while hostshift keeps its add-on under `ddev/`, so even with
-`DDEV_GITHUB_TOKEN` set the download fails with `Unable to read … install.yaml`.
-The path form above is the supported one today.
+`ddev add-on get generoi/hostshift` does **not** work, and the reason is worth
+stating rather than leaving you to discover: DDEV expects `install.yaml` at the
+repository root, and hostshift keeps its add-on under `ddev/` because the root is
+a Go module. The download fails with `Unable to read … install.yaml`. The release
+carries a tarball in the shape DDEV wants instead, which also pins the add-on to
+a version rather than to whatever `master` happens to be — the add-on and the
+published image have to agree about flags, and that skew has broken every project
+twice.
+
+A local clone still works if you are developing the add-on itself:
+`ddev add-on get ~/src/hostshift/ddev`.
 
 Then, in the worktree, one command:
 
@@ -126,7 +130,7 @@ DDEV project of its own with nothing configured.
 ```console
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
-$ ddev add-on get ~/src/hostshift/ddev
+$ ddev add-on get https://github.com/generoi/hostshift/releases/latest/download/hostshift-ddev.tar.gz
 $ ddev hostshift init
 hostshift: slug "wt-a", from the git branch wt-a
 hostshift: canonical hostnames from /Users/you/Projects/acme, the checkout this was made from
@@ -243,7 +247,7 @@ Most do. A worktree inherits the tracked `.ddev/config.yaml`, so it inherits the
 name, and DDEV refuses before hostshift is involved:
 
 ```console
-$ ddev add-on get ~/src/hostshift/ddev
+$ ddev add-on get https://github.com/generoi/hostshift/releases/latest/download/hostshift-ddev.tar.gz
 Unable to get project : a project (web container) in running state already
 exists for acme that was created at /Users/you/Projects/acme
 ```
@@ -256,7 +260,7 @@ canonical hostname, the one the database holds, stops resolving.
 $ git worktree add ../acme-wt-a -b wt-a
 $ cd ../acme-wt-a
 $ printf '#ddev-silent-no-warn\nname: acme-wt-a\n' > .ddev/config.hostshift-name.yaml
-$ ddev add-on get ~/src/hostshift/ddev
+$ ddev add-on get https://github.com/generoi/hostshift/releases/latest/download/hostshift-ddev.tar.gz
 $ ddev hostshift init
 ```
 
@@ -313,6 +317,31 @@ the worktree, then `ddev restart`:
 web_environment:
   - DATABASE_URL=mysql://db:db@ddev-acme-db:3306/db
 ```
+
+**Uploads are separate, and optional.** A shared database references files the
+worktree does not have. A browser is usually fine — many repos ship an nginx
+rule that 302s a missing `/app/uploads/` to production, and hostshift passes
+that through. What it cannot do is serve a file to *PHP*: a template calling
+`file_get_contents()` on an upload fatals, which is a 500 rather than a missing
+image. Mount the parent's when you need that:
+
+```yaml
+# .ddev/docker-compose.uploads.yaml
+services:
+  web:
+    volumes:
+      # Relative to THIS file's directory, `.ddev/` — so two levels up to reach
+      # a sibling checkout, not one. `../acme/…` silently mounts an empty
+      # directory and the failure looks like missing uploads, not a wrong path.
+      - "../../acme/web/app/uploads:/var/www/html/web/app/uploads:ro"
+```
+
+Read-only is deliberate: an upload made in the worktree then writes its row to
+the shared database while the file goes nowhere.
+
+**The worktree also needs any gitignored config the parent has** — `.env` most
+often, since a plugin reading a missing key fatals the same way. `cp
+../acme/.env .` if there is one; not every site has one.
 
 Every DDEV container is already on `ddev_default`, so the parent's database
 container resolves by name with nothing else configured. Note that a shared

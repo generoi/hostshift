@@ -99,7 +99,29 @@ jobs:
           go-version: '1.26'
           cache: true
       - run: make dist VERSION=${{ github.ref_name }}
+
+      # The DDEV add-on, as a tarball DDEV can install straight from the release.
+      #
+      # `ddev add-on get generoi/hostshift` cannot work: DDEV expects install.yaml
+      # at the repository root and this one lives under ddev/, because the root is
+      # a Go module. Rather than move it there, ship the shape DDEV wants.
+      #
+      # A single wrapper directory is required — DDEV descends into the tarball's
+      # first top-level entry, the way GitHub's own source tarballs are laid out.
+      # Files at the root make it look for `commands/install.yaml` and fail.
+      # COPYFILE_DISABLE is a macOS concern only, but the same class of thing:
+      # AppleDouble `._` entries break the descent too.
+      - name: package the DDEV add-on
+        run: |
+          set -eu
+          mkdir -p dist/pkg/hostshift-ddev
+          cp -R ddev/. dist/pkg/hostshift-ddev/
+          tar czf dist/hostshift-ddev.tar.gz -C dist/pkg hostshift-ddev
+          tar tzf dist/hostshift-ddev.tar.gz | head -3
+
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/hostshift-*
+          files: |
+            dist/hostshift-*
+            dist/hostshift-ddev.tar.gz
           generate_release_notes: true
