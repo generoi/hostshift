@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
@@ -61,6 +62,7 @@ no knowledge of any CMS. That work is opinionated and belongs to whatever knows
 the stack — for DDEV, the add-on, as "ddev hostshift".
 
   -C dir        project directory (default ".")
+  --file path   the hostshift.yaml to read instead of the project's; - is stdin
   --slug        derive each variant by prefixing the leftmost label of its
                 canonical host
   --upstream    upstream base URL, e.g. http://web:80
@@ -71,6 +73,15 @@ the stack — for DDEV, the add-on, as "ddev hostshift".
 // does not exist is silently ignored, so the binary would have reported nothing
 // and no build would have failed.
 var version = "dev"
+
+// `go install …@v0.3.0`, the README's other install path, sets no -X flag but
+// does record the module version, so a caller checking for a minimum version
+// gets a real answer rather than "dev".
+func init() {
+	if bi, ok := debug.ReadBuildInfo(); ok && version == "dev" && strings.HasPrefix(bi.Main.Version, "v") {
+		version = bi.Main.Version
+	}
+}
 
 // exit codes, per PLAN §5.8
 const (
@@ -187,12 +198,15 @@ func (p pairFlag) Set(v string) error {
 // common holds the flags every map-using subcommand shares.
 type common struct {
 	dir            string
+	file           string
 	slug, upstream string
 	from, to       repeatable
+	anyVariant     bool
 }
 
 func (c *common) register(fs *flag.FlagSet) {
 	fs.StringVar(&c.dir, "C", ".", "project directory")
+	fs.StringVar(&c.file, "file", "", "hostshift.yaml to read instead of the project's; - reads it from stdin")
 	fs.StringVar(&c.slug, "slug", "", "worktree slug used to derive variant hosts")
 	fs.StringVar(&c.upstream, "upstream", "", "upstream base URL, e.g. http://web:80")
 	fs.Var(&c.from, "from", "canonical origin, repeatable, index-aligned with --to")
@@ -202,10 +216,12 @@ func (c *common) register(fs *flag.FlagSet) {
 
 func (c *common) load() (*config.Resolved, error) {
 	return config.Load(c.dir, config.Flags{
-		Upstream: c.upstream,
-		Slug:     c.slug,
-		From:     c.from,
-		To:       c.to,
+		Upstream:        c.upstream,
+		Slug:            c.slug,
+		From:            c.from,
+		To:              c.to,
+		File:            c.file,
+		VariantOptional: c.anyVariant,
 	})
 }
 
@@ -249,6 +265,9 @@ func cmdRewrite(args []string) (int, error) {
 	rwExtra, err := proxy.ParseTypes(rwTypes)
 	if err != nil {
 		return exitConfig, err
+	}
+	if c.file == "-" {
+		return exitConfig, errors.New("--file -: stdin is the body this command rewrites; name the file instead")
 	}
 	res, err := c.load()
 	if err != nil {
@@ -556,6 +575,7 @@ func cmdProxy(args []string) (int, error) {
 func cmdHosts(args []string) (int, error) {
 	fs := flag.NewFlagSet("hosts", flag.ContinueOnError)
 	dir := fs.String("C", ".", "project directory")
+	asJSON := fs.Bool("json", false, "emit the hostnames as a JSON array")
 	if describe(fs, args, "print the hostnames a project declares, one per line") {
 		return exitOK, nil
 	}
@@ -578,6 +598,12 @@ func cmdHosts(args []string) (int, error) {
 		if _, err := origin.Parse("https://" + h); err != nil {
 			return exitConfig, fmt.Errorf("%s declares %q, which is not a hostname: %w", ddev.Path(*dir), h, err)
 		}
+	}
+	if *asJSON {
+		if err := json.NewEncoder(os.Stdout).Encode(proj.Hosts); err != nil {
+			return exitRuntime, err
+		}
+		return exitOK, nil
 	}
 	for _, h := range proj.Hosts {
 		fmt.Println(h)
@@ -644,6 +670,9 @@ func cmdMap(args []string) (int, error) {
 	if err := fs.Parse(args); err != nil {
 		return exitConfig, nil
 	}
+	// A listing of the sites needs no slug: without one each site is printed
+	// with no variant, and the map is not validated as one.
+	c.anyVariant = *asJSON
 	res, err := c.load()
 	if err != nil {
 		return exitConfig, err
@@ -703,16 +732,27 @@ func cmdMap(args []string) (int, error) {
 		type site struct {
 			Name      string   `json:"name"`
 			Canonical string   `json:"canonical"`
+			Base      string   `json:"base,omitempty"`
 			Aliases   []string `json:"aliases,omitempty"`
-			Variant   string   `json:"variant"`
+			Variant   string   `json:"variant,omitempty"`
 		}
-		out := make([]site, 0, len(res.Map.Sites))
+		out := struct {
+			Layer  string `json:"layer"`
+			Source string `json:"source"`
+			Sites  []site `json:"sites"`
+		}{Layer: res.Layer, Source: res.Source, Sites: make([]site, 0, len(res.Map.Sites))}
+		str := func(o origin.Origin) string {
+			if o.Host == "" {
+				return ""
+			}
+			return o.String()
+		}
 		for _, s := range res.Map.Sites {
-			e := site{Name: s.Name, Canonical: s.Canonical.String(), Variant: s.Variant.String()}
+			e := site{Name: s.Name, Canonical: s.Canonical.String(), Base: str(s.Base), Variant: str(s.Variant)}
 			for _, a := range s.Aliases {
 				e.Aliases = append(e.Aliases, a.String())
 			}
-			out = append(out, e)
+			out.Sites = append(out.Sites, e)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")

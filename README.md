@@ -334,6 +334,56 @@ In a worktree, run `ddev hostshift check` rather than the bare one. The bare
 command resolves *this* checkout's hostnames — not the ones the database holds
 — and reports that map as valid.
 
+### Reading the map from a program
+
+`hostshift map --json` prints the resolved sites, and says which layer they
+came from — `file`, `ddev` or `flags` — and where:
+
+```console
+$ git show origin/master:hostshift.yaml | hostshift map --json --file -
+{
+  "layer": "file",
+  "source": "stdin",
+  "sites": [
+    {
+      "name": "main",
+      "canonical": "https://www.example.com",
+      "base": "https://acme.ddev.site",
+      "aliases": [
+        "https://acme.ddev.site",
+        "https://acme.staging.example.net"
+      ]
+    },
+    {
+      "name": "shop",
+      "canonical": "https://shop.example.com",
+      "base": "https://shop.acme.ddev.site",
+      "aliases": [
+        "https://shop.acme.ddev.site"
+      ]
+    }
+  ]
+}
+```
+
+It needs no `--slug`. Without one there is no variant to derive, so `variant`
+is left out and the sites are a listing rather than a validated map; every
+origin in it has still been parsed as one, so each is a bare `http` or `https`
+scheme and host. Pass `--slug` and each site carries its variant, and the map
+is checked exactly as `check` checks it. `aliases` is what rewrites to the
+variant besides the canonical, so it includes `base`. `base` is the origin the
+variant derives from — the canonical where the file declares none, absent for
+a `--map` pair, which derives nothing.
+
+`--file` reads a hostshift.yaml other than the checkout's, and `--file -`
+reads it from stdin, which is the form above: a program that has to trust the
+map from one commit can hand hostshift that commit's file without writing it
+into a working tree a branch can change. A named file that does not exist is
+an error, not a fall-back to the DDEV layer. Every subcommand that resolves a
+map takes it; `rewrite` refuses `-`, since its stdin is the body.
+
+`hostshift hosts --json` prints the same hostnames as `hosts`, as one array.
+
 ## The database — required, and hostshift does not choose it
 
 **DDEV gives a new worktree an empty database of its own**, so the first thing

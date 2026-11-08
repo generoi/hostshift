@@ -56,6 +56,14 @@ type Flags struct {
 	Slug     string
 	// From/To are an explicit index-aligned map that replaces the files entirely.
 	From, To []string
+	// File is the hostshift.yaml to read instead of <dir>/hostshift.yaml, "-"
+	// for stdin. Unlike the default it must exist: naming a file that is not
+	// there falling back to the DDEV layer would be a silent change of map.
+	File string
+	// VariantOptional resolves the sites even when there is no slug to derive
+	// a variant from; those sites keep a zero Variant and the Map is then a
+	// listing that was never validated as a map, for `map --json` only.
+	VariantOptional bool
 }
 
 // Resolved is everything the proxy needs.
@@ -63,6 +71,7 @@ type Resolved struct {
 	Map      *origin.Map
 	Upstream string
 	Source   string // where the map came from, for diagnostics
+	Layer    string // which layer that was: "file", "ddev" or "flags"
 
 	// Uncovered lists hostnames DDEV registers for this project that the map
 	// does not mention, so they have no variant and cannot be reached here — a
@@ -132,7 +141,7 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		if err != nil {
 			return nil, err
 		}
-		res := &Resolved{Map: m, Upstream: f.Upstream, Source: "--from/--to"}
+		res := &Resolved{Map: m, Upstream: f.Upstream, Source: "--from/--to", Layer: "flags"}
 		// Best-effort: outside a DDEV project there is nothing to compare the
 		// map against, and that is not an error — `hostshift` runs anywhere.
 		if proj, err := ddev.Load(dir); err == nil {
@@ -145,6 +154,7 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		sites   []origin.Site
 		up      = f.Upstream
 		source  string
+		layer   string
 		pattern = DefaultVariantPattern
 	)
 
@@ -163,11 +173,11 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		return nil, err
 	}
 
-	switch hf, path, err := loadFile(dir); {
+	switch hf, path, err := loadFile(dir, f.File); {
 	case err != nil:
 		return nil, err
 	case hf != nil:
-		source = path
+		source, layer = path, "file"
 		if hf.Variant.Pattern != "" {
 			pattern = hf.Variant.Pattern
 		}
@@ -183,17 +193,27 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		if proj == nil {
 			return nil, fmt.Errorf("no map: found neither hostshift.yaml nor .ddev/config.yaml in %s, and no --from/--to given", dir)
 		}
-		source = ddev.Path(dir) + " (DDEV defaults)"
+		source, layer = ddev.Path(dir)+" (DDEV defaults)", "ddev"
 		if sites, err = sitesFromHosts(proj.Hosts, pattern, f.Slug); err != nil {
 			return nil, err
 		}
 	}
 
-	m, err2 := origin.NewMap(sites)
-	if err = err2; err != nil {
-		return nil, err
+	var m *origin.Map
+	for _, s := range sites {
+		if s.Variant.Host == "" {
+			if !f.VariantOptional {
+				return nil, fmt.Errorf("site %q: no variant — pass --slug, or declare `variant:` on the site", s.Name)
+			}
+			m = &origin.Map{Sites: sites}
+		}
 	}
-	res := &Resolved{Map: m, Upstream: up, Source: source}
+	if m == nil {
+		if m, err = origin.NewMap(sites); err != nil {
+			return nil, err
+		}
+	}
+	res := &Resolved{Map: m, Upstream: up, Source: source, Layer: layer}
 
 	// A hostshift.yaml *replaces* the DDEV layer rather than merging with it:
 	// an explicit map is a statement about which hosts this project serves, and
@@ -322,7 +342,7 @@ func mapFromFlags(f Flags) (*origin.Map, error) {
 			if err != nil {
 				return nil, err
 			}
-			sites = append(sites, origin.Site{Name: name, Canonical: c, Variant: v})
+			sites = append(sites, origin.Site{Name: name, Canonical: c, Base: c, Variant: v})
 		}
 		return origin.NewMap(sites)
 	}
@@ -344,11 +364,23 @@ func mapFromFlags(f Flags) (*origin.Map, error) {
 	return origin.NewMap(sites)
 }
 
-func loadFile(dir string) (*File, string, error) {
+func loadFile(dir, file string) (*File, string, error) {
 	path := filepath.Join(dir, "hostshift.yaml")
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, "", nil
+	var (
+		b   []byte
+		err error
+	)
+	switch file {
+	case "":
+		if b, err = os.ReadFile(path); os.IsNotExist(err) {
+			return nil, "", nil
+		}
+	case "-":
+		path = "stdin"
+		b, err = io.ReadAll(os.Stdin)
+	default:
+		path = file
+		b, err = os.ReadFile(path)
 	}
 	if err != nil {
 		return nil, "", err
@@ -415,13 +447,19 @@ func sitesFromFile(f *File, pattern, slug string) ([]origin.Site, error) {
 		if err != nil {
 			return nil, err
 		}
-		sites = append(sites, origin.Site{Name: name, Canonical: canonical, Aliases: aliases, Variant: variant})
+		base := canonical
+		if s.Base != "" {
+			base, _ = origin.Parse(s.Base) // parsed above, as an alias
+		}
+		sites = append(sites, origin.Site{Name: name, Canonical: canonical, Base: base, Aliases: aliases, Variant: variant})
 	}
 	return sites, nil
 }
 
 // deriveVariant applies the pattern to the leftmost label of base. An explicit
-// variant: on the site wins; base falls back to canonical when absent.
+// variant: on the site wins; base falls back to canonical when absent. With no
+// slug it returns the zero Origin, which resolve refuses unless the caller asked
+// for a listing (Flags.VariantOptional).
 func deriveVariant(explicit, base, canonical, pattern, slug, name string) (origin.Origin, error) {
 	if explicit != "" {
 		return origin.Parse(explicit)
@@ -435,7 +473,7 @@ func deriveVariant(explicit, base, canonical, pattern, slug, name string) (origi
 		return origin.Origin{}, fmt.Errorf("site %q: %w", name, err)
 	}
 	if slug == "" {
-		return origin.Origin{}, fmt.Errorf("site %q: no variant — pass --slug, or declare `variant:` on the site", name)
+		return origin.Origin{}, nil
 	}
 	host, err := applyPattern(pattern, slug, o.Host)
 	if err != nil {
@@ -566,7 +604,7 @@ func sitesFromHosts(hosts []string, pattern, slug string) ([]origin.Site, error)
 		if err != nil {
 			return nil, err
 		}
-		sites = append(sites, origin.Site{Name: name, Canonical: c, Variant: v})
+		sites = append(sites, origin.Site{Name: name, Canonical: c, Base: c, Variant: v})
 	}
 	return sites, nil
 }
