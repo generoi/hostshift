@@ -84,7 +84,7 @@ type Flags struct {
 // canonical side and leaves the file alone.
 //
 // The held origin becomes the canonical — what the request direction writes
-// back, and what WordPress must match against wp_blogs — and every other origin
+// back, and so the Host the app sees — and every other origin
 // the site declares becomes an alias, so a residual URL from any environment
 // still rewrites to the one variant. The variant does not move: it is always
 // derived from base.

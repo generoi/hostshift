@@ -323,8 +323,8 @@ esac
 # site: a pristine production dump holds the canonicals, `copy-db` from a
 # search-replaced parent holds the bases, a staging pull holds the aliases. With
 # the file mounted, the proxy maps the canonicals and nothing else, so a copy of
-# the parent's database 301'd every page to the parent's hostname — WordPress
-# matched the Host it was handed against rows holding another one.
+# the parent's database 301'd every page to the parent's hostname — an app that
+# checks the Host it is handed against the hostname its data names redirects.
 #
 # Recorded in .ddev/.env, for the reason HOSTSHIFT_SLUG_CHOSEN is: `check`, the
 # post-start hook and a later bare `init` must resolve the same side the

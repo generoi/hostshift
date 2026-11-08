@@ -525,9 +525,10 @@ A committed production-canonical file describes the sites, not the database
 in front of you. A worktree's data comes from somewhere: a pristine production
 dump holds each site's `canonical`, `ddev hostshift copy-db` from a parent whose
 pull search-replaced to `.ddev.site` holds each site's `base`, and a staging
-pull holds its staging alias. Mapped from the wrong side, WordPress is handed a
-hostname its rows do not name and redirects every page to the one they do —
-a copy-db worktree of a production-canonical repo 301s to the parent.
+pull holds its staging alias. Mapped from the wrong side, the app is handed a
+hostname its data does not name, and one that checks the Host redirects every
+page to the one it does — a copy-db worktree of a production-canonical repo
+301s to the parent.
 
 So say which side, and keep the one file:
 
