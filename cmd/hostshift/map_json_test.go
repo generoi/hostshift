@@ -99,6 +99,59 @@ func TestMapFileOverridesTheProjects(t *testing.T) {
 	}
 }
 
+// --holds picks which declared origin of each site is the canonical side: the
+// same file maps a production dump, a copy of the main checkout's database and
+// a staging pull, and the variant stays where it is.
+func TestMapHolds(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "hostshift.yaml", prodYAML)
+	pairs := func(holds string) (int, string, string) {
+		return run(t, "", cmdMap, "-C", dir, "--slug", "wt-a", "--pairs", "--holds", holds)
+	}
+
+	for holds, want := range map[string]string{
+		"canonical": "https://www.example.com=https://wt-a--acme.ddev.site\nhttps://shop.example.com=https://wt-a--shop.acme.ddev.site\n",
+		"base":      "https://acme.ddev.site=https://wt-a--acme.ddev.site\nhttps://shop.acme.ddev.site=https://wt-a--shop.acme.ddev.site\n",
+	} {
+		if code, out, errOut := pairs(holds); code != exitOK || out != want {
+			t.Errorf("--holds %s: exit %d: %q %s", holds, code, out, errOut)
+		}
+	}
+
+	// The origin it replaces stays in the map as an alias, so a production URL
+	// left in a copied database still rewrites to the variant.
+	_, out, _ := run(t, "", cmdMap, "-C", dir, "--json", "--holds", "base")
+	s := decodeMap(t, out).Sites[0]
+	if s.Canonical != "https://acme.ddev.site" || s.Base != "https://acme.ddev.site" ||
+		strings.Join(s.Aliases, " ") != "https://www.example.com https://acme.staging.example.net" {
+		t.Errorf("--holds base: %+v", s)
+	}
+
+	// An alias only where a site declares exactly one: the shop declares none.
+	if code, _, errOut := pairs("alias"); code != exitConfig || !strings.Contains(errOut, `site "shop": --holds alias, but it declares no alias`) {
+		t.Errorf("alias, none: exit %d: %s", code, errOut)
+	}
+	two := strings.Replace(prodYAML, "aliases: [https://acme.staging.example.net]", "aliases: [https://acme.staging.example.net, https://acme.test.example.net]", 1)
+	staged := two + "    aliases: [https://shop.staging.example.net]\n"
+	writeFile(t, dir, "hostshift.yaml", staged)
+	if code, _, errOut := pairs("alias"); code != exitConfig || !strings.Contains(errOut, "ambiguous") {
+		t.Errorf("alias, two: exit %d: %s", code, errOut)
+	}
+	writeFile(t, dir, "hostshift.yaml", prodYAML+"    aliases: [https://shop.staging.example.net]\n")
+	want := "https://acme.staging.example.net=https://wt-a--acme.ddev.site\nhttps://shop.staging.example.net=https://wt-a--shop.acme.ddev.site\n"
+	if code, out, errOut := pairs("alias"); code != exitOK || out != want {
+		t.Errorf("--holds alias: exit %d: %q %s", code, out, errOut)
+	}
+
+	// No file, no aliases to hold; and a side that is not one is refused.
+	if code, _, errOut := run(t, "", cmdMap, "--slug", "wt-a", "--from", "https://a.ddev.site", "--holds", "alias"); code != exitConfig || !strings.Contains(errOut, "declares no aliases") {
+		t.Errorf("flags: exit %d: %s", code, errOut)
+	}
+	if code, _, errOut := pairs("staging"); code != exitConfig || !strings.Contains(errOut, "canonical, base or alias") {
+		t.Errorf("bad side: exit %d: %s", code, errOut)
+	}
+}
+
 // The layer says which of the three the map came from.
 func TestMapJSONLayer(t *testing.T) {
 	dir := t.TempDir()

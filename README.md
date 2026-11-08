@@ -519,6 +519,45 @@ summarised below. Two things become required with it:
 
 Neither is needed when the database already holds DDEV hostnames.
 
+### Which side the database holds — `--holds`
+
+A committed production-canonical file describes the sites, not the database
+in front of you. A worktree's data comes from somewhere: a pristine production
+dump holds each site's `canonical`, `ddev hostshift copy-db` from a parent whose
+pull search-replaced to `.ddev.site` holds each site's `base`, and a staging
+pull holds its staging alias. Mapped from the wrong side, the app is handed a
+hostname its data does not name, and one that checks the Host redirects every
+page to the one it does — a copy-db worktree of a production-canonical repo
+301s to the parent.
+
+So say which side, and keep the one file:
+
+```
+ddev hostshift init --holds base       # copy-db, or any search-replaced pull
+ddev hostshift init --holds alias      # a staging pull
+ddev hostshift init --holds canonical  # a production dump; the default
+```
+
+`base` and `canonical` are the fields of that name; `alias` is the one alias a
+site declares besides its base, and refuses a site with none or several rather
+than guess. The variant does not move — it is always derived from `base` — so
+the preview URL is the same whichever side the data is on.
+
+The side is recorded as `HOSTSHIFT_HOLDS` in `.ddev/.env`, the way a chosen
+slug is, so `check`, the post-start hook and a later bare `init` resolve the
+same map; `--holds canonical` goes back and records nothing. `copy-db` says so
+when it has just put the bases into a worktree mapped on its canonicals.
+
+Off the canonical side the proxy gets a flat `--from`/`--to` map — the held
+origin of each site against its variant — rather than reading the mounted file,
+because the published image predates the flag. A flat map carries no aliases,
+so a URL in the copy naming one of the site's other origins passes through
+unrewritten, as it did before the repo committed the file. `--holds base`
+without a `hostshift.yaml` is accepted and changes nothing: the map is the
+parent's DDEV hostnames already. The binary takes the same flag
+(`hostshift map --holds base --pairs`), and there it keeps the other origins as
+aliases.
+
 ## Reference
 
 ```
@@ -542,8 +581,9 @@ ddev hostshift env       print what init would write, without writing
 ddev hostshift wp-cli    emit wp-cli.local.yml on stdout
 ```
 
-`--slug NAME` overrides the slug derived from the git branch. `--dry-run` shows
-what `init` would write without writing it.
+`--slug NAME` overrides the slug derived from the git branch. `--holds SIDE`
+says which of `hostshift.yaml`'s origins the database holds (above). `--dry-run`
+shows what `init` would write without writing it.
 
 Flags worth knowing:
 

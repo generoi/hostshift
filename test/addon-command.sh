@@ -3021,6 +3021,82 @@ args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$wtk/.ddev/.env")"
 n="$(printf '%s\n' "$args" | grep -o -- '--max-body' | wc -l | tr -d ' ')"
 check "a second init does not duplicate it" "1" "$n"
 
+echo "== --holds: which of hostshift.yaml's origins the database holds"
+
+# One committed production-canonical file, three databases: a production dump
+# holds the canonicals, `copy-db` from the search-replaced parent holds the
+# bases, a staging pull holds the aliases. With the file mounted the proxy maps
+# the canonicals only, so a copy-db worktree 301'd every page to the parent's
+# hostname and every e2e test failed.
+hm="$work/holdsm"; newproject "$hm" 'name: holdsm\nadditional_hostnames:\n  - shop.holdsm'
+hw="$work/holdsm-wt"
+git -C "$hm" worktree add -q -b wt-h "$hw"
+mkdir -p "$hw/.ddev"; printf 'name: holdsm-wt\n' > "$hw/.ddev/config.worktree.local.yaml"
+printf '%s\n' 'version: 1' 'sites:' \
+  '  - name: main' '    canonical: https://www.example.com' '    base: https://holdsm.ddev.site' \
+  '    aliases: [https://holdsm.staging.example.net]' \
+  '  - name: shop' '    canonical: https://shop.example.com' '    base: https://shop.holdsm.ddev.site' \
+  '    aliases: [https://shop.staging.example.net]' > "$hw/hostshift.yaml"
+held_base="HOSTSHIFT_ARGS=--from https://holdsm.ddev.site --to https://wt-h--holdsm.ddev.site --from https://shop.holdsm.ddev.site --to https://wt-h--shop.holdsm.ddev.site"
+variants_h="HOSTSHIFT_VARIANTS=wt-h--holdsm.ddev.site,wt-h--shop.holdsm.ddev.site"
+
+out="$(cd "$hw" && "$cmd" env --slug wt-h 2>/dev/null || true)"
+check "by default the mounted file maps its canonicals" \
+  "HOSTSHIFT_ARGS=--slug wt-h" "$(printf '%s\n' "$out" | sed -n '/^HOSTSHIFT_ARGS=/p')"
+case "$out" in *HOSTSHIFT_HOLDS*) fail "and records no side" "$out" ;; *) pass "and records no side" ;; esac
+
+# The proxy image predates the flag, so the side goes over as --from/--to.
+out="$(cd "$hw" && "$cmd" env --slug wt-h --holds base 2>/dev/null || true)"
+check "--holds base hands the proxy the bases, flat" \
+  "$held_base" "$(printf '%s\n' "$out" | sed -n '/^HOSTSHIFT_ARGS=/p')"
+check "and the variants do not move" "$variants_h" "$(printf '%s\n' "$out" | sed -n '/^HOSTSHIFT_VARIANTS=/p')"
+contains "and the side is recorded" "HOSTSHIFT_HOLDS=base" "$out"
+
+out="$(cd "$hw" && "$cmd" env --slug wt-h --holds=alias 2>/dev/null || true)"
+contains "--holds alias maps the staging hostnames" \
+  "HOSTSHIFT_ARGS=--from https://holdsm.staging.example.net --to https://wt-h--holdsm.ddev.site --from https://shop.staging.example.net --to" "$out"
+
+# Recorded, so a bare init, `check` and the post-start hook agree with it rather
+# than calling the deployment stale and "fixing" it back to the canonicals.
+(cd "$hw" && "$cmd" init --slug wt-h --holds base >/dev/null 2>&1) || fail "init --holds base exited non-zero" ""
+contains "init writes the side" "HOSTSHIFT_HOLDS=base" "$(cat "$hw/.ddev/.env")"
+out="$(cd "$hw" && "$cmd" env --slug wt-h 2>/dev/null || true)"
+check "a later run without the flag keeps it" \
+  "$held_base" "$(printf '%s\n' "$out" | sed -n '/^HOSTSHIFT_ARGS=/p')"
+contains "wp-cli's url is the held side too" "url: https://holdsm.ddev.site" \
+  "$(cd "$hw" && "$cmd" wp-cli --slug wt-h 2>/dev/null || true)"
+
+env_args="$(sed -n 's/^HOSTSHIFT_ARGS=//p' "$hw/.ddev/.env")"
+env_variants="$(sed -n 's/^HOSTSHIFT_VARIANTS=//p' "$hw/.ddev/.env")"
+env_web="$(sed -n 's/^HOSTSHIFT_WEB_HOSTS=//p' "$hw/.ddev/.env")"
+writefake
+out="$(cd "$hw" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-h 2>&1)" \
+  && pass "check agrees with a recorded side" \
+  || fail "check agrees with a recorded side" "$out"
+case "$out" in *"out of date"*) fail "and does not call it stale" "$out" ;; *) pass "and does not call it stale" ;; esac
+# ...and a proxy still running the canonicals is a different map, not healthy.
+printf 'true\nproxy --slug wt-h \nVIRTUAL_HOST=%s\n' "$env_variants" > "$HS_FAKE_DIR/hostshift-state"
+out="$(cd "$hw" && PATH="$fakecurl:$fakebin:$PATH" "$cmd" check --slug wt-h 2>&1 || true)"
+contains "a proxy on the other side is caught" "different map" "$out"
+(cd "$hw" && "$cmd" init --slug wt-h --holds canonical >/dev/null 2>&1) || fail "init --holds canonical exited non-zero" ""
+check "--holds canonical is the way back, and records nothing" \
+  "" "$(sed -n '/^HOSTSHIFT_HOLDS=/p' "$hw/.ddev/.env")"
+check "and the file is mounted again" "HOSTSHIFT_ARGS=--slug wt-h" "$(sed -n '/^HOSTSHIFT_ARGS=/p' "$hw/.ddev/.env")"
+
+out="$(cd "$hw" && "$cmd" env --slug wt-h --holds staging 2>&1 || true)"
+contains "a side that is not one is refused" "say canonical, base or alias" "$out"
+# Without the file the map already is the bases, so `base` is a no-op a caller
+# can always pass; the others name origins only the file declares.
+mv "$hw/hostshift.yaml" "$work/holds.hold"
+out="$(cd "$hw" && "$cmd" env --slug wt-h --holds base 2>/dev/null || true)"
+contains "without a file --holds base is the parent's hostnames" "$held_base" "$out"
+if out="$(cd "$hw" && "$cmd" env --slug wt-h --holds alias 2>&1)"; then
+  fail "without a file --holds alias is refused" "exited 0: $out"
+else
+  contains "without a file --holds alias is refused" "needs a hostshift.yaml" "$out"
+fi
+mv "$work/holds.hold" "$hw/hostshift.yaml"
+
 echo "== the proxy dials its own web container, not whichever answers"
 
 # The service sits on ddev_default as well as its own network — it must, so the
