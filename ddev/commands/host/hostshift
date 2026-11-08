@@ -57,7 +57,9 @@ usage: ddev hostshift <command> [flags]
 
   --slug NAME         name this worktree's hostnames; recorded, and it sticks
   --slug-from-branch  forget a recorded slug and follow the branch again
-  --dry-run, -n       say what would happen, write nothing
+  --holds SIDE        which of hostshift.yaml's origins the database holds:
+                      canonical (the default), base or alias; recorded
+  --dry-run, -n      say what would happen, write nothing
   --no-restart        init: write the file and stop, for a pre-start hook
   --force             copy-db: overwrite a database that has tables
   --quiet, -q         say nothing when there is nothing to check
@@ -76,6 +78,7 @@ fi
 slug=""
 slug_explicit=""
 forget_slug=""
+holds=""
 branch=""
 dry_run=""
 no_restart=""
@@ -97,6 +100,11 @@ while [ $# -gt 0 ]; do
     # recording it — so without this the only way to return to branch-derived
     # naming is to hand-edit .ddev/.env.
     --slug-from-branch) forget_slug=1; shift ;;
+    # Both spellings, for the reason --slug gives above.
+    --holds) holds="${2:?--holds needs a value}"; shift 2 ;;
+    --holds=*) holds="${1#*=}"
+       [ -n "$holds" ] || { echo "--holds needs a value" >&2; exit 2; }
+       shift ;;
     --dry-run|-n) dry_run=1; shift ;;
     --no-restart) no_restart=1; shift ;;
     --quiet|-q) quiet=1; shift ;;
@@ -307,6 +315,41 @@ case "$slug" in
     echo "  silently truncates or corrupts the map." >&2
     exit 2 ;;
 esac
+
+# Which side of hostshift.yaml the database holds, recorded like a chosen slug.
+#
+# The file declares each site once — canonical, base, aliases — and which of
+# those a database holds depends on where *that copy* came from, not on the
+# site: a pristine production dump holds the canonicals, `copy-db` from a
+# search-replaced parent holds the bases, a staging pull holds the aliases. With
+# the file mounted, the proxy maps the canonicals and nothing else, so a copy of
+# the parent's database 301'd every page to the parent's hostname — WordPress
+# matched the Host it was handed against rows holding another one.
+#
+# Recorded in .ddev/.env, for the reason HOSTSHIFT_SLUG_CHOSEN is: `check`, the
+# post-start hook and a later bare `init` must resolve the same side the
+# database was deployed with, or they call a correct deployment stale and
+# "fix" it back onto the wrong side. `--holds canonical` is the way back, and
+# records nothing because it is the default.
+if [ -z "$holds" ] && [ "$cmd" != "copy-db" ]; then
+  holds="$(sed -n '/^HOSTSHIFT_HOLDS=/{s///p;q;}' .ddev/.env 2>/dev/null | tr -d '\r' || true)"
+fi
+case "${holds:-canonical}" in
+  canonical|base|alias) ;;
+  *) echo "hostshift: --holds $holds: say canonical, base or alias" >&2; exit 2 ;;
+esac
+[ "$holds" = canonical ] && holds=""
+# Without a hostshift.yaml the map already is the base side — the parent's DDEV
+# hostnames, which is what the database holds after `copy-db` — so `base` is
+# accepted as a no-op, and a caller that knows only where its data came from can
+# say so without first asking whether the repo has the file. The other two name
+# origins only the file declares.
+if [ ! -f hostshift.yaml ] && [ -n "$holds" ] && [ "$holds" != base ] && [ "$cmd" != "copy-db" ]; then
+  echo "hostshift: --holds $holds needs a hostshift.yaml to say which hostnames those" >&2
+  echo "  are, and this checkout has none. Without one the map is the parent's" >&2
+  echo "  DDEV hostnames, which is --holds base." >&2
+  exit 2
+fi
 
 # What this project answers to.  `hostshift hosts` reads the DDEV config with
 # its config.*.yaml override merging — parsing that here would be the place the
@@ -673,6 +716,15 @@ if [ "$cmd" = "copy-db" ]; then
       echo "  or re-run the copy once $from is up, which replaces it outright." >&2
     fi
     exit 1; }
+  # Not "nothing else to do" when a hostshift.yaml is here. The file's canonical
+  # side is usually production, and the copy holds $from's DDEV hostnames — its
+  # bases — so a map left on the canonicals 301s every page to the parent.
+  if [ -f hostshift.yaml ] && ! grep -q '^HOSTSHIFT_HOLDS=base$' .ddev/.env 2>/dev/null; then
+    echo "hostshift: copied. It holds $from's hostnames — hostshift.yaml's" >&2
+    echo "  \`base:\` side — so map that side:" >&2
+    echo "    ddev hostshift init --holds base" >&2
+    exit 0
+  fi
   echo "hostshift: copied. It still holds $from's hostnames, which is what" >&2
   echo "  hostshift maps — nothing else to do." >&2
   exit 0
@@ -683,6 +735,37 @@ fi
 # other environments, or production ones the database was never search-replaced
 # away from. Passing --from would override it.
 map_args=()
+# ...which is exactly what --holds wants, and the only way to ask for it.
+#
+# The proxy image is :latest and older than this flag, and the compose file's
+# rule is that nothing may ask it for a flag it does not have. --from/--to has
+# worked since the first release, so the side is resolved here, on the host, and
+# handed over as the flat map the no-file path already uses: the held origin of
+# each site against its variant. `flat` routes everything below that keys on
+# "is there a hostshift.yaml?" for the *proxy's* sake onto that path.
+#
+# The cost is the aliases. A flat list cannot carry them, so a URL in the copy
+# naming one of the site's other origins — production, say, in a copy-db of a
+# search-replaced database — passes through unrewritten, exactly as it did
+# before the repo committed its hostshift.yaml.
+flat=""
+if [ -f hostshift.yaml ] && [ -n "$holds" ] && [ "$cmd" != "copy-db" ]; then
+  if ! held="$(hostshift map --slug "$slug" --holds "$holds" --pairs 2>&1)"; then
+    case "$held" in
+      *"flag provided but not defined: -holds"*)
+        echo "hostshift: --holds needs the hostshift CLI v0.4.0 or later on PATH." >&2
+        echo "  https://github.com/generoi/hostshift/releases" >&2 ;;
+      *) printf '%s\n' "$held" >&2 ;;
+    esac
+    exit 2
+  fi
+  while IFS='=' read -r c v; do
+    [ -n "$c" ] || continue
+    map_args+=(--from "$c" --to "$v")
+  done <<<"$held"
+  [ "${#map_args[@]}" -gt 0 ] || { echo "hostshift: --holds $holds resolved no sites" >&2; exit 2; }
+  flat=1
+fi
 # The parent declares canonical hostnames this worktree cannot see.
 #
 # `hostshift hosts -C <dir>` reads the parent's *DDEV* config and nothing else,
@@ -1216,9 +1299,9 @@ done <<<"$hosts"
 # So it is resolved here, on the host, where the parent checkout is readable, and
 # handed over. Only when there is no hostshift.yaml: that file *is* mounted, it
 # carries aliases a canonical=variant list cannot express, and the container
-# reads it correctly.
+# reads it correctly — for the canonical side. Any other side is flat too.
 hsmap=""
-if [ ! -f hostshift.yaml ]; then
+if [ ! -f hostshift.yaml ] || [ -n "$flat" ]; then
   # Repeated --from/--to, not `--map c=v,c=v`. Comma-separated --map is a flag
   # form this branch added, and the image is :latest: the published binary splits
   # the whole string on its first `=`, so a two-site map came out as one site
@@ -1368,7 +1451,8 @@ fi
 # slug when run as printed, which in the case that motivates --slug at all is
 # back onto the colliding name the collision warning told you to move off.
 env_out="#ddev-silent-no-warn${slug_explicit:+
-HOSTSHIFT_SLUG_CHOSEN=$slug}
+HOSTSHIFT_SLUG_CHOSEN=$slug}${holds:+
+HOSTSHIFT_HOLDS=$holds}
 HOSTSHIFT_ARGS=$args
 HOSTSHIFT_VARIANTS=$variants
 HOSTSHIFT_WEB_HOSTS=$web"
@@ -1422,7 +1506,7 @@ if [ "$cmd" = "check" ]; then
   # variable of the developer's own sharing the prefix — and the compose file
   # reads HOSTSHIFT_* names, so that is how someone arrives at one.
   deployed="$(grep -e '^HOSTSHIFT_ARGS=' -e '^HOSTSHIFT_VARIANTS=' -e '^HOSTSHIFT_WEB_HOSTS=' \
-    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^#ddev-silent-no-warn' .ddev/.env | tr -d '\r' || true)"
+    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^HOSTSHIFT_HOLDS=' -e '^#ddev-silent-no-warn' .ddev/.env | tr -d '\r' || true)"
   if [ "$deployed" != "$env_out" ]; then
     echo "hostshift: .ddev/.env is out of date. It says" >&2
     printf '%s\n' "${deployed:-  nothing}" >&2
@@ -2902,7 +2986,7 @@ trap 'rm -f "$tmp"' EXIT
 # it meant it.
 cp -p .ddev/.env "$tmp"
 { grep -v -e '^HOSTSHIFT_ARGS=' -e '^HOSTSHIFT_VARIANTS=' -e '^HOSTSHIFT_WEB_HOSTS=' \
-    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^#ddev-silent-no-warn' .ddev/.env || true
+    -e '^HOSTSHIFT_SLUG_CHOSEN=' -e '^HOSTSHIFT_HOLDS=' -e '^#ddev-silent-no-warn' .ddev/.env || true
   printf '%s\n' "$env_out"; } > "$tmp"
 mv "$tmp" .ddev/.env
 

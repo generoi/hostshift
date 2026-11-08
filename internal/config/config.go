@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -64,7 +65,34 @@ type Flags struct {
 	// a variant from; those sites keep a zero Variant and the Map is then a
 	// listing that was never validated as a map, for `map --json` only.
 	VariantOptional bool
+	// Holds says which of each hostshift.yaml site's declared origins the
+	// database holds: "canonical" (the default, also ""), "base", or "alias",
+	// the one alias a site declares besides its base. See Holds.
+	Holds string
 }
+
+// The sides a database can hold, for Flags.Holds.
+//
+// A hostshift.yaml declares each site once, with every hostname its content is
+// known by: canonical (usually production), base (the main checkout's DDEV
+// host), aliases (staging). Which of them a given database holds is not a
+// property of the site — it is a property of where that copy came from. A
+// pristine production dump holds the canonicals, a copy of the developer's own
+// search-replaced database holds the bases, a staging pull holds the staging
+// aliases. Writing a second hostshift.yaml per source would be two declarations
+// of one set of sites drifting apart; this names which origin is the map's
+// canonical side and leaves the file alone.
+//
+// The held origin becomes the canonical — what the request direction writes
+// back, and what WordPress must match against wp_blogs — and every other origin
+// the site declares becomes an alias, so a residual URL from any environment
+// still rewrites to the one variant. The variant does not move: it is always
+// derived from base.
+const (
+	HoldsCanonical = "canonical"
+	HoldsBase      = "base"
+	HoldsAlias     = "alias"
+)
 
 // Resolved is everything the proxy needs.
 type Resolved struct {
@@ -135,8 +163,27 @@ func validateUpstream(raw string) error {
 }
 
 func resolve(dir string, f Flags) (*Resolved, error) {
+	switch f.Holds {
+	case "", HoldsCanonical, HoldsBase, HoldsAlias:
+	default:
+		return nil, fmt.Errorf("--holds %q: say canonical, base or alias", f.Holds)
+	}
+	// Only a hostshift.yaml declares more than one origin per site. Under the
+	// other layers canonical and base are the same origin, so either answer is
+	// the map as it stands; an alias is something only the file can name, and
+	// quietly mapping the canonical instead would be the wrong side, silently.
+	fileLayerOnly := func(layer string) error {
+		if f.Holds == HoldsAlias {
+			return fmt.Errorf("--holds alias: the map comes from %s, which declares no aliases — only a hostshift.yaml does", layer)
+		}
+		return nil
+	}
+
 	// Layer 3 first when it is total: an explicit --from/--to map needs no files.
 	if len(f.From) > 0 || len(f.To) > 0 {
+		if err := fileLayerOnly("--from/--to"); err != nil {
+			return nil, err
+		}
 		m, err := mapFromFlags(f)
 		if err != nil {
 			return nil, err
@@ -187,7 +234,13 @@ func resolve(dir string, f Flags) (*Resolved, error) {
 		if sites, err = sitesFromFile(hf, pattern, f.Slug); err != nil {
 			return nil, err
 		}
+		if sites, err = holdSide(sites, hf, f.Holds); err != nil {
+			return nil, err
+		}
 	default:
+		if err := fileLayerOnly("the DDEV config"); err != nil {
+			return nil, err
+		}
 		// Layer 1. For a single-environment site with no extra aliases this is
 		// sufficient on its own and no hostshift.yaml is needed at all.
 		if proj == nil {
@@ -454,6 +507,54 @@ func sitesFromFile(f *File, pattern, slug string) ([]origin.Site, error) {
 		sites = append(sites, origin.Site{Name: name, Canonical: canonical, Base: base, Aliases: aliases, Variant: variant})
 	}
 	return sites, nil
+}
+
+// holdSide makes each site's held origin its canonical (Flags.Holds), and the
+// canonical it replaces one of its aliases. sites are sitesFromFile's, in the
+// file's order.
+func holdSide(sites []origin.Site, f *File, holds string) ([]origin.Site, error) {
+	if holds == "" || holds == HoldsCanonical {
+		return sites, nil
+	}
+	out := make([]origin.Site, 0, len(sites))
+	for i, s := range sites {
+		held := s.Base
+		if holds == HoldsAlias {
+			// The aliases as declared, not s.Aliases, which has base folded in.
+			var cands []origin.Origin
+			for _, raw := range f.Sites[i].Aliases {
+				o, _ := origin.Parse(raw) // parsed by sitesFromFile
+				if !o.Equal(s.Base) && !o.Equal(s.Canonical) &&
+					!slices.ContainsFunc(cands, o.Equal) {
+					cands = append(cands, o)
+				}
+			}
+			// Exactly one, or the answer is a guess. A site with none has no
+			// staging hostname to hold; a site with two could hold either, and
+			// picking the first maps the other's rows to nothing.
+			switch len(cands) {
+			case 1:
+				held = cands[0]
+			case 0:
+				return nil, fmt.Errorf("site %q: --holds alias, but it declares no alias besides its base", s.Name)
+			default:
+				return nil, fmt.Errorf("site %q: --holds alias, but it declares %d aliases besides its base, so which one the database holds is ambiguous", s.Name, len(cands))
+			}
+		}
+		if held.Equal(s.Canonical) {
+			out = append(out, s)
+			continue
+		}
+		aliases := []origin.Origin{s.Canonical}
+		for _, a := range s.Aliases {
+			if !a.Equal(held) {
+				aliases = append(aliases, a)
+			}
+		}
+		s.Canonical, s.Aliases = held, aliases
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // deriveVariant applies the pattern to the leftmost label of base. An explicit

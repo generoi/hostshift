@@ -201,6 +201,7 @@ type common struct {
 	file           string
 	slug, upstream string
 	from, to       repeatable
+	holds          string
 	anyVariant     bool
 }
 
@@ -212,6 +213,9 @@ func (c *common) register(fs *flag.FlagSet) {
 	fs.Var(&c.from, "from", "canonical origin, repeatable, index-aligned with --to")
 	fs.Var(&c.to, "to", "variant origin, repeatable, index-aligned with --from")
 	fs.Var(pairFlag{&c.from, &c.to}, "map", "canonical=variant, repeatable")
+	fs.StringVar(&c.holds, "holds", "",
+		"which of each hostshift.yaml site's origins the database holds:\n"+
+			"canonical (the default), base, or alias (its one alias besides base)")
 }
 
 func (c *common) load() (*config.Resolved, error) {
@@ -221,6 +225,7 @@ func (c *common) load() (*config.Resolved, error) {
 		From:            c.from,
 		To:              c.to,
 		File:            c.file,
+		Holds:           c.holds,
 		VariantOptional: c.anyVariant,
 	})
 }
