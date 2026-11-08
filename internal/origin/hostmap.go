@@ -17,8 +17,12 @@ import (
 type Site struct {
 	Name      string
 	Canonical Origin
-	Aliases   []Origin
-	Variant   Origin
+	// Base is the origin the variant derives from: hostshift.yaml's `base:`,
+	// else the canonical; zero for a --map pair, which derives nothing. It is
+	// already in Aliases when it differs from Canonical; this is for reporting.
+	Base    Origin
+	Aliases []Origin
+	Variant Origin
 }
 
 // CanonicalSet is every origin that rewrites to this site's variant.
